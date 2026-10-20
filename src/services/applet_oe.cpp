@@ -178,7 +178,13 @@ struct EstadoDoApplet {
     //     }
     Kernel::KReadableEvent* readable = nullptr;
 
-    bool tem_mensagem() const { return !mensagens.empty(); }
+    bool tem_mensagem() const {
+        if (!mensagens.empty())
+            return true;
+        // A `FocusStateChanged` so' conta se a notificacao de foco estiver
+        // ligada — a regra do Eden (ver `proxima`).
+        return notificar_foco && foco_mudou;
+    }
 
     // **O evento deve estar sinalizado?**
     //
@@ -208,19 +214,62 @@ struct EstadoDoApplet {
     // applet entra em primeiro plano, e o SDK (que espera do evento de
     // inter-processo) prossegue.
     bool deve_estar_sinalizado() const {
-        return !mensagens.empty();
+        return !mensagens.empty() || (notificar_foco && foco_mudou);
     }
 
-    // A mudanca de foco: o applet foi para o primeiro plano.
+    // **A mudanca de foco** — o `m_has_focus_state_changed` do Eden.
     //
+    // A aplicacao entra em primeiro plano no arranque
+    // (`applet_manager.cpp:342`: `SetFocusState(m_system.Kernel(),
+    // FocusState::InFocus)`), e o Eden sinaliza o evento por causa disso.
+    //
+    // **E' um flag, e nao uma mensagem na fila.** A distincao e' o que
+    // importa: o Eden so' o consome no `PopMessage`, e so' se a
+    // notificacao de foco **estiver ligada** (`lifecycle_manager.cpp:47-63`).
+    bool foco_mudou = true;
+
+    // **`m_focus_state_changed_notification_enabled` do Eden.**
+    //
+    // O guest liga-o com o `SetFocusHandlingMode` (o `self_controller.cpp:191`).
+    //
+    // **Comeca a `true`, como no Eden** (`lifecycle_manager.h:159`:
+    // `bool m_focus_state_changed_notification_enabled{true};`). Com o
+    // notify desligado, o `ShouldSignalSystemEvent` do Eden dava sempre
+    // falso — e o guest ficava **a espera de um evento que nunca era
+    // sinalizado**, em 3936 esperas seguidas.
+    bool notificar_foco = true;
 
     // Tira a proxima. Devolve `None` (= 0) quando nao ha nenhuma.
     u32 proxima() {
-        if (mensagens.empty())
-            return 0;
-        const u32 m = mensagens.front();
-        mensagens.erase(mensagens.begin());
-        return m;
+        if (!mensagens.empty()) {
+            const u32 m = mensagens.front();
+            mensagens.erase(mensagens.begin());
+            return m;
+        }
+        // **A regra do Eden** (`lifecycle_manager.cpp:47-63`):
+        //
+        //     if (m_focus_state_changed_notification_enabled) {
+        //         if (!m_is_application) {
+        //             ...
+        //         } else if (m_has_focus_state_changed) {
+        //             m_has_focus_state_changed = false;
+        //             return AppletMessage::FocusStateChanged;
+        //         }
+        //     }
+        //
+        // A `FocusStateChanged` **so' e' devolvida — e so' e' consumida —
+        // se a notificacao de foco estiver ligada**.
+        //
+        // **Sem esta condicao, o guest ficava a espera para sempre.**
+        // O `ReceiveMessage` (que vem **antes**) consumia a mensagem da
+        // fila, e o `SetFocusHandlingMode` (que vem **depois**) ja nao
+        // encontrava nada para sinalizar — e o evento do sistema nunca
+        // era sinalizado.
+        if (notificar_foco && foco_mudou) {
+            foco_mudou = false;
+            return kFocusStateChanged;
+        }
+        return 0;
     }
 
     // Empurra uma mensagem e sinaliza o evento do sistema.
@@ -575,8 +624,8 @@ private:
 /// O `ISelfController` — o que o jogo pode fazer consigo próprio.
 class SelfController final : public Service::ServiceFramework<SelfController> {
 public:
-    explicit SelfController(Core::System& system)
-        : ServiceFramework{system, "ISelfController"} {
+    explicit SelfController(Core::System& system, std::shared_ptr<EstadoDoApplet> estado)
+        : ServiceFramework{system, "ISelfController"}, estado_{std::move(estado)} {
         static const FunctionInfo functions[] = {
             {0, &SelfController::Exit, "Exit"},
             {1, &SelfController::LockExit, "LockExit"},
@@ -613,6 +662,11 @@ public:
     }
 
 private:
+    // O estado do `am` — o mesmo de todas as sub-interfaces. E' o que
+    // permite ao `SetFocusHandlingMode` ligar a notificacao de mudanca de
+    // foco e sinalizar o evento do sistema.
+    std::shared_ptr<EstadoDoApplet> estado_;
+
     // Sair do jogo. O Eden chama `m_system.Exit()`; aqui o jogo pode
     // simplesmente regressar, e a telemetria regista.
     void Exit(HLERequestContext& ctx) {
@@ -672,6 +726,27 @@ private:
     }
 
     void SetFocusHandlingMode(HLERequestContext& ctx) {
+        // **Tres bools** (`notify`, `background`, `suspend`) — o Eden
+        // (`self_controller.cpp:187`).
+        //
+        // **`notify` e' o que liga a notificacao de mudanca de foco** — e
+        // e' o que faz o `am` sinalizar o evento do sistema
+        // (`lifecycle_manager.cpp`:
+        // `SetFocusStateChangedNotificationEnabled` chama
+        // `SignalSystemEventIfNeeded`).
+        //
+        // Sem isto, o guest ficava a espera de um evento que nunca
+        // chegava, e fazia **polling**: 74 `SignalProcessWideKey` e 53
+        // `SendSyncRequest` antes do primeiro assert.
+        RequestParser rp{ctx};
+        bool args[3]{};
+        rp.PopBools(args, 3);
+
+        if (estado_) {
+            estado_->notificar_foco = args[0];
+            estado_->sinalizar_se_precisa(system.Kernel());
+        }
+
         ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
@@ -755,15 +830,6 @@ private:
 
     // O evento que dispara quando esse numero muda. Ver `handle_de_evento`.
     void GetAccumulatedSuspendedTickChangedEvent(HLERequestContext& ctx) {
-        // **O Eden usa `PushCopyObjects`** (`cmif_serialization.h:397`),
-        // e nao `Push` de um handle: o `OutCopyHandle` registado no
-        // objecto e' posto na handle table do processo, e o handle
-        // escrito no descritor de handles.
-        //
-        // Com `Push` de um handle, o handle ia parar ao raw data — e o
-        // guest lia um numero onde esperava um handle. **Foi assim que o
-        // `GetEventHandle` devolveu `0x8000`** (o pseudo-handle da thread
-        // corrente, lido do sitio errado) em vez do handle do evento.
         ResponseBuilder rb{ctx, 2, 1, 0};
         rb.Push(ResultSuccess);
         rb.PushCopyObjects(ctx, evento_de_sistema(system));
@@ -1296,8 +1362,8 @@ private:
     }
 
     void GetSelfController(HLERequestContext& ctx) {
-        Devolve<SelfController>(ctx, "GetSelfController", [](Core::System& sys, std::shared_ptr<EstadoDoApplet>) {
-            return std::make_shared<SelfController>(sys);
+        Devolve<SelfController>(ctx, "GetSelfController", [](Core::System& sys, std::shared_ptr<EstadoDoApplet> est) {
+            return std::make_shared<SelfController>(sys, std::move(est));
         });
     }
 
@@ -1373,12 +1439,24 @@ public:
             // (`k_event.cpp:52-60`).
             estado_->evento = evento;
             estado_->readable = &evento->GetReadableEvent();
+            // **O evento do sistema ja nasce sinalizado.**
+            //
+            // No Eden, o `m_focus_state_changed_notification_enabled` e' o
+            // `m_has_focus_state_changed` comecam ambos a `true`
+            // (`lifecycle_manager.h:159` e `:168`), e o
+            // `SignalSystemEventIfNeeded` — chamado pelo `SetFocusState` do
+            // lancamento — encontra o `ShouldSignalSystemEvent()` verdadeiro
+            // e **sinaliza o evento**.
+            //
+            // Sem isto, o guest ficava a espera para sempre: o
+            // `WaitSynchronization` devolvia `ResultTimedOut` (o motor nao
+            // dorme) e o guest repetia — 3936 vezes seguidas, ate ao
+            // limite de traps.
+            estado_->sinalizar_se_precisa(system.Kernel());
         }
 
-        // A mensagem de entrada no primeiro plano, e o evento que a
-        // acompanha. Ver `EstadoDoApplet::empurrar`.
-        // O applet entra em primeiro plano. No Eden e' o
-        // `AppletManager` que o faz quando lanca o applet
+        // A mudanca de foco: a aplicacao entra em primeiro plano. No Eden
+        // e' o `AppletManager` que o faz quando lanca o applet
         // (`applet_manager.cpp:342`):
         //
         //     // Applet was started by frontend, so it is foreground.
@@ -1387,7 +1465,9 @@ public:
         // E o `SetFocusState` poe o `m_has_focus_state_changed` — que e'
         // o que faz o `ShouldSignalSystemEvent` devolver verdadeiro, e o
         // que sinaliza o evento do sistema.
-        estado_->empurrar(system.Kernel(), EstadoDoApplet::kFocusStateChanged);
+        //
+        // **E' um flag, e nao uma mensagem na fila** — ver `proxima()`.
+        estado_->foco_mudou = true;
         static const FunctionInfo functions[] = {
             {0, &AppletOE::OpenApplicationProxy, "OpenApplicationProxy"},
         };
