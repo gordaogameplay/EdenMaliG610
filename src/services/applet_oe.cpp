@@ -167,6 +167,43 @@ struct EstadoDoApplet {
 
     bool tem_mensagem() const { return !mensagens.empty(); }
 
+    // **O evento deve estar sinalizado?**
+    //
+    // A regra do Eden (`lifecycle_manager.cpp:125-141`):
+    //
+    //     bool LifecycleManager::ShouldSignalSystemEvent() {
+    //         if (m_focus_state_changed_notification_enabled) {
+    //             if (!m_is_application) {
+    //                 if (m_requested_focus_state != m_acknowledged_focus_state) {
+    //                     return true;
+    //                 }
+    //             } else if (m_has_focus_state_changed) {
+    //                 return true;
+    //             }
+    //         }
+    //         return !m_unordered_messages.empty() || m_has_resume || ...;
+    //     }
+    //
+    // Traduzida para o que este motor tem:
+    //
+    //  * a mudanca de foco conta (o `am` diz que o applet foi para o
+    //    primeiro plano);
+    //  * e ha mensagens na fila.
+    //
+    // **O que faltava no nosso motor e' a mudanca de foco** — e e' a que
+    // o SDK esta a espera. O `am` do Eden sinaliza o evento quando o
+    // applet entra em primeiro plano, e o SDK (que espera do evento de
+    // inter-processo) prossegue.
+    bool deve_estar_sinalizado() const {
+        return !mensagens.empty() || foco_mudou;
+    }
+
+    // A mudanca de foco: o applet foi para o primeiro plano.
+    //
+    // No Eden e' o `m_has_focus_state_changed`, que o
+    // `LifecycleManager::SetFocusState` poe (`lifecycle_manager.h:72-78`).
+    bool foco_mudou = false;
+
     // Tira a proxima. Devolve `None` (= 0) quando nao ha nenhuma.
     u32 proxima() {
         if (mensagens.empty())
@@ -177,11 +214,54 @@ struct EstadoDoApplet {
     }
 
     // Empurra uma mensagem e sinaliza o evento do sistema.
+    //
+    // **O sinal e' no `KReadableEvent`** — o filho, que e' o objecto que
+    // o guest recebe e sobre o qual espera. O `KEvent::Signal` (o pai)
+    // propaga ao filho (`k_event.cpp:52-60`), por isso sinalizar o pai
+    // chega — mas o `Clear` **nao** propaga da mesma maneira, e por isso
+    // o sinal e' feito aqui, no objecto que o guest tem.
     void empurrar(Kernel::KernelCore& kernel, u32 mensagem) {
         mensagens.push_back(mensagem);
-        if (evento != nullptr)
-            evento->Signal(kernel);
+        sinalizar_se_precisa(kernel);
     }
+
+    // **Sinaliza (ou limpa) o evento, conforme a regra do Eden.**
+    //
+    // O Eden (`lifecycle_manager.cpp:158-171`):
+    //
+    //     void LifecycleManager::SignalSystemEventIfNeeded(KernelCore& kernel) {
+    //         const bool applet_message_available = m_applet_message_available;
+    //         if (applet_message_available != this->ShouldSignalSystemEvent()) {
+    //             if (!applet_message_available) {
+    //                 m_system_event.Signal(kernel);
+    //                 m_applet_message_available = true;
+    //             } else {
+    //                 m_system_event.Clear(kernel);
+    //                 m_applet_message_available = false;
+    //             }
+    //         }
+    //     }
+    //
+    // **O evento e' de nivel**: o `WaitSynchronization` do guest consome o
+    // sinal (o nosso `Clear`), e o `am` volta a sinaliza-lo se ainda
+    // houver razao. Sem esta regra, o guest consome o sinal e fica a
+    // espera para sempre — que e' exactamente o que se media.
+    void sinalizar_se_precisa(Kernel::KernelCore& kernel) {
+        if (readable == nullptr)
+            return;
+        const bool precisa = deve_estar_sinalizado();
+        if (precisa == evento_sinalizado)
+            return;
+        if (precisa) {
+            readable->Signal(kernel);
+        } else {
+            readable->Clear(kernel);
+        }
+        evento_sinalizado = precisa;
+    }
+
+    // O estado do sinal, espelhado no `KReadableEvent`.
+    bool evento_sinalizado = false;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -307,6 +387,19 @@ private:
         if (estado_ && estado_->tem_mensagem()) {
             const u32 mensagem = estado_->proxima();
             LOG_DEBUG(Service_AM, "ReceiveMessage: entrega {}", mensagem);
+            // **O evento e' de nivel, e o Eden re-sinaliza depois de
+            // tirar a mensagem** (`lifecycle_manager.cpp:186-192`):
+            //
+            //     bool PopMessage(kernel, out) {
+            //         const auto message = PopMessageInOrderOfPriority();
+            //         this->SignalSystemEventIfNeeded(kernel);
+            //         *out_message = message;
+            //         return message != AppletMessage::None;
+            //     }
+            //
+            // Sem isto, o guest consome o sinal na espera e fica a
+            // espera para sempre.
+            estado_->sinalizar_se_precisa(system.Kernel());
             ResponseBuilder rb{ctx, 5};
             rb.Push(ResultSuccess);
             rb.Push(mensagem);
@@ -1261,6 +1354,17 @@ public:
 
         // A mensagem de entrada no primeiro plano, e o evento que a
         // acompanha. Ver `EstadoDoApplet::empurrar`.
+        // O applet entra em primeiro plano. No Eden e' o
+        // `AppletManager` que o faz quando lanca o applet
+        // (`applet_manager.cpp:342`):
+        //
+        //     // Applet was started by frontend, so it is foreground.
+        //     applet->lifecycle_manager.SetFocusState(m_system.Kernel(), FocusState::InFocus);
+        //
+        // E o `SetFocusState` poe o `m_has_focus_state_changed` — que e'
+        // o que faz o `ShouldSignalSystemEvent` devolver verdadeiro, e o
+        // que sinaliza o evento do sistema.
+        estado_->foco_mudou = true;
         estado_->empurrar(system.Kernel(), EstadoDoApplet::kChangeIntoForeground);
         static const FunctionInfo functions[] = {
             {0, &AppletOE::OpenApplicationProxy, "OpenApplicationProxy"},

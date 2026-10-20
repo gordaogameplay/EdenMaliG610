@@ -1839,3 +1839,143 @@ sub-interfaces, recebe a mensagem de entrada no primeiro plano, e espera
 pelo multi-wait de dominio.
 
 Suite: 6 testes. ia_translate 24, g610_gpu_exec 20 (pixel 1.500000), ia_maxwell 13.
+
+---
+
+# A resposta do IPC estava errada: o `rb{ctx, 2}`
+
+O SDK parou de andar. E a causa nao era o mecanismo de dominio — era
+**o tamanho da resposta**.
+
+## A formula do Eden
+
+`core/hle/service/cmif_serialization.h:475`:
+
+    IPC::ResponseBuilder rb{ctx, 2 + Common::DivCeil(layout.cmif_raw_data_size, sizeof(u32)),
+                            layout.copy_handle_count,
+                            layout.move_handle_count + layout.domain_interface_count};
+
+O `2` inicial e' o **Result**, e o Result ocupa **duas** palavras de 32
+bits (`ipc_helpers.h:201-205`: o `raw` e um zero). O que vem depois
+e' o *raw data* — e o que e' um handle **nao vai para o raw data**:
+vai para a handle table, e o handle e' escrito no descritor de
+handles.
+
+O nosso `appletOE` usava `rb{ctx, 2}` em **todos** os handlers. O
+Result ocupava as duas palavras, e o dado seguinte escrevia por cima
+da segunda.
+
+Medido, a resposta ao `GetEventHandle` era:
+
+    00000000 0000000e 00000000 00000000 4f434653 ...
+
+O `0000000e` (14) era o handle, no sitio do zero do Result. O guest
+lia lixo — e o sintoma era "o guest esta em ciclo".
+
+**A correccao:** 103 handlers. O script que a faz (`/tmp/verificar_rb.py`)
+conta as palavras de cada `rb.Push` — `u32`/`s32` = 1, `u64`/`s64` =
+2, `Result` = 2 — e ajusta o numero.
+
+## O handle do evento era o objecto errado
+
+O Eden devolve o **`KReadableEvent`** — o *filho* do `KEvent` — e e'
+sobre ele que o guest espera (`os/event.cpp:33-35`):
+
+    Kernel::KReadableEvent* Event::GetHandle() noexcept {
+        return std::addressof(m_event->GetReadableEvent());
+    }
+
+Nos devolviamos o `KEvent`, o *pai*. E usavamos `rb.Push(handle)`
+em vez de `rb.PushCopyObjects(ctx, obj)`, que e' o que o Eden faz
+(`cmif_serialization.h:397`): o objecto e' posto na handle table do
+processo, e o handle escrito no descritor de handles.
+
+**O sintoma disto era `0x8000`** — o pseudo-handle da thread corrente
+(`svc_common.h:29`), lido do sitio errado. Um numero que parece
+valido e nao e'.
+
+## A espera consultava o estado, ou nao consultava
+
+O `WaitSynchronization` devolvia `ResultTimedOut` **sempre**. O Eden
+(`k_synchronization_object.cpp:85-160`) consulta `IsSignaled` em cada
+objecto da lista e, se algum estiver sinalizado, **termina ali, sem
+dormir**:
+
+    // Check if any of the objects are already signaled.
+    for (auto i = 0; i < num_objects; ++i) {
+        if (objects[i]->IsSignaled(kernel)) {
+            *out_index = i;
+            slp.CancelSleep();
+            R_THROW(ResultSuccess);
+        }
+    }
+
+O `KReadableEvent` do Eden tem o estado (`m_is_signaled`) e o
+`IsSignaled()` — e o vendor ja os tinha, porque o `k_event.cpp` e' o
+codigo do Eden. So faltava **usar**.
+
+**E o `Wait` nao consome o sinal.** O `Clear` e' do **`am`**, no
+`SignalSystemEventIfNeeded` (`lifecycle_manager.cpp:158-171`), e
+acontece quando o `ShouldSignalSystemEvent()` deixa de ser
+verdadeiro. A primeira versao fazia o `Clear` no `Wait` — e o guest
+consumia o sinal e ficava a espera para sempre.
+
+## O evento e' de nivel, e a regra e' do Eden
+
+`lifecycle_manager.cpp:125-141`:
+
+    bool LifecycleManager::ShouldSignalSystemEvent() {
+        if (m_focus_state_changed_notification_enabled) {
+            if (!m_is_application) {
+                if (m_requested_focus_state != m_acknowledged_focus_state) {
+                    return true;
+                }
+            } else if (m_has_focus_state_changed) {
+                return true;
+            }
+        }
+        return !m_unordered_messages.empty() || m_has_resume || ...;
+    }
+
+Traduzida para o que este motor tem: **a mudanca de foco** conta, e
+**ha mensagens na fila**. E o `PopMessage` re-sinaliza depois de
+tirar a mensagem (`lifecycle_manager.cpp:186-192`).
+
+O que faltava no nosso motor era a **mudanca de foco**: o `am` do
+Eden poe o `m_has_focus_state_changed` quando o applet e' lancado
+(`applet_manager.cpp:342`):
+
+    // Applet was started by frontend, so it is foreground.
+    applet->lifecycle_manager.SetFocusState(m_system.Kernel(), FocusState::InFocus);
+
+## O que mudou
+
+O SDK deixou de pedir `ReceiveMessage` em ciclo — **1311 pedidos** —
+e passou a **esperar por um evento**: e' o que o Eden faz, e o que o
+guest faz num Switch.
+
+Medido: `ICommonStateGetter: comando 1 (ReceiveMessage)` — **uma
+vez**.
+
+E o guest passou do loop de mensagens para o **loop de pedidos** do
+`am` (`SendSyncRequest` + `SignalProcessWideKey`), que e' o passo
+seguinte do arranque do SDK.
+
+## O que ficou por explicar
+
+O SDK espera por um **objecto de dominio** — o `object_id` que o
+`ConvertCurrentObjectToDomain` devolve. E o `am` tem de o
+**sinalizar** quando o estado muda, que e' o mecanismo de notificacao
+push do Switch.
+
+A pista: a sessao do `am` e' um **dominio** (medido: `dominio=1` no
+`GetEventHandle`), e o `DomainMessageHeader` entra na resposta. No
+Eden, o `am` nunca e' chamado por um dominio — o `ConvertToDomain`
+converte a sessao do **`sm:`**, e o SDK usa esse dominio para
+**pedidos ao `am`**.
+
+**A regra do Eden, que e' a que resolve:** um objecto substituido
+pela ponte nao pode coexistir com ela. O Eden compila o
+`k_process.cpp` e o `k_thread.cpp` **reais**; nos usamos a ponte
+`k_process_bridge.h`, e por isso os originais nao podem coexistir
+com ela.

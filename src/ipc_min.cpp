@@ -766,15 +766,31 @@ Result SvcDispatcher::svc_wait_synchronization(SvcContext& ctx) {
             if (evento.GetPointerUnsafe() == nullptr) {
                 continue;
             }
+            if (std::getenv("IA_IPC_TRACE") != nullptr) {
+                std::fprintf(stderr, "[svc]   evento 0x%x sinalizado=%d\n",
+                              indices[k], evento->IsSignaled(kernel) ? 1 : 0);
+            }
             if (evento->IsSignaled(kernel)) {
                 // **Sinalizado: o passo 1 do Eden.** A espera termina
                 // aqui, e devolve o indice do objecto sinalizado.
                 //
-                // O `Clear` e' o que o Eden faz quando o evento ja foi
-                // consumido (`lifecycle_manager.cpp:170`): o evento e'
-                // de nivel, e o proximo `ReceiveMessage` volta a
-                // re-sinaliza-lo se ainda houver mensagem.
-                evento->Clear(kernel);
+                // **E o `Wait` nao consome o sinal.** No Eden
+                // (`k_synchronization_object.cpp:102-107`) o `Wait`
+                // limita-se a ver o estado e a devolver o indice; o
+                // `Clear` e' do **`am`**, no
+                // `SignalSystemEventIfNeeded`
+                // (`lifecycle_manager.cpp:158-171`), e acontece quando o
+                // `ShouldSignalSystemEvent()` deixa de ser verdadeiro.
+                //
+                // A primeira versao fazia o `Clear` aqui — e o guest
+                // consumia o sinal e ficava a espera para sempre,
+                // porque o `am` nao tinha razao para o re-sinalizar
+                // (e nao tinha, sequer: o `am` so' sinaliza quando o
+                // estado muda).
+                ctx.ret     = 0;
+                ctx.has_ret = true;
+                ctx.x[1]    = k;
+                return Result::Success;
                 ctx.ret     = 0;
                 ctx.has_ret = true;
                 ctx.x[1]    = k;
