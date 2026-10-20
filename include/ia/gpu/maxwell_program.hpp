@@ -56,4 +56,9 @@ Program make_minimal_shader();
 Program make_program(const std::vector<maxwell::Insn>& code,
                      const char* stage);
 
+// Um programa que exercita as três formas do ISCADD — carga directa, escala
+// e negação — porque um campo que ninguém escreve é um campo em que ninguém
+// sabe se está no sítio certo.
+Program make_iscadd_shader();
+
 } // namespace ia::gpu::maxwell

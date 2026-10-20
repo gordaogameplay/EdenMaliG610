@@ -56,7 +56,8 @@ enum class Op : std::uint8_t {
     FAdd,      // Rd = a + b        (float)
     FMul,      // Rd = a * b        (float)
     IAdd3,     // Rd = a + b        (inteiro, 32 bits)
-    IAdd,      // Rd = a + b        (inteiro, sem pred a considerar)
+    IAdd,      // Rd = a + b        (inteiro)
+    ISCAdd,    // Rd = (a << shift) + b     (o opcodes mais comum da Switch)
     LOp3,      // Rd = a & b ^ c    (logica)
     Exit,      // fim do programa
     StoreColor,// escreve o alvo (o que o guest faz com ST.E.CON)
@@ -72,6 +73,20 @@ struct Instr {
     std::uint8_t dst = 0;      // registo destino, quando há
     Value a, b, c;
     bool  is_c = false;        // `c` foi preenchido
+
+    // Campos do ISCADD. Vêm aqui e não dentro de `a`/`b` porque são
+    // modificadores da operação, não operandos.
+    //
+    // `shift` são os 5 bits de [39, 44). `neg_a`/`neg_b` são os bits 49/48.
+    // E `condicionado` é o caso em que os dois estão ligados — que não são
+    // duas negações, é a forma PREDICADA do opcode. O IR não tem predicados;
+    // o que se faz é o mesmo que o Eden faz, que é somar 1 a `b`. Está
+    // escrito porque essa aproximação não é uma predicção e um shader que a
+    // use a sério vai dar um resultado errado sem nenhum aviso.
+    std::uint8_t shift = 0;
+    bool          neg_a = false;
+    bool          neg_b = false;
+    bool          condicionado = false;
 
     // Nome da opcode Maxwell que originou isto, só para diagnóstico.
     // Um IR que não sabe de onde veio é um IR em que um erro de descodificação

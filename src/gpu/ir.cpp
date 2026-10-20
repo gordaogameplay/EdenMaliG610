@@ -22,6 +22,7 @@ std::string_view op_name(Op op) noexcept {
     case Op::FMul:       return "FMul";
     case Op::IAdd3:      return "IAdd3";
     case Op::IAdd:       return "IAdd";
+    case Op::ISCAdd:     return "ISCAdd";
     case Op::LOp3:       return "LOp3";
     case Op::Exit:       return "Exit";
     case Op::StoreColor: return "StoreColor";

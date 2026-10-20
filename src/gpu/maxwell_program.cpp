@@ -84,12 +84,18 @@ Program make_program(const std::vector<Insn>& code, const char* stage) {
     return p;
 }
 
-// O programa que vai à G610.
+// Os operandos, com o layout CORRIGIDO.
 //
-// Cada linha tem o encoding do operando à vista. Estes campos não são de
-// memória: `Rd`=[20:28), `Ra`=[0:8), `Rb`=[8:16), imediato 20=[20:39) com o
-// sinal no bit 56, `c[bank][word]`=[20:34)/[34:39). Vem de
-// `impl.cpp` no Eden (GetReg20, GetReg8, GetImm20, CbufAddr).
+// Rd = [ 0,  8)   Ra = [ 8, 16)   Rb = [20, 28)
+// cbuf: offset [20, 34) em palavras, binding [34, 39)
+// ISCADD: escala [39, 44), neg_b no 48, neg_a no 49
+// imm20: valor [20, 39), sinal no bit 56   |   imm32: valor [20, 52)
+//
+// A versão anterior punha o destino em [20, 28) e o teste passava na mesma,
+// porque o gerador e o frontend partilhavam a mesma convenção errada. Um
+// teste que concorda com o bug não é um teste — é uma assinatura. Só a
+// fonte desfaz isto, e a fonte é unânime: `dest_reg` é `BitField<0, 8>` em
+// FADD, FMUL, IADD3, ISCADD e MOV.
 namespace {
 
 constexpr Insn put_reg(unsigned shift, unsigned nbits, unsigned value) {
@@ -97,26 +103,21 @@ constexpr Insn put_reg(unsigned shift, unsigned nbits, unsigned value) {
     return (static_cast<Insn>(value) & m) << shift;
 }
 
-constexpr Insn put_imm20(std::uint64_t v) { return static_cast<Insn>(v & 0x7FFFFull) << 20; }
-constexpr Insn put_imm32(std::uint32_t v) { return static_cast<Insn>(v) << 20; }
+// O registo zero. `IR::Reg::RZ == 255`, com static_assert no Eden.
+constexpr unsigned kRegZero = 0xFF;
 
 constexpr Insn put_cbuf(unsigned binding, unsigned word) {
     return (static_cast<Insn>(word & 0x3FFF) << 20) |
            (static_cast<Insn>(binding & 0x1F) << 34);
 }
 
-// NÃO se põe qualquer bit de "vou buscar a uma constante".
-//
-// `Instruction::is_cbuf` existe (instruction.h:36, bit 5) mas é para
-// opcodes que TÊM as duas formas. `MOV (reg)` e `MOV (cbuf)` são entradas
-// DISTINTAS na tabela, distinguidas pelos 16 bits de topo — é o próprio opcode
-// que diz de onde vem o operando.
-//
-// Pôr o bit à mão foi tentado duas vezes e as duas deu errado: com o bit 0,
-// `MOV R2, c[...]` escrevia em R3; com o bit 5, escrevia em R34. Em ambos os
-// casos o GLSL compilava e a imagem saía errada. A lição não é "usar o bit
-// certo" — é que **aqui não há bit para pôr**.
-constexpr Insn cbuf_flag() { return 0; }
+// O ISCADD: (A << escala) + B.
+constexpr Insn iscadd(unsigned rd, unsigned ra, unsigned escala,
+                      unsigned neg_a = 0, unsigned neg_b = 0) {
+    return put_reg(0, 8, rd) | put_reg(8, 8, ra) |
+           put_reg(39, 5, escala) | (static_cast<Insn>(neg_a) << 49) |
+           (static_cast<Insn>(neg_b) << 48);
+}
 
 } // namespace
 
@@ -126,29 +127,61 @@ Program make_minimal_shader() {
 
     Op op = Op::Invalid;
 
-    //  MOV R2, c[0][0x10]                        -> R2 = 0x3F800000 (1.0f)
+    //  ISCADD R2, RZ, c[0][0x10]   -> R2 = 0x3F800000 (1.0f)
     //
-    //  O destino do MOV é [0:8) e NÃO [20:28) — em Maxwell o `MOV` tem um
-    //  layout de operandos diferente do dos aritméticos. Confirmado em
-    //  `move_register.cpp` (a union tem `BitField<0, 8> dest_reg`).
-    if (find_by_name("MOV (cbuf)", op))
-        p.code.push_back(make(op, put_reg(0, 8, 2) | put_cbuf(0, 0x10) | cbuf_flag()));
+    //  Esta é a forma como os shaders da Switch carregam uma constante: o
+    //  multiplicando é o registo zero, a escala é 0, e o que fica é a
+    //  constante. O `0 << 0` desaparece na aritmética e não precisa de
+    //  nenhum caso especial em lado nenhum.
+    if (find_by_name("ISCADD (cbuf)", op))
+        p.code.push_back(make(op, iscadd(2, kRegZero, 0) | put_cbuf(0, 0x10)));
 
-    //  MOV R3, c[0][0x14]                        -> R3 = 0.5f
-    if (find_by_name("MOV (cbuf)", op))
-        p.code.push_back(make(op, put_reg(0, 8, 3) | put_cbuf(0, 0x14) | cbuf_flag()));
+    //  ISCADD R3, RZ, c[0][0x14]   -> R3 = 0x3F000000 (0.5f)
+    if (find_by_name("ISCADD (cbuf)", op))
+        p.code.push_back(make(op, iscadd(3, kRegZero, 0) | put_cbuf(0, 0x14)));
 
-    //  FMUL R4, R2, R3                           -> R4 = 0.5
+    //  FMUL R4, R2, R3              -> R4 = 0.5
     if (find_by_name("FMUL (reg)", op))
-        p.code.push_back(make(op, put_reg(20, 8, 4) | put_reg(0, 8, 2) |
-                                   put_reg(8, 8, 3)));
+        p.code.push_back(make(op, put_reg(0, 8, 4) | put_reg(8, 8, 2) |
+                                   put_reg(20, 8, 3)));
 
-    //  FADD R4, R4, R2                           -> R4 = 1.5
+    //  FADD R4, R4, R2              -> R4 = 1.5
     if (find_by_name("FADD (reg)", op))
-        p.code.push_back(make(op, put_reg(20, 8, 4) | put_reg(0, 8, 4) |
-                                   put_reg(8, 8, 2)));
+        p.code.push_back(make(op, put_reg(0, 8, 4) | put_reg(8, 8, 4) |
+                                   put_reg(20, 8, 2)));
 
     //  EXIT
+    if (find_by_name("EXIT", op))
+        p.code.push_back(make(op, 0));
+
+    return p;
+}
+
+// Um programa que exercita AS TRÊS formas do ISCADD de uma vez, para que o
+// teste não passe só porque a forma que ele usa é a mais fácil.
+//
+//     ISCADD R1, RZ, c[0][0x20]        -> R1 = c (carga directa)
+//     ISCADD R2, R1, c[0][0x24], esc=2  -> R2 = c2 * 4 + c
+//     ISCADD R3, RZ, 0x2A, neg_a        -> R3 = 0 - 0x2A
+//
+// O shift e a negação são campos que ninguém tinha testado. Um campo que
+// ninguém exercita é um campo em que ninguém sabe se o bit está no sítio
+// certo — e a única forma de saber é escrever a instrução e ver o número.
+Program make_iscadd_shader() {
+    Program p;
+    p.stage = "fragment";
+    Op op = Op::Invalid;
+
+    if (find_by_name("ISCADD (cbuf)", op))
+        p.code.push_back(make(op, iscadd(1, kRegZero, 0) | put_cbuf(0, 0x20)));
+
+    if (find_by_name("ISCADD (cbuf)", op))
+        p.code.push_back(make(op, iscadd(2, 1, 2) | put_cbuf(0, 0x24)));
+
+    if (find_by_name("ISCADD (imm)", op))
+        p.code.push_back(make(op, iscadd(3, kRegZero, 0, /*neg_a=*/1, /*neg_b=*/1) |
+                                   (static_cast<Insn>(0x2A & 0x7FFFF) << 20)));
+
     if (find_by_name("EXIT", op))
         p.code.push_back(make(op, 0));
 

@@ -747,3 +747,100 @@ subconjunto. Já sabemos que o `IMAD.MOV.U32` é o idioma de carregar
 constantes e que o seu destino não está em [20:28). Confirmá-lo em
 `integer_scaled_add.cpp`, e depois medir o subconjunto contra os shaders de
 um `.nsp` de verdade.
+
+
+---
+
+# Frente 2 — marco 3: o layout de operandos estava invertido
+
+Fui confirmar o `IMAD` e encontrei outra coisa. Vale a pena porque é o erro
+mais instrutivo do projecto todo.
+
+## O que a fonte diz
+
+`integer_scaled_add.cpp` (o ficheiro do `ISCADD`, não do `IMAD`) tem:
+
+```cpp
+union {
+    u64 raw;
+    BitField<0, 8, IR::Reg> dest_reg;
+    BitField<8, 8, IR::Reg> op_a;
+} const iscadd{insn};
+```
+
+E o mesmo em `floating_point_add.cpp`, `floating_point_multiply.cpp`,
+`integer_add_three_input.cpp` e `move_register.cpp`: **`dest_reg` é
+`BitField<0, 8>` nos cinco.** O layout certo é:
+
+| campo | bits |
+|---|---|
+| `Rd` destino | **[0, 8)** |
+| `Ra` | **[8, 16)** |
+| `Rb` | **[20, 28)** |
+| `Rc` | [39, 47) — só o IADD3 |
+| predicado | [16, 20) |
+
+E `[20, 39)` é o **operando B**, que conforme o opcode é registo (em
+[20,28)), constante (offset [20,34) + binding [34,39)) ou imediato de 20.
+
+O que eu tinha: `Rd` em [20:28) e `Ra` em [0:8). **Invertido.**
+
+## Porque é que os testes passavam na mesma
+
+Porque o **gerador de SASS sintética** usava a mesma convenção errada. O
+frontend e o gerador concordavam, o teste comparava os dois, e dava certo.
+
+É a forma mais perigosa de um teste passar: um teste que concorda com o bug
+não é um teste, é uma assinatura. A correcção só veio de ir à fonte, e a
+fonte é unânime.
+
+## `ISCADD`, não `IMAD`
+
+Procurando o `IMAD` descobri que nos shaders da Switch o opcode real é o
+**`ISCADD`** — `IMAD_*` está em `not_implemented.cpp` no Eden, e `ISCADD_*`
+está implementado. O Eden não implementa o que não aparece nos jogos.
+
+E o `ISCADD` cobre, com um só opcode:
+
+```
+ISCADD Rd, RZ, c[bank][off]        ->  Rd = constante
+ISCADD Rd, RZ, Rb                  ->  Rd = Rb
+ISCADD Rd, Ra, c[bank][off], esc=n ->  Rd = (Ra << n) + constante
+```
+
+## RZ = 255
+
+`ir/reg.h` no Eden, com `static_assert`:
+
+```cpp
+RZ,
+};
+static_assert(static_cast<int>(Reg::RZ) == 255);
+constexpr size_t NUM_USER_REGS = 255;
+```
+
+Um campo de registo com **0xFF** é o registo zero, não o R255.
+
+O frontend traduz RZ para a **constante 0** logo no `v_reg()`. É o que faz
+`ISCADD Rd, RZ, c[..]` cair no caminho comum sem nenhum caso especial: no
+GLSL, `0 << n` é 0, e a constante fica. Traduzir RZ no frontend em vez de o
+tratarem no backend é o que mantém esta parte do IR honesta — o IR não tem
+casos especiais para "isto era um RZ".
+
+## Campos do `ISCADD` (de `integer_scaled_add.cpp`)
+
+- escala: bits **[39, 44)** (5 bits)
+- `cc` (escreve flags): bit 47
+- `neg_b`: bit 48
+- `neg_a`: bit 49
+- **os dois juntos não são duas negações** — é a forma *predicada* do
+  opcode. O Eden trata-a como `B + 1`. Copiei isso porque é o comportamento
+  medido contra hardware, mas **não é uma predicação** e o IR não tem
+  predicados. Um shader que use isto a sério vai dar um resultado errado sem
+  nenhum aviso. Está escrito no `ir.hpp`.
+
+## Estado
+
+24 verificações no `ia_translate_test`, 20 no `ia_gpu_exec`, 6 suites a
+passar. O pixel na G610 continua a dar 1.500000 com o shader agora escrito em
+`ISCADD`, que é o idioma real.

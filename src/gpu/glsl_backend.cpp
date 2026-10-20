@@ -101,6 +101,17 @@ std::string operand(const ir::Value& v);
 // dados; tinha um problema de INTERPRETAÇÃO. E nenhum teste do tipo "os
 // valores que chegam são os que se escreveram" o apanharia, porque os
 // valores eram os certos.
+// A negação de um operando do ISCADD.
+//
+// Para `uint` a negação é `(0 - x)`, que é a aritmética modular do tipo — a
+// mesma que o hardware faz. Escrever `-x` também funcionaria, mas `0 - x` é
+// explícito e não depende de o compilador decidir que sentido tem o menos.
+std::string talvez_neg(const std::string& x, ir::Type t, bool neg) {
+    if (!neg)
+        return x;
+    return "(0u - " + x + ")";
+}
+
 std::string converter(const ir::Value& v, ir::Type alvo) {
     const std::string base = operand(v);
     if (v.type == alvo)
@@ -220,6 +231,27 @@ std::string to_glsl(const ir::Program& p) {
             const ir::Type dt = (i.dst < 16) ? reg_type[i.dst] : i.type;
             o << "    " << reg_name(i.dst) << " = "
               << converter(i.a, dt) << " + " << converter(i.b, dt) << ";\n";
+            break;
+        }
+        case ir::Op::ISCAdd: {
+            // (A << escala) + B, com as modificações do opcode.
+            //
+            // `0 << n` é 0 no GLSL como em qualquer lado, por isso o RZ que o
+            // frontend traduziu para constante 0 desaparece sozinho. É por
+            // isso que `ISCADD Rd, RZ, c[..]` — a forma de carregar uma
+            // constante nos shaders da Switch — não precisa de caso nenhum
+            // aqui.
+            const ir::Type dt = (i.dst < 16) ? reg_type[i.dst] : i.type;
+            const std::string a = talvez_neg(converter(i.a, dt), dt, i.neg_a && !i.condicionado);
+            std::string b = talvez_neg(converter(i.b, dt), dt, i.neg_b && !i.condicionado);
+            if (i.condicionado)
+                b = "(" + b + " + 1)";
+            o << "    " << reg_name(i.dst) << " = ";
+            if (i.shift != 0)
+                o << "(" << a << " << " << static_cast<unsigned>(i.shift) << ") + ";
+            else
+                o << a << " + ";
+            o << b << ";\n";
             break;
         }
         case ir::Op::StoreColor:

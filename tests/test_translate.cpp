@@ -80,16 +80,41 @@ int main() {
 
     // Os operandos tem de sobreviver intactos. Um `Rd` trocado com um `Ra`
     // da-se por um shader que compila e pinta o sitio errado.
-    // O destino do MOV e' [0:8), nao [20:28). Se o frontend voltar a usar
-    // [20:28) aqui, o teste da soma falha e o GLSL diz `R23`.
+    // O DESTINO esta em [0:8) — em TODOS os opcodes, FADD, FMUL, IADD3,
+    // ISCADD e MOV. A primeira versao punha-o em [20:28) e todos os testes
+    // passavam na mesma, porque o gerador usava a mesma convencao errada.
+    // Este teste so apanha o bug se o gerador e o frontend concordarem
+    // com a FONTE e nao entre si, por isso os numeros estao escritos a mao.
     {
-        bool ok = false;
+        bool ok_carga = false, ok_dst_fmul = false, ok_dst_fadd = false;
         for (const ir::Instr& i : prog.code) {
-            if (i.op == ir::Op::Mov && i.a.kind == ir::Value::Kind::Cbuf &&
-                i.a.binding == 0 && i.a.offset == 0x40)
-                ok = (i.dst == 2);
+            // No ISCADD a constante vem em `b`; em `a` fica o multiplicando
+            // (que aqui e' RZ, traduzido para 0). Procurar em `a` dava a
+            // instrucao como nao encontrada, e o teste falhava sem haver
+            // bug nenhum.
+            if (i.op == ir::Op::ISCAdd && i.b.kind == ir::Value::Kind::Cbuf &&
+                i.b.binding == 0 && i.b.offset == 0x40)
+                ok_carga = (i.dst == 2);
+            if (i.op == ir::Op::FMul)
+                ok_dst_fmul = (i.dst == 4);
+            if (i.op == ir::Op::FAdd)
+                ok_dst_fadd = (i.dst == 4);
         }
-        check(ok, "MOV (cbuf): destino em [0:8) leu 2");
+        check(ok_carga, "ISCADD (cbuf): destino em [0:8) leu 2");
+        check(ok_dst_fmul, "FMUL: destino em [0:8) leu 4");
+        check(ok_dst_fadd, "FADD: destino em [0:8) leu 4");
+    }
+
+    // O RZ e' o campo 0xFF, e vale 0. Sem isto, `ISCADD Rd, RZ, c[..]` leria
+    // um registo a menos e o resultado seria uma constante errada.
+    {
+        bool ok_rz = false;
+        for (const ir::Instr& i : prog.code) {
+            if (i.op == ir::Op::ISCAdd &&
+                i.a.kind == ir::Value::Kind::Imm32 && i.a.imm == 0)
+                ok_rz = true;
+        }
+        check(ok_rz, "RZ (campo 0xFF) traduzido para a constante 0");
     }
     {
         bool ok_dst = false, ok_ra = false, ok_rb = false;
@@ -100,17 +125,20 @@ int main() {
             ok_ra  = (i.a.kind == ir::Value::Kind::Reg && i.a.reg == 2);
             ok_rb  = (i.b.kind == ir::Value::Kind::Reg && i.b.reg == 3);
         }
-        check(ok_dst, "FMUL: Rd em [20:28) leu 4");
-        check(ok_ra, "FMUL: Ra em [0:8) leu 2");
-        check(ok_rb, "FMUL: Rb em [8:16) leu 3");
+        check(ok_dst, "FMUL: destino [0:8) leu 4");
+        check(ok_ra,  "FMUL: Ra em [8:16) leu 2");
+        check(ok_rb,  "FMUL: Rb em [20:28) leu 3");
     }
     {
         bool ok = false;
+        // A constante pode estar em `a` (num MOV) ou em `b` (num ISCADD).
+        // Procura-se nas duas, que e' como se sabe que o factor 4 se
+        // perdeu ou nao em qualquer das formas.
         for (const ir::Instr& i : prog.code) {
-            if (i.a.kind != ir::Value::Kind::Cbuf)
-                continue;
-            if (i.a.binding == 0 && i.a.offset == 0x40) {   // c[0][0x10] * 4
-                ok = true;
+            for (const ir::Value* v : {&i.a, &i.b}) {
+                if (v->kind == ir::Value::Kind::Cbuf && v->binding == 0 &&
+                    v->offset == 0x40)                     // c[0][0x10] * 4
+                    ok = true;
             }
         }
         check(ok, "cbuf: palavra 0x10 virou byte 0x40 (o factor 4 nao se perdeu)");
