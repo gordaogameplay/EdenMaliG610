@@ -43,6 +43,14 @@
 
 namespace {
 
+// **O directorio dos dumps.** `G610_DUMP_DIR` aponta para um directorio de
+// trabalho — por exemplo um disco externo, quando o `/tmp` do sistema nao
+// tem espaco.
+const char* dump_dir() {
+    const char* d = std::getenv("G610_DUMP_DIR");
+    return (d != nullptr && d[0] != 0) ? d : "/tmp";
+}
+
 // A medicao do arranque: o instante em que o guest comecou, o contador de
 // SVCs, e o instante do `Break`.
 long long g_inicio_ns = 0;
@@ -881,7 +889,7 @@ int main(int argc, char** argv) {
             if (tam == 0 || ini + tam > img.size())
                 continue;
             char caminho[128];
-            std::snprintf(caminho, sizeof caminho, "/tmp/g610_%s.text", module.name());
+            std::snprintf(caminho, sizeof caminho, "%s/g610_%s.text", dump_dir(), module.name());
             std::FILE* f = std::fopen(caminho, "wb");
             if (f == nullptr)
                 continue;
@@ -930,7 +938,11 @@ int main(int argc, char** argv) {
                 continue;
             const auto& img = module.nso.image;
             char caminho[128];
-            std::snprintf(caminho, sizeof caminho, "/tmp/g610_%s.nso", module.name());
+            // **Onde os dumps vao.** `G610_DUMP_DIR` aponta para um
+            // directorio de trabalho — por exemplo um disco externo, quando
+            // o `/tmp` do sistema nao tem espaco. Um dump do `main` sao
+            // 40 MB, e com `IA_DUMP_MODULE=todos` sao tres.
+            std::snprintf(caminho, sizeof caminho, "%s/g610_%s.nso", dump_dir(), module.name());
             std::FILE* f = std::fopen(caminho, "wb");
             if (f == nullptr)
                 continue;
@@ -943,7 +955,7 @@ int main(int argc, char** argv) {
             // Um ficheiro ao lado com a geometria: sem os offsets dos
             // segmentos e da dynsym, a imagem dumpada nao se pode analysar.
             char geom[128];
-            std::snprintf(geom, sizeof geom, "/tmp/g610_%s.geom", module.name());
+            std::snprintf(geom, sizeof geom, "%s/g610_%s.geom", dump_dir(), module.name());
             std::FILE* g = std::fopen(geom, "w");
             if (g != nullptr) {
                 std::fprintf(g, "base 0x%llx\\n", static_cast<unsigned long long>(module.vaddr_base));
