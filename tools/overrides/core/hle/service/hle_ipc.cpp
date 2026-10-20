@@ -16,6 +16,7 @@
 #include "vendor/eden/common/common_funcs.h"
 #include "vendor/eden/common/common_types.h"
 #include "vendor/eden/common/logging.h"
+#include "vendor/eden/core/hle/service/service.h"
 #include "vendor/eden/common/scratch_buffer.h"
 #include "vendor/eden/core/guest_memory.h"
 #include "vendor/eden/core/hle/kernel/k_auto_object.h"

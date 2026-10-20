@@ -71,6 +71,12 @@ Result ServiceManager::RegisterService(Kernel::KServerPort** out_server_port, st
 
     service_ports.emplace(name, std::addressof(port->GetClientPort()));
     registered_services.emplace(name, handler);
+
+    // **Log nosso.** O Eden nao tem este log, e sem ele nao se sabe **que
+    // servicos** existem — que e' a primeira pergunta quando um pedido do
+    // guest fica pendente a espera de um servico que nao aparece.
+    LOG_INFO(Service_SM, "Service registered: {} ({} servico(s) no total)",
+             name, registered_services.size());
     if (deferral_event) {
         deferral_event->Signal(kernel);
     }
@@ -211,6 +217,18 @@ Result SM::GetServiceImpl(Kernel::KClientSession** out_client_session, HLEReques
     }
 
     *out_client_session = session;
+
+    // **Log nosso.** O handle da sessao e' a **unica forma de dizer que
+    // servico e' que** — sem ele, um trace de IPC mostra `SendSyncRequest
+    // 0x301fa` e nao diz mais nada. E e' a forma de ligar um pedido a um
+    // servico, que e' a primeira coisa que se quer saber quando um guest
+    // fica a fazer polling.
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        Kernel::Handle h{};
+        Kernel::GetCurrentProcess(kernel).GetHandleTable().Add(kernel, &h, session);
+        std::fprintf(stderr, "[sm] GetService(\"%s\") -> sessao 0x%x\n", name.c_str(),
+                     (unsigned)h);
+    }
     return ResultSuccess;
 }
 

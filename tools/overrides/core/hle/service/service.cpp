@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <string>
+
 #include <fmt/ranges.h>
 #include "vendor/eden/common/assert.h"
 #include "vendor/eden/common/logging.h"
@@ -69,6 +71,13 @@ void ServiceFrameworkBase::ReportUnimplementedFunction(HLERequestContext& ctx,
 
     system.GetReporter().SaveUnimplementedFunctionReport(ctx, ctx.GetCommand(), function_name, service_name);
     UNIMPLEMENTED_MSG("Unknown / unimplemented {}", fmt::to_string(buf));
+    // **Log nosso.** Um comando que o servico nao implementa e' uma peca em
+    // falta, e a **lista de pecas em falta** e' a primeira coisa que se
+    // quer saber. Sem este log, nao ha forma de saber que comando o guest
+    // pediu — e o guest fica a espera de uma resposta que vem como um
+    // sucesso vazio.
+    LOG_WARNING(Service, "{}: comando {} NAO IMPLEMENTADO", std::string(GetServiceName()),
+                ctx.GetCommand());
     if (Settings::values.use_auto_stub) {
         LOG_WARNING(Service, "Using auto stub fallback!");
         IPC::ResponseBuilder rb{ctx, 2};
@@ -114,6 +123,12 @@ void ServiceFrameworkBase::InvokeRequestTipc(HLERequestContext& ctx) {
 Result ServiceFrameworkBase::HandleSyncRequest(Kernel::KServerSession& session,
                                                HLERequestContext& ctx) {
     const auto guard = LockService();
+
+    // **Log nosso.** Qualquer comando que chega a um servico, com o nome
+    // do servico. E o que liga um pedido a uma resposta.
+    LOG_WARNING(Service, "HSR {}: comando {} tipo={} tem_domain={}",
+                std::string(GetServiceName()), ctx.GetCommand(),
+                (unsigned)ctx.GetCommandType(), ctx.HasDomainMessageHeader() ? 1 : 0);
 
     Result result = ResultSuccess;
 
