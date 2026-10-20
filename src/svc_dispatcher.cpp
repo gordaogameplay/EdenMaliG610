@@ -1156,30 +1156,25 @@ Result SvcDispatcher::svc_create_thread(SvcContext& ctx) {
     ctx.ret      = 0;
     ctx.has_ret  = true;
 
-    // **A thread NAO corre, ainda.** O codigo do guest e' nativo, logo uma
-    // thread de guest e' uma thread do host — e ai estao as tres coisas que
-    // tem de ser **por thread**:
+    // **A thread NAO corre, ainda.** O passo 1 (o estado por thread) esta'
+    // escrito e **revertido**: com o `TPIDR_EL0`, o `sigsetjmp` e a
+    // recuperacao por thread, o processo morre de OOM — e o guest e' lido
+    // como se nao tivesse TLS.
     //
-    //   - o `TPIDR_EL0` (o guest le o TLS com `mrs x, tpidrro_el0`);
-    //   - o ponto de regresso do `sigsetjmp` (um `siglongjmp` para o buffer
-    //     de outra thread e' comportamento indefinido);
-    //   - o ponto de recuperacao de faults.
+    // O que a medicao diz (e o que o proximo passo tem de resolver):
     //
-    // O Eden resolve isto com objectos de kernel (`KThread` com TLS e
-    // contexto proprios) e um scheduler; o nosso `vendor` **nao tem
-    // `KThread`** (medido: `ls vendor/eden/core/hle/kernel/ | grep -i
-    // thread` nao da nada), o que tambem significa que um IPC feito por esta
-    // thread usaria o buffer de mensagem da principal.
+    //   - o `sigsetjmp` tem de estar numa frame que **sobreviva** ao codigo
+    //     do guest (um `siglongjmp` para o buffer de uma frame ja
+    //     regressada e' comportamento indefinido — dava `exit 70`);
+    //   - o `TPIDR_EL0` tem de ser instalado **antes** de o guest correr, e
+    //     nao so durante as traps: o guest le-o com `mrs x, tpidrro_el0` (que
+    //     o patcher reescreve para `tpidr_el0`) em qualquer momento, e fora
+    //     de uma trap o registo e' o da `libc` do host;
+    //   - o `TPIDR_EL0` do **host** tambem tem de ser por thread: o
+    //     handler troca o TLS do host pelo do guest *durante* a trap, e a
+    //     `libc` de cada thread tem o seu.
     //
-    // O prototipo foi feito e **revertido**: com a thread a correr, o codigo
-    // do guest nela dava fault logo a entrar, e o fault matava o processo
-    // (o `sigsetjmp` tem de estar numa frame que sobreviva ao guest). O
-    // entry point que o SDK passa (`0x83abb240`, no `subsdk1`) e' uma
-    // funcao valida — medido no dump do boot_trace — e le o TLS do guest,
-    // por isso o proximo passo e' dar-lhe um `TPIDR_EL0` correcto e um `sp`
-    // de thread, e ver ONDE ela da fault.
-    //
-    // ate la, a thread fica como esta: um handle valido, e o guest vivo.
+    // ate isso, a thread fica como esta: um handle valido, e o guest vivo.
     if (std::getenv("IA_IPC_TRACE") != nullptr) {
         std::fprintf(stderr,
                      "[svc] CreateThread handle=0x%x entry=0x%llx arg=0x%llx "

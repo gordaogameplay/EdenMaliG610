@@ -2618,3 +2618,50 @@ O que fica para o próximo passo, com o motor em estado bom (62,3 ms,
    protótipo está feito, e revertido porque o fault matava o processo);
 2. dar à thread o `sp` certo e **ver onde ela dá fault** — que é a
    informação que falta.
+
+---
+
+# Sessão 2026-10-20 (quarta parte) — o passo 1: o estado por thread
+
+## O que o passo 1 é
+
+Uma thread de guest tem de ter, **por thread**:
+
+| | porquê |
+|---|---|
+| o `TPIDR_EL0` | o guest lê o TLS com `mrs x, tpidrro_el0` (o patcher reescreve para `tpidr_el0`) |
+| o ponto de regresso (`sigsetjmp`) | um `siglongjmp` para o `sigjmp_buf` de outra thread é comportamento indefinido |
+| a recuperação de faults | um fault na thread nova não pode saltar para a recuperação da principal |
+| o `TPIDR_EL0` do **host** | o handler troca o TLS do host pelo do guest *durante* a trap, e a `libc` de cada thread tem o seu |
+
+O Eden resolve isto com objectos de kernel (`KThread`, com TLS e contexto
+próprios) e um *scheduler*. Nós somos **nativos**: o código do guest corre
+directamente na CPU, logo os registos já são por thread — o que falta é o
+nosso livro de contas.
+
+## O que foi medido (e porque o passo 1 foi revertido)
+
+| Sintoma | Causa |
+|---|---|
+| `exit 70` ("sem ponto de regresso") | o `sigsetjmp` estava numa **frame que já tinha regressado**; o `siglongjmp` para um buffer morto é indefinido |
+| o guest lia o TLS do **host** | o `TPIDR_EL0` era global e ficava a 0 — o guest escrevia por cima da `libc` (o processo morria de **OOM**) |
+| o `SIGSEGV` da thread nova não era reportado | o `TPIDR_EL0` do guest só era instalado **durante** as traps; fora de uma trap o registo é o da `libc` do host, e o guest lia-o a toda a hora |
+
+Ou seja: o passo 1 tem **três** partes, e as três são necessárias — não
+basta trocar o `TPIDR_EL0` por thread.
+
+**O passo 1 fica escrito e revertido**, porque com ele o processo morre de
+OOM e o guest fica sem TLS. O motor está no estado bom (61,9 ms, 218 SVCs,
+0 SVCs com erro, 6/6 testes).
+
+## O que fica feito para o passo 2
+
+O que falta, por ordem:
+
+1. instalar o `TPIDR_EL0` do guest **antes** de o guest correr (e não só
+   durante as traps) — é a causa do OOM;
+2. o `sigsetjmp` numa frame que sobreviva (a rotina `g610_run_guest`, em
+   ensamblador, porque o `sp` do guest tem de ser o `sp` da CPU);
+3. o `TPIDR_EL0` do host por thread;
+4. **medir onde a thread dá fault** — que é a informação que falta, e que o
+   dump do `entry point` (no `boot_trace`) já permite comparar.
