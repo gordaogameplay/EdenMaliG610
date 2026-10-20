@@ -57,6 +57,15 @@
 
 #include "g610/eden_bridge.hpp"
 
+// O `KReadableEvent` — o objecto que o guest recebe de um
+// `GetEventHandle`, e o que a espera consulta. E' o codigo do Eden.
+#include "vendor/eden/core/hle/kernel/k_readable_event.h"
+// A ponte: e' onde vive o `GetCurrentProcess` (o `k_process.h` do Eden
+// foi substituido por ela).
+#include "vendor/eden/core/hle/kernel/k_process_bridge.h"
+// A tabela de handles: e' de onde se busca o objecto por handle.
+#include "vendor/eden/core/hle/kernel/k_handle_table.h"
+
 #include <cstdlib>
 
 namespace g610 {
@@ -680,79 +689,145 @@ Result SvcDispatcher::svc_send_sync_request(SvcContext& ctx) {
 //
 // ## O que o Eden faz
 //
-// Espera que um dos eventos seja sinalizado, e devolve o indice de um deles.
-// Se o timeout expirar, devolve `ResultTimedOut`.
+// `k_synchronization_object.cpp:85-160`, o `KSynchronizationObject::Wait`:
+//
+//     1. consulta `IsSignaled` em cada objecto da lista; se algum
+//        estiver sinalizado, devolve **sucesso** imediatamente, com o
+//        indice desse objecto — e **nao dorme**;
+//     2. se o timeout for zero, devolve `ResultTimedOut`;
+//     3. caso contrario, dorme a thread ate alguém sinalizar.
 //
 // ## O que este motor faz, e porquê
 //
-// **Este motor nao tem eventos que disparem.** O `am` do Eden sinaliza o
-// evento de mudanca de estado do applet quando o estado muda — e no Eden,
-// quem o sinaliza e' o `WindowSystem` e o `LifecycleManager`, que sao
-// subsistemas de video e de janelas que este motor nao tem.
+// **O passo 1 e' o que interessa, e e' exacto.** O `KReadableEvent` do
+// Eden tem o estado (`m_is_signaled`) e o `IsSignaled()` — e o vendor
+// ja os tem, porque o `k_event.cpp` e' o codigo do Eden.
 //
-// Sem isso, o SDK da Nintendo fica a esperar: medido, o guest passou a
-// chamar `WaitSynchronization` com um timeout de 2,2 segundos, mil e
-// quinhentas vezes, sem sair do sitio — e o sintoma era um "o guest esta em
-// ciclo" que nao parececia nada.
+// E o guest pode ser servido **sem custo de hardware e sem sair da
+// execucao nativa**: o objecto ja esta sinalizado, a espera termina
+// ali, e a thread do guest nunca para. Nao ha escalonador, nao ha
+// interrupcao, nao ha trabalho desperdicado.
 //
-// A espera e' devolvida como **satisfeita**, e o indice devolvido e' o do
-// primeiro handle. A razao: o estado que o guest esta a esperar ja esta
-// disponivel e nao muda — o applet esta em primeiro plano, o foco e' o
-// nosso, e nada os altera. Dizer "esperou" e' o que o guest precisa para
-// seguir; dizer " expirou" faz o guest repetir a espera, para sempre.
+// **O passo 3 e' o que este motor nao tem.** Dormir a thread do guest
+// exige o escalonador do Eden (`KScopedSchedulerLockAndSleep`), que
+// nao existe aqui — e nao deve existir: este motor corre o guest
+// nativamente, sem troca de contexto.
 //
-// **Esta e' uma divida, e esta escrita para a divida:** quando o motor
-// tiver eventos de verdade, este sitio passa a consultar o sinalizado, e a
-// mesma forma vale — o `KSynchronizationObject::Wait` do Eden faz a
-// mesma coisa com o escalonador por baixo.
+// A resposta honesta para o passo 3 e' `ResultTimedOut`, que e' o que o
+// Eden devolve quando o prazo expira sem nada acontecer. O SDK sabe o
+// que isso significa.
+//
+// **E o passo 3 e' raramente o que acontece.** O `am` sinaliza o
+// evento do sistema quando o estado do applet muda, e o SDK espera
+// **por** esse evento. Se o evento ja esta sinalizado — e esta, porque
+// o applet entra em primeiro plano no arranque — o passo 1 responde, e
+// o SDK prossegue. Esta e' a razao do jogo entrar no loop de mensagens
+// em vez de ficar a dormir.
+//
+// ## A diferenca que falhava
+//
+// A versao anterior devolvia `ResultTimedOut` **sempre**, sem
+// consultar o estado. O SDK, que faz `ReceiveMessage` + espera em
+// ciclo, voltava a pedir: 1311 pedidos em poucos segundos, e o motor a
+// 100% de CPU a fazer nada.
+//
+// A versao antes dessa devolvia sucesso **sempre** — e o mesmo cycling,
+// por outra razao.
+//
+// **A espera tem de consultar o estado.** E' o que o Eden faz, e e'
+// uma linha de codigo.
 Result SvcDispatcher::svc_wait_synchronization(SvcContext& ctx) {
     const std::uint64_t timeout_ns = ctx.x[0];
     const std::uint64_t handles_ptr = ctx.x[1];
     const std::uint32_t num_handles = static_cast<std::uint32_t>(ctx.x[2]);
 
-    // O array de handles e' memoria do guest: le-se directamente.
-    std::uint32_t primeiro = 0;
-    if (num_handles > 0 && handles_ptr != 0) {
+    // Os handles sao do guest: le-se o array directamente da memoria dele.
+    std::uint32_t indices[Kernel::Svc::ArgumentHandleCountMax];
+    std::uint32_t n = 0;
+    for (std::uint32_t k = 0; k < num_handles && k < Kernel::Svc::ArgumentHandleCountMax; ++k) {
         std::uint32_t h = 0;
-        if (read_guest(handles_ptr, &h, sizeof h)) {
-            primeiro = h;
+        if (!read_guest(handles_ptr + k * sizeof(h), &h, sizeof h)) {
+            break;
+        }
+        indices[n++] = h;
+    }
+
+    // O passo 1 do Eden: algum dos objectos ja esta sinalizado?
+    //
+    // A consulta e' ao `KReadableEvent` — que e' o objecto que o guest
+    // recebe (o Eden devolve `GetSystemEvent().GetHandle()`, e o
+    // `Event` do Eden devolve o `KReadableEvent*`).
+    if (n > 0) {
+        auto& kernel = eden_->Kernel();
+        auto& processo = Kernel::GetCurrentProcess(kernel);
+        for (std::uint32_t k = 0; k < n; ++k) {
+            auto evento = processo.GetHandleTable().GetObject<Kernel::KReadableEvent>(
+                kernel, Kernel::Handle{indices[k]});
+            if (evento.GetPointerUnsafe() == nullptr) {
+                continue;
+            }
+            if (evento->IsSignaled(kernel)) {
+                // **Sinalizado: o passo 1 do Eden.** A espera termina
+                // aqui, e devolve o indice do objecto sinalizado.
+                //
+                // O `Clear` e' o que o Eden faz quando o evento ja foi
+                // consumido (`lifecycle_manager.cpp:170`): o evento e'
+                // de nivel, e o proximo `ReceiveMessage` volta a
+                // re-sinaliza-lo se ainda houver mensagem.
+                evento->Clear(kernel);
+                ctx.ret     = 0;
+                ctx.has_ret = true;
+                ctx.x[1]    = k;
+                return Result::Success;
+            }
         }
     }
 
-    // O timeout e' a unica informacao que se pode usar para distinguir
-    // "espera infinita" de "espera com prazo". Regista-se, porque um dia o
-    // motor vai precisar dele.
-    (void)timeout_ns;
+    // A telemetria: **que** handle espera, e esta sinalizado. E' a
+    // pergunta que decide o resto — e sem ela o sintoma e' "o guest
+    // esta em ciclo", que nao parece nada.
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr, "[svc] WaitSynchronization: %u handle(s), timeout=%llu ns",
+                      n, static_cast<unsigned long long>(timeout_ns));
+        for (std::uint32_t k = 0; k < n; ++k) {
+            std::fprintf(stderr, " 0x%x", indices[k]);
+        }
+        // **O x30 e' o endereco de retorno** — quem esta a esperar. E a
+        // unica forma de saber que caminho do SDK e' este, sem simbolos.
+        std::fprintf(stderr, "  [x30=0x%llx]", static_cast<unsigned long long>(ctx.gpr[30]));
+        // E o **conteudo** do array de handles: e' o que o guest
+        // realmente espera. O valor ja sai no `0x%x` de cima.
+        for (std::uint32_t k = 0; k < n && k < 4; ++k) {
+            std::uint32_t v = 0;
+            if (read_guest(handles_ptr + k * sizeof(v), &v, sizeof v)) {
+                std::fprintf(stderr, " [mem%u=0x%x]", k, v);
+            }
+        }
+        // **A stack do guest.** O SDK guarda o handle num slot da stack
+        // (`str w0, [sp, #12]` no `InterProcessEventImplByHorizon::Wait`),
+        // e a stack mostra o valor que ele **realmente** recebeu.
+        std::uint64_t sp = ctx.sp;
+        for (std::uint64_t off = 0; off < 0x40; off += 4) {
+            std::uint32_t v = 0;
+            if (read_guest(sp + off, &v, sizeof v)) {
+                std::fprintf(stderr, " [sp+%llx=%x]",
+                             static_cast<unsigned long long>(off), v);
+            }
+        }
+        std::fprintf(stderr, "\n");
+    }
 
-    // `ResultTimedOut`, e nao sucesso.
-    //
-    // **A espera nao pode dizer que passou se ninguem sinalizou nada.** A
-    // primeira versao devolvia sucesso, e o SDK — que faz
-    // `ReceiveMessage` + `WaitSynchronization` em ciclo — voltava a pedir
-    // imediatamente: 1311 pedidos em few segundos, e o motor a 100% de CPU
-    // a fazer nada.
-    //
-    // O Eden devolve `ResultTimedOut` quando o prazo expira sem nada
-    // acontecer, e o SDK sabe o que isso significa. E' essa a resposta
-    // honesta, e o guest sabe o que fazer com ela.
-    // `ResultTimedOut`, e nao sucesso.
-    //
-    // **A espera nao pode dizer que passou se ninguem sinalizou nada.** A
-    // primeira versao devolvia sucesso, e o SDK — que faz
-    // `ReceiveMessage` + `WaitSynchronization` em ciclo — voltava a pedir
-    // imediatamente: 1311 pedidos em poucos segundos, e o motor a 100% de
-    // CPU a fazer nada.
-    //
-    // O Eden devolve `ResultTimedOut` quando o prazo expira sem nada
-    // acontecer, e o SDK sabe o que isso significa. E' essa a resposta
-    // honesta, e o guest sabe o que fazer com ela.
-    //
-    // **A espera que o SDK faz no fim e' maior do que esta.** A fila de
-    // mensagens do SDK (`nn::os::ReceiveMessageQueue`) espera por um
-    // *multi-wait de dominio* — `nn::os::InitializeMultiWaitHolder` — e nao
-    // por um evento. Esse multi-wait e' a machine de dominios do IPC
-    // controller, que este motor ainda nao tem. E' a parede de espera, e
-    // esta escrita em `PROGRESSO.md`.
+    // O passo 2 do Eden: timeout zero e' `ResultTimedOut`.
+    if (timeout_ns == 0) {
+        ctx.ret     = static_cast<std::uint64_t>(Result::TimedOut);
+        ctx.has_ret = true;
+        ctx.x[1]    = 0;
+        return Result::Success;
+    }
+
+    // O passo 3: dormir a thread do guest. Nao existe aqui — ver a nota
+    // em cima. A resposta honesta e' o prazo expirado, que e' o que o
+    // Eden devolve quando o prazo passa sem nada acontecer.
     ctx.ret     = static_cast<std::uint64_t>(Result::TimedOut);
     ctx.has_ret = true;
     ctx.x[1]    = 0;   // o indice do handle sinalizado

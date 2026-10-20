@@ -26,6 +26,14 @@ void Controller::ConvertCurrentObjectToDomain(HLERequestContext& ctx) {
     IPC::ResponseBuilder rb{ctx, 3};
     rb.Push(ResultSuccess);
     rb.Push<u32>(1); // Converted sessions start with 1 request handler
+
+    // **Log nosso.** O `ConvertCurrentObjectToDomain` e' o que transforma a
+    // sessao do guest num **dominio** — e o dominio e' o objecto que o
+    // SDK espera. Sem este log, um `ConvertCurrentObjectToDomain` que
+    // corre sem efeito e' indistinguivel de um que corre bem: o guest
+    // fica a esperar por um handle que nunca chega, e o sintoma e' "o
+    // guest esta em ciclo".
+    LOG_WARNING(Service, "ConvertCurrentObjectToDomain: a sessao passa a dominio");
 }
 
 void Controller::CloneCurrentObject(HLERequestContext& ctx) {

@@ -155,9 +155,15 @@ struct EstadoDoApplet {
     // espera por um e le o outro.
     Kernel::KEvent* evento = nullptr;
 
-    // O handle do evento. Vem do `KHandleTable::Add` — o `KEvent` nao tem
-    // `GetHandle()`, porque o handle vive na tabela, e nao no objecto.
-    std::uint32_t handle_evento = 0;
+    // O `KReadableEvent` — o objecto que o guest recebe de um
+    // `GetEventHandle`, e sobre o qual espera. E' o **filho** do `KEvent`.
+    //
+    // O Eden devolve exactamente este (`os/event.cpp:33-35`):
+    //
+    //     Kernel::KReadableEvent* Event::GetHandle() noexcept {
+    //         return std::addressof(m_event->GetReadableEvent());
+    //     }
+    Kernel::KReadableEvent* readable = nullptr;
 
     bool tem_mensagem() const { return !mensagens.empty(); }
 
@@ -202,19 +208,31 @@ struct EstadoDoApplet {
 //     *out_event = m_applet->lifecycle_manager.GetSystemEvent().GetHandle();
 //
 // e' um `OutCopyHandle`, ou seja, um handle copiado para o guest.
-std::uint32_t handle_de_evento(Core::System& system) {
+//
+// **Devolve o `KReadableEvent`, e nao o handle.** E' o que o Eden faz
+// (`os/event.cpp:33-35`):
+//
+//     Kernel::KReadableEvent* Event::GetHandle() noexcept {
+//         return std::addressof(m_event->GetReadableEvent());
+//     }
+//
+// E' o `KReadableEvent` — o **filho** do `KEvent` — que o guest
+// recebe, e sobre o qual espera. O `PushCopyObjects` (o `OutCopyHandle` do
+// Eden) e' que o regista na handle table e escreve o handle.
+//
+// A versao anterior devolvia o handle e escrevia-o no raw data com
+// `rb.Push` — o que punha o handle no sitio errado. **Foi assim que o
+// `GetEventHandle` devolveu `0x8000`** (o pseudo-handle da thread
+// corrente) em vez do handle do evento, e o SDK ficou a esperar por
+// um handle que nunca chegou.
+Kernel::KReadableEvent* evento_de_sistema(Core::System& system) {
     auto& kernel = system.Kernel();
     auto& processo = Kernel::GetCurrentProcess(kernel);
 
     auto* evento = new Kernel::KEvent(kernel);
     evento->Initialize(kernel, &processo);
 
-    Kernel::Handle handle{};
-    if (R_FAILED(processo.GetHandleTable().Add(kernel, &handle, evento))) {
-        LOG_WARNING(Service_AM, "handle_de_evento: a reserva do handle falhou");
-        return 0;
-    }
-    return static_cast<std::uint32_t>(handle);
+    return &evento->GetReadableEvent();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -266,17 +284,22 @@ private:
     // O evento de notificação. O Eden devolve um `KReadableEvent`; aqui
     // devolve-se um handle inválido e diz-se isso, porque um evento que
     // nunca é sinalizado é o que um applet sem gestor de eventos recebe.
+    // O evento do sistema do applet.
+    //
+    // **O Eden usa `PushCopyObjects`**, e nao `Push` de um handle
+    // (`cmif_serialization.h:397`): o `OutCopyHandle` registado no
+    // objecto e' posto na handle table do processo, e o handle escrito
+    // no descritor de handles.
+    //
+    // Com `Push` de um handle, o handle ia parar ao raw data — e o guest
+    // lia um numero onde esperava um handle. **Foi assim que o
+    // `GetEventHandle` devolveu `0x8000`** (o pseudo-handle da thread
+    // corrente, lido do sitio errado) em vez do handle do evento, e o
+    // SDK ficou a esperar por um handle que nunca chegou.
     void GetEventHandle(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 2, 1, 0};
         rb.Push(ResultSuccess);
-        rb.Push(estado_ ? handle_do_evento_do_sistema() : 0u);
-    }
-
-    // O handle do evento do sistema. O evento e' **o mesmo** que o
-    // `handle_de_evento` devolveu — e por isso que o `empurrar` o possa
-    // sinalizar.
-    std::uint32_t handle_do_evento_do_sistema() const {
-        return estado_ ? estado_->handle_evento : 0u;
+        rb.PushCopyObjects(ctx, estado_ ? estado_->readable : nullptr);
     }
 
     void ReceiveMessage(HLERequestContext& ctx) {
@@ -284,7 +307,7 @@ private:
         if (estado_ && estado_->tem_mensagem()) {
             const u32 mensagem = estado_->proxima();
             LOG_DEBUG(Service_AM, "ReceiveMessage: entrega {}", mensagem);
-            ResponseBuilder rb{ctx, 2};
+            ResponseBuilder rb{ctx, 5};
             rb.Push(ResultSuccess);
             rb.Push(mensagem);
             return;
@@ -292,14 +315,14 @@ private:
 
         // `ResultNoMessages`, como o Eden (`common_state_getter.cpp:99-104`).
         // E' um Result **valido**, e o SDK sabe o que significa.
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(kResultNoMessages);
     }
 
     // `OperationMode`: 0 = Handheld, 1 = Console.
     void GetOperationMode(HLERequestContext& ctx) {
         LOG_DEBUG(Service_AM, "GetOperationMode: Handheld");
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 5};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u32>(0));
     }
@@ -309,14 +332,14 @@ private:
     // está docked.
     void GetPerformanceMode(HLERequestContext& ctx) {
         LOG_DEBUG(Service_AM, "GetPerformanceMode: Normal");
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 5};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u32>(0));
     }
 
     // `SystemBootMode`: 0 = NormalBoot.
     void GetBootMode(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 5};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u32>(0));
     }
@@ -324,91 +347,109 @@ private:
     // `FocusState`: 0 = NotFocused, 1 = Focused. Um jogo que está a correr
     // tem o foco.
     void GetCurrentFocusState(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 5};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u32>(1));
     }
 
     void RequestToAcquireSleepLock(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void ReleaseSleepLock(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void ReleaseSleepLockTransiently(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void GetAcquiredSleepLockEvent(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        // **O Eden usa `PushCopyObjects`** (`cmif_serialization.h:397`),
+        // e nao `Push` de um handle: o `OutCopyHandle` registado no
+        // objecto e' posto na handle table do processo, e o handle
+        // escrito no descritor de handles.
+        //
+        // Com `Push` de um handle, o handle ia parar ao raw data — e o
+        // guest lia um numero onde esperava um handle. **Foi assim que o
+        // `GetEventHandle` devolveu `0x8000`** (o pseudo-handle da thread
+        // corrente, lido do sitio errado) em vez do handle do evento.
+        ResponseBuilder rb{ctx, 2, 1, 0};
         rb.Push(ResultSuccess);
-        rb.Push(handle_de_evento(system));
+        rb.PushCopyObjects(ctx, evento_de_sistema(system));
     }
 
     void PushToGeneralChannel(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void GetReaderLockAccessorEx(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void GetWriterLockAccessorEx(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void IsVrModeEnabled(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 5};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     void SetVrModeEnabled(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void SetLcdBacklighOffEnabled(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void BeginVrModeEx(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void EndVrModeEx(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void IsInControllerFirmwareUpdateSection(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 5};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     // A resolução por omissão do ecrã do Switch: 1280x720.
     void GetDefaultDisplayResolution(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 3};
+        ResponseBuilder rb{ctx, 6};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<s32>(1280));
         rb.Push(static_cast<s32>(720));
     }
 
     void GetDefaultDisplayResolutionChangeEvent(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        // **O Eden usa `PushCopyObjects`** (`cmif_serialization.h:397`),
+        // e nao `Push` de um handle: o `OutCopyHandle` registado no
+        // objecto e' posto na handle table do processo, e o handle
+        // escrito no descritor de handles.
+        //
+        // Com `Push` de um handle, o handle ia parar ao raw data — e o
+        // guest lia um numero onde esperava um handle. **Foi assim que o
+        // `GetEventHandle` devolveu `0x8000`** (o pseudo-handle da thread
+        // corrente, lido do sitio errado) em vez do handle do evento.
+        ResponseBuilder rb{ctx, 2, 1, 0};
         rb.Push(ResultSuccess);
-        rb.Push(handle_de_evento(system));
+        rb.PushCopyObjects(ctx, evento_de_sistema(system));
     }
 
 private:
@@ -460,73 +501,82 @@ private:
     // simplesmente regressar, e a telemetria regista.
     void Exit(HLERequestContext& ctx) {
         LOG_WARNING(Service_AM, "Exit: o jogo pediu para sair");
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void LockExit(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void UnlockExit(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void EnterFatalSection(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void LeaveFatalSection(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void GetLibraryAppletLaunchableEvent(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        // **O Eden usa `PushCopyObjects`** (`cmif_serialization.h:397`),
+        // e nao `Push` de um handle: o `OutCopyHandle` registado no
+        // objecto e' posto na handle table do processo, e o handle
+        // escrito no descritor de handles.
+        //
+        // Com `Push` de um handle, o handle ia parar ao raw data — e o
+        // guest lia um numero onde esperava um handle. **Foi assim que o
+        // `GetEventHandle` devolveu `0x8000`** (o pseudo-handle da thread
+        // corrente, lido do sitio errado) em vez do handle do evento.
+        ResponseBuilder rb{ctx, 2, 1, 0};
         rb.Push(ResultSuccess);
-        rb.Push(handle_de_evento(system));
+        rb.PushCopyObjects(ctx, evento_de_sistema(system));
     }
 
     void SetScreenShotPermission(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void SetOperationModeChangedNotification(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void SetPerformanceModeChangedNotification(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void SetFocusHandlingMode(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void SetRestartMessageEnabled(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void SetScreenShotAppletIdentityInfo(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void SetOutOfFocusSuspendingEnabled(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void SetAlbumImageOrientation(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
@@ -534,64 +584,73 @@ private:
     // layer para dar — e diz-se.
     void CreateManagedDisplayLayer(HLERequestContext& ctx) {
         LOG_WARNING(Service_AM, "CreateManagedDisplayLayer: sem subsistema de video");
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 6};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u64>(0));
     }
 
     void IsSystemBufferSharingEnabled(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 5};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     void GetSystemSharedLayerHandle(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 3};
+        ResponseBuilder rb{ctx, 8};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u64>(0));
         rb.Push(static_cast<u64>(0));
     }
 
     void GetSystemSharedBufferHandle(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 6};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u64>(0));
     }
 
     void CreateManagedDisplaySeparableLayer(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 6};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u64>(0));
     }
 
     void SetHandlesRequestToDisplay(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void ApproveToDisplay(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void OverrideAutoSleepTimeAndDimmingTime(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     // O numero de ticks que o applet passou suspenso. Nao ha suspensao
     // aqui, e' zero.
     void GetAccumulatedSuspendedTickValue(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 6};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u64>(0));
     }
 
     // O evento que dispara quando esse numero muda. Ver `handle_de_evento`.
     void GetAccumulatedSuspendedTickChangedEvent(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        // **O Eden usa `PushCopyObjects`** (`cmif_serialization.h:397`),
+        // e nao `Push` de um handle: o `OutCopyHandle` registado no
+        // objecto e' posto na handle table do processo, e o handle
+        // escrito no descritor de handles.
+        //
+        // Com `Push` de um handle, o handle ia parar ao raw data — e o
+        // guest lia um numero onde esperava um handle. **Foi assim que o
+        // `GetEventHandle` devolveu `0x8000`** (o pseudo-handle da thread
+        // corrente, lido do sitio errado) em vez do handle do evento.
+        ResponseBuilder rb{ctx, 2, 1, 0};
         rb.Push(ResultSuccess);
-        rb.Push(handle_de_evento(system));
+        rb.PushCopyObjects(ctx, evento_de_sistema(system));
     }
 };
 
@@ -620,7 +679,7 @@ private:
     // explicito, porque uma ausencia de resposta deixa o guest a ler lixo
     // (ver a nota sobre o auto-stub em `settings_bridge.h`).
     void CreateWindow(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
@@ -628,39 +687,39 @@ private:
     // `AppletManager`, que o associa ao applet; aqui e' o nosso PID, que e'
     // o unico que existe.
     void GetAppletResourceUserId(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 6};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u64>(1));
     }
 
     void GetAppletResourceUserIdOfCallerApplet(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 6};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u64>(1));
     }
 
     void AcquireForegroundRights(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void ReleaseForegroundRights(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void RejectToChangeIntoBackground(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void SetAppletWindowVisibility(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void SetAppletGpuTimeSlice(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 };
@@ -684,29 +743,29 @@ public:
 
 private:
     void SetExpectedMasterVolume(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void GetMainAppletExpectedMasterVolume(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 5};
         rb.Push(ResultSuccess);
         rb.Push(1.0f);
     }
 
     void GetLibraryAppletExpectedMasterVolume(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 5};
         rb.Push(ResultSuccess);
         rb.Push(1.0f);
     }
 
     void ChangeMainAppletMasterVolume(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void SetTransparentVolumeRate(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 };
@@ -740,57 +799,57 @@ public:
 private:
     // Todas as capturas dependem do subsistema de vídeo. Não o há.
     void GetLastForegroundCaptureImageEx(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 5};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     void GetCallerAppletCaptureImageEx(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 5};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     void TakeScreenShotOfOwnLayer(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void ClearCaptureBuffer(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void AcquireLastApplicationCaptureSharedBuffer(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 5};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     void ReleaseLastApplicationCaptureSharedBuffer(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void AcquireLastForegroundCaptureSharedBuffer(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 5};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     void ReleaseLastForegroundCaptureSharedBuffer(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void AcquireCallerAppletCaptureSharedBuffer(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 5};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     void ReleaseCallerAppletCaptureSharedBuffer(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 };
@@ -833,109 +892,109 @@ public:
 
 private:
     void PopLaunchParameter(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void CreateApplicationAndRequestToStart(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     // O armazenamento é o sistema de ficheiros, que não existe ainda.
     void EnsureSaveData(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     // O idioma: o do sistema. `nn::oe::Language::AmericanEnglish` = 1.
     void GetDesiredLanguage(HLERequestContext& ctx) {
         LOG_DEBUG(Service_AM, "GetDesiredLanguage: 1 (AmericanEnglish)");
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 6};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u64>(1));
     }
 
     void SetTerminateResult(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void GetDisplayVersion(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 5};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u32>(0));
     }
 
     void ExtendSaveData(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void GetSaveDataSize(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void CreateCacheStorage(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void GetSaveDataSizeMax(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void GetCacheStorageMax(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void BeginBlockingHomeButtonShortAndLongPressed(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void EndBlockingHomeButtonShortAndLongPressed(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void BeginBlockingHomeButton(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void EndBlockingHomeButton(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void NotifyRunning(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 5};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     void GetPseudoDeviceId(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void SetMediaPlaybackStateForApplication(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void IsGamePlayRecordingSupported(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 5};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     void InitializeGamePlayRecording(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 };
@@ -962,43 +1021,43 @@ public:
 private:
     // `AppletProcessLaunchReason`: 0 = Normal, 1 = ApplicationRequested.
     void GetLaunchReason(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 5};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u32>(0));
     }
 
     void OpenCallingLibraryApplet(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void PushContext(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void PopContext(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void CancelWindingReservation(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void WindAndDoReserved(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void ReserveToStartAndWaitAndUnwindThis(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void ReserveToStartAndWait(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 };
@@ -1020,7 +1079,7 @@ public:
 
 private:
     void Reservado(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 };
@@ -1042,27 +1101,27 @@ public:
 
 private:
     void CreateLibraryApplet(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void CreateLibraryAppletEx(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void CreateStorage(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void CreateTransferMemoryStorage(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 
     void CreateHandleStorage(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 2};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
     }
 };
@@ -1191,13 +1250,13 @@ public:
             auto& processo = Kernel::GetCurrentProcess(kernel);
             auto* evento = new Kernel::KEvent(kernel);
             evento->Initialize(kernel, &processo);
-            Kernel::Handle handle{};
-            if (R_SUCCEEDED(processo.GetHandleTable().Add(kernel, &handle, evento))) {
-                estado_->evento = evento;
-                estado_->handle_evento = static_cast<std::uint32_t>(handle);
-            } else {
-                LOG_WARNING(Service_AM, "appletOE: o handle do evento do sistema nao reservou");
-            }
+            // O objecto registado e' o `KReadableEvent` — o **filho**,
+            // que e' o que o guest recebe. O `KEvent` (o pai) fica
+            // apontado para o `empurrar` o sinalizar, e o
+            // `KEvent::Signal` propaga ao filho
+            // (`k_event.cpp:52-60`).
+            estado_->evento = evento;
+            estado_->readable = &evento->GetReadableEvent();
         }
 
         // A mensagem de entrada no primeiro plano, e o evento que a

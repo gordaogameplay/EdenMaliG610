@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <sstream>
 
 #include <boost/range/algorithm_ext/erase.hpp>
@@ -23,6 +25,9 @@
 #include "vendor/eden/core/hle/kernel/k_server_session.h"
 #include "vendor/eden/core/hle/kernel/k_process_bridge.h"  // PONTE: ver README
 #include "vendor/eden/core/hle/kernel/k_kernel_core_bridge.h"  // PONTE
+#include <cstdio>
+#include <cstdlib>
+
 #include "vendor/eden/core/hle/service/hle_ipc.h"
 #include "vendor/eden/core/hle/service/ipc_helpers.h"
 #include "vendor/eden/core/memory_bridge.h"  // PONTE: substitui core/memory.h
@@ -303,6 +308,17 @@ Result HLERequestContext::WriteToOutgoingCommandBuffer() {
                 cmd_buf[current_offset++] = 0;
             }
         }
+    }
+
+    // **Log nosso.** A resposta que vai para o guest, em hexadecimal.
+    // Sem isto, um `rb{ctx, N}` com o N errado nao da signal nenhum: o
+    // guest le lixo, e o sintoma e' "o guest esta em ciclo".
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr, "[ipc] resposta (%u palavras):", write_size);
+        for (u32 k = 0; k < write_size && k < 16; ++k) {
+            std::fprintf(stderr, " %08x", cmd_buf[k]);
+        }
+        std::fprintf(stderr, "\n");
     }
 
     // Copy the translated command buffer back into the thread's command buffer area.
