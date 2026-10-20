@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* Terceira sonda: medir em vez de esperar por timeout.
  *
  * Os testes anteriores rebentaram com timeout porque o handler reentrava em

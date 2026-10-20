@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Teste do controlador: prova que a pilha SDL2 + evdev + mapeamento funciona.
 //
 // Não é um teste do motor — é um teste do INPUT. A pergunta é se um programa

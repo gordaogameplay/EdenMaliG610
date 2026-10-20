@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — motor de execução nativa (medido, não suposto).
 //
 // O mecanismo, verificado no Orange Pi 5 Pro com `tests/probe_ucontext.cpp`:

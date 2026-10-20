@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* EdenMaliG610 — offsets partilhados entre C++ e assembly.
  *
  * Este header é o ÚNICO que o assembly inclui. Não pode ter nada de C++:

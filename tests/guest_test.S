@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* Guest sintético para validar a execução nativa.
  *
  * Não é código de um jogo: é o menor programa que exercita o ciclo completo

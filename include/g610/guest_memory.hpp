@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — espaço de endereçamento do guest.
 //
 // O guest de 39 bits corre NATIVO no A76: os endereços que ele calcula são os

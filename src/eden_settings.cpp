@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // A definição do `Settings::values` do Eden.
 //
 // Ver `vendor/eden/common/settings_bridge.h` para o que substitui e para a

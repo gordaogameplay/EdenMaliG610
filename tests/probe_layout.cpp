@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Sonda: o que um NSO real diz sobre o seu próprio layout?
 //
 // O carregador precisa de três factos que ainda não estão medidos:

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — memória executável para os testes de execução.
 #include "exec_mem.hpp"
 

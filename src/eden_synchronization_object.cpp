@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Substitui `core/hle/kernel/k_synchronization_object.cpp` do Eden.
 //
 // Ver `vendor/eden/core/hle/kernel/k_process_bridge.h` para a ponte.

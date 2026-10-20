@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* Teste decisivo do mecanismo de execucao nativa.
  *
  * Se o handler conseguir manipular o ucontext e o guest continuar, o motor de

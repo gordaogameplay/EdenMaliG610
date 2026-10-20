@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* Segunda sonda: se o kernel ignora uc_mcontext.pc, o que e' que ele honra?
  *
  * O timeout anterior provou que avancar o PC no ucontext nao funciona: o

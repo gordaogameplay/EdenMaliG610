@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — onde o guest corre.
 //
 // A short version: **nos núcleos grandes, e não onde calhou cair.**

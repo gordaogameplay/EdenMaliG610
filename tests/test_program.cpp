@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — diagnóstico do programa guest multi-módulo.
 //
 // Carrega o ExeFS inteiro (rtld + main + sdk), planeia o layout do espaço de

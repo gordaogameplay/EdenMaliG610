@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — traçador do arranque real.
 //
 // O rtld é código nativo AArch64 e está pronto a correr. A questão é: que

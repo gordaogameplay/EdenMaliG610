@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — tradução Maxwell -> Valhall.
 //
 // A GPU do Switch é uma NVIDIA Maxwell (GM20B). A do Orange Pi 5 Pro é uma

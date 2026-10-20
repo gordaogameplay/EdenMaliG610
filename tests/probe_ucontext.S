@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* Sonda decisiva: o handler pode manipular o ucontext para o guest continuar?
  *
  * A pergunta que decide o desenho do motor. O handler recebe um ucontext com

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+# SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+# SPDX-License-Identifier: GPL-3.0-or-later
 # -*- coding: utf-8 -*-
 """Regera a lista `IA_EDEN_SOURCES` do `CMakeLists.txt` a partir do que existe.
 

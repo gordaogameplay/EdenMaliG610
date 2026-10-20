@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Teste do input: mapeamento SDL -> botões do Switch.
 //
 // O teste sintético (`g610_input`) prova que a pilha funciona. Este prova que o

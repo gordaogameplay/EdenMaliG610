@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Substitui `common/logging.cpp` do Eden.
 //
 // ## O que o código vendorizado realmente pede

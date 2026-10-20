@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — gerador de programas Maxwell sintéticos.
 //
 // O objectivo é ter SASS válido SEM o jogo, para validar o descodificador e,

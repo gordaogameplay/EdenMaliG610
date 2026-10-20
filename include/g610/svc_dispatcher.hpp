@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — despachante de SVC.
 //
 // A execução nativa funciona assim: o binário ARM64 do jogo corre tal e qual no

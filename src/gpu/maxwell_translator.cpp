@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — implementação da tradução Maxwell -> Vulkan.
 #include "g610/gpu/maxwell_translator.hpp"
 

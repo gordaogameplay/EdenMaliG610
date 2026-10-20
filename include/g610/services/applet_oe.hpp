@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // O registo do `appletOE`.
 //
 // O serviço em si vive em `src/services/applet_oe.cpp`; aqui fica só a

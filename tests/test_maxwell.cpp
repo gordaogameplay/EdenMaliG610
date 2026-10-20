@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Teste da tabela e do descodificador Maxwell.
 //
 // Isto não testa um tradutor: ainda não há tradutor. Testa a coisa de que o

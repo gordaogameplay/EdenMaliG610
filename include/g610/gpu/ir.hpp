@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — o IR dos shaders, para o subconjunto mínimo.
 //
 // O que este IR é: a forma intermédia entre SASS Maxwell e GLSL. É pequeno de

@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — input do guest.
 //
 // O guest é um jogo de Nintendo. Os botões que ele vê não são os do teclado, nem

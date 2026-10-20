@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — programa guest: ExeFS multi-módulo + espaço de endereçamento.
 //
 // Um jogo de Switch não é um binário. O ExeFS tem vários NSO e o arranque é

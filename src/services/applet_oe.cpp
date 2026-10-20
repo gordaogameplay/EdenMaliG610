@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // O `appletOE` — o proxy do `am` (Application Manager), **nosso**.
 //
 // ## O que é

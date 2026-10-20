@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — carregador de NSO.
 //
 // Um NSO é um ELF64 AArch64 com cabeçalhos extra da Nintendo no fim do ficheiro

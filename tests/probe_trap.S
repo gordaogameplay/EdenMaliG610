@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* guest_test.S contem um SVC #3 (ExitProcess). Ao executa-lo nativamente
  * fora do motor, o SVC levanta SIGILL/SIGTRAP no kernel Linux de utilizador.
  * Este teste documenta o que o kernel entrega ao handler:

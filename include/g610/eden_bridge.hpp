@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Onde o motor nativo se liga ao sistema do Eden.
 //
 // Ver `vendor/eden/core/hle/kernel/k_process_bridge.h` para o `KProcess`,

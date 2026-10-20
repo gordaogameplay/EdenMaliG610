@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — backend: IR -> GLSL.
 //
 // Porquê GLSL e não SPIR-V: o `glslang` está instalado no Pi e faz

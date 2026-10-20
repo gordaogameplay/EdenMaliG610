@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — executor nativo de ROMs de Switch para RK3588 / Mali-G610.
 //
 // Ponto de entrada. Faz três coisas, por ordem:

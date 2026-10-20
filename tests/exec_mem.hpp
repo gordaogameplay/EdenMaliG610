@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — memória executável para o guest nos testes.
 //
 // O patcher escreve no .text do guest para o transformar (SVC->BRK). O .text

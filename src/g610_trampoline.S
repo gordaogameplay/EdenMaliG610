@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* EdenMaliG610 — trampoline de execução nativa.
  *
  * O mecanismo, numa frase: o tpidr_el0 do processador é a chave que diz, em

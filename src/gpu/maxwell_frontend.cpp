@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — frontend: SASS Maxwell -> IR, para o subconjunto mínimo.
 //
 // A codificação dos operandos não é de memória. Sai de três ficheiros do

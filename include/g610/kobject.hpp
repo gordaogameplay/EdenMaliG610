@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — a tabela de objectos do kernel.
 //
 // Copiada do desenho do Eden (`k_handle_table.h`, `k_handle_table.cpp`,

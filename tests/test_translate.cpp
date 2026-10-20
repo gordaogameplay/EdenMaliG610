@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // A cadeia inteira do tradutor, sem o jogo.
 //
 //   SASS Maxwell sintetico -> IR -> GLSL -> SPIR-V

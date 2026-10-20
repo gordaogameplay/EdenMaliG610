@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* EdenMaliG610 — entrada no guest.
  *
  * Troca o registo de stack pelo do guest e salta para o código do guest. A

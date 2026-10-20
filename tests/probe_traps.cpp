@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 /* Sonda do ciclo de traps do Linux em modo de utilizador (AArch64).
  *
  * Pergunta que responde: quando o guest levanta um BRK, o que é que o kernel

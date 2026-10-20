@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — teste de execução nativa de ponta a ponta.
 //
 // Compila o guest sintético (tests/guest_test.S) para AArch64, extrai o

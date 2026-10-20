@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Executar o SPIR-V gerado NA MALI-G610 de verdade.
 //
 // Onde acaba a cadeia do marco 1: SASS -> IR -> GLSL -> SPIR-V, e o

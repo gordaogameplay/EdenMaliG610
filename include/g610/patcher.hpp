@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — patcher estático.
 //
 // Corre uma única vez, no carregamento do programa. Percorre a região de
