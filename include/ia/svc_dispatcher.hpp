@@ -303,6 +303,12 @@ public:
     // Portas de serviço nomeadas. Devolve um handle ou 0.
     std::uint32_t connect_named_port(const std::string& name);
     const std::string& last_port() const noexcept { return last_port_; }
+
+    // O último comando IPC despachado, e quantos houve. O tracer usa isto
+    // para mostrar o que o guest perguntou — sem ele, "o jogo não arrancou" é
+    // a única informação que sobra.
+    const std::string& last_ipc() const noexcept { return last_ipc_; }
+    std::uint64_t sync_request_calls() const noexcept { return sync_request_calls_; }
     void          close_handle(std::uint32_t handle);
 
     // O jogo pediu para terminar?
@@ -386,6 +392,31 @@ private:
 
     Result svc_unsupported(SvcContext&);
 
+    // ── IPC mínimo ────────────────────────────────────────────────────────
+    //
+    // O transporte do `sm:`. Ver `src/ipc_min.cpp` para o layout, que foi
+    // medido no pedido real e conferido contra `ipc.h` do Eden.
+    static constexpr std::size_t kIpcBufferMax = 0x200;
+
+    // Despacha um pedido e escreve a resposta no MESMO buffer do guest.
+    // Devolve false se não foi um pedido SMART válido.
+    bool ipc_dispatch(std::uint64_t buffer, std::size_t size);
+
+    Result svc_send_sync_request(SvcContext& ctx);
+    Result svc_send_sync_request_light(SvcContext& ctx);
+
+    // Escreve uma resposta vazia com um Result — o "não sei responder" honesto.
+    void write_empty_reply(std::uint64_t buffer, std::size_t size, std::uint32_t result);
+
+    // Handle <-> nome de serviço. É a única "sessão" que existe: um handle é
+    // um inteiro e um nome, e nada mais. STUB declarado.
+    std::string service_name_for_handle(std::uint32_t handle) const;
+
+    static constexpr std::uint32_t kResultNotImplemented = 0x00040001;
+
+    std::string       last_ipc_;
+    std::uint64_t     sync_request_calls_ = 0;
+
 
 
     tel::Telemetry& tel_;
@@ -403,6 +434,10 @@ private:
     // A última porta a que o guest se ligou, para o relatório. STUB: não há
     // IPC por trás do handle.
     std::string       last_port_;
+
+    // `ConnectToNamedPort` fabrica handles a partir de 0x1000. `name_by_handle_`
+    // é o que permite responder a um `SendSyncRequest` sabendo a que serviço
+    // ele é dirigido.
 
     std::uint64_t    mem_total_   = 0;
     std::uint64_t    mem_used_    = 0;

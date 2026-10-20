@@ -159,7 +159,7 @@ void on_trap(int sig, std::uint64_t pc, std::uint64_t sp, void* user) {
         ssize_t w = ::write(2, b, (size_t)k);
         (void)w;
     }
-    (void)user;
+
 }
 
 // Callback do motor. Assinatura async-signal-safe: só escreve em memória
@@ -177,7 +177,63 @@ void on_svc(std::uint32_t number, ia::SvcContext& ctx, std::uint64_t pc,
     c.pc = pc;
     c.sp = sp;
     g_calls.push_back(c);
-    (void)user;
+
+    // O pedido de IPC, em bruto.
+    //
+    // `SendSyncRequest(handle, buffer, size)` — o buffer é a MessageBuffer do
+    // ThreadLocalRegion (os primeiros 0x100 bytes), que é NOSSA memória e que
+    // podemos ler. Antes de responder a um único comando de serviço é preciso
+    // ver o que o guest perguntou: um pedido de `sm:` que se responde às
+    // cegas é um palpite.
+    //
+    // A estrutura é a de todos os serviços IPC do Horizon
+    // (switchbrew/IPC_services):
+    //
+    //     u32 type;                 0 = pedido, 1 = resposta
+    //     u32 unknown;
+    //     ServiceCmdArg args[8];    { char name[0x20]; u32 pad; u64 data; }
+    //
+    // total 8 + 8*0x28 = 0x148 bytes de cabeçalho.
+    if ((number == 0x21 || number == 0x20) && g_mem != nullptr) {
+        std::uint8_t m[0x148];
+        std::string e;
+        if (g_mem->read(ctx.x[1], m, sizeof m, e)) {
+            std::uint32_t type, unk;
+            std::memcpy(&type, m, 4);
+            std::memcpy(&unk, m + 4, 4);
+            std::printf("[ipc ] pedido em %llu (handle %llx) type=%u unk=0x%08x\n",
+                        (unsigned long long)ctx.x[1],
+                        (unsigned long long)ctx.x[0], type, unk);
+            // Hexdump bruto: a estrutura assumida pode estar errada, e ver os
+            // bytes é mais barato do queinferir a partir de uma leitura.
+            for (int off = 0; off < 0x60; off += 16) {
+                std::string hexs, txt;
+                for (int k = 0; k < 16; ++k) {
+                    char t[8];
+                    std::snprintf(t, sizeof t, "%02x ", m[off + k]);
+                    hexs += t;
+                    const unsigned char ch = m[off + k];
+                    txt += (ch >= 32 && ch < 127) ? static_cast<char>(ch) : '.';
+                }
+                std::printf("        +%02x  %s  %s\n", off, hexs.c_str(), txt.c_str());
+            }
+            for (int a = 0; a < 8; ++a) {
+                const std::uint8_t* p = m + 8 + a * 0x28;
+                char nome[0x21] = {0};
+                std::memcpy(nome, p, 0x20);
+                std::uint64_t data;
+                std::memcpy(&data, p + 0x20 + 4, 8);
+                bool vazio = true;
+                for (int k = 0; k < 0x20; ++k)
+                    if (nome[k] != 0) vazio = false;
+                if (vazio && data == 0)
+                    continue;
+                std::printf("        arg[%d] \"%s\"  data=0x%llx\n", a, nome,
+                            (unsigned long long)data);
+            }
+        }
+    }
+   (void)user;
     // Confirma que o observer corre DENTRO do handler. Sem isto, e sem o
     // relatório (que só imprime quando o guest sai), um SVC despachado sem
     // guest parado não deixa rasto nenhum.
@@ -650,6 +706,10 @@ int main(int argc, char** argv) {
     std::printf("  svcs vistas : %d\n", g_svcs);
     std::printf("  amostras    : %d  (último PC 0x%llx)\n", g_samples,
                 (unsigned long long)g_sample_pc);
+    if (!svc.last_ipc().empty())
+        std::printf("  ultima IPC  : %s\n", svc.last_ipc().c_str());
+    std::printf("  SendSyncReq : %llu\n",
+                (unsigned long long)svc.sync_request_calls());
     if (!svc.last_port().empty())
         std::printf("  ultima porta: \"%s\"  (STUB: handle fabricado, sem IPC)\n",
                     svc.last_port().c_str());

@@ -44,6 +44,7 @@ add_library(ia_core STATIC
   src/guest_program.cpp
   src/input.cpp
   src/svc_dispatcher.cpp
+    src/ipc_min.cpp
   src/gpu/maxwell_translator.cpp
   src/patcher.cpp
   src/native_engine.cpp

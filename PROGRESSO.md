@@ -50,10 +50,58 @@ Quando uma hipótese é refutada, escreve-se. A lista está em
 
 ## Onde paramos
 
-O guest passou o crt0 e pediu a porta **`sm:`** (o service manager), seguida de
-`SendSyncRequest`. Daí em diante é IPC a sério, que é a fronteira combinada.
+O guest passou o crt0, pediu a porta **`sm:`**, e está a falar SMART IPC.
+Construí­mos o transporte e despachamos o primeiro comando — `sm: Initialize`
+— mas o guest continua a chamar `svc Break(x0=0)` a seguir.
 
 **164 verificações, 0 falhas.**
+
+### O transporte (`src/ipc_min.cpp`)
+
+Medido no pedido real do jogo, e conferido contra `core/hle/ipc.h` do Eden:
+
+```
+0x00  CommandHeader        type=6 (RequestWithContext), data_size=10
+0x08  BufferDescriptorC    8 bytes
+0x10  HandleDescriptorHeader
+0x20  DataPayloadHeader    "SFCI"
+0x28  corpo: cmd_id = 0   -> Initialize
+```
+
+E a resposta, de `ResponseBuilder` (`ipc_helpers.h:36-95`):
+
+- **magic = `"SFCO"`**, não `"SFCI"` — I/O, input/output (`ipc_helpers.h:88`)
+- `CommandHeader.type = 0` — o `type` só é escrito no caminho TIPC
+- `data_size = normal_params + 2 + 4` (os 4 u32 são 16 bytes de padding)
+
+Os comandos do `sm:` e os seus números são os do Eden (`sm.cpp:270-278`):
+`0 Initialize`, `1 GetService`, `2 RegisterService`, `3 UnregisterService`.
+
+### Três tentativas, sem avanço
+
+| # | O que mudei | Resultado |
+|---|---|---|
+| 1 | resposta com magic `SFCI`, `type = 6` | `Break(x0=0)` |
+| 2 | limite de escrita à MessageBuffer (0x100) | `Break(x0=0)` — mas **fixou uma regressão real** |
+| 3 | magic `SFCO`, `type = 0`, `data_size = 8` | `Break(x0=0)` |
+
+A tentativa 2 valeu a pena por si: o buffer de IPC **é** a MessageBuffer do
+ThreadLocalRegion, e a primeira versão limpava `size` = 0x1000 bytes a partir
+do corpo — o que apagava os ThreadVars em +0x1E0 e partia o TLS. Um sucesso
+falso teria sido pior que o `Break`.
+
+### O que NÃO está resolvido
+
+O `Break(x0=0)` continua. **Não sei se é**:
+- o `CommandHeader` da resposta (a posição do payload depende de quantos
+  descritores há, e a resposta não tem nenhum — o `ResponseBuilder` alinharia
+  o payload em 0x18, não em 0x20);
+- o SDK precisar de mais do que um Result de `Initialize`;
+- ou a resposta ter de ser escrita noutro sítio (o Eden, em modo HLE, tem
+  `ctx.CommandBuffer()` a apontar para o buffer do cliente — que é o que
+  fazemos — mas não confirmei que a geometria é a mesma).
+
+Paro aqui pela regra das três tentativas.
 
 ---
 
