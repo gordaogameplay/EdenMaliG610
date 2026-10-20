@@ -2163,3 +2163,81 @@ O `aoc:u` (`IAddOnContentManager`, 374 linhas no Eden) e' o proximo: o Eden
 implementa-o com o `ContentProvider` e o `PatchManager` — o emulador de
 ficheiros. Num motor nativo nao ha DLC, e a lista e' vazia; o que o guest
 precisa e' que o **servico exista** e responda.
+
+---
+
+## O `aoc:u` e o `pctl`: os dois servicos que faltavam
+
+**O `aoc:u` travava o arranque do guest.** O `sm:` respondia *"Waiting for
+service aoc:u to become available"* e **ficava bloqueado**
+(`sm.cpp:200-203`, `ctx.SetIsDeferred()`). Enquanto o `sm:` espera, nenhum
+pedido seguinte e' atendido — e os pedidos do `pctl` ficavam na fila, sem
+o log do `sm:` mostrar sequer o nome deles.
+
+**E o `pctl` estava vendorizado mas nunca registado.** O `LoopProcess` — que
+e' o que regista as quatro portas no `sm:` — nunca era chamado. O codigo
+estava compilado e nunca executado, e o guest nao dizia nada: um pedido
+pendente **nao e' um erro, e' uma espera**.
+
+**E os handlers do `pctl` usam `D<>` (dominio), nao `C<>` (sessao
+normal).** O Eden usa `D<>` em todos. Uma versao anterior deste projecto
+trocou para `C<>` por inferencia — a resposta saia com 0 palavras — e a
+inferencia estava errada. Medido: com `C<>`, o SDK recebia um ponteiro que
+nao era um objecto de dominio e abortava com `this == NULL`.
+
+## O layout: o `main` linkado para 0x80000000
+
+**O jogo linkou o `main` para 0x80000000, e este motor punha-o em
+0x80005000.** A diferenca — 0x5000 — era o que fazia o jogo abortar num
+assert **seu**.
+
+Medido: o `adrp` do jogo e' relativo ao PC, e o valor que ele dava era
+0x5000 acima do linkado. A string da assercao do jogo (*"SuperStripe
+instance is null"*) esta, no guest, em 0x81b06601; o linkador a puser em
+0x81b01601.
+
+Duas causas:
+
+1. O `rtld` ocupava 0x5000 (a imagem **do ficheiro**, 0x3DA6, mais o
+   `.bss`) quando devia ocupar 0x4000 (o **fim do ultimo segmento**,
+   0x3280, mais o `.bss` — que e' o que o Eden mede, `nso.cpp:131`).
+2. O `rtld` ocupava o sitio do `main`. O `rtld` (o `ldr`) e' linkado em
+   **PC-relativo**; o `main` e' linkado para um sitio **fixo**, e o `ldr`
+   le-o de uma tabela (medido: **nove ocorrencias de 0x80000000** nos
+   dados do `rtld`).
+
+## O heap de 8 GiB, e o `MAP_NORESERVE`
+
+O Eden, para 39 bits, reserva **8 GiB** de heap
+(`k_address_space_info.cpp:36`), e o `GetInfo(21)` devolve o
+`HeapRegionSize` do processo — que sao esses mesmos 8 GiB.
+
+**E o `mmap` de 8,75 GiB precisa de `MAP_NORESERVE`**: o overcommit
+heuristico do Linux recusa a reserva num Pi de 7,7 GiB, e o guest nem
+chegava a arrancar.
+
+## Medicoes
+
+| Medida | Valor |
+|---|---|
+| Despacho de SVC | **115,9 ns** por chamada (**8,6 M/s**) |
+| Arranque do guest ate ao abort | **32,0 – 32,9 ms**, com **165 SVCs** |
+| Faults do guest | **0** |
+| Suite | **6/6** |
+
+O despacho e' medido por `g610_bench_svc` (20 milhoes de chamadas); o
+arranque, pelo instante do `Break` que o `boot_trace` regista.
+
+## Onde estamos
+
+O guest chega ao `am`, pede as sub-interfaces, e o `am` responde. Os
+servicos todos respondem — `lm`, `apm`, `appletOE`, `aoc:u`, `pctl` e as
+suas tres variantes.
+
+O que falta e' o **polling**: o SDK pede e volta a pedir, a espera de um
+evento que o `am` nao sinaliza. Medido: 74 `SignalProcessWideKey` e 53
+`SendSyncRequest` antes do primeiro assert.
+
+E o assert, que agora e' **do jogo** e nao um artefacto do motor: o jogo
+verifica um byte do seu objecto (`ldrb w8, [x21, #8]; cbz w8, ...`) e
+aborta se ele nao for zero.
