@@ -14,6 +14,37 @@
 #include <unistd.h>
 #include <ucontext.h>
 
+// ---------------------------------------------------------------------------
+// O estado das threads de GUEST
+// ---------------------------------------------------------------------------
+//
+// `__thread` com o modelo **initial-exec** explicito. As tres razoes, todas
+// medidas:
+//
+//   - `thread_local` em modo PIC passa por `__tls_get_addr`, que **pode
+//     alocar** — e alocar dentro de um handler de sinais e' um caminho para
+//     o OOM (o processo morria no primeiro `SendSyncRequest`);
+//   - `__thread` sem modelo forcado usa *local-exec*, cujo offset e'
+//     resolvido no link — e o binario e' PIE, logo o offset esta' errado e o
+//     valor lido e' lixo (o motor acha que esta' numa thread de guest, poe o
+//     TLS da `libc` a zero, e morre);
+//   - o modelo *initial-exec* da um acesso directo (`%fs:offset`), sem
+//     alocacao e sem lock — e portanto seguro dentro de um handler.
+//
+// Sao globais e nao por thread porque o Eden tambem tem um "current thread"
+// global (`GetCurrentThreadPointer`); nos temos uma thread de guest, e a
+// corrida entre a principal e a de guest limita-se a estes tres valores.
+__thread __attribute__((tls_model("initial-exec"))) volatile bool g_thread_de_guest = false;
+__thread __attribute__((tls_model("initial-exec"))) std::uint64_t g_guest_tls = 0;
+__thread __attribute__((tls_model("initial-exec"))) std::uint64_t g_host_tls = 0;
+
+
+// O ponto de regresso das threads de guest. E' um buffer **partilhado**: um
+// `siglongjmp` para o `sigjmp_buf` de outra thread e' comportamento
+// indefinido, e o buffer tem de ser o da frame que armou o `sigsetjmp`.
+sigjmp_buf g_thread_jmp;
+volatile bool g_thread_have_jmp = false;
+
 namespace g610 {
 
 namespace {
@@ -465,6 +496,108 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
 // Handler de sinais
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Correr codigo do guest numa thread nova
+// ---------------------------------------------------------------------------
+//
+// O codigo do guest e' NATIVO: corre directamente na CPU. Logo, uma thread de
+// guest e' uma thread do host a correr o entry point, com o `sp` que o guest
+// deu no `CreateThread` e com o `TPIDR_EL0` apontado para o TLS *dela*.
+//
+// O `sp` nao pode ser mudado em C++ (o compilador mete-o no meio), por isso
+// ha uma rotocao em ensamblador.
+//
+// **Os registos do guest ficam a zero**, como no Eden
+// (`KThread::InitializeContext`: tudo a zero, menos o `x0` — o argumento —
+// e o `x18`, o platform register). Sem isto, a thread nova herda os registos
+// do host: o entry point que o SDK passa le o `x7` e o `x19`, e com valores
+// do host ele salta para um endereco do host.
+extern "C" __attribute__((naked)) void g610_run_guest(std::uint64_t entry,
+                                                      std::uint64_t arg,
+                                                      std::uint64_t sp,
+                                                      std::uint64_t platform_reg) {
+    __asm__ volatile(
+        "sub  sp, sp, #0x30\n"
+        "str  x0, [sp, #0]\n"     // o entry point
+        "str  x1, [sp, #8]\n"     // o argumento
+        "str  x2, [sp, #16]\n"    // o `sp` do guest
+        "str  x3, [sp, #24]\n"    // o platform register
+        "mov  x0, xzr\n"
+        "mov  x1, xzr\n"
+        "mov  x2, xzr\n"
+        "mov  x3, xzr\n"
+        "mov  x4, xzr\n"
+        "mov  x5, xzr\n"
+        "mov  x6, xzr\n"
+        "mov  x7, xzr\n"
+        "mov  x8, xzr\n"
+        "mov  x9, xzr\n"
+        "mov  x10, xzr\n"
+        "mov  x11, xzr\n"
+        "mov  x12, xzr\n"
+        "mov  x13, xzr\n"
+        "mov  x14, xzr\n"
+        "mov  x15, xzr\n"
+        "mov  x16, xzr\n"
+        "mov  x17, xzr\n"
+        "mov  x19, xzr\n"
+        "mov  x20, xzr\n"
+        "mov  x21, xzr\n"
+        "mov  x22, xzr\n"
+        "mov  x23, xzr\n"
+        "mov  x24, xzr\n"
+        "mov  x25, xzr\n"
+        "mov  x26, xzr\n"
+        "mov  x27, xzr\n"
+        "mov  x28, xzr\n"
+        "mov  x29, xzr\n"
+        "mov  x30, xzr\n"
+        "ldr  x18, [sp, #24]\n"    // o platform register
+        "ldr  x0, [sp, #8]\n"     // o argumento
+        "ldr  x16, [sp, #16]\n"   // o `sp` do guest
+        "ldr  x17, [sp, #0]\n"    // o entry point
+        "mov  sp, x16\n"         // o `sp` do guest
+        "blr  x17\n"             // o entry point
+        "brk  #0\n");            // a thread do guest nao volta
+}
+
+int NativeEngine::run_guest_thread(std::uint64_t entry, std::uint64_t arg,
+                                   std::uint64_t sp, std::uint64_t tls) {
+    // O `sigsetjmp` tem de estar numa frame que **sobreviva** ao codigo do
+    // guest: um `siglongjmp` para o `sigjmp_buf` de uma frame ja regressada
+    // e' comportamento indefinido.
+    g_thread_de_guest = true;
+    g_guest_tls       = tls;
+    g_host_tls        = read_thread_pointer();
+
+    if (sigsetjmp(g_thread_jmp, 1) != 0) {
+        // Um fault trouxe-nos para aqui. A thread acaba — e o lugar do fault
+        // e' a informacao mais valuable que temos.
+        g_thread_have_jmp = false;
+        write_thread_pointer(g_host_tls);
+        std::fprintf(stderr,
+                     "[thrd] a thread de guest faultou: pc=0x%llx addr=0x%llx sp=0x%llx\n",
+                     (unsigned long long)g_hooks.fault_pc,
+                     (unsigned long long)g_hooks.fault_addr,
+                     (unsigned long long)g_hooks.fault_sp);
+        return 1;
+    }
+    g_thread_have_jmp = true;
+
+    // **O TLS do guest tem de estar instalado ANTES de o guest correr.** O
+    // handler de sinais troca o TLS do host pelo do guest *durante* as traps
+    // — mas o guest le o `TPIDR_EL0` a toda a hora, e fora de uma trap o
+    // registo e' o da `libc` do host.
+    write_thread_pointer(g_guest_tls);
+
+    g610_run_guest(entry, arg, sp, g_hooks.platform_reg);
+
+    write_thread_pointer(g_host_tls);
+    g_thread_have_jmp = false;
+    g_thread_de_guest = false;
+    return 0;
+}
+
 void NativeEngine::signal_trampoline(int sig, siginfo_t* info, void* raw) {
     // Duas trocas, e o motivo é o mesmo nos dois sentidos: quem executa
     // decide de quem é o registo.
@@ -562,6 +695,23 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw) {
             uc->uc_mcontext.sp = g_hooks.recovery_sp;
             uc->uc_mcontext.pc = g_hooks.recovery_pc;
             return;
+        }
+
+        // Numa thread de guest, cada trap e' uma pista: e' o unico registo
+        // do que o guest esta' a fazer la dentro.
+        if (g_thread_de_guest) {
+            std::fprintf(stderr,
+                         "[thrd] trap #%u pc=0x%llx sp=0x%llx x0=0x%llx x1=0x%llx "
+                         "x2=0x%llx x3=0x%llx x7=0x%llx x19=0x%llx x28=0x%llx\n",
+                         number, (unsigned long long)pc,
+                         (unsigned long long)uc->uc_mcontext.sp,
+                         (unsigned long long)uc->uc_mcontext.regs[0],
+                         (unsigned long long)uc->uc_mcontext.regs[1],
+                         (unsigned long long)uc->uc_mcontext.regs[2],
+                         (unsigned long long)uc->uc_mcontext.regs[3],
+                         (unsigned long long)uc->uc_mcontext.regs[7],
+                         (unsigned long long)uc->uc_mcontext.regs[19],
+                         (unsigned long long)uc->uc_mcontext.regs[28]);
         }
 
         // Despachar o serviço: argumentos em x0-x5, resultado em x0.

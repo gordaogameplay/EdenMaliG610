@@ -4,6 +4,7 @@
 #include "g610/svc_dispatcher.hpp"
 
 #include "g610/eden_bridge.hpp"
+#include "g610/native_engine.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <sched.h>
 #include <thread>
+#include <vector>
 
 namespace g610 {
 
@@ -1156,25 +1158,30 @@ Result SvcDispatcher::svc_create_thread(SvcContext& ctx) {
     ctx.ret      = 0;
     ctx.has_ret  = true;
 
-    // **A thread NAO corre, ainda.** O passo 1 (o estado por thread) esta'
-    // escrito e **revertido**: com o `TPIDR_EL0`, o `sigsetjmp` e a
-    // recuperacao por thread, o processo morre de OOM — e o guest e' lido
-    // como se nao tivesse TLS.
+    // **A thread corre.** O codigo do guest e' nativo, logo uma thread de
+    // guest e' uma thread do host a correr o entry point, com o `sp` que o
+    // guest deu (o Eden chama-lhe `user_stack_top`, `k_thread.h:737`) e com
+    // o `TPIDR_EL0` apontado para o TLS *dela*.
     //
-    // O que a medicao diz (e o que o proximo passo tem de resolver):
-    //
-    //   - o `sigsetjmp` tem de estar numa frame que **sobreviva** ao codigo
-    //     do guest (um `siglongjmp` para o buffer de uma frame ja
-    //     regressada e' comportamento indefinido — dava `exit 70`);
-    //   - o `TPIDR_EL0` tem de ser instalado **antes** de o guest correr, e
-    //     nao so durante as traps: o guest le-o com `mrs x, tpidrro_el0` (que
-    //     o patcher reescreve para `tpidr_el0`) em qualquer momento, e fora
-    //     de uma trap o registo e' o da `libc` do host;
-    //   - o `TPIDR_EL0` do **host** tambem tem de ser por thread: o
-    //     handler troca o TLS do host pelo do guest *durante* a trap, e a
-    //     `libc` de cada thread tem o seu.
-    //
-    // ate isso, a thread fica como esta: um handle valido, e o guest vivo.
+    // O TLS e' uma copia do da thread principal, com o handle novo em
+    // TLS+0x110 — que e' exactamente o que o Eden escreve
+    // (`Write32(tls + 0x110, *out_handle)`, `svc_thread.cpp:79`).
+    if (mem_ != nullptr && tls_base_ != 0) {
+        const std::uint64_t tls = tls_base_ + 0x1000ull * (++tls_threads_);
+        std::vector<std::uint8_t> bloco(0x1000, 0);
+        if (read_guest(tls_base_, bloco.data(), bloco.size())) {
+            std::memcpy(bloco.data() + 0x110, &h.raw, sizeof h.raw);
+            std::memset(bloco.data(), 0, 0x100);
+            if (!write_guest(tls, bloco.data(), bloco.size())) {
+                last_ipc_ = "CreateThread: nao escrevi o TLS da thread";
+            } else {
+                std::thread([entry, arg, stack_bottom, tls]() {
+                    NativeEngine::run_guest_thread(entry, arg, stack_bottom, tls);
+                }).detach();
+            }
+        }
+    }
+
     if (std::getenv("IA_IPC_TRACE") != nullptr) {
         std::fprintf(stderr,
                      "[svc] CreateThread handle=0x%x entry=0x%llx arg=0x%llx "

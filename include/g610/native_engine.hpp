@@ -31,6 +31,13 @@
 #include "g610/svc_dispatcher.hpp"
 #include "g610/telemetry.hpp"
 
+// Corre codigo do guest numa thread nova, com o `sp` que o guest deu.
+//
+// O codigo do guest e' NATIVO, logo o `sp` e' o do registo da CPU — e nao
+// pode ser mudado em C++. A rotocao esta' em ensamblador, no `.cpp`.
+extern "C" void g610_run_guest(std::uint64_t entry, std::uint64_t arg,
+                               std::uint64_t sp, std::uint64_t platform_reg);
+
 namespace g610 {
 
 // O que o guest fez na última trap. Registado para o relatório e para
@@ -169,6 +176,14 @@ public:
     // quando não há guest — e é o que evita que a libc do host fique com um
     // `fs` a apontar para memória que não existe.
     void set_guest_tls(std::uint64_t base) noexcept { hooks_.guest_tls = base; }
+
+    // Corre o codigo do guest **nesta** thread, com o `TPIDR_EL0` apontado
+    // para o TLS `tls` e com o ponto de regresso **dela**.
+    //
+    // Devolve 0 se o guest voltou, e 1 se o interrompeu um fault — nesse
+    // caso, a thread acaba aqui e o processo continua.
+    static int run_guest_thread(std::uint64_t entry, std::uint64_t arg,
+                                std::uint64_t sp, std::uint64_t tls);
 
     // O x1 do guest no entry point. Ver `EngineHooks::guest_x1`.
     void set_guest_x1(std::uint64_t v) noexcept { hooks_.guest_x1 = v; }
