@@ -401,3 +401,61 @@ dereference. Mapeámos [0x6000'0000, 0x8000'0000).
   plausíveis, **não medidos contra hardware real**.
 - Como o kernel do Switch dimensiona o bloco estático de TLS da thread
   principal a partir do NPDM → **não investigado**.
+---
+
+# GPU: Maxwell -> Valhall (investigado a pedido)
+
+## O que está medido no Orange Pi 5 Pro
+
+```
+GPU0: deviceName  = Mali-G610
+      driverName  = panvk   (Mesa 25.2.8)
+      apiVersion  = 1.4.318
+```
+
+PanVK activo, Vulkan 1.4, mais GBM e EGL/GLES2. **O lado destino existe e
+funciona.** Limites da G610 relevantes para degradar recursos:
+`maxImageDimension2D = 16383`, `maxImageDimension3D = 512`.
+
+## O tradutor já existe como fonte
+
+`~/eden/src/shader_recompiler/`, ~19 000 linhas:
+
+```
+frontend/maxwell/   decode.cpp, opcodes.cpp, structured_control_flow.cpp,
+                    translate/        -> descodifica SASS Maxwell
+frontend/ir/        -> IR
+ir_opt/             -> optimizações
+backend/spirv/      -> SPIR-V
+backend/glsl/       -> GLSL
+backend/glasm/      -> GLASM
+```
+
+Isto é literalmente o Maxwell -> Valhall que se pede, pela via que é possível:
+SASS -> IR -> SPIR-V, e o PanVK compõe para Valhall. O caminho não é
+instrução-a-instrução para a ALU da Mali (ninguém publica a ISA da Mali), é
+**descodificar Maxwell e voltar a compilar** — que é o mesmo resultado.
+
+## O nosso `src/gpu/maxwell_translator.cpp` é um esqueleto
+
+`ShaderCache::compile()` faz `memcpy` do blob e chama-lhe SPIR-V. São 480
+linhas das quais ~90 são comentários. É a mesma classe de tease do runtime
+antigo do piDroid — e a regra do projecto diz que isso se apanha medindo.
+
+## O bloqueio real
+
+**O jogo não chega à GPU.** Aborta em `nn::oe` antes de abrir o NVN. Não há
+comandos Maxwell para traduzir porque ainda não existe nenhum.
+
+O caminho até lá é o boot: IPC do kernel. Foi aí que me perdi.
+
+## O que muda no plano
+
+Duas frentes, e a segunda **não depende da primeira**:
+
+1. **Boot** — terminar o que falta do `nn::oe` para o jogo abrir o NVN.
+2. **Tradutor** — construí-lo e testá-lo **sem o jogo**, com programas Maxwell
+   sintéticos, exactamente como o motor de CPU foi validado com um guest
+   sintético antes de tocar no Pokémon Shield.
+
+A frente 2 é a que o enunciado pede, e é testável hoje.
