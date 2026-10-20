@@ -1175,3 +1175,66 @@ inventar um caminho novo.
 Suite: **6 testes, todos a passar**. GPU medido: 1.500000 na G610. O jogo
 continua a abortar no primeiro IPC, e continua a não ser por causa do
 formato da resposta — as 16 variantes já o provaram.
+
+
+---
+
+# O que o programa de teste é, afinal
+
+`IA_STRINGS=main` extrai o texto ASCII de 18.059 strings da `.rodata` e da
+`.data` do `main`, já descomprimidas. O que lá está:
+
+```
+C:\jenkins\workspace\orion\RomBuild\program\output\NX64\Release\main.nss
+c:/projects/env/NintendoSDK/NintendoSDK/Libraries/NX-NXFP2-a64/Release//glslc.nss
+nnSdk.nss
+_ZN2nn4diag6detail18OnAssertionFailureENS0_13AssertionTypeEPKcS4_S4_i
+nndetailDiagAbortFormatImpl
+
+RigidBody::setRigidBodyFlag: dynamic meshes/planes/heightfields are not supported!
+GPU cloth creation failed. Falling back to CPU implementation.
+CPostEffect::Initialize(): m_pMotionBlurReducedWork->InitializeDevice() succeeded.
+==== TEXSHADERSET::InitializeDevice() succeeded. ====
+IGPUIndexBuffer::...BuildIndexBuffer(Size: %d, nBuffers: %d, %s, Usage: 0x%x ...) failed
+SiGfx failed to initialize.
+```
+
+## O que isto muda
+
+**Não é um jogo comercial.** É um programa do **SDK da Nintendo** com PhysX
+(monorcloths, articulações), **SiGfx** — a API de gráficos da Nintendo,
+equivalente ao NVN — pós-processamento, texturas e protobuf.
+
+Três consequências, todas boas:
+
+1. **Tem shaders Maxwell, e many.** `NX-NXFP2-a64` é o perfil Maxwell+ e
+   `glslc.nss` é o compilador de shaders da NVIDIA. O banco `GshD` não está
+   no `main` porque os shaders vivem nos objectos da SDK — mas estão lá.
+
+2. **É código de nicho.** As mensagens de asserção estão em texto claro na
+   `.rodata`. Um jogo comercial esconde tudo; este diz o que espera. É
+   exactamente o oposto do problema que tive antes.
+
+3. **A função de abort está identificada:**
+   `nn::diag::detail::OnAssertionFailure(AssertionType, const char* cond,
+   const char* file, const char* func, int line)`. E os argumentos chegam em
+   x0..x4 — o que casa com a função de log de erro que desassemblei
+   (`mov x24, x0` ... `mov w21, w3`, mais os registos de `va_list`).
+
+## O abort, outra vez
+
+Continua a ser depois do primeiro `SendSyncRequest`, e continua a não ser por
+causa do formato da resposta — as 16 variantes já o provaram, incluindo
+"não escrever nada".
+
+Com o `nn::diag` identificado, o passo certo deixou de ser adivinhar o
+formato e passou a ser **ter a tabela de objectos** (portos, sessões, handles)
+como o Eden tem, e dar ao `sm:` um servidor de verdade. `ConnectToNamedPort`
+cria uma sessão por dentro — está no `svc_port.cpp` — e é por isso que o
+`SendSyncRequest` a seguir funciona sem `OpenSession`.
+
+## Estado
+
+Suite: **6 testes, todos a passar**. GPU: 1.500000 na G610.
+
+Telemetria nova: `IA_STRINGS=main`.

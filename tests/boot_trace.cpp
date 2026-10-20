@@ -330,6 +330,77 @@ void on_svc(std::uint32_t number, ia::SvcContext& ctx, std::uint64_t pc,
     // procurar o alvo deu "nenhuma chamada directa encontrada", e a stack
     // deu a resposta à primeira. A stack e' o caminho que nao depende de haver
     // símbolos, e é muito mais barato.
+    // ── as STRINGS de um modulo ──────────────────────────────────────────
+    //
+    // `IA_STRINGS=main` extrai todo o texto ASCII imprimivel dos segmentos de
+    // dados de um modulo e imprime-o.
+    //
+    // Existe por causa de uma descoberta: o `main` que estamos a correr
+    // chama-se `piDroid_Test_ARM` e NAO tem banco de shaders — `GshD` nao
+    // aparece no ficheiro. Nao e' um jogo comercial: e' um programa de teste
+    // em libnx. Isso muda a estrategia toda, e a forma de o confirmar foi ver
+    // o que o programa diz de si proprio. E, por acaso, a melhor coisa que
+    // pode ser: codigo de nicho, e o texto esta no sitio.
+    //
+    // `IA_STR=0x...` le texto num endereco avulso, para quando a string e'
+    // num `.bss` que a varrimento nao pega.
+    if (number == 0x26 && g_mem != nullptr && g_prog != nullptr) {
+        const char* qual = std::getenv("IA_STRINGS");
+        if (qual != nullptr) {
+            for (const auto& m : g_prog->modules()) {
+                if (std::string(m.name()) != qual)
+                    continue;
+                // Os segmentos 1 e 2 sao a rodata e a data. O texto vive la.
+                for (int sg = 1; sg <= 2; ++sg) {
+                    const std::uint64_t ini = m.vaddr_base + m.nso.segments[sg].vaddr;
+                    const std::size_t tam = static_cast<std::size_t>(m.nso.segments[sg].size);
+                    if (tam == 0 || tam > (16u << 20))
+                        continue;
+                    std::vector<char> buf(tam);
+                    std::string e5;
+                    if (!g_mem->read(ini, buf.data(), tam, e5)) {
+                        std::printf("[txt] %s seg%d: nao li: %s\n", m.name(), sg,
+                                    e5.c_str());
+                        continue;
+                    }
+                    std::size_t i2 = 0;
+                    while (i2 < buf.size()) {
+                        std::size_t j = i2;
+                        while (j < buf.size() && buf[j] >= 0x20 && buf[j] < 0x7F)
+                            ++j;
+                        if (j - i2 >= 8)
+                            std::printf("[txt] %s 0x%llx: %.*s\n", m.name(),
+                                        (unsigned long long)(ini + i2),
+                                        static_cast<int>(j - i2), buf.data() + i2);
+                        i2 = (j == i2) ? i2 + 1 : j + 1;
+                    }
+                }
+            }
+        }
+
+        const char* vs = std::getenv("IA_STR");
+        if (vs != nullptr) {
+            const std::uint64_t p0 = std::strtoull(vs, nullptr, 0);
+            for (int n = 0; n < 4; ++n) {
+                char txt[256];
+                std::string e3;
+                if (!g_mem->read(p0 + n * 256, txt, sizeof txt - 1, e3)) {
+                    std::printf("[str] 0x%llx: nao li: %s\n",
+                                (unsigned long long)(p0 + n * 256), e3.c_str());
+                    continue;
+                }
+                txt[sizeof txt - 1] = 0;
+                std::printf("[str] 0x%llx: \"%s\"\n",
+                            (unsigned long long)(p0 + n * 256), txt);
+                std::printf("      hex:");
+                for (int b = 0; b < 64; ++b)
+                    std::printf("%02x%s", static_cast<unsigned char>(txt[b]),
+                                (b % 16 == 15) ? "\n          " : " ");
+                std::printf("\n");
+            }
+        }
+    }
+
     if (number == 0x26 && sp != 0 && g_mem != nullptr) {
         std::uint64_t words[4] = {0, 0, 0, 0};
         std::string e;
