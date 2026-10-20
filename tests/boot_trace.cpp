@@ -1544,6 +1544,110 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ── o GOT do `main` foi corrigido? ────────────────────────────────────
+    //
+    // O `main` tem 821 stubs de PLT no fim do `.text`, e cada um salta
+    // atraves de um slot do GOT. No ficheiro, os slots valem `0x17e8f90` — o
+    // endereco *relativo ao modulo* do trampolim `PLT0`. Se o guest nao os
+    // corrigir, a primeira chamada a uma funcao importada salta para o sitio
+    // errado.
+    //
+    // Esta e' a medicao que diz quem resolve as importacoes: o nosso motor,
+    // ou o `rtld` do proprio jogo.
+    for (const auto& module : prog.modules()) {
+        if (module.kind != GuestKind::kMain)
+            continue;
+
+        // Onde esta o GOT? Os stubs de PLT do `main` estao no fim do
+        // `.text`, e cada um salta atraves de um slot do GOT. A sequencia e':
+        //
+        //     adrp x16, <pagina>
+        //     ldr  x17, [x16, #off]
+        //     add  x16, x16, #off
+        //     br   x17
+        //
+        // O `off` e' o mesmo nos dois (`ldr` escala por 8, `add` nao), o que
+        // da a posicao do slot. Os stubs sao contiguos, e por isso procuramos
+        // a *maior* serie, e nao o primeiro padrao que apareca (que pode ser
+        // uma coincidencia noutro sitio do `.text`).
+        const std::vector<std::uint8_t>& img = module.nso.image;
+        const std::size_t ini = module.nso.seg_offset[0];
+        const std::size_t tam = static_cast<std::size_t>(module.nso.segments[0].size);
+
+        auto is_stub = [&](std::size_t o, std::uint64_t& slot) {
+            if (o + 16 > tam)
+                return false;
+            std::uint32_t adrp = 0, ldr = 0, add = 0, br = 0;
+            std::memcpy(&adrp, img.data() + ini + o, 4);
+            std::memcpy(&ldr, img.data() + ini + o + 4, 4);
+            std::memcpy(&add, img.data() + ini + o + 8, 4);
+            std::memcpy(&br, img.data() + ini + o + 12, 4);
+            if ((adrp & 0x9F000000u) != 0x90000000u)
+                return false;
+            if ((ldr & 0xFFC00000u) != 0xF9400000u)
+                return false;
+            if ((add & 0xFFC00000u) != 0x91000000u)
+                return false;
+            if (br != 0xD61F0220u)
+                return false;
+
+            // A pagina do `adrp` e' relativa ao PC, e o imm21 tem duas
+            // metades: `immlo` (bits 30:29) e `immhi` (bits 23:5).
+            const std::int64_t immlo = (adrp >> 29) & 3;
+            const std::int64_t immhi = (adrp >> 5) & 0x7FFFF;
+            std::int64_t imm = immlo | (immhi << 2);
+            if (imm & 0x100000)
+                imm -= 0x200000;
+            const std::uint64_t pc = module.vaddr_base + module.nso.segments[0].vaddr + o;
+            const std::uint64_t page =
+                (pc & ~static_cast<std::uint64_t>(0xFFF)) +
+                static_cast<std::uint64_t>(imm * 4096);
+            const std::uint64_t ldr_off =
+                static_cast<std::uint64_t>((ldr >> 10) & 0xFFF) * 8;
+            const std::uint64_t add_off = (add >> 10) & 0xFFF;
+            if (page + ldr_off != page + add_off)
+                return false;  // nao e' um stub
+            slot = page + ldr_off;
+            return true;
+        };
+
+        std::size_t melhor_n = 0;
+        std::uint64_t got = 0;
+        for (std::size_t o = 0; o + 16 <= tam; o += 4) {
+            std::uint64_t slot = 0;
+            if (!is_stub(o, slot))
+                continue;
+            std::size_t n = 0;
+            std::uint64_t s2 = 0;
+            while (is_stub(o + n * 16, s2))
+                n++;
+            if (n > melhor_n) {
+                melhor_n = n;
+                got = slot;
+            }
+        }
+        if (!got) {
+            std::printf("  GOT do main: nao encontrei stubs de PLT\n");
+            break;
+        }
+        std::printf("  GOT do main: %zu stubs de PLT, primeiro slot em 0x%llx\n",
+                    melhor_n, (unsigned long long)got);
+
+        std::uint64_t slots[8] = {};
+        std::string e2;
+        if (!prog.memory().read(got, slots, sizeof slots, e2)) {
+            std::printf("  GOT do main: nao legivel em 0x%llx (%s)\n",
+                        (unsigned long long)got, e2.c_str());
+            break;
+        }
+        std::printf("  GOT do main @0x%llx (8 primeiros slots):\n",
+                    (unsigned long long)got);
+        for (int i = 0; i < 8; i++) {
+            std::printf("    [%d] 0x%016llx\n", i, (unsigned long long)slots[i]);
+        }
+        break;
+    }
+
     // Resumo por serviço: o que o rtld pede mais vezes é o que vale a pena
     // implementar primeiro.
     struct Agg { std::uint32_t n; std::size_t count; };
