@@ -83,6 +83,21 @@ void ServiceFrameworkBase::InvokeRequest(HLERequestContext& ctx) {
         return ReportUnimplementedFunction(ctx, info);
 
     LOG_TRACE(Service, "{}", MakeFunctionString(info->name, GetServiceName(), ctx.CommandBuffer()));
+
+    // **Log nosso, e a razao de este ficheiro estar na lista de overrides.**
+    //
+    // O `LOG_TRACE` acima so existe em compilacoes de depuracao, e o
+    // `TRACE` e' o nivel mais baixo: o filtro deixa-o de fora. E sem este
+    // log, um guest que chama um comando em ciclo nao diz **qual** comando
+    // e' — e a lista de comandos que o jogo pede e' a informacao que mais
+    // importa ter.
+    //
+    // O Eden nao precisa disto porque implementa todos os comandos. Aqui,
+    // cada comando que o jogo pede e' uma peca em falta, e o log e' a
+    // lista de trabalho.
+    LOG_WARNING(Service, "{}: comando {} ({})", GetServiceName(), ctx.GetCommand(),
+                info->name);
+
     handler_invoker(this, info->handler_callback, ctx);
 }
 

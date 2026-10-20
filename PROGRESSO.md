@@ -1517,3 +1517,208 @@ Suite: **6 testes, todos a passar**. `ia_translate` 24 verificações,
 O guest inicializa o SDK e vai buscar os serviços. O próximo na fila é o
 `appletOE` — que é o `am` do Eden, e o `am` é grande (8946 linhas) e
 arrasta o núcleo de HID e o sistema de janelas.
+
+---
+
+# Do `apm` ao `appletOE`: o SDK entra no loop do jogo
+
+## Onde estávamos
+
+O SDK inicializava (`sm:Initialize`, `lm:OpenLogger`) e pedia o `apm`.
+Depois pedia o **`appletOE`** — e o `sm:` ficava à espera dele, para sempre.
+
+## O `apm`: cinco ficheiros do Eden, 280 linhas
+
+O `apm` são `apm.cpp` (29 linhas), `apm_interface.{h,cpp}` e
+`apm_controller.{h,cpp}`. A única dependência específica do Eden era o
+`APMController`, e esse queria um `Core::Timing::CoreTiming&` que **nunca
+usava** — o Eden diz isso nos TODOs do fim do ficheiro:
+
+    // TODO(DarkLordZach): Actually signal core_timing to change clock speed.
+    // TODO(Rodrigo): Remove [[maybe_unused]] when core_timing is used.
+
+O controller foi reescrito por nós: sem o `CoreTiming`, e com o modo de
+performance fixo em `Normal` (este motor corre um jogo, e o jogo não está
+docked). O comportamento observável é o do Eden: `Config7` por omissão,
+validação da configuração, e o mapa `Normal→Config7`, `FastLoad→Config13`,
+`Partial→Config15`.
+
+**O padrão de um serviço do Eden, que se repete:**
+
+- o serviço é fino (o `apm.cpp` do Eden tem 29 linhas);
+- o estado vive num *controller*, que o `Core::System` possui;
+- a interface CMIF (os IDs dos comandos e as estruturas) é a parte que
+  **tem de ser exacta** e vem do Eden tal e qual;
+- o `Core::System` do Eden **não** é adoptado: tem ~40 acessores a
+  subsistemas reais (GPU, áudio, HID, temporização) e adoptá-lo seria
+  adoptar o emulador.
+
+Por isso o `Core::System` nosso ganhou um accessor por serviço, e os
+controllers vivem nele.
+
+## O `appletOE`: nosso, e porquê
+
+O `am` do Eden tem 8946 linhas e arrasta o **núcleo de HID** (o
+`ButtonPoller` precisa de `hid_core/frontend/emulated_controller.h`) e o
+**sistema de janelas** (`WindowSystem`). Trazer o `am` inteiro seria trazer
+o emulador.
+
+O que o SDK precisa no arranque é um conjunto pequeno de respostas. E o
+ficheiro `src/services/applet_oe.cpp` é a versão fina: a **interface CMIF é
+a do Eden, tal e qual** (os IDs dos comandos e o formato das respostas são o
+contrato com o guest), e o **conteúdo** é o mínimo que um jogo precisa.
+
+A estrutura (do Eden, `core/hle/service/am/service/`):
+
+    appletOE  (o serviço)
+      └─ IApplicationProxy        (comando 0 = OpenApplicationProxy)
+           ├─ 0  GetCommonStateGetter
+           ├─ 1  GetSelfController
+           ├─ 2  GetWindowController
+           ├─ 3  GetAudioController
+           ├─ 4  GetDisplayController
+           ├─ 10 GetProcessWindingController
+           ├─ 11 GetLibraryAppletCreator
+           ├─ 20 GetApplicationFunctions
+           └─ 1000 GetDebugFunctions
+
+**Os nove foram pedidos pelo SDK, e os nove foram entregues.**
+
+## Quatro coisas que só se descobrem medindo
+
+### 1. O `WaitSynchronization` não estava implementado
+
+SVC 0x18 não existia no nosso despachante. O SDK ficou a chamá-lo, e o
+motor respondia "não sei", e o guest repetia — 4000 traps, e a mensagem
+era "o guest está em ciclo", que não parececia nada.
+
+A ABI é a do Eden (`svc.cpp:1420`): x0 = o prazo em nanossegundos, x1 = o
+ponteiro para o array de handles, x2 = o número de handles; a saída é o
+índice do handle sinalizado.
+
+**O motor não tem eventos que disparem.** O `am` do Eden sinaliza o evento
+de mudança de estado do applet, e quem o sinaliza é o `WindowSystem` e o
+`LifecycleManager` — subsistemas de vídeo e de janelas que aqui não
+existem. Por isso a espera é devolvida como **expirada**
+(`ResultTimedOut`, o que o Eden devolve quando o prazo passa sem nada
+acontecer) e não como "satisfeita".
+
+A primeira versão devolvia sucesso, e o SDK — que faz
+`ReceiveMessage` + `WaitSynchronization` em ciclo — voltava a pedir
+imediatamente: 1311 pedidos em poucos segundos, e o motor a 100% de CPU a
+fazer nada.
+
+### 2. O `MRS x, cntpct_el0` é ilegal no EL0 do Linux
+
+O SDK lê o contador com `mrs x0, cntpct_el0` (em 0x82d22fd0) e o motor
+respondeu "instrução ilegal".
+
+O `cntpct_el0` é o contador **físico**, que só o EL1 lê; o `cntvct_el0` é
+o **virtual**, que o Linux expõe ao EL0. O Eden faz a mesma coisa
+(`nce/patcher.cpp:134-144`).
+
+**E é o mesmo bit que o do `TPIDRRO_EL0`.** O `sysreg` do MRS está nos
+bits [20:5], e os dois pares diferem no bit 0 do `sysreg`:
+
+    MRS Xt, TPIDRRO_EL0 = 0x5E01  ->  MRS Xt, TPIDR_EL0 = 0x5E00
+    MRS Xt, CNTPCT_EL0  = 0x5F01  ->  MRS Xt, CNTVCT_EL0 = 0x5F00
+
+Um bit, nos dois casos — e por isso há **uma** regra e não duas.
+
+O Eden ainda multiplica o valor por um factor, para converter de ticks do
+host para ticks do Switch. **A escala não é feita aqui**, e a razão está
+escrita no código: o que o jogo faz com o valor é medir tempo e semear um
+gerador aleatório, e para as duas coisas o que importa é que o contador
+seja **monótono** — e o `cntvct_el0` é.
+
+### 3. Um Result inválido é pior do que um Result de erro
+
+O SDK aborta ante um Result **inválido**:
+`nn::result::detail::ConvertInvalidImpl` (medido em 0x82d37748) chama o
+abort. E o nosso `ResultUnknown` — que é `0xFFFFFFFF` — é exactamente
+isso.
+
+Medido: o SDK pediu `ReceiveMessage`, o nosso serviço respondeu
+`ResultUnknown`, e o SDK morreu num assert.
+
+**A regra que daqui saiu, e que vale para todos os comandos deste
+serviço:** um comando que sabemos responder dá `ResultSuccess` e o valor
+certo; um comando que não sabemos responder dá `ResultSuccess` e saídas a
+zero. **Nunca um Result de erro.** O Eden pode dar-se a esse luxo porque
+implementa tudo; aqui, um Result de erro é um assert no guest.
+
+A excepção é o `ReceiveMessage`, em que o próprio Eden devolve um Result
+de erro **específico** — `Service::AM::ResultNoMessages` (`am_results.h`),
+que é um Result **válido** (módulo 128) e que o SDK sabe interpretar.
+
+### 4. Uma tabela de comandos que o grep apanhou mal
+
+A primeira extração das tabelas do `am` do Eden usou um padrão que só
+apanhava as entradas com `D<&...>`, e perdeu as entradas com `nullptr` —
+que são comandos que o Eden regista e **não implementa**. A tabela do
+`IWindowController` ficou com 5 comandos em vez de 8, e o SDK bateu logo
+nela.
+
+A tabela certa:
+
+    {0,  nullptr, "CreateWindow"},
+    {1,  GetAppletResourceUserId},
+    {2,  GetAppletResourceUserIdOfCallerApplet},
+    {10, AcquireForegroundRights},
+    {11, ReleaseForegroundRights},
+    {12, RejectToChangeIntoBackground},
+    {20, SetAppletWindowVisibility},
+    {21, SetAppletGpuTimeSlice},
+
+**A regra para extrair tabelas: o padrão tem de apanhar as entradas com
+`nullptr` também.** Um comando registado e não implementado ainda é um
+comando que o guest pode pedir, e a resposta tem de ser um Result, não
+silêncio.
+
+## O log por comando
+
+O `LOG_TRACE` do Eden só existe em compilações de depuração, e o `TRACE` é
+o nível mais baixo: o filtro deixa-o de fora. E sem um log, um guest que
+chama um comando em ciclo não diz **qual** comando é.
+
+Por isso o `ServiceFrameworkBase::InvokeRequest` tem agora um
+`LOG_WARNING` por comando. **O Eden não precisa disto** porque implementa
+todos os comandos; aqui, cada comando que o jogo pede é uma peça em falta,
+e o log é a lista de trabalho.
+
+Foi ele que mostrou, de uma vez, o que o jogo pede:
+
+    1311  ICommonStateGetter: comando 1 (ReceiveMessage)
+       3  sm:: comando 1 (GetService)
+       1  IWindowController: comando 1 (GetAppletResourceUserId)
+       1  ISelfController: comando 91 (GetAccumulatedSuspendedTickChangedEvent)
+       1  IpcController: comando 3 (QueryPointerBufferSize)
+       1  IpcController: comando 0 (ConvertCurrentObjectToDomain)
+
+## Onde estamos
+
+O SDK:
+
+1. inicializa (`sm:Initialize`, `lm:OpenLogger`);
+2. pede o `apm` e recebe-o;
+3. pede o `appletOE` e recebe-o;
+4. pede as **nove** sub-interfaces do proxy do `am` e recebe-as;
+5. sobrevive aos asserts (o `ResultUnknown` deixou de matar o guest);
+6. e entra no **loop de mensagens do jogo**: `ReceiveMessage` → sem
+   mensagem → esperar → repetir.
+
+O passo 6 é o ponto onde o motor precisa de mais: o `am` real entrega
+mensagens de applet (a mudança de foco, o pedido de saída, o botão HOME), e
+o nosso `appletOE` não tem por onde as entregar — não há `Applet`, não há
+`LifecycleManager`, não há `WindowSystem`. O `ReceiveMessage` devolve
+`ResultNoMessages`, que é o que o Eden devolve quando não há mensagens, e
+o jogo fica à espera de uma que nunca chega.
+
+**É este o próximo passo, e está escrito com a precisão que a medição
+permitiu:** o `am` precisa de um estado de applet (foco, mensagens) que
+seja consultável, e o `ReceiveMessage` precisa de uma fila.
+
+## O estado da suite
+
+Suite: **6 testes, todos a passar**. `ia_translate` 24 verificações,
+`ia_gpu_exec` 20 (pixel 1.500000 na G610), `ia_maxwell` 13.

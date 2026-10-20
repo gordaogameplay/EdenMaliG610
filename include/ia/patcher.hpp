@@ -43,6 +43,12 @@ struct PatchReport {
     // `MRS <Xt>, TPIDRRO_EL0` reescritos como `MRS <Xt>, TPIDR_EL0`. Se for
     // 0 e o guest faultar a ler o TLS, o patch não foi aplicado.
     std::uint64_t tpidrro_to_tpidr = 0;
+
+    // Quantas vezes `MRS <Xt>, CNTPCT_EL0` foi reescrito em
+    // `MRS <Xt>, CNTVCT_EL0`. O `cntpct_el0` e' o contador fisico, que so o
+    // EL1 le; o `cntvct_el0` e' o virtual, que o Linux expoe. Ver
+    // `instructions.hpp`.
+    std::uint64_t cntpct_to_cntvct = 0;
     std::uint64_t msr_seen        = 0;
     std::uint64_t exclusives_seen = 0;
     std::uint32_t first_svc       = 0;

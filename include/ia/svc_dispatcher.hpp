@@ -131,6 +131,12 @@ enum class Result : std::uint32_t {
     NotInitialized2      = 30,
     InvalidMemorySize     = 31,
     Unsupported           = 64,
+    // `ResultTimedOut` do Eden (`svc_results.h:30`): modulo Kernel (1),
+    // descricao 117. Vale 1 | (117 << 9) = 0x3AE1.
+    //
+    // E' o que o `WaitSynchronization` devolve quando o prazo expira sem
+    // nada acontecer — e o que o SDK sabe interpretar.
+    TimedOut              = 1 | (117 << 9),
 };
 
 // Contexto de um SVC. x0–x5 são os argumentos (o kernel do Switch passa-os
@@ -524,6 +530,15 @@ private:
     static int ipc_variant();
 
     Result svc_send_sync_request(SvcContext& ctx);
+    // `WaitSynchronization(handles, num_handles, timeout_ns)`.
+    //
+    // A ABI, do Eden (`svc.cpp:1420`):
+    //
+    //     x0 = timeout em nanossegundos
+    //     x1 = ponteiro para o array de handles
+    //     x2 = numero de handles
+    //     saida: x0 = Result, x1 = o indice do handle sinalizado
+    Result svc_wait_synchronization(SvcContext& ctx);
     Result svc_send_sync_request_light(SvcContext& ctx);
 
     // Escreve uma resposta vazia com um Result — o "não sei responder" honesto.

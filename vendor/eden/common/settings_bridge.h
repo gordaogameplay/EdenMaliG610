@@ -37,7 +37,22 @@ namespace Settings {
 
 struct Values {
     // Ver a nota do ficheiro: `false` é a escolha, não a omissão.
-    bool use_auto_stub = false;
+    // **DIVERGENCIA DELIBERADA DO EDEN.** O Eden tem isto a `false` (e o
+    // default dele tambem e' `false`): um comando que um servico nao
+    // implementa fica **sem resposta**, e o guest le o que estiver no buffer.
+    //
+    // Aqui isso e' um crash. Medido: o SDK pediu o comando 1 do
+    // `IWindowController` (`GetAppletResourceUserId`), o nosso servico
+    // respondeu com "nao implementado" sem escrever nada, e o guest leu
+    // lixo do buffer de mensagens — e o salto seguinte foi para um
+    // endereco de **host** (0xaaaadaf341a4), que e' um fault de memoria do
+    // guest.
+    //
+    // A razao de o Eden poder ter isto desligado e' que o Eden implementa
+    // todos os comandos: um comando desconhecido la' e' um bug do Eden. A
+    //qui e' o nosso bug, e a resposta honesta e' um Result de erro, e nao
+    // o silencio.
+    bool use_auto_stub = true;
     bool use_debug_asserts = false;
 };
 

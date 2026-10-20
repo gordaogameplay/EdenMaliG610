@@ -22,6 +22,22 @@ EDEN = os.path.expanduser("~/eden/src")
 ROOT = os.path.expanduser("~/EdenMaliIA")
 VENDOR = os.path.join(ROOT, "vendor", "eden")
 
+# Includes que o Eden traz por uma via indirecta e que a poda nao reproduz.
+#
+# O `cmif_serialization.h` do Eden usa `Common::AlignUp` sem incluir o
+# cabecalho que o define: no Eden, ele chega por um include que a nossa
+# arvore podada nao tem. Em vez de depender dessa coincidencia — e de a
+# perder a cada sincronizacao —, o include e' escrito explicitamente.
+#
+# E' a unica correccao deste tipo. Se aparecer outra, o sitio e' aqui, e a
+# razao fica escrita ao lado.
+INCLUDES_EXTRA = {
+    "core/hle/service/cmif_serialization.h": [
+        '#include "vendor/eden/common/alignment.h"',
+    ],
+}
+
+
 INC_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
 
 
@@ -65,6 +81,20 @@ def vendorizar(origem_rel):
                     fila.append(alvo)
             else:
                 novo.append(linha)
+        # Includes extra, se este ficheiro precisar de algum.
+        #
+        # Vao **no topo**, logo a seguir ao ultimo include que o ficheiro
+        # tinha. Um include no fim do ficheiro nao ajuda ninguem: o
+        # `cmif_serialization.h` usa `Common::AlignUp` a partir da linha 147,
+        # e o include no fim chega tarde demais.
+        extras = [e for e in INCLUDES_EXTRA.get(rel, []) if e not in novo]
+        if extras:
+            ultimo = -1
+            for k, linha in enumerate(novo):
+                if INC_RE.match(linha):
+                    ultimo = k
+            novo = novo[:ultimo + 1] + extras + novo[ultimo + 1:]
+
         texto = "\n".join(novo)
 
         with open(dst, "w", encoding="utf-8") as f:

@@ -119,6 +119,48 @@ static_assert(MRS{0xD53BE020}.rt() == 0, "Rt = 0");
 static_assert(MRS{0xD53BE020}.sysreg() == 0x5F01, "CNTPCT_EL0 = 0x5F01");
 
 // ---------------------------------------------------------------------------
+// MRS <Xt>, CNTPCT_EL0  ->  MRS <Xt>, CNTVCT_EL0
+//
+// **E' o mesmo bit que o do `TPIDRRO_EL0`.** O `sysreg` do MRS esta nos
+// bits [20:5], e os dois pares differem no bit 0 do `sysreg` — ou seja, no
+// bit 5 da instrucao:
+//
+//     MRS Xt, TPIDRRO_EL0 = 0x5E01   ->  MRS Xt, TPIDR_EL0 = 0x5E00
+//     MRS Xt, CNTPCT_EL0  = 0x5F01   ->  MRS Xt, CNTVCT_EL0 = 0x5F00
+//
+// Um bit, nos dois casos, e por isso que ha **uma** regra e nao duas.
+//
+// ## Porque o `CNTPCT_EL0` nao serve
+//
+// O `cntpct_el0` e' o contador **fisico** do temporizador, e so e' legivel a
+// partir do EL1. O `cntvct_el0` e' o contador **virtual**, e o Linux
+// expoe-o ao EL0 (e' o que `clock_gettime` usa).
+//
+// O Eden faz a mesma coisa (`nce/patcher.cpp:134-144`,
+// `WriteCntpctHandler`), e ainda multiplica o valor por um factor para o
+// converter de ticks do host para ticks do Switch. **A escala nao e' feita
+// aqui**, e a razao esta escrita em `patcher.cpp`: o que o jogo faz com o
+// valor e' medir tempo e semear um gerador aleatorio, e para as duas
+// coisas o que importa e' que o contador seja **monotonico** — e o
+// `cntvct_el0` e'.
+//
+// A medicao que trouxe aqui: o SDK da Nintendo le o contador com
+// `mrs x0, cntpct_el0` (em 0x82d22fd0) e o motor respondeu "instrucao
+// ilegal do guest".
+[[nodiscard]] constexpr bool is_mrs_cntpct(std::uint32_t insn) noexcept {
+    return MRS{insn}.verify() && MRS{insn}.sysreg() == 0x5F01;
+}
+
+// `MRS <Xt>, CNTPCT_EL0` em `MRS <Xt>, CNTVCT_EL0`, sem tocar em Rt.
+[[nodiscard]] constexpr std::uint32_t cntpct_to_cntvct(std::uint32_t insn) noexcept {
+    return is_mrs_cntpct(insn) ? (insn & ~0x20u) : insn;
+}
+
+static_assert(cntpct_to_cntvct(0xD53BE020u) == 0xD53BE000u,
+              "MRS X0, CNTPCT_EL0 -> MRS X0, CNTVCT_EL0");
+static_assert(cntpct_to_cntvct(0xD53BE021u) == 0xD53BE001u,
+              "Rt preservado na conversao do contador");
+
 // MRS <Xt>, TPIDRRO_EL0  ->  MRS <Xt>, TPIDR_EL0
 // ---------------------------------------------------------------------------
 //

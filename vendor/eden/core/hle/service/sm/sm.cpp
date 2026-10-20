@@ -179,6 +179,16 @@ Result SM::GetServiceImpl(Kernel::KClientSession** out_client_session, HLEReques
     IPC::RequestParser rp{ctx};
     std::string name(PopServiceName(rp));
 
+    // O nome que foi lido. **Este log é nosso**, e é a razão de o ficheiro
+    // estar na lista de overrides: sem ele, um pedido de serviço que falha
+    // é indistinguivel de um pedido que nunca chegou.
+    //
+    // E o log tem um valor diagnóstico que não é óbvio: o `PopServiceName` do
+    // Eden lê o nome nos **primeiros 8 bytes do corpo do pedido**, e o corpo
+    // do pedido é onde o *jogo* o põe — a uma distancia do inicio do
+    // pacote que depende de como a geometria foi montada.
+    LOG_WARNING(Service_SM, "GetService: nome lido = \"{}\"", name);
+
     // Find the named port.
     Kernel::KClientPort* client_port{};
     auto port_result = service_manager.GetServicePort(&client_port, name);

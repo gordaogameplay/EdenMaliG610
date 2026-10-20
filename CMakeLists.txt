@@ -55,6 +55,7 @@ add_library(ia_core STATIC
   src/guest_program.cpp
   src/input.cpp
   src/svc_dispatcher.cpp
+  src/services/applet_oe.cpp
   src/ipc_min.cpp
   src/guest_placement.cpp
   src/gpu/ir.cpp

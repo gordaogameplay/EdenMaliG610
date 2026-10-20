@@ -41,6 +41,7 @@
 #include "vendor/eden/core/hle/kernel/svc_results.h"
 #include "vendor/eden/core/hle/service/apm/apm.h"
 #include "vendor/eden/core/hle/service/apm/apm_controller.h"
+#include "ia/services/applet_oe.hpp"
 #include "vendor/eden/core/hle/service/lm/lm.h"
 #include "vendor/eden/core/hle/service/server_manager.h"
 #include "vendor/eden/core/hle/service/sm/sm.h"
@@ -535,6 +536,9 @@ EdenSystem::EdenSystem(GuestMemory& memoria, std::uint64_t pid, std::uint64_t ti
     // O `apm` (a performance do sistema). O SDK pergunta por ele no arranque,
     // e o `sm:` fica a espera ate que exista.
     Service::APM::LoopProcess(*this);
+
+    // O `appletOE` — o proxy do `am`. Ver `src/services/applet_oe.cpp`.
+    ia::services::registar_applet_oe(*this);
 
     // A verificacao que esteve aqui -- `KObjectName::Find("sm:")` -- **partiu
     // o jogo**.

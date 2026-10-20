@@ -237,6 +237,7 @@ void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
     case Svc::UnmapSharedMemory:    r = svc_unmap_memory(ctx);   break;
     case Svc::QueryMemory:          r = svc_query_memory(ctx);   break;
     case Svc::GetInfo:              r = svc_get_info(ctx);       break;
+    case Svc::WaitSynchronization:  r = svc_wait_synchronization(ctx); break;
     case Svc::SendSyncRequest:      r = svc_send_sync_request(ctx); break;
     case Svc::SendSyncRequestLight: r = svc_send_sync_request_light(ctx); break;
     case Svc::GetThreadPriority:    r = svc_get_thread_priority(ctx); break;

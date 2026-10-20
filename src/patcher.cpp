@@ -26,6 +26,7 @@ std::string PatchReport::summary() const {
       << "hints -> NOP       : " << hints_nop << "\n"
       << "MRS / MSR vistos   : " << mrs_seen << " / " << msr_seen << "\n"
       << "MRS TPIDRRO->TPIDR : " << tpidrro_to_tpidr << "\n"
+      << "MRS CNTPCT->CNTVCT : " << cntpct_to_cntvct << "\n"
       << "exclusivos vistos  : " << exclusives_seen << "\n";
     return o.str();
 }
@@ -66,6 +67,18 @@ bool StaticPatcher::patch_word(std::uint32_t& insn, PatchSite& site) {
         // a largura é a mesma, e o valor que o guest quer é precisamente o
         // que `TPIDR_EL0` devolve — desde que o motor instale lá a base do
         // TLS do guest. Ver `NativeEngine`.
+        // `MRS <Xt>, CNTPCT_EL0` -> `MRS <Xt>, CNTVCT_EL0`.
+        //
+        // O `cntpct_el0` e' o contador fisico, que so o EL1 le; o
+        // `cntvct_el0` e' o virtual, que o Linux expoe. O Eden faz o mesmo
+        // (`nce/patcher.cpp:134-144`). Sem isto, o SDK da Nintendo morre
+        // com "instrucao ilegal" no `mrs x0, cntpct_el0` (medido em
+        // 0x82d22fd0).
+        if (arm::MRS{insn}.verify() && arm::is_mrs_cntpct(insn)) {
+            insn = arm::cntpct_to_cntvct(insn);
+            site.after = insn;
+            return true;
+        }
         if (arm::MRS{insn}.verify() && arm::is_mrs_tpidrro(insn)) {
             insn = arm::tpidrro_to_tpidr(insn);
             site.after = insn;
@@ -134,9 +147,11 @@ bool StaticPatcher::patch(std::vector<std::uint8_t>& image,
             ++report_.hints_nop;
         } else if (changed) {
             // Distingue o patch de TLS do patch de SVC pelo encoding original.
-            if (arm::is_mrs_tpidrro(site.before))
+            if (arm::is_mrs_tpidrro(site.before)) {
                 ++report_.tpidrro_to_tpidr;
-            else {
+            } else if (arm::is_mrs_cntpct(site.before)) {
+                ++report_.cntpct_to_cntvct;
+            } else {
                 ++report_.svc_patched;
                 if (!report_.saw_any_svc) {
                     report_.first_svc = site.svc;

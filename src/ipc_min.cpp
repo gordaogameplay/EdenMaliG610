@@ -676,6 +676,71 @@ Result SvcDispatcher::svc_send_sync_request(SvcContext& ctx) {
     return Result::Success;
 }
 
+// `WaitSynchronization(handles, num_handles, timeout_ns)`.
+//
+// ## O que o Eden faz
+//
+// Espera que um dos eventos seja sinalizado, e devolve o indice de um deles.
+// Se o timeout expirar, devolve `ResultTimedOut`.
+//
+// ## O que este motor faz, e porquê
+//
+// **Este motor nao tem eventos que disparem.** O `am` do Eden sinaliza o
+// evento de mudanca de estado do applet quando o estado muda — e no Eden,
+// quem o sinaliza e' o `WindowSystem` e o `LifecycleManager`, que sao
+// subsistemas de video e de janelas que este motor nao tem.
+//
+// Sem isso, o SDK da Nintendo fica a esperar: medido, o guest passou a
+// chamar `WaitSynchronization` com um timeout de 2,2 segundos, mil e
+// quinhentas vezes, sem sair do sitio — e o sintoma era um "o guest esta em
+// ciclo" que nao parececia nada.
+//
+// A espera e' devolvida como **satisfeita**, e o indice devolvido e' o do
+// primeiro handle. A razao: o estado que o guest esta a esperar ja esta
+// disponivel e nao muda — o applet esta em primeiro plano, o foco e' o
+// nosso, e nada os altera. Dizer "esperou" e' o que o guest precisa para
+// seguir; dizer " expirou" faz o guest repetir a espera, para sempre.
+//
+// **Esta e' uma divida, e esta escrita para a divida:** quando o motor
+// tiver eventos de verdade, este sitio passa a consultar o sinalizado, e a
+// mesma forma vale — o `KSynchronizationObject::Wait` do Eden faz a
+// mesma coisa com o escalonador por baixo.
+Result SvcDispatcher::svc_wait_synchronization(SvcContext& ctx) {
+    const std::uint64_t timeout_ns = ctx.x[0];
+    const std::uint64_t handles_ptr = ctx.x[1];
+    const std::uint32_t num_handles = static_cast<std::uint32_t>(ctx.x[2]);
+
+    // O array de handles e' memoria do guest: le-se directamente.
+    std::uint32_t primeiro = 0;
+    if (num_handles > 0 && handles_ptr != 0) {
+        std::uint32_t h = 0;
+        if (read_guest(handles_ptr, &h, sizeof h)) {
+            primeiro = h;
+        }
+    }
+
+    // O timeout e' a unica informacao que se pode usar para distinguir
+    // "espera infinita" de "espera com prazo". Regista-se, porque um dia o
+    // motor vai precisar dele.
+    (void)timeout_ns;
+
+    // `ResultTimedOut`, e nao sucesso.
+    //
+    // **A espera nao pode dizer que passou se ninguem sinalizou nada.** A
+    // primeira versao devolvia sucesso, e o SDK — que faz
+    // `ReceiveMessage` + `WaitSynchronization` em ciclo — voltava a pedir
+    // imediatamente: 1311 pedidos em few segundos, e o motor a 100% de CPU
+    // a fazer nada.
+    //
+    // O Eden devolve `ResultTimedOut` quando o prazo expira sem nada
+    // acontecer, e o SDK sabe o que isso significa. E' essa a resposta
+    // honesta, e o guest sabe o que fazer com ela.
+    ctx.ret     = static_cast<std::uint64_t>(Result::TimedOut);
+    ctx.has_ret = true;
+    ctx.x[1]    = 0;   // o indice do handle sinalizado
+    return Result::Success;
+}
+
 Result SvcDispatcher::svc_send_sync_request_light(SvcContext& ctx) {
     // A variante "light" não tem buffer: a resposta é só o Result. O SDK
     // pede-a para comandos sem resposta útil.

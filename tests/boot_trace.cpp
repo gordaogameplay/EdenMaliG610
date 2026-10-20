@@ -824,6 +824,51 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ── despejar a imagem completa de um modulo ────────────────────────────
+    //
+    // `IA_DUMP_MODULE=sdk` escreve a imagem inteira do modulo (cabeçalho
+    // NSO, segmentos e tudo) em `/tmp/ia_<nome>.nso`, para se poder analysar
+    // a tabela de simbolos dinamicos sem um debugger.
+    if (const char* dump_modulo = std::getenv("IA_DUMP_MODULE")) {
+        for (const auto& module : prog.modules()) {
+            if (dump_modulo[0] != 0 && std::strcmp(dump_modulo, module.name()) != 0)
+                continue;
+            const auto& img = module.nso.image;
+            char caminho[128];
+            std::snprintf(caminho, sizeof caminho, "/tmp/ia_%s.nso", module.name());
+            std::FILE* f = std::fopen(caminho, "wb");
+            if (f == nullptr)
+                continue;
+            std::fwrite(img.data(), 1, img.size(), f);
+            std::fclose(f);
+            std::printf("[dump] %s: %zu bytes em %s (base 0x%llx)\n", module.name(), img.size(),
+                        caminho,
+                        static_cast<unsigned long long>(module.vaddr_base));
+
+            // Um ficheiro ao lado com a geometria: sem os offsets dos
+            // segmentos e da dynsym, a imagem dumpada nao se pode analysar.
+            char geom[128];
+            std::snprintf(geom, sizeof geom, "/tmp/ia_%s.geom", module.name());
+            std::FILE* g = std::fopen(geom, "w");
+            if (g != nullptr) {
+                std::fprintf(g, "base 0x%llx\\n", static_cast<unsigned long long>(module.vaddr_base));
+                for (int k = 0; k < 3; ++k) {
+                    std::fprintf(g, "seg %d vaddr 0x%llx size 0x%llx offset %zu\\n", k,
+                                 static_cast<unsigned long long>(module.nso.segments[k].vaddr),
+                                 static_cast<unsigned long long>(module.nso.segments[k].size),
+                                 static_cast<std::size_t>(module.nso.seg_offset[k]));
+                }
+                const auto* h = module.nso.nso_header();
+                if (h != nullptr) {
+                    std::fprintf(g, "dynsym %u %u\\ndynstr %u %u\\n", h->dynsym_offset,
+                                 h->dynsym_size, h->dynstr_offset, h->dynstr_size);
+                }
+                std::fclose(g);
+                std::printf("[dump] %s: geometria em %s\\n", module.name(), geom);
+            }
+        }
+    }
+
     // ── quem escreve num endereco concreto ──────────────────────────────────
     //
     // `IA_FIND_STORE=0x836a1038` procura, no `.text` de cada módulo, o par
@@ -1013,7 +1058,12 @@ int main(int argc, char** argv) {
     // de ficar a queimar CPU sem fim com a saída truncada.
     // 40 traps: o rtld faz uma dúzia de serviços no arranque antes de tocar em
     // código do jogo. Três era pouco para ver a sequência.
-    engine.set_trap_limit(40);
+    // O limite de traps. Subiu de 40 para 4000 porque o SDK **faz polling**:
+    // depois de pedir um serviço ao `sm:`, ele repete `GetInfo` e
+    // `SendSyncRequest` a espera que o evento de notificacao dispare. Com
+    // 40 traps, o motor parava a meio dessa espera — e o sintoma era
+    // "o guest esta em ciclo", que é o que o polling **parece** e não é.
+    engine.set_trap_limit(4000);
     engine.set_observer(&on_svc, nullptr);
     engine.set_trapper(&on_trap, nullptr);
     if (!engine.install_handlers(err)) {
