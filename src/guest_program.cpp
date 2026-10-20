@@ -144,8 +144,37 @@ bool GuestProgram::plan_layout(std::uint64_t heap_reserve, std::string& error) {
     // calculados para esse layout, e movê-los produz leituras de memória
     // alheia. O sintoma foi o rtld carregar endereços do HOST nos seus
     // registos (x19 = 0xffffd7db6f20) sem nenhuma trap pelo caminho.
+    // **O `main` (o executavel do jogo) e' linkado para `kCodeBase`**
+    // (0x8000'0000), e o `rtld` (o `ldr`) assume isso.
+    //
+    // Medido: o `rtld` tem **nove ocorrencias de 0x80000000** nos seus
+    // dados (o segmento 1, a partir do offset 0x2000) — e' a tabela de
+    // onde ele le o endereco do `main`.
+    //
+    // E o **delta medido** e' de 0x5000: o `adrp` do jogo, que e'
+    // relativo ao PC, dava um endereco 0x5000 acima do linkado. A
+    // string que o jogo usa na sua assercao esta, no guest, em
+    // 0x81b06601 — e o linkador a puser em 0x81b01601.
+    //
+    // A causa: o `rtld` ocupava 0x5000 (a imagem **do ficheiro**, 0x3DA6,
+    // mais o `.bss`, alinhado a 0x1000) quando devia ocupar 0x4000 (o
+    // **fim do ultimo segmento**, 0x3280, mais o `.bss` — que e' o que o
+    // Eden mede: `nso.cpp:131`, `PageAlignSize(codeset.memory.size() +
+    // bss_size)`). A diferenca de uma pagina empurrava o `main` 0x1000
+    // para a frente — e o resto do delta vinha do `rtld` estar a
+    // piscar o sitio do `main`.
+    //
+    // O `rtld` e' linkado em **PC-relativo** (o `ldr` e' do sistema, e
+    // o linkador nao presume onde ele fica), por isso pode estar em
+    // qualquer sitio. O `main` e' linkado para um sitio **fixo**, e o
+    // `ldr` le-o de uma tabela.
+    //
+    // **O `rtld` vai para DEPOIS de todos** — e' o entry point, mas o
+    // entry point e' um **endereco**, nao uma ordem.
     std::uint64_t cursor = layout::kCodeBase;
     for (auto& m : modules_) {
+        if (m.kind == GuestModule::kRtld)
+            continue;   // o `rtld` e' colocado no fim
         const std::uint64_t size =
             static_cast<std::uint64_t>(m.nso.image.size());
 
@@ -160,9 +189,38 @@ bool GuestProgram::plan_layout(std::uint64_t heap_reserve, std::string& error) {
         // terminava muito depois de a `sdk` já ter começado, e a tabela tinha
         // um "BURACO" em vez de uma sobreposição porque as regiões foram
         // ordenadas por base.
-        const std::uint64_t footprint = size + m.nso.bss_size;
+        // **O fim do ultimo segmento**, e nao o tamanho da imagem.
+        //
+        // O Eden (`nso.cpp:131`):
+        //
+        //     u32 image_size = PageAlignSize(u32(codeset.memory.size()) +
+        //                                        nso_header.segments[2].bss_size);
+        //
+        // E `codeset.memory.size()` e' `last_segment.location +
+        // last_segment.size` — o fim do **ultimo segmento**. A imagem
+        // (`module.nso.image`) e' maior: tem as secoes de simbolos
+        // atras, **dois megabytes** no `main` deste jogo.
+        //
+        // A diferenca de uma pagina (ou de varias) empurrava o `sdk`
+        // para a frente — e o `sdk` e' linkado **junto com o `main`**,
+        // logo tem de ficar exactamente onde o linkador o puser.
+        const std::uint64_t fim_do_codigo =
+            m.nso.segments[2].vaddr + m.nso.segments[2].size;
+        const std::uint64_t footprint = fim_do_codigo + m.nso.bss_size;
         const std::uint64_t aligned = layout::page_align_up(footprint);
 
+        m.vaddr_base = cursor;
+        cursor += aligned;
+    }
+    // O `rtld` vai para o fim: e' linkado em PC-relativo, e o `main` e' que
+    // tem o endereco fixo.
+    for (auto& m : modules_) {
+        if (m.kind != GuestModule::kRtld)
+            continue;
+        const std::uint64_t fim_do_codigo =
+            m.nso.segments[2].vaddr + m.nso.segments[2].size;
+        const std::uint64_t footprint = fim_do_codigo + m.nso.bss_size;
+        const std::uint64_t aligned = layout::page_align_up(footprint);
         m.vaddr_base = cursor;
         cursor += aligned;
     }
