@@ -156,6 +156,9 @@ enum class Result : std::uint32_t {
     // 113 e 116.
     InvalidCoreId         = 1 | (113 << 9),
     InvalidCombination    = 1 | (116 << 9),
+    // `ResultInvalidPriority` do Eden (`kernel/svc_results.h:25`): modulo
+    // Kernel (1), descricao 112.
+    InvalidPriority       = 1 | (112 << 9),
 };
 
 // Contexto de um SVC. x0–x5 são os argumentos (o kernel do Switch passa-os
@@ -228,19 +231,23 @@ struct GuestRegion {
     std::uint32_t state = 0;       // MemoryState
     std::uint32_t permission = 0;  // MemoryPermission
 
-    // MemoryState (Eden, svc_types.h:19)
-    static constexpr std::uint32_t kFree    = 0x00;
-    static constexpr std::uint32_t kStatic  = 0x02;
-    static constexpr std::uint32_t kCode    = 0x03;
-    static constexpr std::uint32_t kNormal  = 0x05;
+    // MemoryState (Eden, svc_types.h:19-43)
+    static constexpr std::uint32_t kFree        = 0x00;
+    static constexpr std::uint32_t kStatic      = 0x02;
+    static constexpr std::uint32_t kCode        = 0x03;
+    static constexpr std::uint32_t kNormal      = 0x05;
+    static constexpr std::uint32_t kIpc         = 0x0A;
+    static constexpr std::uint32_t kStack       = 0x0B;
+    static constexpr std::uint32_t kThreadLocal = 0x0C;
 
     // MemoryPermission (Eden, svc_types.h:57)
-    static constexpr std::uint32_t kRead     = 1u << 0;
-    static constexpr std::uint32_t kWrite    = 1u << 1;
-    static constexpr std::uint32_t kExecute  = 1u << 2;
-    static constexpr std::uint32_t kReadOnly = kRead;
-    static constexpr std::uint32_t kReadExec = kRead | kExecute;
-    static constexpr std::uint32_t kReadWrite = kRead | kWrite;
+    static constexpr std::uint32_t kNone       = 0u;
+    static constexpr std::uint32_t kRead       = 1u << 0;
+    static constexpr std::uint32_t kWrite      = 1u << 1;
+    static constexpr std::uint32_t kExecute    = 1u << 2;
+    static constexpr std::uint32_t kReadOnly   = kRead;
+    static constexpr std::uint32_t kReadExec   = kRead | kExecute;
+    static constexpr std::uint32_t kReadWrite  = kRead | kWrite;
 };
 
 // O sistema do Eden, quando está ligado. Ver `attach_eden`.
@@ -539,6 +546,8 @@ private:
     Result svc_get_thread_core_mask(SvcContext& ctx);
     Result svc_set_thread_core_mask(SvcContext& ctx);
     Result svc_get_current_processor_number(SvcContext& ctx);
+    Result svc_create_thread(SvcContext& ctx);
+    Result svc_start_thread(SvcContext& ctx);
 
     Result svc_unsupported(SvcContext&);
 

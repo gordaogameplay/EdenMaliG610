@@ -259,6 +259,8 @@ void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
     case Svc::GetThreadCoreMask:    r = svc_get_thread_core_mask(ctx); break;
     case Svc::SetThreadCoreMask:    r = svc_set_thread_core_mask(ctx); break;
     case Svc::GetCurrentProcessorNumber: r = svc_get_current_processor_number(ctx); break;
+    case Svc::CreateThread:         r = svc_create_thread(ctx); break;
+    case Svc::StartThread:          r = svc_start_thread(ctx); break;
     case Svc::SignalProcessWideKey: r = svc_signal_process_wide_key(ctx); break;
     default:                        r = svc_unsupported(ctx);    break;
     }
@@ -673,25 +675,66 @@ Result SvcDispatcher::svc_query_memory(SvcContext& ctx) {
     // Sem a tabela (os testes unitários), caímos no comportamento antigo:
     // a reserva inteira, como uma região normal.
     if (!regions_.empty()) {
+        // As regioes estao por ordem de base (ver `memory_regions`).
+        std::uint64_t anterior_fim = 0;
+        std::uint64_t seguinte_base = 0;
+        bool achou = false;
         for (const GuestRegion& r : regions_) {
             if (r.size == 0)
                 continue;
             if (query >= r.base && query < r.base + r.size) {
-                // O **bloco**, não a página.
+                // O **bloco**, nao a pagina.
                 //
                 // O Eden (`k_page_table_base.cpp:904`, `QueryInfoImpl`)
-                // devolve o `KMemoryBlock` que contém o endereço — e o
-                // bloco é a região, não a página de 4 KiB. A medição
-                // confirma: com a página, o `rtld` do jogo percorria o
-                // espaço do processo a 4 KiB de cada vez (3999
-                // interrogações e a varredura não terminava); com a
-                // região, são 10 interrogações — uma por região — e o
-                // `rtld` encontra os módulos.
+                // devolve o `KMemoryBlock` que contem o endereco - e o
+                // bloco e' a regiao, nao a pagina de 4 KiB. A medicao
+                // confirma: com a pagina, o `rtld` do jogo percorria o
+                // espaco do processo a 4 KiB de cada vez (3999
+                // interrogacoes e a varredura nao terminava); com a
+                // regiao, sao 10 interrogacoes - uma por regiao - e o
+                // `rtld` encontra os modulos.
                 info.base_address = r.base;
                 info.size         = r.size;
                 info.state        = r.state;
                 info.permission   = r.permission;
+                achou = true;
                 break;
+            }
+            if (r.base <= query) {
+                anterior_fim = r.base + r.size;
+            } else {
+                seguinte_base = r.base;
+                break;
+            }
+        }
+
+        if (!achou) {
+            // **O bloco FREE.** O Eden nao devolve "nada": devolve o bloco
+            // livre que contem o endereco, com o **tamanho** desse bloco.
+            //
+            // A arvore de blocos do Eden contem blocos `Free`
+            // (`k_memory_block_manager.h:129`: `FindBlock` procura um bloco
+            // com estado `Free` e devolve-o se nao houver nenhum mapeado).
+            // E' assim que o SDK ve o espaco livre do processo: pergunta o
+            // `svcQueryMemory` de um endereco e recebe o bloco livre com o
+            // tamanho certo.
+            //
+            // Sem isto, o `nn::os::detail::AddressSpaceAllocator::AllocateSpace`
+            // do SDK percorria o espaco do processo a procurar espaco para
+            // alocar, recebia `size=0` em tudo o que nao estivesse mapeado,
+            // e acabava por lancar uma excecao. Medido: 527 interrogacoes
+            // `svcQueryMemory` seguidas de uma excecao sem quem a apanhe.
+            if (seguinte_base == 0) {
+                // O fim do espaco do processo.
+                seguinte_base = (mem_ != nullptr && mem_->size() != 0)
+                                    ? mem_->base() + mem_->size()
+                                    : anterior_fim;
+            }
+            if (seguinte_base > anterior_fim) {
+                info.base_address = anterior_fim;
+                info.size         = seguinte_base - anterior_fim;
+                info.state        = GuestRegion::kFree;
+                info.permission   = GuestRegion::kNone;
             }
         }
     } else if (mem_ != nullptr && mem_->owns(query)) {
@@ -731,6 +774,18 @@ Result SvcDispatcher::svc_query_memory(SvcContext& ctx) {
     // protege o caso de um SDK que não faça a escrita.
     if (out_page != 0 && !write_guest(out_page, &page_flags, sizeof(page_flags)))
         return Result::Invalid;
+
+    // O que o guest recebeu. E' a medicao que diz se o bloco serve: o
+    // `nn::os::detail::AddressSpaceAllocator::AllocateSpace` do SDK escolhe
+    // um endereco aleatorio, pergunta o `svcQueryMemory` e exige que o
+    // bloco devolvido seja MAIOR do que o total que precisa (medido no
+    // `sdk`, offset 0x32c138-0x32c154).
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[qm  ] query=0x%016llx -> base=0x%llx size=0x%llx state=%u perm=%u\n",
+                     (unsigned long long)query, (unsigned long long)info.base_address,
+                     (unsigned long long)info.size, info.state, info.permission);
+    }
 
     ++query_memory_calls_;
     return Result::Success;
@@ -962,11 +1017,22 @@ Result SvcDispatcher::svc_set_thread_core_mask(SvcContext& ctx) {
         }
     }
 
-    // O handle tem de existir. Só há uma thread de guest — a principal — e o
-    // Eden dá-lhe um handle na sua tabela (medido no guest: 0x81ff).
+    // O handle tem de existir. São três os casos:
+    //
+    //   - o handle **pseudo** da thread corrente (-2), como no Eden;
+    //   - o handle da thread principal, que o Eden dá na sua tabela
+    //     (medido no guest: 0x81ff);
+    //   - uma thread que **nosotros** criámos (`CreateThread`), que vive na
+    //     nossa tabela de handles.
+    //
+    // O terceiro caso é o que o SDK usa a seguir a criar a thread: medido,
+    // o `SetThreadCoreMask` seguinte ao `CreateThread` vem com o handle
+    // da thread nova, e devolvia `InvalidHandle`.
     const std::uint32_t principal = main_thread_handle();
     const bool pseudo = (handle == kCurrentThreadHandle);
-    if (eden_attached() && principal != 0 && handle != principal && !pseudo)
+    const Handle h{static_cast<std::uint32_t>(handle)};
+    const bool nossa = handles_.obter(h) != nullptr;
+    if (eden_attached() && principal != 0 && handle != principal && !pseudo && !nossa)
         return Result::InvalidHandle;
 
     core_mask_ = mask;
@@ -1008,7 +1074,9 @@ Result SvcDispatcher::svc_get_thread_core_mask(SvcContext& ctx) {
 
     const std::uint32_t principal = main_thread_handle();
     const bool pseudo = (handle == kCurrentThreadHandle);
-    if (eden_attached() && principal != 0 && handle != principal && !pseudo)
+    const Handle h{static_cast<std::uint32_t>(handle)};
+    const bool nossa = handles_.obter(h) != nullptr;
+    if (eden_attached() && principal != 0 && handle != principal && !pseudo && !nossa)
         return Result::InvalidHandle;
 
     ctx.x[1] = static_cast<std::uint64_t>(static_cast<std::uint32_t>(core_id_));
@@ -1029,6 +1097,96 @@ Result SvcDispatcher::svc_get_current_processor_number(SvcContext& ctx) {
     const int cpu = ::sched_getcpu();
     ctx.x[1] = static_cast<std::uint64_t>(static_cast<std::uint32_t>(cpu < 0 ? 0 : cpu));
     ctx.ret      = static_cast<std::uint64_t>(static_cast<std::uint32_t>(cpu < 0 ? 0 : cpu));
+    ctx.has_ret  = true;
+    return Result::Success;
+}
+
+// CreateThread — `SvcWrap_CreateThread64` no Eden (svc.cpp:1304).
+//
+//     x0 = ponteiro de saída (o handle)    x1 = o handle (saída)
+//     x1 = entry point   x2 = argumento   x3 = fundo da stack
+//     x4 = prioridade    x5 = core_id
+//
+// **Este SVC matava o jogo**, do mesmo modo que o 0x0f: nao estava
+// implementado, caia no `default` e devolvia `Result::Unsupported` (64 =
+// 0x40), que o SDK trata como fatal. Medido: o `svc #180` foi o `0x08`, o
+// `svc #182` foi o `SetTerminateResult` e o `svc #184` foi o `Break`.
+//
+// **STUB, e aqui esta' a razao.** A thread nao e' criada: este motor corre
+// o guest NATIVAMENTE, numa thread do host, com as traps resolvidas por
+// sinais — correr uma segunda thread de guest exige que o estado do
+// despachante, o TLS e o `TPIDR_EL0` sejam por thread, e o despachante
+// hoje tem um estado so. Criar a thread e' o passo seguinte; o que esta' aqui
+// e' o que o guest precisa para nao morrer: um handle valido.
+//
+// A thread que o SDK cria aqui e' do proprio SDK (o entry point medido esta
+// no `subsdk1`), e o jogo continua depois dela.
+Result SvcDispatcher::svc_create_thread(SvcContext& ctx) {
+    const std::uint64_t out_handle = ctx.x[0];
+    const std::uint64_t entry       = ctx.x[1];
+    const std::uint64_t arg         = ctx.x[2];
+    const std::uint64_t stack_bottom = ctx.x[3];
+    const std::int32_t  priority    = static_cast<std::int32_t>(ctx.x[4]);
+    const std::int32_t  core_id     = static_cast<std::int32_t>(ctx.x[5]);
+
+    // A validacao e' a do Eden (`kernel/svc/svc_thread.cpp:26-44`), com os
+    // limites do Eden (`kernel/svc_types.h:101-102`): a prioridade vai de 0
+    // (a mais alta) a 63 (a mais baixa) — 64 niveis. O guest passou 0x2C
+    // (44), que e' a prioridade da thread principal. Uma versao anterior
+    // aceitava so 0..31 e devolvia `InvalidPriority` — o mesmo genre de
+    // erro que matou o jogo com o 0x0f.
+    if (priority < 0 || priority > 63)
+        return Result::InvalidPriority;
+
+    auto* to = new KObject();
+    to->kind = KObject::Kind::Thread;
+    to->name = "thread";
+    const Handle h = handles_.reservar();
+    if (!handles_.registar(h, to)) {
+        delete to;
+        return Result::OutOfResource;
+    }
+
+    // O handle sai no ponteiro E em x1 (o Eden faz as duas coisas:
+    // `SetArg64(args, 1, out_handle)`).
+    if (!write_guest(out_handle, &h.raw, sizeof h.raw))
+        return Result::InvalidAddress;
+    ctx.x[1]     = h.raw;
+    ctx.ret      = 0;
+    ctx.has_ret  = true;
+
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[svc] CreateThread handle=0x%x entry=0x%llx arg=0x%llx "
+                     "stack=0x%llx prio=%d core=%d  (STUB: a thread nao corre)\n",
+                     static_cast<unsigned>(h.raw), (unsigned long long)entry,
+                     (unsigned long long)arg, (unsigned long long)stack_bottom,
+                     priority, core_id);
+    }
+    return Result::Success;
+}
+
+// StartThread — `SvcWrap_StartThread64` no Eden (svc.cpp:1367).
+//
+//     x0 = handle da thread
+//     x0 = Result
+//
+// **STUB**, pela mesma razao do `CreateThread`: a thread existe na nossa
+// tabela de handles, mas **nao corre** — este motor corre o guest
+// nativamente, numa thread do host. Devolver `Success` e' o que o guest
+// precisa para nao morrer: um erro aqui e' fatal para o SDK (medido: o
+// `svc #183` foi o `0x09` a devolver `Unsupported` (0x40), e o SDK foi
+// logo a `SetTerminateResult` e ao `Break`).
+Result SvcDispatcher::svc_start_thread(SvcContext& ctx) {
+    const std::uint64_t handle = ctx.x[0];
+    const Handle h{static_cast<std::uint32_t>(handle)};
+    const std::uint32_t principal = main_thread_handle();
+    const bool pseudo = (handle == kCurrentThreadHandle);
+    const bool nossa = handles_.obter(h) != nullptr;
+    if (eden_attached() && principal != 0 && handle != principal && !pseudo && !nossa)
+        return Result::InvalidHandle;
+
+    ctx.ret      = 0;
     ctx.has_ret  = true;
     return Result::Success;
 }

@@ -126,7 +126,9 @@ inline constexpr Handle kInvalidHandle{};
 // ficheiro, com um contador que fabricava os dois ao mesmo tempo.
 
 struct KObject {
-    enum class Kind : std::uint8_t { Port, Session };
+    // `Thread`: uma thread de guest que o motor criou mas **nao** corre
+    // (ver `svc_create_thread`). O objecto existe para o handle ser valido.
+    enum class Kind : std::uint8_t { Port, Session, Thread };
 
     Kind kind = Kind::Port;
 
