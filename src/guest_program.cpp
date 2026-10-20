@@ -540,8 +540,29 @@ std::vector<GuestRegion> GuestProgram::memory_regions() const {
     // Cada módulo em três regiões, à medida dos segmentos. Os gaps entre
     // segmentos (medidos: 3328 bytes no `main`) ficam absorbidos na região
     // anterior, para que não haja buracos.
-    for (std::size_t i = 0; i < modules_.size(); ++i) {
-        const GuestModule& m  = modules_[i];
+    //
+    // **Pela ordem das bases, nao pela ordem da lista.** A lista tem o
+    // `rtld` primeiro (e' o entry point) mas ele e' linkado em PC-relativo
+    // e fica no FIM do codigo - a sua base e' a mais alta de todas.
+    // Percorrer a lista por ordem dava ao `rtld` um `module_end` MENOR que
+    // a sua base, e a regiao saia invertida (`0x834d5000 .. 0x80000000`).
+    // Com o tamanho a dar a volta em `uint64`, essa regiao casava com quase
+    // tudo, e o `svcQueryMemory` respondia com a regiao errada.
+    //
+    // A medicao: com a lista por ordem, o `rtld` (0x834d2000) ficava
+    // dentro da regiao de dados do `sdk` (0x833af000..0x834d6000) e o seu
+    // proprio `.text` nunca era descrito como `Code`.
+    std::vector<std::size_t> por_base;
+    por_base.reserve(modules_.size());
+    for (std::size_t i = 0; i < modules_.size(); ++i)
+        por_base.push_back(i);
+    std::sort(por_base.begin(), por_base.end(),
+              [this](std::size_t a, std::size_t b) {
+                  return modules_[a].vaddr_base < modules_[b].vaddr_base;
+              });
+
+    for (std::size_t i = 0; i < por_base.size(); ++i) {
+        const GuestModule& m  = modules_[por_base[i]];
         const LoadedModule& n = m.nso;
 
         const std::uint64_t b = m.vaddr_base;
@@ -556,7 +577,7 @@ std::vector<GuestRegion> GuestProgram::memory_regions() const {
         // cinco interrogações, a quinta no enchimento, e o rtld passou
         // directamente a complainar de símbolos sem nunca ter visto a `sdk`.
         const std::uint64_t module_end =
-            (i + 1 < modules_.size()) ? modules_[i + 1].vaddr_base : code_end_;
+            (i + 1 < por_base.size()) ? modules_[por_base[i + 1]].vaddr_base : code_end_;
 
         const std::uint64_t text_lo = b + n.segments[0].vaddr;
         const std::uint64_t ro_lo   = b + n.segments[1].vaddr;
