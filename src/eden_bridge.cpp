@@ -543,7 +543,7 @@ EdenSystem::EdenSystem(GuestMemory& memoria, std::uint64_t pid, std::uint64_t ti
     // A verificacao que esteve aqui -- `KObjectName::Find("sm:")` -- **partiu
     // o jogo**.
     //
-    // `Find` devolve um `KScopedAutoObject`, e sair de作用域 chama `Close()`
+    // `Find` devolve um `KScopedAutoObject`, e sair do ambito chama `Close()`
     // no `KClientPort`. Se esse `Close` destruir a porta -- e no nosso motor
     // pode, porque o `KPort` do `ServerManager` é o único dono e a contagem de
     // referências vive no `KAutoObject` do Eden -- então a porta desaparece do

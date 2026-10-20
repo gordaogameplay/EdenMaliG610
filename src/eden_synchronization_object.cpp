@@ -110,7 +110,7 @@ std::vector<KThread*> KSynchronizationObject::GetWaitingThreadsForDebugging(Kern
 //
 // A lição não é sobre o `Wait`: é que **uma medição vale para a árvore de
 // ficheiros que se mediu, e não para a seguinte.** Quando se acrescenta
-// código, as medições que一下子 ficaram obsoletas e nenhuma das ferramentas
+// código, as medições que ficaram obsoletas e nenhuma das ferramentas
 // avisa. Por isso que este ficheiro reimplemente `Wait` em vez de o deixar
 // por definir: fica correcta com o que existe hoje, e a próxima medição
 // confirma.

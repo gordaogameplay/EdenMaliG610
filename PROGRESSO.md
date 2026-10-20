@@ -948,7 +948,7 @@ O motor, a telemetria e o tradutor estão bons. O que falta é o OS — e o
 
 # Seguir o abort: a cadeia de chamadas
 
-Sem símbolos e sem、断点 no debugger, a pergunta e' "que comparacao falhou".
+Sem símbolos e sem ponto de paragem no debugger, a pergunta e' "que comparacao falhou".
 Resposta: chegar ao codigo.
 
 ## A janela do abort
