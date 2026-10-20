@@ -329,6 +329,14 @@ public:
     // caso dos testes, e o caso de um dia em que o heap seja gerido de outra
     // forma.
     void set_heap_base(std::uint64_t base) noexcept { heap_base_ = base; }
+
+    // O tamanho do heap do guest.
+    //
+    // **O SDK dimensiona o heap do jogo a partir do `GetInfo(21)`**
+    // (`TotalNonSystemMemorySize`), e o que pede no `SetHeapSize` tem de
+    // caber no que o motor mapeou. Por isso o valor tem de ser o do
+    // layout, e nao o da reserva inteira.
+    void set_heap_size(std::uint64_t size) noexcept { heap_size_ = size; }
     std::uint64_t heap_base() const noexcept { return heap_base_; }
 
     // A pilha do guest, para `GetInfo(StackRegionAddress/Size)`.

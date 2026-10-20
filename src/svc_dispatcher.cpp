@@ -259,17 +259,52 @@ void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
 }
 
 Result SvcDispatcher::svc_set_heap_size(SvcContext& ctx) {
-    // ABI do Switch: SetHeapSize(u64 size) -> u64 heap_base
+    // **A ABI é a do Eden**, e foi medida no SDK.
     //
-    // x0 à entrada é o TAMANHO pedido; x0 à saída é o ENDEREÇO BASE do heap.
-    // São coisas diferentes, e confundir as duas é o que fazia esta função
-    // devolver 0 — o que faz o rtld tratar o heap como se estivesse na página
-    // zero, e o primeiro acesso do guest a 0 ser um fault de memória sem
-    // nenhum contexto.
+    // O Eden (`src/core/hle/kernel/svc.cpp:1250-1255`):
     //
-    // O rtld usa este endereço como base para os blocos que pede depois com
-    // MapMemory, portanto tem de estar dentro da reserva que fizémos.
-    const std::uint64_t requested = ctx.x[0];
+    //     static void SvcWrap_SetHeapSize64(Core::System& system, std::span<uint64_t, 8> args) {
+    //         uint64_t size = Convert<uint64_t>(GetArg64(args, 1));
+    //         uint64_t out_address{};
+    //         Result ret = SetHeapSize64(system, std::addressof(out_address), size);
+    //         SetArg64(args, 0, Convert<uint64_t>(ret));
+    //         SetArg64(args, 1, Convert<uint64_t>(out_address));
+    //     }
+    //
+    // E `svc_physical_memory.cpp:14`:
+    //
+    //     Result SetHeapSize(Core::System& system, u64* out_address, u64 size) {
+    //         ...
+    //         *out_address = GetInteger(address);
+    //
+    // Ou seja: **x0 e' o ponteiro de saida** e **x1 e' o tamanho**. O
+    // endereco base do heap volta em **x1** — e tambem e' escrito no
+    // ponteiro.
+    //
+    // **Medido no SDK** (modulo `sdk` desassemblado):
+    //
+    //   0x82d799ec — a wrapper do SVC 1:
+    //       str  x0, [sp, #-16]!   ; guarda o ponteiro de saida
+    //       brk  #0x1
+    //       ldr  x2, [sp]
+    //       str  x1, [x2]          ; escreve x1 no endereco x0
+    //
+    //   0x82d29ee0 — `nn::os::detail::MemoryHeapManagerImplByHorizon::SetHeapSize`:
+    //       mov  x0, x1            ; x0 do SVC = 1.o argumento
+    //       mov  x1, x2            ; x1 do SVC = 2.o argumento
+    //       bl   0x82d799ec
+    //
+    // **O sintoma da versao errada tambem esta medido.** Com x0 tratado
+    // como o tamanho, o SDK lia x1 (0x7e00000 — o tamanho) como se fosse
+    // o endereco base do heap, e escrevia la. Era o fault em 0x82d25ca0,
+    // com a escrita a 0x7e00010.
+    //
+    // Uma versao anterior deste ficheiro inverteu a ordem para
+    // (tamanho, endereco) — com a justificacao de que "a fonte da verdade
+    // para a ABI do guest e' o guest". O guest diz o contrario, e o
+    // Eden concorda com o guest.
+    const std::uint64_t out_address = ctx.x[0];
+    const std::uint64_t requested   = ctx.x[1];
     if (requested == 0)
         return Result::Invalid;
 
@@ -286,10 +321,23 @@ Result SvcDispatcher::svc_set_heap_size(SvcContext& ctx) {
     }
 
     heap_size_ = requested;
-    // O endereço base é o VALOR DE RETORNO. Na ABI do Switch, x0 é o registo
-    // de retorno; escrevê-lo em ctx.x[0] não chega ao guest porque o motor
-    // substitui x0 por ctx.ret.
-    ctx.ret     = base;
+
+    // O endereço base vai para a **memória do guest**, no ponteiro de
+    // saída — que é o que a ABI do Eden diz (`*out_address = ...`).
+    //
+    // E o resultado do SVC é o `Result`, em x0. Não é o endereço: são
+    // coisas diferentes, e confundir as duas é o que fazia o rtld
+    // tratar o heap como se estivesse na página zero.
+    if (out_address != 0) {
+        if (!write_guest(out_address, &base, sizeof base)) {
+            return Result::InvalidAddress;
+        }
+    }
+    // E o endereço base volta em **x1** — o Eden faz exactamente isto
+    // (`SetArg64(args, 1, out_address)`), e o SDK lê x1 (a wrapper
+    // desassemblada em 0x82d799ec escreve x1 no ponteiro).
+    ctx.x[1]    = base;
+    ctx.ret     = 0;
     ctx.has_ret = true;
     return Result::Success;
 }
@@ -738,7 +786,22 @@ Result SvcDispatcher::svc_get_info(SvcContext& ctx) {
     case 16: value = system_resource_size_; break;  // SystemResourceSizeTotal
     case 17: value = 0;                     break;  // SystemResourceSizeUsed
     case 20: value = 0;                     break;  // UserExceptionContextAddress
-    case 21: value = mem_total_;            break;  // TotalNonSystemMemorySize
+    // A memoria **nao-sistema** (o Eden: `GetTotalNonSystemUserPhysicalMemorySize`,
+    // `k_process.cpp`): e' a memoria do processo do guest, e nao a do
+    // sistema.
+    //
+    // **O SDK dimensiona o heap do jogo a partir deste numero.** Com o
+    // valor errado, pediu um heap de 2,4 GB — e o assert de
+    // crescimento de vector do SDK (`!safe_add(&new_capacity, new_size,
+    // (new_size / 2))`) transbordou, e o guest abortou.
+    //
+    // E o que este motor tem de facto e' o **heap**: e' ai que o jogo
+    // aloca, e e' o limite que o `SetHeapSize` vai pedir. Dar a
+    // reserva inteira faz o SDK pedir mais do que existe.
+    case 21: value = heap_size_ != 0 ? heap_size_ : mem_total_; break;
+    // (o `heap_size_` so' esta posto depois do `SetHeapSize`; antes
+    // disso, o que vale e' o `mem_total_` — que e' o tamanho da
+    // reserva do guest)
     case 22: value = mem_used_;             break;  // UsedNonSystemMemorySize
     case 23: value = 1;                     break;  // IsApplication
     case 24: value = kFreeThreadCount;      break;  // FreeThreadCount

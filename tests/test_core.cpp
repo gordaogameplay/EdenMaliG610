@@ -161,39 +161,10 @@ void test_svc_dispatch() {
     tel.set_live_console(false);
     g610::SvcDispatcher svc(tel);
 
-    // SetHeapSize (0x01)
-    //
-    // x0 à entrada é o TAMANHO; x0 à saída é o ENDEREÇO BASE. São coisas
-    // diferentes — a versão anterior devolvia 0 em x0, o que fazia o rtld
-    // tratar o heap como se estivesse na página zero.
-    {
-        svc.set_heap_base(0x0000'0000'9000'0000ull);
-        g610::SvcContext c;
-        c.x[0] = 0x4000'0000; // 1 GiB de heap
-        svc.dispatch(static_cast<std::uint32_t>(g610::Svc::SetHeapSize), c);
-        // O ENDEREÇO do heap é o valor de RETORNO, e o registo de retorno na
-        // ABI do Switch é x0 — que o motor preenche a partir de `ctx.ret`.
-        // Pô-lo em `ctx.x[0]` não chegava ao guest: o motor substitui x0.
-        check(svc.heap_size() == 0x4000'0000, "heap size registado");
-        check(c.ret == 0x0000'0000'9000'0000ull,
-              "SetHeapSize devolve o ENDEREÇO do heap, não o tamanho");
-        check(c.ret != 0,
-              "o endereço do heap nunca é 0 (o primeiro acesso faultaria)");
-    }
-
-    // Tamanho zero é inválido: devolver um endereço para um heap de 0 bytes
-    // faz o rtld escrever fora de qualquer região.
-    {
-        g610::SvcContext c;
-        c.x[0] = 0;
-        svc.dispatch(static_cast<std::uint32_t>(g610::Svc::SetHeapSize), c);
-        check(c.ret != 0, "SetHeapSize com size=0 é recusado");
-    }
-
     // --- Os SVC que recebem endereços precisam de espaço de guest ligado ---
     //
     // Isto mudou por uma razão medida: o despachante deixou de
-    // desreferenciar endereços do guest directamente. Um ponteiro do host
+    // desreferenciar endereços do guest diretamente. Um ponteiro do host
     // passado como se fosse um endereço de guest era um bug à espera de
     // acontecer — em produção o espaço é de 39 bits e o ponteiro do host
     // está normalmente fora dele.
@@ -205,6 +176,53 @@ void test_svc_dispatch() {
         return;
     }
     svc.bind_memory(&mem);
+
+    // SetHeapSize (0x01)
+    //
+    // A ABI é a do Eden (`svc.cpp:1250-1255`): **x0 é o ponteiro de
+    // saída** e **x1 é o tamanho**. O endereço base do heap volta em
+    // **x1** e também é escrito no ponteiro.
+    //
+    //     SetArg64(args, 0, ret);              // x0 = Result
+    //     SetArg64(args, 1, out_address);      // x1 = endereço base
+    //
+    // E foi medido no SDK: a wrapper do SVC 1 (0x82d799ec) faz
+    // `str x1, [x2]`, com x2 = o x0 que o guardou — ou seja, escreve x1
+    // no ponteiro de x0.
+    //
+    // Este teste validava a forma errada (x0 = tamanho, x0 = base no
+    // retorno), e passava. Um teste que valida uma ABI inventada dá
+    // confiança a uma coisa falsa — e foi exactamente o que aconteceu:
+    // o guest lia o tamanho como se fosse o endereço, e ia escrever a
+    // 0x7e00010.
+    {
+        svc.set_heap_base(0x0000'0000'9000'0000ull);
+        const std::uint64_t out = kBase + 0x1000;
+        g610::SvcContext c;
+        c.x[0] = out;              // o ponteiro de saída
+        c.x[1] = 0x4000'0000;      // 1 GiB de heap
+        svc.dispatch(static_cast<std::uint32_t>(g610::Svc::SetHeapSize), c);
+        check(svc.heap_size() == 0x4000'0000, "heap size registado");
+        check(c.ret == 0, "SetHeapSize devolve o Result em x0 (0 = sucesso)");
+        check(c.x[1] == 0x0000'0000'9000'0000ull,
+              "SetHeapSize devolve o ENDEREÇO do heap em x1");
+        std::uint64_t escrito = 0;
+        check(mem.read(out, &escrito, sizeof escrito, err) &&
+                  escrito == 0x0000'0000'9000'0000ull,
+              "SetHeapSize escreve o endereço base no ponteiro de x0");
+        check(escrito != 0,
+              "o endereço do heap nunca é 0 (o primeiro acesso faultaria)");
+    }
+
+    // Tamanho zero é inválido: devolver um endereço para um heap de 0 bytes
+    // faz o rtld escrever fora de qualquer região.
+    {
+        g610::SvcContext c;
+        c.x[0] = kBase + 0x1000;
+        c.x[1] = 0;
+        svc.dispatch(static_cast<std::uint32_t>(g610::Svc::SetHeapSize), c);
+        check(c.ret != 0, "SetHeapSize com size=0 é recusado");
+    }
 
     // ConnectToNamedPort (0x1F).
     //

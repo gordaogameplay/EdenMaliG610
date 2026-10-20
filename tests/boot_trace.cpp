@@ -970,8 +970,16 @@ int main(int argc, char** argv) {
     g610::SvcDispatcher svc(tel);
     svc.bind_memory(&prog.memory());
     svc.set_heap_base(g610::layout::kHeapBase);
+    svc.set_heap_size(g610::layout::kHeapSize);
     svc.set_alias_region(g610::layout::kAliasBase, g610::layout::kAliasSize);
-    svc.set_memory_totals(prog.memory().base() + prog.memory().size(),
+    // A memoria do guest: o **tamanho** da reserva, e nao o fim dela.
+    //
+    // O Eden devolve o *tamanho* (`GetTotalNonSystemUserPhysicalMemorySize`),
+    // e o SDK subtrai o usado para saber quanto ainda ha. Com o *fim*
+    // da reserva, a subtracao dava um numero sem sentido — e o SDK
+    // pediu um heap de 2,4 GB, e o assert de crescimento de vector
+    // (`!safe_add(&new_capacity, new_size, (new_size / 2))`) transbordou.
+    svc.set_memory_totals(prog.memory().size(),
                           prog.modules().empty()
                               ? 0
                               : prog.modules().front().nso.image.size());
