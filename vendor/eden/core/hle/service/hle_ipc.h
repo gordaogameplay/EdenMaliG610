@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "vendor/eden/core/hle/kernel/k_process_bridge.h"  // PONTE
+
 #include <array>
 #include <functional>
 #include <memory>
@@ -19,6 +21,7 @@
 #include "vendor/eden/common/assert.h"
 #include "vendor/eden/common/common_types.h"
 #include "vendor/eden/common/concepts.h"
+#include "vendor/eden/common/scratch_buffer.h"
 #include "vendor/eden/common/swap.h"
 #include "vendor/eden/core/hle/ipc.h"
 #include "vendor/eden/core/hle/kernel/k_handle_table.h"

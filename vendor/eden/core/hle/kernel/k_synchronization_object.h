@@ -6,7 +6,6 @@
 
 #pragma once
 
-#include "vendor/eden/core/hle/kernel/k_process_bridge.h"  // PONTE
 
 #include <vector>
 

@@ -4,6 +4,7 @@
 #pragma once
 
 #include "vendor/eden/common/common_types.h"
+#include "vendor/eden/core/hle/kernel/svc_types.h"  // LimitableResource, MemoryPermission, Handle
 #include "vendor/eden/common/literals.h"
 
 namespace Kernel {

@@ -1449,44 +1449,29 @@ pixel lido `1.500000`. Suite de 6 testes a passar.
 
 ---
 
-# A ideia dos A55 como auxiliares de tradução — registada, com as suas reservas
+# Os quatro núcleos livres
 
-Dada por ti a partir da pesquisa sobre como o Switch usa os núcleos. Vale a
-pena写下 porque é boa e porque tem um custo escondido.
+**Nota de recurso, não de plano.** O RK3588 dá 4 × A76 ao guest e ficam
+**4 × A55 @ 1800 MHz sem fazer nada**. Ficam aqui registados para o dia em
+quealguma coisa precise deles.
 
-**A ideia.** O Switch dá 3 × A57 a 1020 MHz ao jogo. O RK3588 dá-nos
-4 × A76 a 2400 MHz para o guest — e ficam **4 × A55 a 1800 MHz sem fazer
-nada**. Usá-los como auxiliares da tradução Maxwell → Valhall, em paralelo
-com a GPU, daria mais computação do que o próprio Switch.
+Proposta que foi feita e **descartada**: usá-los como auxiliares da tradução
+Maxwell → Valhall em paralelo com a GPU. A conta é boa — é mais computação do
+que o Switch tem — mas tem três custos que não se medem sem medir:
 
-**Porque é plausível.** Os quatro A55 estão literalmente ociosos. O Switch
-tem três A57 com trabalho; nós temos quatro A55 sem. A tradução é trabalho
-real, e é paralelizável por shader.
+1. **Largura de banda.** A tradução lê dados que depois vão para os A76 e para
+   a GPU. Os A55 competiriam pela mesma DRAM, e num SoC em que a memória é o
+   recurso mais disputado, e a GPU é a que mais puxa, pôr quatro núcleos a
+   mais pode **piorar** o resultado.
+2. **A tradução é custo de arranque, não steady state.** Um shader traduz-se
+   uma vez e fica em cache. O `glslc` gera em runtime, mas uma vez *por
+   shader*, não por frame. O ganho real é no arranque e nos loads.
+3. **Coordenação.** Passar um shader dos A55 → A76 → GPU tem latência de
+   troca de cluster. Em shaders pequenos custa mais do que o trabalho.
 
-**As três reservas, todas honestas:**
-
-1. **Largura de banda.** A traduz��ão precisa de dados que depois vão para
-   os A76 e para a GPU. Os A55 competiriam pela mesma DRAM. Num SoC em que
-   a memória é o recurso mais disputado — e a GPU é a que mais puxa — pôr
-   quatro núcleos a mais a lerem e escreverem pode **piorar** o resultado.
-   Isto não se resolve com um perfil; resolve-se medindo o throughput da
-   memória antes e depois.
-
-2. **A tradução é quase sempre custo de arranque.** Um shader é traduzido
-   uma vez e fica em cache. O steady state só tem tradução se houver
-   variantes, shaders gerados em runtime, ou computação. O `glslc` gera
-   em runtime — mas uma vez por shader, não por frame. O ganho real é
-   sobretudo no **arranque** e nos **loads**, não no jogo a correr.
-
-3. **A coordenação custa.** Passar um shader traduzido dos A55 para os A76 e
-   daí para a GPU tem latência de troca de cluster, e sincronização. Em
-   shaders pequenos o custo pode ser maior que o trabalho.
-
-**Onde isto encaixa.** É uma decisão de arquitectura, não uma optimização.
-Fica registada com as reservas ao lado, porque uma ideia boa anotada sem as
-suas reservas vira uma ideia má implementada seis meses depois.
-
----
+Isto é decisão de arquitectura, não optimização. **Está anotado como recurso,
+não como plano** — porque uma ideia boa sem as reservas ao lado vira uma má
+implementação seis meses depois.
 
 # A costura: onde está
 

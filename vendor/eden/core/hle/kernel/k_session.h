@@ -17,6 +17,9 @@
 
 namespace Kernel {
 
+class KClientPort;
+
+
 class SessionRequestManager;
 
 class KSession final : public KAutoObjectWithSlabHeapAndContainer<KSession, KAutoObjectWithList> {

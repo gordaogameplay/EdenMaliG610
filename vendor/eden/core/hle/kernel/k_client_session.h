@@ -16,6 +16,9 @@
 
 namespace Kernel {
 
+class KEvent;
+
+
 class KernelCore;
 class KSession;
 

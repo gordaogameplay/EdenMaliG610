@@ -8,6 +8,7 @@
 
 #include <array>
 #include "vendor/eden/common/common_types.h"
+#include "vendor/eden/core/hle/kernel/slab_helpers.h"
 #include "vendor/eden/core/hle/kernel/k_light_condition_variable.h"
 #include "vendor/eden/core/hle/kernel/k_light_lock.h"
 
