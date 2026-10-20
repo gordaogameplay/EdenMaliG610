@@ -1,4 +1,4 @@
-// EdenMaliIA — descodificação de instruções AArch64 que o guest precisa de
+// EdenMaliG610 — descodificação de instruções AArch64 que o guest precisa de
 // intercepção.
 //
 // O guest de um título de Switch corre nativamente no Cortex-A76. Quase tudo é
@@ -23,7 +23,7 @@
 
 #include <cstdint>
 
-namespace ia::arm {
+namespace g610::arm {
 
 // ---------------------------------------------------------------------------
 // SVC — Supervisor Call
@@ -373,4 +373,4 @@ enum class Disposition : std::uint8_t {
     return Disposition::RunNatively;
 }
 
-} // namespace ia::arm
+} // namespace g610::arm

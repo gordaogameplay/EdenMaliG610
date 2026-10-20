@@ -1,4 +1,4 @@
-// EdenMaliIA — a tabela de objectos do kernel.
+// EdenMaliG610 — a tabela de objectos do kernel.
 //
 // Copiada do desenho do Eden (`k_handle_table.h`, `k_handle_table.cpp`,
 // `svc_port.cpp`), não do código. O Eden é GPL e o nosso projecto não é; o
@@ -66,7 +66,7 @@
 #include <string>
 #include <vector>
 
-namespace ia {
+namespace g610 {
 
 // ── o handle ──────────────────────────────────────────────────────────────
 //
@@ -230,4 +230,4 @@ private:
     std::uint32_t m_invalidos = 0;
 };
 
-} // namespace ia
+} // namespace g610

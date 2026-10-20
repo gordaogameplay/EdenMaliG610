@@ -1,4 +1,4 @@
-// EdenMaliIA — teste de execução nativa de ponta a ponta.
+// EdenMaliG610 — teste de execução nativa de ponta a ponta.
 //
 // Compila o guest sintético (tests/guest_test.S) para AArch64, extrai o
 // .text, aplica o patcher estático — que transforma os SVC em BRK — e
@@ -20,10 +20,10 @@
 #include <vector>
 
 #include "exec_mem.hpp"
-#include "ia/native_engine.hpp"
-#include "ia/patcher.hpp"
-#include "ia/svc_dispatcher.hpp"
-#include "ia/telemetry.hpp"
+#include "g610/native_engine.hpp"
+#include "g610/patcher.hpp"
+#include "g610/svc_dispatcher.hpp"
+#include "g610/telemetry.hpp"
 
 // Rotinas do guest, escritas em assembly (tests/guest_test.S). Executam
 // codigo AArch64 nativo — sao o guest que o motor vai correr.
@@ -36,8 +36,8 @@ extern "C" void guest_one_svc();
 // o que nao e uma expressao constante.
 #include "guest_sizes.h"
 
-using ia::test::mmap_exec;
-using ia::test::munmap_exec;
+using g610::test::mmap_exec;
+using g610::test::munmap_exec;
 
 namespace {
 
@@ -51,14 +51,14 @@ void check(bool ok, const char* what) {
 } // namespace
 
 int main() {
-    std::printf("══════ EdenMaliIA — execução nativa ══════\n");
+    std::printf("══════ EdenMaliG610 — execução nativa ══════\n");
 
-    ia::tel::Telemetry tel;
+    g610::tel::Telemetry tel;
     tel.set_live_console(false);
     tel.start("0000000000000000", "guest-test");
 
-    ia::SvcDispatcher svc(tel);
-    ia::NativeEngine engine(tel, svc);
+    g610::SvcDispatcher svc(tel);
+    g610::NativeEngine engine(tel, svc);
 
     std::string err;
     if (!engine.install_handlers(err)) {
@@ -74,8 +74,8 @@ int main() {
         // O patcher reescreve SVC->BRK in-place no código do guest. É
         // exactamente o que faz ao programa de um jogo, e tem de funcionar
         // equally aqui.
-        ia::StaticPatcher patcher(tel);
-        ia::PatchReport pr{};
+        g610::StaticPatcher patcher(tel);
+        g610::PatchReport pr{};
         std::string pe;
 
         std::vector<std::uint8_t> image(kGuestTextSize);
@@ -105,14 +105,14 @@ int main() {
         constexpr std::size_t kStack = 256 * 1024;
         alignas(16) std::uint8_t stack[kStack];
 
-        const ia::RunResult r = engine.run(entry,
+        const g610::RunResult r = engine.run(entry,
                                            reinterpret_cast<std::uint64_t>(
                                                stack + kStack));
 
         check(r.traps >= 3, "houve pelo menos 3 traps");
         check(r.svc_calls == 3, "os três SVC foram despachados");
         check(r.exited, "ExitProcess terminou o guest");
-        check(r.last_trap == ia::TrapKind::SvcCall,
+        check(r.last_trap == g610::TrapKind::SvcCall,
               "a última trap foi um SVC, não um fault");
         check(r.error.empty(), "sem erro");
 
@@ -131,8 +131,8 @@ int main() {
         // guest_one_svc põe x0=123 e chama ExitProcess. O dispatcher regista
         // o exit_code a partir de x0 — se o argumento não tiver chegado,
         // o código de saída seria 0 em vez de 123.
-        ia::StaticPatcher patcher(tel);
-        ia::PatchReport pr{};
+        g610::StaticPatcher patcher(tel);
+        g610::PatchReport pr{};
         std::string pe;
 
         std::vector<std::uint8_t> image(kGuestTextOneSize);
@@ -145,7 +145,7 @@ int main() {
         constexpr std::size_t kStack = 256 * 1024;
         alignas(16) std::uint8_t stack[kStack];
 
-        const ia::RunResult r = engine.run(entry,
+        const g610::RunResult r = engine.run(entry,
                                            reinterpret_cast<std::uint64_t>(
                                                stack + kStack));
 
@@ -160,8 +160,8 @@ int main() {
     // ── recuperação de fault ────────────────────────────────────────────
     std::printf("\n[3] recuperação de fault de memória\n");
     {
-        ia::StaticPatcher patcher(tel);
-        ia::PatchReport pr{};
+        g610::StaticPatcher patcher(tel);
+        g610::PatchReport pr{};
         std::string pe;
 
         std::vector<std::uint8_t> image(kGuestTextFaultSize);
@@ -174,12 +174,12 @@ int main() {
         constexpr std::size_t kStack = 256 * 1024;
         alignas(16) std::uint8_t stack[kStack];
 
-        const ia::RunResult r = engine.run(entry,
+        const g610::RunResult r = engine.run(entry,
                                            reinterpret_cast<std::uint64_t>(
                                                stack + kStack));
 
         check(r.faults == 1, "o fault foi registado uma vez");
-        check(r.last_trap == ia::TrapKind::GuestFault,
+        check(r.last_trap == g610::TrapKind::GuestFault,
               "a paragem foi classificada como fault de guest");
         check(!r.error.empty(), "o fault produziu uma descrição");
         check(!r.exited, "o guest não chegou a chamar ExitProcess");

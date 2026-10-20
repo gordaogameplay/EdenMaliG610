@@ -1,4 +1,4 @@
-// EdenMaliIA — motor de execução nativa (medido, não suposto).
+// EdenMaliG610 — motor de execução nativa (medido, não suposto).
 //
 // O mecanismo, verificado no Orange Pi 5 Pro com `tests/probe_ucontext.cpp`:
 //
@@ -25,11 +25,11 @@
 #include <cstdint>
 #include <string>
 
-#include "ia/guest_context.hpp"
-#include "ia/svc_dispatcher.hpp"
-#include "ia/telemetry.hpp"
+#include "g610/guest_context.hpp"
+#include "g610/svc_dispatcher.hpp"
+#include "g610/telemetry.hpp"
 
-namespace ia {
+namespace g610 {
 
 // O que o guest fez na última trap. Registado para o relatório e para
 // distinguir uma paragem por serviço de uma por fault.
@@ -124,7 +124,7 @@ struct EngineHooks {
 
     // O x1 do guest no entry point: o handle da thread principal.
     //
-    // Ver `ia_call_guest.S`. Zero é o valor que o motor usava, e zero é
+    // Ver `g610_call_guest.S`. Zero é o valor que o motor usava, e zero é
     // **o valor de um mutex livre** — o que fazia o SDK da Nintendo abortar.
     std::uint64_t   guest_x1 = 0;
 
@@ -261,7 +261,7 @@ private:
 
 // Executa `code` com `sp` no registo de stack, como `void()`.
 //
-// Definida em assembly (src/ia_call_guest.S), daí o `extern "C"` sem o qual o
+// Definida em assembly (src/g610_call_guest.S), daí o `extern "C"` sem o qual o
 // linker procura um nome com agressão de nomes.
 //
 // O terceiro argumento é o platform register (x18) — a stack canary do
@@ -272,8 +272,8 @@ private:
 // guest real não acontece (ele chama ExitProcess, ou fica em ciclo). O
 // `[[noreturn]]` documenta a intenção e evita que o optimizador assuma um
 // regresso que nunca vem.
-extern "C" [[noreturn]] void ia_call_guest(void (*code)(), std::uint64_t sp,
+extern "C" [[noreturn]] void g610_call_guest(void (*code)(), std::uint64_t sp,
                                             std::uint64_t platform_reg,
                                             std::uint64_t guest_x1);
 
-} // namespace ia
+} // namespace g610

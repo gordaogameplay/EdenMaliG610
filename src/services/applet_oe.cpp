@@ -66,7 +66,7 @@
 #include "vendor/eden/core/hle/service/server_manager.h"
 #include "vendor/eden/core/hle/service/service.h"
 
-namespace ia::services {
+namespace g610::services {
 
 namespace {
 
@@ -1250,4 +1250,4 @@ void registar_applet_oe(Core::System& system) {
     Service::ServerManager::RunServer(std::move(server_manager));
 }
 
-} // namespace ia::services
+} // namespace g610::services

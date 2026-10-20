@@ -1,10 +1,10 @@
-// EdenMaliIA — memória executável para os testes de execução.
+// EdenMaliG610 — memória executável para os testes de execução.
 #include "exec_mem.hpp"
 
 #include <sys/mman.h>
 #include <cstring>
 
-namespace ia::test {
+namespace g610::test {
 
 void* mmap_exec(void* host_image, std::size_t size) {
     if (size == 0)
@@ -47,4 +47,4 @@ void munmap_exec(void* addr, std::size_t size) {
     ::munmap(addr, rounded);
 }
 
-} // namespace ia::test
+} // namespace g610::test

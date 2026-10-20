@@ -1,6 +1,6 @@
 // Teste do input: mapeamento SDL -> botões do Switch.
 //
-// O teste sintético (`ia_input`) prova que a pilha funciona. Este prova que o
+// O teste sintético (`g610_input`) prova que a pilha funciona. Este prova que o
 // mapeamento está CORRETO — e a razão de existir é o A/B.
 //
 // ---------------------------------------------------------------------------
@@ -28,7 +28,7 @@
 #include <cstring>
 #include <string>
 
-#include "ia/input.hpp"
+#include "g610/input.hpp"
 
 namespace {
 
@@ -39,7 +39,7 @@ void check(bool ok, const std::string& what) {
     else    { ++g_fail; std::printf("  FALHOU: %s\n", what.c_str()); }
 }
 
-using ia::input::Button;
+using g610::input::Button;
 
 } // namespace
 
@@ -48,7 +48,7 @@ int main() {
 
     // ── 1. o controlador abre? ────────────────────────────────────────────
     std::printf("\n[1] abertura\n");
-    ia::input::Controller ctl;
+    g610::input::Controller ctl;
     std::string err;
     const bool abriu = ctl.open(err);
 
@@ -102,11 +102,11 @@ int main() {
 
     // ── 3. os nomes dos botoes ────────────────────────────────────────────
     std::printf("\n[3] nomes dos botoes\n");
-    check(std::strcmp(ia::input::to_string(Button::A), "A") == 0, "A");
-    check(std::strcmp(ia::input::to_string(Button::B), "B") == 0, "B");
-    check(std::strcmp(ia::input::to_string(Button::ZL), "ZL") == 0, "ZL");
-    check(std::strcmp(ia::input::to_string(Button::Plus), "START") == 0, "START");
-    check(std::strcmp(ia::input::to_string(Button::DDown), "D-Down") == 0, "D-Down");
+    check(std::strcmp(g610::input::to_string(Button::A), "A") == 0, "A");
+    check(std::strcmp(g610::input::to_string(Button::B), "B") == 0, "B");
+    check(std::strcmp(g610::input::to_string(Button::ZL), "ZL") == 0, "ZL");
+    check(std::strcmp(g610::input::to_string(Button::Plus), "START") == 0, "START");
+    check(std::strcmp(g610::input::to_string(Button::DDown), "D-Down") == 0, "D-Down");
 
     // ── 4. leitura sem hardware ───────────────────────────────────────────
     std::printf("\n[4] poll() sem controlador\n");

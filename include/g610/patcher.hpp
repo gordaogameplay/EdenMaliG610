@@ -1,4 +1,4 @@
-// EdenMaliIA — patcher estático.
+// EdenMaliG610 — patcher estático.
 //
 // Corre uma única vez, no carregamento do programa. Percorre a região de
 // texto, identifica as instruções que precisam de tratamento e reescreve-as
@@ -27,10 +27,10 @@
 #include <string>
 #include <vector>
 
-#include "ia/instructions.hpp"
-#include "ia/telemetry.hpp"
+#include "g610/instructions.hpp"
+#include "g610/telemetry.hpp"
 
-namespace ia {
+namespace g610 {
 
 // Relatório do que o patcher fez. É informação de diagnóstico, não
 // decoração: se o patcher não apanhar os SVC de um programa, o guest não
@@ -96,4 +96,4 @@ private:
     std::vector<PatchSite> sites_;
 };
 
-} // namespace ia
+} // namespace g610

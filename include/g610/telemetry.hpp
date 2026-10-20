@@ -1,4 +1,4 @@
-// EdenMaliIA — telemetria embutida.
+// EdenMaliG610 — telemetria embutida.
 //
 // Este header existe por uma razão: um emulador pronto não instrumenta o
 // caminho crítico, e sem números não há diagnóstico. Aqui cada ponto onde
@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-namespace ia::tel {
+namespace g610::tel {
 
 using Clock = std::chrono::steady_clock;
 using Nanos = std::int64_t;
@@ -221,7 +221,7 @@ private:
     std::atomic<Nanos> avg_frame_ns_{0};
     Bottleneck  dominant_ = Bottleneck::Unknown;
 
-    std::string out_dir_ = "ia-telemetry";
+    std::string out_dir_ = "g610-telemetry";
     std::string title_id_, title_name_;
     bool        live_ = true;
     std::uint64_t live_counter_ = 0;
@@ -253,7 +253,7 @@ private:
     std::atomic<Nanos>*      sink_;
 };
 
-} // namespace ia::tel
+} // namespace g610::tel
 
 #define IA_SCOPE_TIMER(atomic_sink)                                             \
-    ::ia::tel::ScopedTimer ia_timer__{::ia::tel::Clock::now(), &(atomic_sink)}
+    ::g610::tel::ScopedTimer g610_timer__{::g610::tel::Clock::now(), &(atomic_sink)}

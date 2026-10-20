@@ -1,11 +1,11 @@
-// EdenMaliIA — bloco de argumentos do processo.
-#include "ia/nso_arguments.hpp"
+// EdenMaliG610 — bloco de argumentos do processo.
+#include "g610/nso_arguments.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 
-namespace ia {
+namespace g610 {
 
 namespace {
 
@@ -87,4 +87,4 @@ std::string NsoArgumentBlock::summary() const {
     return out;
 }
 
-} // namespace ia
+} // namespace g610

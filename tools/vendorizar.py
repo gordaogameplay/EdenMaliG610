@@ -19,7 +19,7 @@ import subprocess
 import sys
 
 EDEN = os.path.expanduser("~/eden/src")
-ROOT = os.path.expanduser("~/EdenMaliIA")
+ROOT = os.path.expanduser("~/EdenMaliG610")
 VENDOR = os.path.join(ROOT, "vendor", "eden")
 
 # Includes que o Eden traz por uma via indirecta e que a poda nao reproduz.

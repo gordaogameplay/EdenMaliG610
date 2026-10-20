@@ -1,21 +1,21 @@
-#include "ia/gpu/maxwell_isa.hpp"
+#include "g610/gpu/maxwell_isa.hpp"
 
 #include <array>
 
-namespace ia::gpu::maxwell {
+namespace g610::gpu::maxwell {
 
 namespace {
 
 // Tabela de (nome, máscara, valor). O índice é o valor da opacidade.
 constexpr std::array<OpcodePattern, 280> kPatterns = {{
 #define MOP(name, cute, mask, value) OpcodePattern{mask, value},
-#include "ia/gpu/maxwell_isa.inc"
+#include "g610/gpu/maxwell_isa.inc"
 #undef MOP
 }};
 
 constexpr std::array<std::string_view, 280> kNames = {{
 #define MOP(name, cute, mask, value) cute,
-#include "ia/gpu/maxwell_isa.inc"
+#include "g610/gpu/maxwell_isa.inc"
 #undef MOP
 }};
 
@@ -52,4 +52,4 @@ OpcodePattern pattern_of(Op op) noexcept {
 
 std::size_t opcode_count() noexcept { return kPatterns.size(); }
 
-} // namespace ia::gpu::maxwell
+} // namespace g610::gpu::maxwell

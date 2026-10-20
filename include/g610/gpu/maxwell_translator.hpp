@@ -1,4 +1,4 @@
-// EdenMaliIA — tradução Maxwell -> Valhall.
+// EdenMaliG610 — tradução Maxwell -> Valhall.
 //
 // A GPU do Switch é uma NVIDIA Maxwell (GM20B). A do Orange Pi 5 Pro é uma
 // ARM Mali-G610, que implementa Valhall. Não é possível executar os comandos
@@ -37,9 +37,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include "ia/telemetry.hpp"
+#include "g610/telemetry.hpp"
 
-namespace ia::gpu {
+namespace g610::gpu {
 
 // ---------------------------------------------------------------------------
 // Comandos Maxwell.
@@ -183,4 +183,4 @@ private:
     std::uint64_t    cmds_dropped_ = 0;
 };
 
-} // namespace ia::gpu
+} // namespace g610::gpu

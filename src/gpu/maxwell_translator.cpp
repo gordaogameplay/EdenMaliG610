@@ -1,9 +1,9 @@
-// EdenMaliIA — implementação da tradução Maxwell -> Vulkan.
-#include "ia/gpu/maxwell_translator.hpp"
+// EdenMaliG610 — implementação da tradução Maxwell -> Vulkan.
+#include "g610/gpu/maxwell_translator.hpp"
 
 #include <cstring>
 
-namespace ia::gpu {
+namespace g610::gpu {
 
 namespace {
 
@@ -291,4 +291,4 @@ bool MaxwellTranslator::drain_pushbuffer(std::vector<std::uint8_t>& buffer,
     return true;
 }
 
-} // namespace ia::gpu
+} // namespace g610::gpu

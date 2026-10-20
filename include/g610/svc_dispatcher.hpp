@@ -1,4 +1,4 @@
-// EdenMaliIA — despachante de SVC.
+// EdenMaliG610 — despachante de SVC.
 //
 // A execução nativa funciona assim: o binário ARM64 do jogo corre tal e qual no
 // Cortex-A76, em modo de utilizador. Não há JIT nem intérprete. A única coisa
@@ -17,8 +17,8 @@
 // SvcRegistry e respondidos pelo motor de IPC.
 #pragma once
 
-#include "ia/guest_memory.hpp"
-#include "ia/kobject.hpp"
+#include "g610/guest_memory.hpp"
+#include "g610/kobject.hpp"
 
 #include <cstdint>
 #include <cstdint>
@@ -28,9 +28,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include "ia/telemetry.hpp"
+#include "g610/telemetry.hpp"
 
-namespace ia {
+namespace g610 {
 
 // Heap por omissão quando não há programa ligado. Dentro dos 39 bits e longe
 // do zero, porque devolver 0 faz o guest faultar no primeiro acesso.
@@ -228,7 +228,7 @@ struct GuestRegion {
 //
 // **Declarado no namespace, e não dentro de `SvcDispatcher`.** Declarado
 // dentro, seria `SvcDispatcher::EdenSystem` — um tipo diferente do
-// `ia::EdenSystem` que `eden_bridge.cpp` define, e o `unique_ptr` daria
+// `g610::EdenSystem` que `eden_bridge.cpp` define, e o `unique_ptr` daria
 // "invalid application of sizeof to incomplete type" ao destruir. É o mesmo
 // erro do `KObjectNameGlobalData`, e pela mesma razão: uma declaração à
 // frente dentro de uma classe nomeia a classe, não o namespace.
@@ -322,7 +322,7 @@ public:
 
     // Onde começa o heap que SetHeapSize devolve.
     //
-    // Vem do layout do programa (`ia::layout::kHeapBase`). Definir aqui
+    // Vem do layout do programa (`g610::layout::kHeapBase`). Definir aqui
     // separado permite ao despachante funcionar sem um programa — que é o
     // caso dos testes, e o caso de um dia em que o heap seja gerido de outra
     // forma.
@@ -609,4 +609,4 @@ private:
     int              exit_code_   = 0;
 };
 
-} // namespace ia
+} // namespace g610

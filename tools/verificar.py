@@ -21,7 +21,7 @@ import re
 import subprocess
 import sys
 
-ROOT = os.path.expanduser("~/EdenMaliIA")
+ROOT = os.path.expanduser("~/EdenMaliG610")
 VENDOR = os.path.join(ROOT, "vendor", "eden")
 
 

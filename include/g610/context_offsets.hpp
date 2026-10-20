@@ -1,4 +1,4 @@
-/* EdenMaliIA — offsets partilhados entre C++ e assembly.
+/* EdenMaliG610 — offsets partilhados entre C++ e assembly.
  *
  * Este header é o ÚNICO que o assembly inclui. Não pode ter nada de C++:
  * o assembler do GCC não tem <array>, <cstdint> nem <cstddef>.
@@ -15,7 +15,7 @@
  *
  *  - O C++ le as constantes `constexpr` e usa-as nos `static_assert` que
  *    verificam o layout.
- *  - O assembly (src/ia_trampoline.S) nao percebe `namespace` nem
+ *  - O assembly (src/g610_trampoline.S) nao percebe `namespace` nem
  *    `constexpr`, por isso usa as macros `IA_*` definidas mais abaixo, cujo
  *    valor tem de ser igual ao das constantes.
  *
@@ -55,7 +55,7 @@
 
 #ifndef __ASSEMBLY__
 
-namespace ia {
+namespace g610 {
 
 namespace off {
 
@@ -94,6 +94,6 @@ inline constexpr unsigned kTlsCtxSize   = IA_TLS_SIZE;
 
 } // namespace off
 
-} // namespace ia
+} // namespace g610
 
 #endif // __ASSEMBLY__

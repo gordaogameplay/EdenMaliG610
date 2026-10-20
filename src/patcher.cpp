@@ -1,11 +1,11 @@
-// EdenMaliIA — implementação do patcher estático.
-#include "ia/patcher.hpp"
+// EdenMaliG610 — implementação do patcher estático.
+#include "g610/patcher.hpp"
 
 #include <cstring>
 #include <iomanip>
 #include <sstream>
 
-namespace ia {
+namespace g610 {
 
 using arm::Disposition;
 
@@ -178,4 +178,4 @@ bool StaticPatcher::patch(std::vector<std::uint8_t>& image,
     return true;
 }
 
-} // namespace ia
+} // namespace g610

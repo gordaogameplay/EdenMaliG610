@@ -1,4 +1,4 @@
-// EdenMaliIA — programa guest: ExeFS multi-módulo + espaço de endereçamento.
+// EdenMaliG610 — programa guest: ExeFS multi-módulo + espaço de endereçamento.
 //
 // Um jogo de Switch não é um binário. O ExeFS tem vários NSO e o arranque é
 // uma coreografia:
@@ -38,15 +38,15 @@
 #include <string>
 #include <vector>
 
-#include "ia/guest_context.hpp"
-#include "ia/guest_memory.hpp"
-#include "ia/nso_arguments.hpp"
-#include "ia/nso_loader.hpp"
-#include "ia/patcher.hpp"
-#include "ia/svc_dispatcher.hpp"
-#include "ia/telemetry.hpp"
+#include "g610/guest_context.hpp"
+#include "g610/guest_memory.hpp"
+#include "g610/nso_arguments.hpp"
+#include "g610/nso_loader.hpp"
+#include "g610/patcher.hpp"
+#include "g610/svc_dispatcher.hpp"
+#include "g610/telemetry.hpp"
 
-namespace ia {
+namespace g610 {
 
 // Um módulo do ExeFS, carregado e pronto a ser copiado para o guest.
 struct GuestModule {
@@ -275,4 +275,4 @@ constexpr std::uint64_t page_align_up(std::uint64_t v) noexcept {
 
 } // namespace layout
 
-} // namespace ia
+} // namespace g610

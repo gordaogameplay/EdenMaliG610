@@ -1,4 +1,4 @@
-// EdenMaliIA — gerador de programas Maxwell sintéticos.
+// EdenMaliG610 — gerador de programas Maxwell sintéticos.
 //
 // O objectivo é ter SASS válido SEM o jogo, para validar o descodificador e,
 // mais tarde, o tradutor. É a mesma disciplina que validou o motor de CPU:
@@ -17,9 +17,9 @@
 #include <string>
 #include <vector>
 
-#include "ia/gpu/maxwell_isa.hpp"
+#include "g610/gpu/maxwell_isa.hpp"
 
-namespace ia::gpu::maxwell {
+namespace g610::gpu::maxwell {
 
 // Um programa: uma lista de instruções e o cabeçalho que o Maxwell põe à
 // frente. O formato exacto do cabeçalho é o que se vai descobrir a seguir; por
@@ -61,4 +61,4 @@ Program make_program(const std::vector<maxwell::Insn>& code,
 // sabe se está no sítio certo.
 Program make_iscadd_shader();
 
-} // namespace ia::gpu::maxwell
+} // namespace g610::gpu::maxwell

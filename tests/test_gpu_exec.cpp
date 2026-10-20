@@ -229,14 +229,14 @@ constexpr VkDeviceSize kTamLeitura = VkDeviceSize(kLargura) * kAltura * 16;
 } // namespace
 
 int main(int argc, char** argv) {
-    std::string glsl_tradutor = (argc > 1) ? argv[1] : "/tmp/ia_min.frag";
+    std::string glsl_tradutor = (argc > 1) ? argv[1] : "/tmp/g610_min.frag";
 
     // ── 1. device ─────────────────────────────────────────────────────────
     std::printf("[1] abrir o device Vulkan\n");
 
     VkApplicationInfo app{};
     app.sType            = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    app.pApplicationName = "EdenMaliIA";
+    app.pApplicationName = "EdenMaliG610";
     app.apiVersion       = VK_API_VERSION_1_1;
 
     VkInstanceCreateInfo ici{};
@@ -440,8 +440,8 @@ int main(int argc, char** argv) {
     VK_CHECK(vkCreateFramebuffer(ctx.dev, &fbci, nullptr, &ctx.fb));
 
     std::vector<char> cod_vert;
-    check(compilar(kGlslVertice, "vert", "/tmp/ia_exec.vert.spv") &&
-              ler_ficheiro("/tmp/ia_exec.vert.spv", cod_vert),
+    check(compilar(kGlslVertice, "vert", "/tmp/g610_exec.vert.spv") &&
+              ler_ficheiro("/tmp/g610_exec.vert.spv", cod_vert),
           "o vertex shader compilou");
 
     VkShaderModuleCreateInfo smci{};
@@ -835,7 +835,7 @@ int main(int argc, char** argv) {
     // geometria, a rasterização e o readback estão bons — e o problema está
     // onde o tradutor toca. Se der 0, é este ficheiro que está errado.
     std::printf("\n[3] shader de CONTROLO (escrito a mao, sem o banco)\n");
-    const float controlo = desenhar(kGlslControlo, "/tmp/ia_exec.controlo.spv",
+    const float controlo = desenhar(kGlslControlo, "/tmp/g610_exec.controlo.spv",
                                     "controlo");
     check(std::fabs(controlo - kEsperadoControlo) < 1e-5f,
           "o shader de controlo devolveu 3.0 — a cena inteira funciona");
@@ -845,7 +845,7 @@ int main(int argc, char** argv) {
     // aritmética nenhuma. Se isto não der 1.0, o tradutor está inocente.
     std::printf("\n[3b] shader de CONTROLO do banco (le c[0][0x10], nada mais)\n");
     const float controlo_cbuf = desenhar(kGlslControloCbuf,
-                                         "/tmp/ia_exec.controlo_cbuf.spv",
+                                         "/tmp/g610_exec.controlo_cbuf.spv",
                                          "controlo do banco");
     check(std::fabs(controlo_cbuf - 1.0f) < 1e-5f,
           "o banco de constantes chega ao shader: c[0][0x10] leu 1.0");
@@ -859,7 +859,7 @@ int main(int argc, char** argv) {
         std::vector<char> lido;
         if (!ler_ficheiro(glsl_tradutor, lido)) {
             std::printf("  FALHOU: nao li o GLSL de %s\n"
-                        "           corre primeiro o ia_translate_test.\n",
+                        "           corre primeiro o g610_translate_test.\n",
                         glsl_tradutor.c_str());
             ++g_pass; ++g_fail;
             return 1;
@@ -870,7 +870,7 @@ int main(int argc, char** argv) {
     std::printf("\n[4] shader do TRADUTOR (%s)\n", glsl_tradutor.c_str());
     std::printf("       passo do array de constantes: %u bytes\n",
                 glsl_cbuf_stride_bytes());
-    const float obtido = desenhar(glsl, "/tmp/ia_exec.frag.spv", "tradutor");
+    const float obtido = desenhar(glsl, "/tmp/g610_exec.frag.spv", "tradutor");
 
     std::printf("       previsto = %.6f\n", kEsperado);
 
@@ -878,7 +878,7 @@ int main(int argc, char** argv) {
     // A regra está no backend e o teste não a repete: confirma-a. Se o layout
     // mudar um dia, isto falha com um número em vez de a imagem ficar preta e
     // ninguém perceber porquê.
-    check(run("spirv-dis /tmp/ia_exec.frag.spv | grep -q 'ArrayStride 16'") == 0,
+    check(run("spirv-dis /tmp/g610_exec.frag.spv | grep -q 'ArrayStride 16'") == 0,
           "o SPIR-V medido tem ArrayStride 16 (o passo que o backend usou)");
 
     check(std::fabs(obtido - kEsperado) < 1e-5f,

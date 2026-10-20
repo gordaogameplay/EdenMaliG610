@@ -1,4 +1,4 @@
-// EdenMaliIA — backend: IR -> GLSL.
+// EdenMaliG610 — backend: IR -> GLSL.
 //
 // Porquê GLSL e não SPIR-V: o `glslang` está instalado no Pi e faz
 // GLSL -> SPIR-V. Escrever um emissor de SPIR-V seria milhares de linhas para
@@ -9,13 +9,13 @@
 // tradutor de shaders que ninguém consegue ler não é um tradutor, é uma
 // máquina negra.
 
-#include "ia/gpu/ir.hpp"
+#include "g610/gpu/ir.hpp"
 
 #include <cstdio>
 #include <cstring>
 #include <sstream>
 
-namespace ia::gpu {
+namespace g610::gpu {
 
 namespace {
 
@@ -150,7 +150,7 @@ std::string to_glsl(const ir::Program& p) {
     // `#version 310 es` — ES 3.1 é o mínimo para UBO com array e para
     // `layout(location=)` na saída. É o que o Vulkan 1.4 do G610 quer.
     o << "#version 310 es\n";
-    o << "// Gerado por EdenMaliIA a partir de SASS Maxwell.\n";
+    o << "// Gerado por EdenMaliG610 a partir de SASS Maxwell.\n";
     o << "// Subconjunto minimo: sem texturas, sem controlo de fluxo.\n";
     o << "// Estagio: " << p.stage << "\n\n";
 
@@ -287,11 +287,11 @@ std::string to_glsl(const ir::Program& p) {
     return o.str();
 }
 
-} // namespace ia::gpu
+} // namespace g610::gpu
 
 // A parte de fora do anonimo, para o teste poder usar o mesmo número que o
 // backend usou. Um teste que recalcula a regra por conta própria está a
 // testar a sua própria cópia da regra, e não a regra.
 std::uint32_t glsl_cbuf_stride_bytes() noexcept {
-    return ::ia::gpu::cbuf_stride_bytes();
+    return ::g610::gpu::cbuf_stride_bytes();
 }

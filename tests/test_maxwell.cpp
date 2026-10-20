@@ -9,8 +9,8 @@
 #include <string>
 #include <vector>
 
-#include "ia/gpu/maxwell_isa.hpp"
-#include "ia/gpu/maxwell_program.hpp"
+#include "g610/gpu/maxwell_isa.hpp"
+#include "g610/gpu/maxwell_program.hpp"
 
 namespace {
 
@@ -30,7 +30,7 @@ void check(bool ok, const std::string& what) {
 } // namespace
 
 int main() {
-    using namespace ia::gpu::maxwell;
+    using namespace g610::gpu::maxwell;
 
     // ── 1. a tabela ──────────────────────────────────────────────────────
     std::printf("[1] tabela de opcodes\n");

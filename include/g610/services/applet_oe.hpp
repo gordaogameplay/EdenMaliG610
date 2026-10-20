@@ -12,7 +12,7 @@ namespace Core {
 class System;
 }
 
-namespace ia::services {
+namespace g610::services {
 
 // Regista o `appletOE` no `sm:` do sistema.
 //
@@ -21,4 +21,4 @@ namespace ia::services {
 // `lm` usam.
 void registar_applet_oe(Core::System& system);
 
-} // namespace ia::services
+} // namespace g610::services

@@ -1,7 +1,7 @@
-// EdenMaliIA — espaço de endereçamento do guest.
-#include "ia/guest_memory.hpp"
+// EdenMaliG610 — espaço de endereçamento do guest.
+#include "g610/guest_memory.hpp"
 
-#include "ia/nso_loader.hpp" // kGuestPageSize
+#include "g610/nso_loader.hpp" // kGuestPageSize
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -11,7 +11,7 @@
 #include <cstring>
 #include <utility>
 
-namespace ia {
+namespace g610 {
 
 int to_posix(Prot p) noexcept {
     int flags = 0;
@@ -174,4 +174,4 @@ std::uint8_t* GuestMemory::host_pointer(std::uint64_t addr, std::uint64_t size) 
     return reinterpret_cast<std::uint8_t*>(addr);
 }
 
-} // namespace ia
+} // namespace g610

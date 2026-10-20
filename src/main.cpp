@@ -1,4 +1,4 @@
-// EdenMaliIA — executor nativo de ROMs de Switch para RK3588 / Mali-G610.
+// EdenMaliG610 — executor nativo de ROMs de Switch para RK3588 / Mali-G610.
 //
 // Ponto de entrada. Faz três coisas, por ordem:
 //
@@ -19,18 +19,18 @@
 #include <string>
 #include <thread>
 
-#include "ia/gpu/maxwell_translator.hpp"
-#include "ia/patcher.hpp"
-#include "ia/guest_program.hpp"
-#include "ia/nso_loader.hpp"
-#include "ia/svc_dispatcher.hpp"
-#include "ia/telemetry.hpp"
+#include "g610/gpu/maxwell_translator.hpp"
+#include "g610/patcher.hpp"
+#include "g610/guest_program.hpp"
+#include "g610/nso_loader.hpp"
+#include "g610/svc_dispatcher.hpp"
+#include "g610/telemetry.hpp"
 
 namespace {
 
 void print_usage(const char* argv0) {
     std::cout
-        << "EdenMaliIA — executor nativo Switch -> RK3588\n\n"
+        << "EdenMaliG610 — executor nativo Switch -> RK3588\n\n"
         << "uso:\n"
         << "  " << argv0 << " doctor <main.nso> [--npdm <main.npdm>]\n"
         << "  " << argv0 << " exefs <exefs_dir>      programa multi-módulo\n"
@@ -53,7 +53,7 @@ std::string arg_value(int argc, char** argv, const char* flag, std::string def) 
 // ---------------------------------------------------------------------------
 // probe — o inventário do que a máquina consegue, medido.
 // ---------------------------------------------------------------------------
-void cmd_probe(ia::tel::Telemetry& tel) {
+void cmd_probe(g610::tel::Telemetry& tel) {
     std::cout << "\n══════ ambiente medido ══════\n";
 
     std::cout << "  CPU      : ";
@@ -106,8 +106,8 @@ int main(int argc, char** argv) {
     const std::string cmd = argv[1];
 
     // --- telemetria: ligada antes de tudo, para capturar também o arranque ---
-    ia::tel::Telemetry telemetry;
-    telemetry.set_output_dir("ia-telemetry");
+    g610::tel::Telemetry telemetry;
+    telemetry.set_output_dir("g610-telemetry");
     telemetry.set_frame_history(1800); // ~30 s a 60 fps
     telemetry.start("0000000000000000", cmd);
     telemetry.set_live_console(true);
@@ -139,7 +139,7 @@ int main(int argc, char** argv) {
             std::cerr << "uso: " << argv[0] << " exefs <exefs_dir>\n";
             return 2;
         }
-        ia::GuestProgram prog(telemetry);
+        g610::GuestProgram prog(telemetry);
         std::string err;
         if (!prog.load(argv[2], err)) {
             std::cerr << "\ncarregamento: " << err << "\n";
@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
             return 3;
         }
         std::cout << "\n══════ programa multi-módulo ══════\n" << prog.summary();
-        std::cout << "  heap base : 0x" << std::hex << ia::layout::kHeapBase << std::dec
+        std::cout << "  heap base : 0x" << std::hex << g610::layout::kHeapBase << std::dec
                   << " (SetHeapSize devolve este endereço)\n";
         std::cout << "\n  NOTA: o entry point é o do rtld, não o do main. O main\n"
                   << "  só corre quando o rtld o chama, depois de mapear a memória\n"
@@ -173,13 +173,13 @@ int main(int argc, char** argv) {
     // --- 1. NPDM: a decisão nativo vs JIT --------------------------------
     std::string npdm_path = arg_value(argc, argv, "--npdm", "");
     if (npdm_path.empty())
-        npdm_path = ia::NsoLoader::find_npdm(nso_path);
+        npdm_path = g610::NsoLoader::find_npdm(nso_path);
 
-    ia::LoadedModule mod;
+    g610::LoadedModule mod;
     std::string error;
 
     if (!npdm_path.empty()) {
-        if (!ia::NsoLoader{}.load_npdm(npdm_path, mod, error)) {
+        if (!g610::NsoLoader{}.load_npdm(npdm_path, mod, error)) {
             std::cerr << "NPDM: " << error << "\n";
         }
     } else {
@@ -204,7 +204,7 @@ int main(int argc, char** argv) {
               << "\n";
 
     // --- 2. carga do NSO ---------------------------------------------------
-    if (!ia::NsoLoader{}.load(nso_path, mod, error)) {
+    if (!g610::NsoLoader{}.load(nso_path, mod, error)) {
         std::cerr << "\nNSO: " << error << "\n";
         return 2;
     }
@@ -216,11 +216,11 @@ int main(int argc, char** argv) {
     std::cout << "  base      : 0x" << std::hex << mod.base << std::dec << "\n";
     std::cout << "  entry     : 0x" << std::hex << mod.entry_point << std::dec << "\n";
     std::cout << "  text      : " << mod.text_size()   << " bytes"
-              << (mod.segments[ia::kNsoText].compressed ? " (LZ4)" : "") << "\n";
+              << (mod.segments[g610::kNsoText].compressed ? " (LZ4)" : "") << "\n";
     std::cout << "  rodata    : " << mod.rodata_size() << " bytes"
-              << (mod.segments[ia::kNsoRodata].compressed ? " (LZ4)" : "") << "\n";
+              << (mod.segments[g610::kNsoRodata].compressed ? " (LZ4)" : "") << "\n";
     std::cout << "  data      : " << mod.data_size()   << " bytes"
-              << (mod.segments[ia::kNsoData].compressed ? " (LZ4)" : "") << "\n";
+              << (mod.segments[g610::kNsoData].compressed ? " (LZ4)" : "") << "\n";
     std::cout << "  bss       : " << mod.bss_size << " bytes\n";
     std::cout << "  imagem    : " << mod.image.size() << " bytes"
               << " (espaço virtual, com gaps)\n";
@@ -239,8 +239,8 @@ int main(int argc, char** argv) {
     // O entry point tem de estar dentro do segmento de texto: é o início do
     // código executável. Fora dele, o primeiro salto corre em dados.
     const bool entry_ok =
-        mod.entry_point >= mod.base + mod.segments[ia::kNsoText].vaddr &&
-        mod.entry_point < mod.base + mod.segments[ia::kNsoText].vaddr + mod.text_size();
+        mod.entry_point >= mod.base + mod.segments[g610::kNsoText].vaddr &&
+        mod.entry_point < mod.base + mod.segments[g610::kNsoText].vaddr + mod.text_size();
     std::cout << "  entry ok  : " << (entry_ok ? "sim" : "NÃO — fora de .text")
               << "\n";
 
@@ -249,17 +249,17 @@ int main(int argc, char** argv) {
     // A76 pode correr nativamente: os SVC passam a BRK (para o despachante
     // apanhar a trap) e os hints a NOP (um WFI bloquearia o guest à espera de
     // um evento que só o host pode tratar).
-    ia::StaticPatcher patcher(telemetry);
-    ia::PatchReport pr{};
+    g610::StaticPatcher patcher(telemetry);
+    g610::PatchReport pr{};
     // O patcher varre o `.text` no SEU offset dentro da imagem — que é o
     // vaddr do segmento, não 0. Nos módulos medidos o text começa em 0, mas
     // isso é propriedade deste jogo, não da formato: varrer de 0 arrastaria os
     // gaps e o começo da rodata para dentro da zona de código.
-    if (!mod.segment_inside(ia::kNsoText)) {
+    if (!mod.segment_inside(g610::kNsoText)) {
         std::cerr << "\npatch: o .text está fora da imagem do módulo\n";
         return 3;
     }
-    if (!patcher.patch(mod.image, mod.segments[ia::kNsoText].vaddr,
+    if (!patcher.patch(mod.image, mod.segments[g610::kNsoText].vaddr,
                        mod.text_size(), pr, error)) {
         std::cerr << "\npatch: " << error << "\n";
         return 3;
@@ -277,12 +277,12 @@ int main(int argc, char** argv) {
     }
 
     // --- 4. motor ----------------------------------------------------------
-    ia::SvcDispatcher svc(telemetry);
-    ia::gpu::MaxwellTranslator gpu(telemetry);
+    g610::SvcDispatcher svc(telemetry);
+    g610::gpu::MaxwellTranslator gpu(telemetry);
 
     std::cout << "\n══════ motor ══════\n";
     std::cout << "  SVC dispatcher    : activo ("
-              << sizeof(ia::SvcDispatcher) << " bytes de estado)\n";
+              << sizeof(g610::SvcDispatcher) << " bytes de estado)\n";
     std::cout << "  Maxwell->Valhall  : activo\n";
     std::cout << "  telemetria        : " << (native_ok ? "ligada" : "ligada (modo JIT not supported)")
               << "\n";

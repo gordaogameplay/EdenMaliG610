@@ -1,12 +1,12 @@
-// EdenMaliIA — implementação do carregador de NSO.
-#include "ia/nso_loader.hpp"
+// EdenMaliG610 — implementação do carregador de NSO.
+#include "g610/nso_loader.hpp"
 
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 
-namespace ia {
+namespace g610 {
 
 namespace fs = std::filesystem;
 
@@ -378,4 +378,4 @@ bool NsoLoader::load(const std::string& path, LoadedModule& out, std::string& er
     return true;
 }
 
-} // namespace ia
+} // namespace g610

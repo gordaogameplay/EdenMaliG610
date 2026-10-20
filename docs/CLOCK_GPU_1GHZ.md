@@ -236,7 +236,7 @@ EmuOS sobreviver ao 6.1.
 A Mali-G610 é uma tiler de **fill-rate** alto e largura de banda baixa, e o
 Pokémon Shield é limitado por fill rate. Neste caso o ganho de clock
 translaciona-se praticamente 1:1 em FPS. Acompanhar com o `gpu_ns` da
-telemetria do EdenMaliIA dá a confirmação directa: se o FPS subir ~17%, o
+telemetria do EdenMaliG610 dá a confirmação directa: se o FPS subir ~17%, o
 gargalo era mesmo a GPU e o clock era mesmo o travão.
 
 ## 7. Como confirmar que se chegou lá

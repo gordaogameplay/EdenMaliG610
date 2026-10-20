@@ -1,16 +1,16 @@
-// EdenMaliIA — programa guest multi-módulo.
-#include "ia/guest_program.hpp"
+// EdenMaliG610 — programa guest multi-módulo.
+#include "g610/guest_program.hpp"
 
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
 #include <filesystem>
 
-#include "ia/patcher.hpp"
+#include "g610/patcher.hpp"
 
 namespace fs = std::filesystem;
 
-namespace ia {
+namespace g610 {
 
 namespace {
 
@@ -550,4 +550,4 @@ std::string GuestProgram::summary() const {
     return out;
 }
 
-} // namespace ia
+} // namespace g610

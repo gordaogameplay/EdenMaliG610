@@ -1,4 +1,4 @@
-// EdenMaliIA — a ISA Maxwell, tal como a dapatmos medir.
+// EdenMaliG610 — a ISA Maxwell, tal como a dapatmos medir.
 //
 // Isto NÃO é documentação nem memória. É a tabela de 280 opcodes com os seus
 // padrões de bits, transcrita de `maxwell.inc` (ver a nota de proveniência no
@@ -20,7 +20,7 @@
 #include <cstdint>
 #include <string_view>
 
-namespace ia::gpu::maxwell {
+namespace g610::gpu::maxwell {
 
 // Uma palavra SASS de 64 bits.
 using Insn = std::uint64_t;
@@ -36,7 +36,7 @@ struct OpcodePattern {
 // chance de o confirmar contra a tabela.
 enum class Op : std::uint16_t {
 #define MOP(name, cute, mask, value) name,
-#include "ia/gpu/maxwell_isa.inc"
+#include "g610/gpu/maxwell_isa.inc"
 #undef MOP
     Invalid = 0xFFFF,
 };
@@ -62,4 +62,4 @@ OpcodePattern pattern_of(Op op) noexcept;
 // ninguém dar conta é uma tabela que ninguém conhece.
 std::size_t opcode_count() noexcept;
 
-} // namespace ia::gpu::maxwell
+} // namespace g610::gpu::maxwell

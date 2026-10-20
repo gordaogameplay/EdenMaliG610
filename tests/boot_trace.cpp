@@ -1,4 +1,4 @@
-// EdenMaliIA — traçador do arranque real.
+// EdenMaliG610 — traçador do arranque real.
 //
 // O rtld é código nativo AArch64 e está pronto a correr. A questão é: que
 // serviços é que ele pede, e por que ordem? Esta é a forma de responder —
@@ -33,11 +33,11 @@
 #include <signal.h>
 #include <ucontext.h>
 
-#include "ia/guest_program.hpp"
-#include "ia/guest_memory.hpp"
-#include "ia/native_engine.hpp"
-#include "ia/svc_dispatcher.hpp"
-#include "ia/telemetry.hpp"
+#include "g610/guest_program.hpp"
+#include "g610/guest_memory.hpp"
+#include "g610/native_engine.hpp"
+#include "g610/svc_dispatcher.hpp"
+#include "g610/telemetry.hpp"
 
 namespace {
 
@@ -77,9 +77,9 @@ constexpr std::size_t kMaxCalls = 400;
 // O sinal e' entregue ao processo e, como o guest corre na sua propria stack,
 // o handler ve' o contexto do GUEST. E' o mesmo mecanismo dos SVC, visto por um
 // caminho diferente.
-using GuestKind = ia::GuestModule::Kind;
+using GuestKind = g610::GuestModule::Kind;
 
-const ia::GuestModule* find(const ia::GuestProgram& p, GuestKind k) {
+const g610::GuestModule* find(const g610::GuestProgram& p, GuestKind k) {
     for (const auto& m : p.modules())
         if (m.kind == k)
             return &m;
@@ -93,12 +93,12 @@ static bool g_hooks_dump_slots = false;
 static bool g_slots_quiet = false;
 static std::vector<std::uint64_t> g_slot_offsets;
 // Ponteiros que o observer usa para ler memória do guest. Postos pelo main.
-static ia::GuestMemory* g_mem = nullptr;
+static g610::GuestMemory* g_mem = nullptr;
 
 // O programa, para o observer poder percorrer os modulos e varrer o .text
 // quando o guest aborta. Sem simbolos, achar quem chamou a funcao que
 // abortou e a unica forma de saber o que falhou.
-static const ia::GuestProgram* g_prog = nullptr;
+static const g610::GuestProgram* g_prog = nullptr;
 static std::string g_scratch;
 
 static volatile int g_samples = 0;
@@ -171,12 +171,12 @@ void on_trap(int sig, std::uint64_t pc, std::uint64_t sp, void* user) {
 // (o vector) e num buffer fixo. Nenhuma alocação, nenhum printf.
 static volatile int g_svcs = 0;
 
-void on_svc(std::uint32_t number, ia::SvcContext& ctx, std::uint64_t pc,
+void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
             std::uint64_t sp, void* user) {
     ++g_svcs;
     SvcCall c{};
     c.number = number;
-    c.name   = ia::to_string(static_cast<ia::Svc>(number));
+    c.name   = g610::to_string(static_cast<g610::Svc>(number));
     for (int i = 0; i < 6; ++i)
         c.x[i] = ctx.x[i];
     c.pc = pc;
@@ -259,7 +259,7 @@ void on_svc(std::uint32_t number, ia::SvcContext& ctx, std::uint64_t pc,
         std::string e;
         if (g_mem->read(inicio, janela, sizeof janela, e)) {
             char caminho[64];
-            std::snprintf(caminho, sizeof caminho, "/tmp/ia_break_%llx.bin",
+            std::snprintf(caminho, sizeof caminho, "/tmp/g610_break_%llx.bin",
                           (unsigned long long)inicio);
             std::FILE* f = std::fopen(caminho, "wb");
             if (f != nullptr) {
@@ -459,7 +459,7 @@ void on_svc(std::uint32_t number, ia::SvcContext& ctx, std::uint64_t pc,
                 if (!g_mem->read(inicio, janela, sizeof janela, e))
                     continue;
                 char caminho[64];
-                std::snprintf(caminho, sizeof caminho, "/tmp/ia_chamador_%llx.bin",
+                std::snprintf(caminho, sizeof caminho, "/tmp/g610_chamador_%llx.bin",
                               (unsigned long long)inicio);
                 std::FILE* f = std::fopen(caminho, "wb");
                 if (f == nullptr)
@@ -492,7 +492,7 @@ void on_svc(std::uint32_t number, ia::SvcContext& ctx, std::uint64_t pc,
                 if (!g_mem->read(inicio, janela, sizeof janela, e))
                     continue;
                 char caminho[64];
-                std::snprintf(caminho, sizeof caminho, "/tmp/ia_chamador_%llx.bin",
+                std::snprintf(caminho, sizeof caminho, "/tmp/g610_chamador_%llx.bin",
                               (unsigned long long)inicio);
                 auto cod_de = [&](std::size_t i) {
                     return static_cast<std::uint32_t>(janela[i * 4]) |
@@ -656,12 +656,12 @@ int main(int argc, char** argv) {
     std::printf("══════ arranque real do rtld ══════\n");
     std::printf("  exefs: %s\n\n", exefs.c_str());
 
-    ia::tel::Telemetry tel;
+    g610::tel::Telemetry tel;
     tel.set_live_console(false);
     tel.start("0000000000000000", "boot-trace");
 
     // ── 1. carregar e mapear ──────────────────────────────────────────────
-    ia::GuestProgram prog(tel);
+    g610::GuestProgram prog(tel);
     std::string err;
 
     // O rtld recebe argv[0] como primeiro argumento. Sem isto lê lixo.
@@ -799,7 +799,7 @@ int main(int argc, char** argv) {
 
     // ── despejar o .text de um modulo ──────────────────────────────────────
     //
-    // `IA_DUMP_TEXT=rtld` escreve o `.text` do modulo em `/tmp/ia_<nome>.text`,
+    // `IA_DUMP_TEXT=rtld` escreve o `.text` do modulo em `/tmp/g610_<nome>.text`,
     // para desassemblar com o objdump do host. É a forma de trabalhar com
     // 15 KB de código em vez de 64 bytes de cada vez.
     if (const char* dump_alvo = std::getenv("IA_DUMP_TEXT")) {
@@ -812,7 +812,7 @@ int main(int argc, char** argv) {
             if (tam == 0 || ini + tam > img.size())
                 continue;
             char caminho[128];
-            std::snprintf(caminho, sizeof caminho, "/tmp/ia_%s.text", module.name());
+            std::snprintf(caminho, sizeof caminho, "/tmp/g610_%s.text", module.name());
             std::FILE* f = std::fopen(caminho, "wb");
             if (f == nullptr)
                 continue;
@@ -827,7 +827,7 @@ int main(int argc, char** argv) {
     // ── o modulo `main`, em binario ─────────────────────────────────────────
     //
     // `IA_DUMP_MAIN` escreve o `.text` do modulo `main` em
-    // `/tmp/ia_main.text`. E' o **proprio jogo**, e a unica forma de ver o
+    // `/tmp/g610_main.text`. E' o **proprio jogo**, e a unica forma de ver o
     // que ele chama sem um debugger.
     if (const char* dump_main = std::getenv("IA_DUMP_MAIN")) {
         for (const auto& module : prog.modules()) {
@@ -838,12 +838,12 @@ int main(int argc, char** argv) {
             const std::size_t tam = static_cast<std::size_t>(module.nso.segments[0].size);
             if (tam == 0 || ini + tam > img.size())
                 continue;
-            std::FILE* f = std::fopen("/tmp/ia_main.text", "wb");
+            std::FILE* f = std::fopen("/tmp/g610_main.text", "wb");
             if (f == nullptr)
                 continue;
             std::fwrite(img.data() + ini, 1, tam, f);
             std::fclose(f);
-            std::printf("[dump] main: %zu bytes em /tmp/ia_main.text (base 0x%llx)\n", tam,
+            std::printf("[dump] main: %zu bytes em /tmp/g610_main.text (base 0x%llx)\n", tam,
                         static_cast<unsigned long long>(module.vaddr_base +
                                                      module.nso.segments[0].vaddr));
         }
@@ -852,7 +852,7 @@ int main(int argc, char** argv) {
     // ── despejar a imagem completa de um modulo ────────────────────────────
     //
     // `IA_DUMP_MODULE=sdk` escreve a imagem inteira do modulo (cabeçalho
-    // NSO, segmentos e tudo) em `/tmp/ia_<nome>.nso`, para se poder analysar
+    // NSO, segmentos e tudo) em `/tmp/g610_<nome>.nso`, para se poder analysar
     // a tabela de simbolos dinamicos sem um debugger.
     if (const char* dump_modulo = std::getenv("IA_DUMP_MODULE")) {
         for (const auto& module : prog.modules()) {
@@ -860,7 +860,7 @@ int main(int argc, char** argv) {
                 continue;
             const auto& img = module.nso.image;
             char caminho[128];
-            std::snprintf(caminho, sizeof caminho, "/tmp/ia_%s.nso", module.name());
+            std::snprintf(caminho, sizeof caminho, "/tmp/g610_%s.nso", module.name());
             std::FILE* f = std::fopen(caminho, "wb");
             if (f == nullptr)
                 continue;
@@ -873,7 +873,7 @@ int main(int argc, char** argv) {
             // Um ficheiro ao lado com a geometria: sem os offsets dos
             // segmentos e da dynsym, a imagem dumpada nao se pode analysar.
             char geom[128];
-            std::snprintf(geom, sizeof geom, "/tmp/ia_%s.geom", module.name());
+            std::snprintf(geom, sizeof geom, "/tmp/g610_%s.geom", module.name());
             std::FILE* g = std::fopen(geom, "w");
             if (g != nullptr) {
                 std::fprintf(g, "base 0x%llx\\n", static_cast<unsigned long long>(module.vaddr_base));
@@ -965,10 +965,10 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(texto));
     }
 
-    ia::SvcDispatcher svc(tel);
+    g610::SvcDispatcher svc(tel);
     svc.bind_memory(&prog.memory());
-    svc.set_heap_base(ia::layout::kHeapBase);
-    svc.set_alias_region(ia::layout::kAliasBase, ia::layout::kAliasSize);
+    svc.set_heap_base(g610::layout::kHeapBase);
+    svc.set_alias_region(g610::layout::kAliasBase, g610::layout::kAliasSize);
     svc.set_memory_totals(prog.memory().base() + prog.memory().size(),
                           prog.modules().empty()
                               ? 0
@@ -976,7 +976,7 @@ int main(int argc, char** argv) {
     svc.set_system_resource_size(prog.modules().empty()
                                      ? 0
                                      : prog.modules().front().nso.system_resource_size);
-    svc.set_stack_region(ia::layout::kStackBase, ia::layout::kStackSize);
+    svc.set_stack_region(g610::layout::kStackBase, g610::layout::kStackSize);
     // A prioridade da thread principal vem do NPDM (`main_thread_priority`).
     if (!prog.modules().empty())
         svc.set_main_thread_priority(prog.modules().front().nso.main_thread_priority);
@@ -1023,13 +1023,13 @@ int main(int argc, char** argv) {
         std::printf("\n══════ regiões (svcQueryMemory) ══════\n");
         std::uint64_t prev_end = 0;
         for (const auto& r : svc.regions()) {
-            const char* st = r.state == ia::GuestRegion::kCode   ? "Code"
-                             : r.state == ia::GuestRegion::kNormal ? "Normal"
-                             : r.state == ia::GuestRegion::kStatic ? "Static"
+            const char* st = r.state == g610::GuestRegion::kCode   ? "Code"
+                             : r.state == g610::GuestRegion::kNormal ? "Normal"
+                             : r.state == g610::GuestRegion::kStatic ? "Static"
                                                                    : "?";
-            const char* pm = r.permission == ia::GuestRegion::kReadExec ? "R-X"
-                             : r.permission == ia::GuestRegion::kReadOnly  ? "R--"
-                             : r.permission == ia::GuestRegion::kReadWrite ? "RW-"
+            const char* pm = r.permission == g610::GuestRegion::kReadExec ? "R-X"
+                             : r.permission == g610::GuestRegion::kReadOnly  ? "R--"
+                             : r.permission == g610::GuestRegion::kReadWrite ? "RW-"
                                                                           : "---";
             const bool gap = prev_end != 0 && r.base != prev_end;
             std::printf("  0x%012llx .. 0x%012llx  %-7s %s%s\n",
@@ -1042,7 +1042,7 @@ int main(int argc, char** argv) {
     }
 
     // ── 3. motor, com o traçador ligado ───────────────────────────────────
-    ia::NativeEngine engine(tel, svc);
+    g610::NativeEngine engine(tel, svc);
 
     // ── a camada de IPC do Eden ───────────────────────────────────────────
     //
@@ -1068,15 +1068,15 @@ int main(int argc, char** argv) {
     }
 
     // O bloco de TLS do guest só existe depois de `map_into()`.
-    engine.set_guest_tls(ia::layout::kTlsBase);
-    svc.set_eden_tls(ia::layout::kTlsBase);
+    engine.set_guest_tls(g610::layout::kTlsBase);
+    svc.set_eden_tls(g610::layout::kTlsBase);
 
-    // O x1 do entry point: o handle da thread principal. Ver `ia_call_guest.S`.
+    // O x1 do entry point: o handle da thread principal. Ver `g610_call_guest.S`.
     engine.set_guest_x1(svc.main_thread_handle());
     std::printf("  handle da thread principal: 0x%x\n", svc.main_thread_handle());
 
     // O bloco de TLS do guest só existe depois de `map_into()`.
-    engine.set_guest_tls(ia::layout::kTlsBase);
+    engine.set_guest_tls(g610::layout::kTlsBase);
     // Poucos traps: este tracer é para ver os PRIMEIROS serviços pedidos, e
     // um guest em spin de código não levanta traps nenhum. O limite não o
     // apanha, mas garante que o programa acaba e imprime relatório — em vez
@@ -1183,9 +1183,9 @@ int main(int argc, char** argv) {
     // Lê-se o conteúdo do slot e compara-se com o que o ficheiro NSO traz
     // nesse offset. Se forem diferentes, alguém tinha de o reescrever.
     if (g_hooks_dump_slots) {
-        const ia::GuestModule* rtld = nullptr;
+        const g610::GuestModule* rtld = nullptr;
         for (const auto& m : prog.modules())
-            if (m.kind == ia::GuestModule::kRtld)
+            if (m.kind == g610::GuestModule::kRtld)
                 rtld = &m;
         for (std::uint64_t off : g_slot_offsets) {
             std::uint8_t v[8];
@@ -1218,7 +1218,7 @@ int main(int argc, char** argv) {
     // ninguém sabe onde".
     std::printf("\n══════ metadata NSO (onde o rtld procura os símbolos) ══════\n");
     for (const auto& m : prog.modules()) {
-        const ia::NsoHeader* h = m.nso.nso_header();
+        const g610::NsoHeader* h = m.nso.nso_header();
         if (h == nullptr) {
             std::printf("  %-6s sem cabeçalho NSO guardado\n", m.name());
             continue;
@@ -1283,7 +1283,7 @@ int main(int argc, char** argv) {
     }
 
     trace("\n[boot] a entrar no rtld...\n");
-    const ia::RunResult r =
+    const g610::RunResult r =
         engine.run(reinterpret_cast<void (*)()>(entry), sp);
 
     {
@@ -1296,10 +1296,10 @@ int main(int argc, char** argv) {
     std::printf("  parou por   : %s\n",
                 r.error.empty() ? "(sem erro)" : r.error.c_str());
     std::printf("  última trap : %s\n",
-                r.last_trap == ia::TrapKind::GuestFault ? "fault de memória"
-                : r.last_trap == ia::TrapKind::SvcCall   ? "SVC"
-                : r.last_trap == ia::TrapKind::Breakpoint ? "breakpoint"
-                : r.last_trap == ia::TrapKind::Yield     ? "yield"
+                r.last_trap == g610::TrapKind::GuestFault ? "fault de memória"
+                : r.last_trap == g610::TrapKind::SvcCall   ? "SVC"
+                : r.last_trap == g610::TrapKind::Breakpoint ? "breakpoint"
+                : r.last_trap == g610::TrapKind::Yield     ? "yield"
                                                           : "nenhuma");
     std::printf("  svc_calls   : %llu\n", (unsigned long long)r.svc_calls);
     std::printf("  traps       : %llu\n", (unsigned long long)r.traps);
@@ -1325,9 +1325,9 @@ int main(int argc, char** argv) {
         {
             std::uint8_t blk[0x200];
             std::string e2;
-            if (prog.memory().read(ia::layout::kTlsBase, blk, sizeof blk, e2)) {
+            if (prog.memory().read(g610::layout::kTlsBase, blk, sizeof blk, e2)) {
                 std::printf("  bloco TLS em 0x%012llx:\n",
-                            (unsigned long long)ia::layout::kTlsBase);
+                            (unsigned long long)g610::layout::kTlsBase);
                 for (int o = 0x1C0; o < 0x200; o += 16) {
                     std::string hexs;
                     for (int k = 0; k < 16; ++k) {
@@ -1451,7 +1451,7 @@ int main(int argc, char** argv) {
     std::printf("  serviços distintos: %zu\n", agg.size());
     for (auto& a : agg)
         std::printf("    0x%02x %-24s %zu vez%s\n", a.n,
-                    ia::to_string(static_cast<ia::Svc>(a.n)).c_str(),
+                    g610::to_string(static_cast<g610::Svc>(a.n)).c_str(),
                     a.count, a.count == 1 ? "" : "es");
 
     trace("\n[boot] fim\n");

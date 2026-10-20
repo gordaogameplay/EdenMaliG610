@@ -1,4 +1,4 @@
-// EdenMaliIA — o IR dos shaders, para o subconjunto mínimo.
+// EdenMaliG610 — o IR dos shaders, para o subconjunto mínimo.
 //
 // O que este IR é: a forma intermédia entre SASS Maxwell e GLSL. É pequeno de
 // propósito — cobre só as operações de que um fragment shader sem texturas
@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-namespace ia::gpu::ir {
+namespace g610::gpu::ir {
 
 // Tipos que um registo Maxwell pode ter.
 //
@@ -106,4 +106,4 @@ struct Program {
     std::size_t unsupported = 0;
 };
 
-} // namespace ia::gpu::ir
+} // namespace g610::gpu::ir

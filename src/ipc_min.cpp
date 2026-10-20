@@ -53,13 +53,13 @@
 // receber uma resposta vazia — e isso tem de ser dito quando acontecer, não
 // descoberto depois.
 
-#include "ia/svc_dispatcher.hpp"
+#include "g610/svc_dispatcher.hpp"
 
-#include "ia/eden_bridge.hpp"
+#include "g610/eden_bridge.hpp"
 
 #include <cstdlib>
 
-namespace ia {
+namespace g610 {
 namespace {
 
 // Onde acaba a MessageBuffer.
@@ -824,4 +824,4 @@ KObject* SvcDispatcher::object_for_handle(std::uint32_t handle) const {
     return const_cast<SvcDispatcher*>(this)->handles_.obter(Handle{handle});
 }
 
-} // namespace ia
+} // namespace g610

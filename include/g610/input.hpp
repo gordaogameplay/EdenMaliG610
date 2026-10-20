@@ -1,4 +1,4 @@
-// EdenMaliIA — input do guest.
+// EdenMaliG610 — input do guest.
 //
 // O guest é um jogo de Nintendo. Os botões que ele vê não são os do teclado, nem
 // os do(evdev), nem os que o SDL chama — são os do Switch: A, B, X, Y, L, R,
@@ -20,7 +20,7 @@
 //
 // O SDL segue a convenção da PlayStation: o seu `A` é o `BTN_SOUTH`, que é o
 // botão de BAIXO, que na Nintendo é o **B**. Medido no Orange Pi 5 Pro com
-// `ia_input`:
+// `g610_input`:
 //
 //     A       <- BTN_SOUTH
 //     B       <- BTN_EAST
@@ -48,7 +48,7 @@
 #include <cstdint>
 #include <string>
 
-namespace ia::input {
+namespace g610::input {
 
 // Os botões do Switch, na nomenclatura que o guest espera.
 enum class Button : std::uint8_t {
@@ -142,4 +142,4 @@ private:
     State  prev_{};
 };
 
-} // namespace ia::input
+} // namespace g610::input

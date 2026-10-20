@@ -53,7 +53,7 @@
 #include <cstring>
 #include <string>
 
-#include "ia/guest_memory.hpp"
+#include "g610/guest_memory.hpp"
 #include "vendor/eden/common/common_types.h"   // VAddr, u8
 #include "vendor/eden/common/typed_address.h"  // Common::ProcessAddress
 
@@ -82,7 +82,7 @@ public:
     // A assinatura muda, e é o único ponto em que a ponte não bate com o
     // Eden. Compila porque ninguém do lado vendorizado constrói esta classe:
     // quem a constrói é o `KProcess` da ponte.
-    explicit Memory(::ia::GuestMemory& memoria) : memoria_(memoria) {}
+    explicit Memory(::g610::GuestMemory& memoria) : memoria_(memoria) {}
 
     Memory(const Memory&) = delete;
     Memory& operator=(const Memory&) = delete;
@@ -244,7 +244,7 @@ public:
     }
 
 private:
-    ::ia::GuestMemory& memoria_;
+    ::g610::GuestMemory& memoria_;
 };
 
 

@@ -1,7 +1,7 @@
-// EdenMaliIA — implementação do despachante de SVC.
-#include "ia/svc_dispatcher.hpp"
+// EdenMaliG610 — implementação do despachante de SVC.
+#include "g610/svc_dispatcher.hpp"
 
-#include "ia/eden_bridge.hpp"
+#include "g610/eden_bridge.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -9,7 +9,7 @@
 #include <cstring>
 #include <thread>
 
-namespace ia {
+namespace g610 {
 
 namespace {
 std::uint64_t host_tick_ns() {
@@ -862,4 +862,4 @@ Result SvcDispatcher::svc_unsupported(SvcContext&) {
     return Result::Unsupported;
 }
 
-} // namespace ia
+} // namespace g610

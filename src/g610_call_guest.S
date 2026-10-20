@@ -1,4 +1,4 @@
-/* EdenMaliIA — entrada no guest.
+/* EdenMaliG610 — entrada no guest.
  *
  * Troca o registo de stack pelo do guest e salta para o código do guest. A
  * partir daí o código AArch64 corre nativamente no Cortex-A76: sem tradução,
@@ -63,11 +63,11 @@
  * registos callee-saved. Nesse caminho o canário de `run()` é válido.
  *
  * O caso patológico é o guest fazer `ret` sem ExitProcess. Para que também
- * ele passe pelo mecanismo de recuperação, `ia_call_guest` empurra para a
- * stack do guest o endereço de `ia_guest_returned`:
+ * ele passe pelo mecanismo de recuperação, `g610_call_guest` empurra para a
+ * stack do guest o endereço de `g610_guest_returned`:
  *
- *   guest faz `ret`   -> salta para ia_guest_returned
- *   ia_guest_returned -> brk #0xFFFD
+ *   guest faz `ret`   -> salta para g610_guest_returned
+ *   g610_guest_returned -> brk #0xFFFD
  *   handler           -> escreve sp = recovery_sp, pc = recovery_pc
  *   recovery_pc       -> siglongjmp de volta a run()
  *
@@ -81,7 +81,7 @@
  * guest vai ler quando fizer `ret`.
  */
 
-/* void ia_call_guest(void (*code)(), unsigned long sp, unsigned long platform_reg,
+/* void g610_call_guest(void (*code)(), unsigned long sp, unsigned long platform_reg,
  *                    unsigned long guest_x1)
  *
  * x0 = endereço de entrada do guest
@@ -111,13 +111,13 @@
  * A medição que levou aqui: o `g_OsBootParamter` do SDK estava todo a zeros, e
  * o dono do mutex também.
  */
-.section .text.ia_call_guest, "ax", %progbits
-.global ia_call_guest
-.type ia_call_guest, %function
-ia_call_guest:
+.section .text.g610_call_guest, "ax", %progbits
+.global g610_call_guest
+.type g610_call_guest, %function
+g610_call_guest:
     /* Endereço para onde um `ret` do guest deve cair. */
-    adrp    x4, ia_guest_returned
-    add     x4, x4, :lo12:ia_guest_returned
+    adrp    x4, g610_guest_returned
+    add     x4, x4, :lo12:g610_guest_returned
 
     /* Duas palavras de 16 bytes abaixo do topo da stack do guest. Subtrair
      * 16 (e não 8) preserva o alinhamento a 16 exigido pela AAPCS64.
@@ -203,22 +203,22 @@ ia_call_guest:
     ldr     x1,  [sp]         /* o handle da thread principal (ver o cabecalho) */
     ldr     x17, [sp, #-32]   /* endereço de entrada ([sp-32], nao [sp-16]) */
     br      x17
-.size ia_call_guest, . - ia_call_guest
+.size g610_call_guest, . - g610_call_guest
 
 /* ---------------------------------------------------------------------------
- * ia_guest_returned — o guest fez `ret` sem ter chamado ExitProcess
+ * g610_guest_returned — o guest fez `ret` sem ter chamado ExitProcess
  *
  * Só é alcançado por um `ret` do guest que consuma o endereço que
- * `ia_call_guest` deixou na stack. Produz uma trap em vez de saltar para o
+ * `g610_call_guest` deixou na stack. Produz uma trap em vez de saltar para o
  * vazio, para que o handler tenha uma saída limpa e o relatório diga o que
  * aconteceu.
  * --------------------------------------------------------------------------- */
-.section .text.ia_guest_returned, "ax", %progbits
-.global ia_guest_returned
-.type ia_guest_returned, %function
-ia_guest_returned:
+.section .text.g610_guest_returned, "ax", %progbits
+.global g610_guest_returned
+.type g610_guest_returned, %function
+g610_guest_returned:
     /* BRK #0xFFFD — o handler reconhece como "o guest regressou". */
     brk     #0xFFFD
-.size ia_guest_returned, . - ia_guest_returned
+.size g610_guest_returned, . - g610_guest_returned
 
 .section .note.GNU-stack, "", %progbits

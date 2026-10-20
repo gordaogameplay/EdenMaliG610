@@ -1,4 +1,4 @@
-// EdenMaliIA — frontend: SASS Maxwell -> IR, para o subconjunto mínimo.
+// EdenMaliG610 — frontend: SASS Maxwell -> IR, para o subconjunto mínimo.
 //
 // A codificação dos operandos não é de memória. Sai de três ficheiros do
 // Eden, e cada campo tem a sua fonte:
@@ -35,13 +35,13 @@
 // que torna `ISCADD Rd, RZ, c[bank][off]` a forma canónica de carregar uma
 // constante — o `0 << escala` desaparece e sobra a constante.
 
-#include "ia/gpu/ir.hpp"
-#include "ia/gpu/maxwell_isa.hpp"
-#include "ia/gpu/maxwell_program.hpp"
+#include "g610/gpu/ir.hpp"
+#include "g610/gpu/maxwell_isa.hpp"
+#include "g610/gpu/maxwell_program.hpp"
 
 #include <cstring>
 
-namespace ia::gpu {
+namespace g610::gpu {
 
 namespace {
 
@@ -288,4 +288,4 @@ ir::Program translate(const maxwell::Program& prog) {
     return out;
 }
 
-} // namespace ia::gpu
+} // namespace g610::gpu

@@ -1,4 +1,4 @@
-# EdenMaliIA — execução nativa de ROMs de Switch no RK3588
+# EdenMaliG610 — execução nativa de ROMs de Switch no RK3588
 
 ## O que é
 
@@ -118,12 +118,12 @@ do `main`, que é o start normal do C++.
 
 | Componente | Ficheiro | Estado |
 |---|---|---|
-| Descodificação de instruções | `include/ia/instructions.hpp` | feito, 25 asserts |
+| Descodificação de instruções | `include/g610/instructions.hpp` | feito, 25 asserts |
 | Patcher estático | `src/patcher.cpp` | feito, validado no `main` real |
-| Layout do contexto verificado | `include/ia/context_offsets.hpp` | feito, 16 asserts |
-| Trampoline de entrada/saída | `src/ia_trampoline.S` | feito, compila |
+| Layout do contexto verificado | `include/g610/context_offsets.hpp` | feito, 16 asserts |
+| Trampoline de entrada/saída | `src/g610_trampoline.S` | feito, compila |
 | Handlers de trap | `src/native_engine.cpp` | feito, não testado em execução |
-| Spinlock de ThreadParameters | `src/ia_trampoline.S` | feito |
+| Spinlock de ThreadParameters | `src/g610_trampoline.S` | feito |
 | Page tables de 39 bits + fastmem | — | por fazer |
 
 **95 testes, 0 falhas.**
@@ -160,7 +160,7 @@ Por frame, o tempo é decomposto em `cpu`, `gpu`, `translate`, `shader`,
 - **Consola**: uma linha por segundo (não por frame — a 60 fps enche o ecrã e
   esconde a informação).
 
-Saída: `ia-telemetry/<tag>_<frames>.json` e `<tag>.csv`.
+Saída: `g610-telemetry/<tag>_<frames>.json` e `<tag>.csv`.
 
 ## Uso
 
@@ -168,10 +168,10 @@ Saída: `ia-telemetry/<tag>_<frames>.json` e `<tag>.csv`.
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-./build/ia probe                       # inventário do hardware
-./build/ia doctor <main> [--npdm ...]  # diagnostico do programa
-./build/ia run <main> [--npdm ...]     # execução com telemetria
-./build/ia_tests                       # 51 testes
+./build/g610 probe                       # inventário do hardware
+./build/g610 doctor <main> [--npdm ...]  # diagnostico do programa
+./build/g610 run <main> [--npdm ...]     # execução com telemetria
+./build/g610_tests                       # 51 testes
 ```
 
 ## Honestidade sobre o estado
@@ -294,7 +294,7 @@ O guest não é um jogo: é o menor programa que exercita o caminho todo —
 aritmética nativa, trap por SVC, argumentos que atravessam, resultado que
 volta, execução que continua, `ExitProcess` que termina.
 
-**109 verificações no total** (96 em `ia_tests`, 13 em `ia_exec`), 0 falhas.
+**109 verificações no total** (96 em `g610_tests`, 13 em `g610_exec`), 0 falhas.
 
 ### O mecanismo, em três passos
 
@@ -357,7 +357,7 @@ um teste que verifica o que se supõe, em vez do que é, não apanha nada.
 saída do programa — morria antes do primeiro `printf`.
 
 **Causa**: `run()` é C++ compilado com `-fstack-protector-strong` (o default
-do Ubuntu). `ia_call_guest` faz `mov sp, sp_do_guest`; se a execução voltar a
+do Ubuntu). `g610_call_guest` faz `mov sp, sp_do_guest`; se a execução voltar a
 `run()` por um caminho que não restaure `sp`, o epílogo verifica o canário
 numa stack que não é a sua.
 
@@ -366,12 +366,12 @@ guest clobbera x19, e a verificação acontece no regresso, com o canário já
 inalcançável. Reproduzido em todas as variantes.
 
 **Solução**: tornar o regresso patológico também uma trap, para que passe
-pelo mesmo mecanismo dos restantes. `ia_call_guest` empurra o endereço de
-`ia_guest_returned` para a stack do guest:
+pelo mesmo mecanismo dos restantes. `g610_call_guest` empurra o endereço de
+`g610_guest_returned` para a stack do guest:
 
 ```
-guest faz `ret`        -> salta para ia_guest_returned
-ia_guest_returned      -> brk #0xFFFD
+guest faz `ret`        -> salta para g610_guest_returned
+g610_guest_returned      -> brk #0xFFFD
 handler                -> escreve sp = recovery_sp, pc = recovery_pc
 recovery_pc            -> siglongjmp de volta a run()
 ```
@@ -563,7 +563,7 @@ Porquê estes números e não outros:
   instruções.
 
 Todos os pares de regiões são verificados na planarização, e o teste
-`ia_program` também. Uma sobreposição aqui não dá erro na carga: dá
+`g610_program` também. Uma sobreposição aqui não dá erro na carga: dá
 corruption silenciosa muito mais tarde, num SVC que escreve por cima de uma
 instrução — o pior tipo de bug.
 
@@ -623,7 +623,7 @@ gap       : 3328 bytes antes de rodata
 gap       : 784 bytes antes de data
 ```
 
-E o `ia_program` verifica, lendo **do endereço do guest**, que `.text` e
+E o `g610_program` verifica, lendo **do endereço do guest**, que `.text` e
 `.rodata` estão nos sítios certos:
 
 ```
@@ -697,7 +697,7 @@ continuava a correr.
 ### Como foi encontrado
 
 Ao implementares `MapMemory` fui ver os números no Eden, e `ExitProcess = 0x03`
-não estava lá. O `ia_exec` já falhava por isto — o guest sintético usava
+não estava lá. O `g610_exec` já falhava por isto — o guest sintético usava
 `svc #3` e o teste de execução já não passava. O teste estava a passar antes
 porque testava o que o código fazia, não o que o guest pedia.
 
@@ -861,8 +861,8 @@ O teste que teria apanhado o `SetHeapSize` a devolver 0 é um que verifica
 
 ## 22. Instrumentação: traçar o arranque real
 
-O guest sintético (`ia_exec`) valida o mecanismo. Não diz o que um jogo real
-precisa. Para isso construí `ia_boot`, que corre o **rtld real** e reporta.
+O guest sintético (`g610_exec`) valida o mecanismo. Não diz o que um jogo real
+precisa. Para isso construí `g610_boot`, que corre o **rtld real** e reporta.
 
 O que se aprendeu ao construir isto:
 
@@ -898,7 +898,7 @@ Oito amostras, o mesmo PC. Era um `b .` — branch para si próprio. Um spin.
 
 ### 3. Desassemblar sem debugger
 
-`ia_boot --raw <ficheiro>` escreve a imagem do entry num ficheiro e o
+`g610_boot --raw <ficheiro>` escreve a imagem do entry num ficheiro e o
 `objdump -b binary` desassembla. Mais fiável do que decodificar AArch64 à mão,
 e fica registado para o próximo.
 
@@ -941,7 +941,7 @@ entry de jogo assume isso: lê registos antes de os escrever.
 
 ### A correcção
 
-`ia_call_guest` limpa x0-x30 (menos x18, que é a canary) antes de saltar, e
+`g610_call_guest` limpa x0-x30 (menos x18, que é a canary) antes de saltar, e
 guarda o endereço de entrada **na stack do guest** — o único sítio que sobrevive
 ao cleaning:
 
@@ -1040,7 +1040,7 @@ Parecia um hypercall. **Era uma leitura errada**, e só um teste a desmentiu.
 
 ### O teste que refutou
 
-`ia_boot --slots` lê o slot em 0x30B0 do módulo:
+`g610_boot --slots` lê o slot em 0x30B0 do módulo:
 
 ```
 slot 0x30b0 @0x800030b0 = 0x0000000000002610
@@ -1109,7 +1109,7 @@ adicionar. Se o faz por outratrap, é uma peça diferente do motor.
 
 ### O que foi medido
 
-`ia_input` abre o DS4 real ligado ao Orange Pi 5 Pro:
+`g610_input` abre o DS4 real ligado ao Orange Pi 5 Pro:
 
 ```
 joysticks anexados : 1
@@ -1246,7 +1246,7 @@ $ swaymsg "[con_id=6]" focus
 
 Verificado: 99,6% de bytes não-zero, strings ilegíveis (assinatura de save de
 Switch **encriptado**), cópia byte-a-byte idêntica para
-`EdenMaliIA/saves/01008DB008C2C000/main`.
+`EdenMaliG610/saves/01008DB008C2C000/main`.
 
 Há um segundo save, de 2026-10-17 02:59, com outro hash de título
 (`F0FC9C14...`) — um segundo perfil/ saveslot.
@@ -1485,7 +1485,7 @@ if (!ctx.has_ret)
     ctx.ret = static_cast<std::uint64_t>(r);
 ```
 
-**Este é o padrão que os testes escondem:** o `ia_exec` usava um guest
+**Este é o padrão que os testes escondem:** o `g610_exec` usava um guest
 sintético com `svc #7` e verificava `exit_code` — que vem de `ctx.x[0]`, não
 de `ctx.ret`. Passava sem exercitar nenhum dos dois caminhos.
 

@@ -40,7 +40,7 @@
 #include <cstdint>
 #include <memory>
 
-#include "ia/guest_memory.hpp"
+#include "g610/guest_memory.hpp"
 #include "vendor/eden/core/system_ref.h"
 
 namespace Kernel {
@@ -59,7 +59,7 @@ class ServiceManager;
 } // namespace SM
 } // namespace Service
 
-namespace ia {
+namespace g610 {
 
 // O sistema. Ver a nota da cadeia acima.
 class EdenSystem final : public Core::System {
@@ -148,4 +148,4 @@ bool eden_connect_to_named_port(Kernel::KernelCore& kernel, GuestMemory& memoria
 // `KClientSession::SendSyncRequest` vai buscar sozinho.
 bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_handle);
 
-} // namespace ia
+} // namespace g610

@@ -101,7 +101,7 @@ Faltam, por ordem de bloqueio:
 
 ### O rtld real já corre
 
-`ia_boot` corre o entry point real do rtld do Pokémon Shield. Antes desta
+`g610_boot` corre o entry point real do rtld do Pokémon Shield. Antes desta
 sessão o guest **girava para sempre sem levantar uma trap** — o sintoma mais
 opaco possível. Agora:
 
@@ -132,7 +132,7 @@ trampoline saltava com x0 = endereço do entry.
   código puro não levanta traps. Como o guest corre na sua própria stack, o
   handler do sinal vê o contexto *do guest*. Respondeu "o guest está parado em
   `pc=0x800000f8`" quando nada mais dizia alguma coisa.
-- **`ia_boot --raw <ficheiro>`** despeja a imagem do entry para desassemblar
+- **`g610_boot --raw <ficheiro>`** despeja a imagem do entry para desassemblar
   com o `objdump`, sem debugger.
 - **Limite de traps** no motor: um guest em fuga deixa de ser um processo a
   100% de CPU sem saída, e passa a ser um relatório.

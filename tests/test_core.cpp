@@ -1,4 +1,4 @@
-// EdenMaliIA — testes do núcleo.
+// EdenMaliG610 — testes do núcleo.
 //
 // Sem framework externo: um executável que devolve != 0 se algo falhar.
 // Corre-se no Pi com `ctest` ou directamente.
@@ -9,14 +9,14 @@
 #include <thread>
 #include <vector>
 
-#include "ia/gpu/maxwell_translator.hpp"
-#include "ia/guest_context.hpp"
-#include "ia/instructions.hpp"
-#include "ia/patcher.hpp"
-#include "ia/guest_memory.hpp"
-#include "ia/nso_loader.hpp"
-#include "ia/svc_dispatcher.hpp"
-#include "ia/telemetry.hpp"
+#include "g610/gpu/maxwell_translator.hpp"
+#include "g610/guest_context.hpp"
+#include "g610/instructions.hpp"
+#include "g610/patcher.hpp"
+#include "g610/guest_memory.hpp"
+#include "g610/nso_loader.hpp"
+#include "g610/svc_dispatcher.hpp"
+#include "g610/telemetry.hpp"
 
 namespace {
 
@@ -39,12 +39,12 @@ void check(bool ok, const std::string& what) {
 
 
 // ---------------------------------------------------------------------------
-using ia::tel::Bottleneck;
-using ia::tel::Nanos;
+using g610::tel::Bottleneck;
+using g610::tel::Nanos;
 
 void test_classification() {
-    using ia::tel::Telemetry;
-    using ia::tel::FrameRecord;
+    using g610::tel::Telemetry;
+    using g610::tel::FrameRecord;
 
     auto f = [](Nanos total, Nanos cpu, Nanos gpu, Nanos tr, Nanos sh,
                 Nanos present, std::uint32_t draws) {
@@ -88,7 +88,7 @@ void test_classification() {
 
 // ---------------------------------------------------------------------------
 void test_service_profiler() {
-    ia::tel::ServiceProfiler sp;
+    g610::tel::ServiceProfiler sp;
     sp.record(0x03, 1'000'000);  // ExitProcess, 1 ms
     sp.record(0x03, 500'000);    // mais uma
     sp.record(0x70, 100'000);    // ConnectToNamedPort, muito mais barato
@@ -108,19 +108,19 @@ void test_service_profiler() {
 void test_npdm_bits() {
     // Sem ficheiro, testa só a aritmética dos bits, que é onde costuma estar o
     // erro: address_space_type ocupa os bits 1-3, não o bit 0.
-    ia::LoadedModule m;
+    g610::LoadedModule m;
     m.has_64_bit = true;
     m.address_space_type = 3;
 
-    check(ia::kNpdmFlagIs64Bit == 1u, "bit de 64-bit é o bit 0 de Flags0");
-    check(((0x07u & ia::kNpdmAddressSpaceMask) >> ia::kNpdmAddressSpaceShift) ==
-              ia::kNpdmAddressSpace64Bit39,
+    check(g610::kNpdmFlagIs64Bit == 1u, "bit de 64-bit é o bit 0 de Flags0");
+    check(((0x07u & g610::kNpdmAddressSpaceMask) >> g610::kNpdmAddressSpaceShift) ==
+              g610::kNpdmAddressSpace64Bit39,
           "Flags0=0x07 produz address_space_type=3 (AddressSpace64Bit39)");
 
     // Os Flags0 são UM BYTE. Se alguém os ler como u32, os bits acima do bit 7
     // vêm dos campos vizinhos e a decisão nativo/JIT fica errada. Este teste
     // fixa o tamanho da struct para que essa regressão não possa passar.
-    check(sizeof(ia::NpdmMeta) == 0x80, "NpdmMeta tem 0x80 bytes");
+    check(sizeof(g610::NpdmMeta) == 0x80, "NpdmMeta tem 0x80 bytes");
     {
         // Reproduz o cabeçalho real do Pokémon Shield (lido do ficheiro).
         std::uint8_t real[0x80] = {};
@@ -131,12 +131,12 @@ void test_npdm_bits() {
         real[0x1E] = 0x10; real[0x1F] = 0x00; // stack = 1 MB
         std::memcpy(real + 0x20, "Application", 11);
 
-        ia::NpdmMeta h{};
+        g610::NpdmMeta h{};
         std::memcpy(&h, real, sizeof(h));
         check(h.flags0 == 0x07, "Flags0 lido como byte em 0x0C");
-        check((h.flags0 & ia::kNpdmFlagIs64Bit) != 0, "Pokémon Shield é 64-bit");
-        check(((h.flags0 & ia::kNpdmAddressSpaceMask) >>
-               ia::kNpdmAddressSpaceShift) == 3, "Pokémon Shield é 64-bit/39");
+        check((h.flags0 & g610::kNpdmFlagIs64Bit) != 0, "Pokémon Shield é 64-bit");
+        check(((h.flags0 & g610::kNpdmAddressSpaceMask) >>
+               g610::kNpdmAddressSpaceShift) == 3, "Pokémon Shield é 64-bit/39");
         check(h.main_thread_priority == 0x2C, "prioridade da thread principal = 44");
         check(h.main_thread_stack_size == 0x100000, "stack = 1 MB");
         check(std::string(h.name, 11) == "Application", "nome = Application");
@@ -146,18 +146,18 @@ void test_npdm_bits() {
     const bool native = m.has_64_bit && m.address_space_type == 3;
     check(native, "64-bit + AddressSpace64Bit39 implica execução nativa");
 
-    check(ia::NsoLoader::default_base(3) != 0,
+    check(g610::NsoLoader::default_base(3) != 0,
           "endereço base de 39 bits é não nulo");
-    check((ia::NsoLoader::default_base(3) & ia::kGuestAddressMask) ==
-              ia::NsoLoader::default_base(3),
+    check((g610::NsoLoader::default_base(3) & g610::kGuestAddressMask) ==
+              g610::NsoLoader::default_base(3),
           "base de 39 bits está dentro da máscara de 39 bits");
 }
 
 // ---------------------------------------------------------------------------
 void test_svc_dispatch() {
-    ia::tel::Telemetry tel;
+    g610::tel::Telemetry tel;
     tel.set_live_console(false);
-    ia::SvcDispatcher svc(tel);
+    g610::SvcDispatcher svc(tel);
 
     // SetHeapSize (0x01)
     //
@@ -166,9 +166,9 @@ void test_svc_dispatch() {
     // tratar o heap como se estivesse na página zero.
     {
         svc.set_heap_base(0x0000'0000'9000'0000ull);
-        ia::SvcContext c;
+        g610::SvcContext c;
         c.x[0] = 0x4000'0000; // 1 GiB de heap
-        svc.dispatch(static_cast<std::uint32_t>(ia::Svc::SetHeapSize), c);
+        svc.dispatch(static_cast<std::uint32_t>(g610::Svc::SetHeapSize), c);
         // O ENDEREÇO do heap é o valor de RETORNO, e o registo de retorno na
         // ABI do Switch é x0 — que o motor preenche a partir de `ctx.ret`.
         // Pô-lo em `ctx.x[0]` não chegava ao guest: o motor substitui x0.
@@ -182,9 +182,9 @@ void test_svc_dispatch() {
     // Tamanho zero é inválido: devolver um endereço para um heap de 0 bytes
     // faz o rtld escrever fora de qualquer região.
     {
-        ia::SvcContext c;
+        g610::SvcContext c;
         c.x[0] = 0;
-        svc.dispatch(static_cast<std::uint32_t>(ia::Svc::SetHeapSize), c);
+        svc.dispatch(static_cast<std::uint32_t>(g610::Svc::SetHeapSize), c);
         check(c.ret != 0, "SetHeapSize com size=0 é recusado");
     }
 
@@ -195,10 +195,10 @@ void test_svc_dispatch() {
     // passado como se fosse um endereço de guest era um bug à espera de
     // acontecer — em produção o espaço é de 39 bits e o ponteiro do host
     // está normalmente fora dele.
-    ia::GuestMemory mem;
+    g610::GuestMemory mem;
     std::string err;
     const std::uint64_t kBase = 0x0000'0000'2000'0000ull;
-    if (!mem.map(kBase, 0x0010'0000, ia::Prot::Read | ia::Prot::Write, err)) {
+    if (!mem.map(kBase, 0x0010'0000, g610::Prot::Read | g610::Prot::Write, err)) {
         check(false, "reservar espaco de guest para o teste: " + err);
         return;
     }
@@ -222,10 +222,10 @@ void test_svc_dispatch() {
             return;
         }
 
-        ia::SvcContext c;
+        g610::SvcContext c;
         c.x[0] = 0;
         c.x[1] = name_addr;
-        svc.dispatch(static_cast<std::uint32_t>(ia::Svc::ConnectToNamedPort), c);
+        svc.dispatch(static_cast<std::uint32_t>(g610::Svc::ConnectToNamedPort), c);
 
         check(c.ret == 0, "ConnectToNamedPort devolve Success");
         check(c.x[1] != 0, "o handle volta em x1, no registo que era o nome");
@@ -241,10 +241,10 @@ void test_svc_dispatch() {
         if (!mem.write(vazio, "", 1, err))
             return;
 
-        ia::SvcContext c;
+        g610::SvcContext c;
         c.x[0] = 0;
         c.x[1] = vazio;
-        svc.dispatch(static_cast<std::uint32_t>(ia::Svc::ConnectToNamedPort), c);
+        svc.dispatch(static_cast<std::uint32_t>(g610::Svc::ConnectToNamedPort), c);
         check(c.ret != 0, "ConnectToNamedPort com nome vazio é recusado");
     }
 
@@ -253,30 +253,30 @@ void test_svc_dispatch() {
         svc.reset_run_state();
 
         // Dentro da reserva: tem de aceitar.
-        ia::SvcContext c;
+        g610::SvcContext c;
         c.x[0] = kBase + 0x4000;
         c.x[1] = kBase + 0x5000;
         c.x[2] = 0x1000;
-        svc.dispatch(static_cast<std::uint32_t>(ia::Svc::MapMemory), c);
+        svc.dispatch(static_cast<std::uint32_t>(g610::Svc::MapMemory), c);
         check(c.ret == 0, "MapMemory aceita um destino dentro da reserva");
         check(svc.map_memory_calls() == 1, "MapMemory foi contabilizado");
 
         // Fora da reserva: tem de recusar, não mapear por cima do host.
-        ia::SvcContext fora;
+        g610::SvcContext fora;
         fora.x[0] = kBase + 0x0010'0000 + 0x1000; // depois do fim
         fora.x[1] = kBase;
         fora.x[2] = 0x1000;
-        svc.dispatch(static_cast<std::uint32_t>(ia::Svc::MapMemory), fora);
+        svc.dispatch(static_cast<std::uint32_t>(g610::Svc::MapMemory), fora);
         check(fora.ret != 0, "MapMemory recusa um destino fora da reserva");
         check(svc.map_memory_calls() == 1,
               "o MapMemory recusado não foi contabilizado");
 
         // Tamanho zero: inválido.
-        ia::SvcContext zero;
+        g610::SvcContext zero;
         zero.x[0] = kBase;
         zero.x[1] = kBase;
         zero.x[2] = 0;
-        svc.dispatch(static_cast<std::uint32_t>(ia::Svc::MapMemory), zero);
+        svc.dispatch(static_cast<std::uint32_t>(g610::Svc::MapMemory), zero);
         check(zero.ret != 0, "MapMemory com size=0 é recusado");
     }
 
@@ -284,9 +284,9 @@ void test_svc_dispatch() {
     // é SetMemoryAttribute: o guest "saiu" por um serviço de memória.
     {
         svc.reset_run_state();
-        ia::SvcContext c;
+        g610::SvcContext c;
         c.x[0] = 42;
-        svc.dispatch(static_cast<std::uint32_t>(ia::Svc::ExitProcess), c);
+        svc.dispatch(static_cast<std::uint32_t>(g610::Svc::ExitProcess), c);
         check(c.ret == 0, "ExitProcess devolve Success");
         check(svc.exited(), "ExitProcess marca o processo como terminado");
         check(svc.exit_code() == 42, "ExitProcess guarda o código em x0");
@@ -296,9 +296,9 @@ void test_svc_dispatch() {
 
 // ---------------------------------------------------------------------------
 void test_maxwell_extract() {
-    ia::tel::Telemetry tel;
+    g610::tel::Telemetry tel;
     tel.set_live_console(false);
-    ia::gpu::MaxwellTranslator tr(tel);
+    g610::gpu::MaxwellTranslator tr(tel);
 
     std::vector<std::uint8_t> pb;
     auto push = [&](std::uint32_t w) {
@@ -320,7 +320,7 @@ void test_maxwell_extract() {
     push(1);          // instance_count
     push(0x0000'0000); // Nop final
 
-    std::vector<ia::gpu::DrawCommand> cmds;
+    std::vector<g610::gpu::DrawCommand> cmds;
     std::string err;
     const auto n = tr.translate(pb, cmds, err);
 
@@ -333,9 +333,9 @@ void test_maxwell_extract() {
     // Buffer truncado a meio de um payload não pode ler fora nem bloquear.
     {
         std::vector<std::uint8_t> trunc(pb.begin(), pb.begin() + 12); // corta o payload
-        std::vector<ia::gpu::DrawCommand> c2;
+        std::vector<g610::gpu::DrawCommand> c2;
         std::string e2;
-        ia::gpu::MaxwellTranslator t2(tel);
+        g610::gpu::MaxwellTranslator t2(tel);
         const auto n2 = t2.translate(trunc, c2, e2);
         check(n2 == 0, "payload truncado não produz comando incompleto");
         check(t2.commands_unknown() >= 1, "payload truncado é contado como inválido");
@@ -353,9 +353,9 @@ void test_maxwell_extract() {
         push2((0x18u << 2) | 1u); // DrawArrays com payload
         push2(0xFFFF'FFF0);       // comprimento não alinhado/absurdo
         push2(0);
-        std::vector<ia::gpu::DrawCommand> c3;
+        std::vector<g610::gpu::DrawCommand> c3;
         std::string e3;
-        ia::gpu::MaxwellTranslator t3(tel);
+        g610::gpu::MaxwellTranslator t3(tel);
         t3.translate(bad, c3, e3);
         check(t3.commands_unknown() >= 1, "comprimento de payload absurdo é recusado");
     }
@@ -373,9 +373,9 @@ void test_maxwell_extract() {
         push3((0x3FFu << 2) | 1u); // opcode 0x3FF, inexistente
         push3(4);
         push3(1);
-        std::vector<ia::gpu::DrawCommand> c4;
+        std::vector<g610::gpu::DrawCommand> c4;
         std::string e4;
-        ia::gpu::MaxwellTranslator t4(tel);
+        g610::gpu::MaxwellTranslator t4(tel);
         t4.translate(unk, c4, e4);
         check(t4.commands_unknown() == 1, "opcode desconhecido é contado uma vez");
     }
@@ -383,9 +383,9 @@ void test_maxwell_extract() {
 
 // ---------------------------------------------------------------------------
 void test_shader_cache() {
-    ia::tel::Telemetry tel;
+    g610::tel::Telemetry tel;
     tel.set_live_console(false);
-    ia::gpu::ShaderCache cache(tel);
+    g610::gpu::ShaderCache cache(tel);
 
     std::vector<std::uint8_t> blob(256, 0xAB);
     bool hit = false;
@@ -409,7 +409,7 @@ void test_shader_cache() {
 
 // ---------------------------------------------------------------------------
 void test_flush() {
-    ia::tel::Telemetry tel;
+    g610::tel::Telemetry tel;
     tel.set_live_console(false);
     tel.set_frame_history(16);
     tel.set_output_dir("/tmp/ia-telem-test");
@@ -437,7 +437,7 @@ void test_flush() {
 
 // ---------------------------------------------------------------------------
 void test_context_layout() {
-    using namespace ia;
+    using namespace g610;
     // Estes asserts já estão no header e o build falha se não baterem.
     // Repetir aqui documenta a dependência: se alguém mexer num offset sem
     // actualizar o assembly, este teste é o primeiro a dizer porquê.
@@ -467,7 +467,7 @@ void test_context_layout() {
 
 // ---------------------------------------------------------------------------
 void test_instructions() {
-    using namespace ia::arm;
+    using namespace g610::arm;
 
     // SVC
     check(SVC{0xD40000C1}.verify(), "SVC #6 verifica");
@@ -515,9 +515,9 @@ void test_instructions() {
 
 // ---------------------------------------------------------------------------
 void test_patcher() {
-    ia::tel::Telemetry tel;
+    g610::tel::Telemetry tel;
     tel.set_live_console(false);
-    ia::StaticPatcher p(tel);
+    g610::StaticPatcher p(tel);
 
     // Uma pequena "imagem" com SVC, YIELD e código normal.
     std::vector<std::uint8_t> image(64, 0);
@@ -531,7 +531,7 @@ void test_patcher() {
     };
     std::memcpy(image.data(), words, sizeof(words));
 
-    ia::PatchReport rep{};
+    g610::PatchReport rep{};
     std::string err;
     check(p.patch(image, 0, sizeof(words), rep, err),
           "patcher aceita uma região válida");
@@ -553,18 +553,18 @@ void test_patcher() {
 
     // Limites inválidos têm de ser recusados, não gerar um crash.
     {
-        ia::StaticPatcher p2(tel);
+        g610::StaticPatcher p2(tel);
         std::vector<std::uint8_t> small(16, 0);
-        ia::PatchReport r2{};
+        g610::PatchReport r2{};
         std::string e2;
         check(!p2.patch(small, 0, 4096, r2, e2),
               "região maior que a imagem é recusada");
         check(!e2.empty(), "erro tem mensagem");
     }
     {
-        ia::StaticPatcher p2(tel);
+        g610::StaticPatcher p2(tel);
         std::vector<std::uint8_t> small(16, 0);
-        ia::PatchReport r2{};
+        g610::PatchReport r2{};
         std::string e2;
         check(!p2.patch(small, 1, 8, r2, e2),
               "região não alinhada a 4 bytes é recusada");
@@ -574,7 +574,7 @@ void test_patcher() {
 } // namespace
 
 int main() {
-    std::printf("══════ EdenMaliIA testes ══════\n");
+    std::printf("══════ EdenMaliG610 testes ══════\n");
 
     std::printf("\n[telemetria — classificação de gargalo]\n");
     test_classification();

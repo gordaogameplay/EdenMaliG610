@@ -1,4 +1,4 @@
-// EdenMaliIA — diagnóstico do programa guest multi-módulo.
+// EdenMaliG610 — diagnóstico do programa guest multi-módulo.
 //
 // Carrega o ExeFS inteiro (rtld + main + sdk), planeia o layout do espaço de
 // endereçamento, mapeia, e verifica que cada módulo fica exactamente onde o
@@ -15,8 +15,8 @@
 #include <string>
 #include <vector>
 
-#include "ia/guest_program.hpp"
-#include "ia/telemetry.hpp"
+#include "g610/guest_program.hpp"
+#include "g610/telemetry.hpp"
 
 namespace {
 
@@ -38,7 +38,7 @@ std::string hexaddr(std::uint64_t v) {
     return b;
 }
 
-const ia::GuestModule* find(const ia::GuestProgram& p, ia::GuestModule::Kind k) {
+const g610::GuestModule* find(const g610::GuestProgram& p, g610::GuestModule::Kind k) {
     for (const auto& m : p.modules())
         if (m.kind == k)
             return &m;
@@ -57,11 +57,11 @@ int main(int argc, char** argv) {
     std::printf("══════ programa guest (multi-módulo) ══════\n");
     std::printf("  exefs: %s\n\n", exefs.c_str());
 
-    ia::tel::Telemetry tel;
+    g610::tel::Telemetry tel;
     tel.set_live_console(false);
     tel.start("0000000000000000", "guest-program");
 
-    ia::GuestProgram prog(tel);
+    g610::GuestProgram prog(tel);
     std::string err;
 
     if (!prog.load(exefs, err)) {
@@ -73,9 +73,9 @@ int main(int argc, char** argv) {
     std::printf("[1] módulos do ExeFS\n");
     check(!prog.modules().empty(), "pelo menos um módulo carregado");
 
-    const auto* rtld = find(prog, ia::GuestModule::kRtld);
-    const auto* main_m = find(prog, ia::GuestModule::kMain);
-    const auto* sdk    = find(prog, ia::GuestModule::kSdk);
+    const auto* rtld = find(prog, g610::GuestModule::kRtld);
+    const auto* main_m = find(prog, g610::GuestModule::kMain);
+    const auto* sdk    = find(prog, g610::GuestModule::kSdk);
 
     check(rtld != nullptr,
           "rtld carregado — é o entry point real, não o main");
@@ -101,7 +101,7 @@ int main(int argc, char** argv) {
 
     check(prog.memory().owns(prog.entry_point()),
           "o entry point está dentro do espaço mapeado");
-    check(prog.stack_top() % ia::kStackAlign == 0,
+    check(prog.stack_top() % g610::kStackAlign == 0,
           "topo da pilha alinhado a 16 bytes (AAPCS64)");
 
     // ── 3. bases calculadas ──────────────────────────────────────────────
@@ -129,14 +129,14 @@ int main(int argc, char** argv) {
             continue;
 
         const std::uint64_t taddr =
-            m.vaddr_base + m.nso.segments[ia::kNsoText].vaddr;
+            m.vaddr_base + m.nso.segments[g610::kNsoText].vaddr;
         std::vector<std::uint8_t> t(64);
         if (!prog.memory().read(taddr, t.data(), 64, err)) {
             check(false, std::string(m.name()) + ": " + err);
             continue;
         }
         check(std::memcmp(t.data(),
-                          m.nso.image.data() + m.nso.segments[ia::kNsoText].vaddr,
+                          m.nso.image.data() + m.nso.segments[g610::kNsoText].vaddr,
                           64) == 0,
               std::string(m.name()) + ": .text no sítio certo (" +
                   hexaddr(taddr) + ")");
@@ -145,7 +145,7 @@ int main(int argc, char** argv) {
             continue;
 
         const std::uint64_t raddr =
-            m.vaddr_base + m.nso.segments[ia::kNsoRodata].vaddr;
+            m.vaddr_base + m.nso.segments[g610::kNsoRodata].vaddr;
         const std::uint64_t text_end = taddr + m.nso.text_size();
         check(raddr > text_end,
               std::string(m.name()) + ": rodata " +
@@ -158,7 +158,7 @@ int main(int argc, char** argv) {
             continue;
         }
         check(std::memcmp(r.data(),
-                          m.nso.image.data() + m.nso.segments[ia::kNsoRodata].vaddr,
+                          m.nso.image.data() + m.nso.segments[g610::kNsoRodata].vaddr,
                           32) == 0,
               std::string(m.name()) + ": rodata no sítio certo (" +
                   hexaddr(raddr) + ")");
@@ -188,7 +188,7 @@ int main(int argc, char** argv) {
     // reconhecer como módulo.
     std::printf("\n[6] regiões do svcQueryMemory\n");
     {
-        const std::vector<ia::GuestRegion>& r = prog.memory_regions();
+        const std::vector<g610::GuestRegion>& r = prog.memory_regions();
         check(!r.empty(), "há regiões");
 
         std::uint64_t cursor = 0;
@@ -212,8 +212,8 @@ int main(int argc, char** argv) {
                 if (g.base != m.vaddr_base)
                     continue;
                 achou = true;
-                check(g.state == ia::GuestRegion::kCode &&
-                          g.permission == ia::GuestRegion::kReadExec,
+                check(g.state == g610::GuestRegion::kCode &&
+                          g.permission == g610::GuestRegion::kReadExec,
                       std::string(m.name()) + ": .text é Code/R-X (o rtld "
                                               "só aceita este par)");
             }

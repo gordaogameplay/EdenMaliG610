@@ -7,7 +7,7 @@ Existe porque **contei-as mal durante horas**. O contador de uma linha
 cheio de notas em português desbalanceia logo.
 
 A primeira vez que isto custou tempo, um comentário meu dizia
-«um `namespace ia {` e declarou `ia::Kernel`» — e o contador dizia que faltava
+«um `namespace g610 {` e declarou `g610::Kernel`» — e o contador dizia que faltava
 uma chave. Duas tentativas de consertar o ficheiro, e o ficheiro estava certo
 desde o início.
 
@@ -93,7 +93,7 @@ def saldo(texto):
 def main():
     ficheiros = []
     if "--todos" in sys.argv:
-        padroes = ["src/*.cpp", "src/*.hpp", "include/ia/*.hpp", "include/ia/*.h",
+        padroes = ["src/*.cpp", "src/*.hpp", "include/g610/*.hpp", "include/g610/*.h",
                    "tests/*.cpp", "vendor/eden/core/*.h", "vendor/eden/common/*.h",
                    "vendor/eden/core/hle/kernel/k_*bridge*.h"]
         for pad in padroes:

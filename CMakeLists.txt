@@ -1,11 +1,11 @@
-# EdenMaliIA — motor nativo de Switch para RK3588
+# EdenMaliG610 — motor nativo de Switch para RK3588
 #
 # Compila-se dentro do Orange Pi 5 Pro. Sem dependências de emulador:
 # apenas Vulkan (PanVK) e a toolchain AArch64 nativa.
 
 cmake_minimum_required(VERSION 3.20)
-# ASM é necessário para a entrada no guest (src/ia_call_guest.S).
-project(edenmaliia LANGUAGES CXX ASM)
+# ASM é necessário para a entrada no guest (src/g610_call_guest.S).
+project(edenmalig610 LANGUAGES CXX ASM)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -29,7 +29,7 @@ add_compile_options(-fno-omit-frame-pointer -fasynchronous-unwind-tables)
 find_package(Vulkan REQUIRED)
 # SDL2: o input do guest passa por ele em vez de evdev directo, porque ha
 # um mapeamento por guid ja configurado no sistema e porque o SDL trata do
-# ruido e das diferencas entre dispositivos. Ver include/ia/input.hpp.
+# ruido e das diferencas entre dispositivos. Ver include/g610/input.hpp.
 find_package(SDL2 REQUIRED)
 
 # fmt: o motor de formatacao que o codigo vendorizado do Eden usa
@@ -47,7 +47,7 @@ find_package(fmt REQUIRED)
 # Separado do executável para que os testes liguem as mesmas fontes e não uma
 # cópia — um teste que passa contra uma cópia não garante nada sobre o
 # binário que corre no ecrã.
-add_library(ia_core STATIC
+add_library(g610_core STATIC
   src/telemetry.cpp
   src/nso_loader.cpp
   src/nso_arguments.cpp
@@ -66,22 +66,22 @@ add_library(ia_core STATIC
   src/gpu/maxwell_translator.cpp
   src/patcher.cpp
   src/native_engine.cpp
-  src/ia_call_guest.S
+  src/g610_call_guest.S
 )
-target_include_directories(ia_core PUBLIC
+target_include_directories(g610_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}                # `vendor/eden/core/...`
   ${CMAKE_CURRENT_SOURCE_DIR}/vendor/third_party
 )
-target_compile_definitions(ia_core PUBLIC ANKERL_UNORDERED_DENSE_STD_MODULE=1)
-target_link_libraries(ia_core PUBLIC Vulkan::Vulkan SDL2::SDL2 fmt::fmt pthread)
+target_compile_definitions(g610_core PUBLIC ANKERL_UNORDERED_DENSE_STD_MODULE=1)
+target_link_libraries(g610_core PUBLIC Vulkan::Vulkan SDL2::SDL2 fmt::fmt pthread)
 
 # --- o Eden vendorizado ------------------------------------------------------
 # A parte SISTEMÁTICA do OS do Eden: a camada de IPC e os objectos de porta e
 # sessão de que ela depende. Ver vendor/eden/README.md para o inventário, para
 # o que foi deixado de fora e para cada corte.
 #
-# Entra no MESMO `ia_core` e não numa biblioteca à parte, porque o `KernelCore`
+# Entra no MESMO `g610_core` e não numa biblioteca à parte, porque o `KernelCore`
 # da ponte é o nosso `Core::System` e o `EdenSystem` é o nosso motor: as duas
 # metades dependem uma da outra, e duas bibliotecas a dependerem uma da outra
 # dariam ao linker um círculo para resolver em vez de uma ordem.
@@ -140,7 +140,7 @@ set(IA_EDEN_SOURCES
 # `src/eden_log.cpp` substitui `vendor/eden/common/logging.cpp`: as duas
 # funções que o codigo vendorizado pede, a escrever no stderr em vez de num
 # ficheiro. Ver a nota no topo desse ficheiro.
-target_sources(ia_core PRIVATE
+target_sources(g610_core PRIVATE
   src/eden_bridge.cpp
   src/eden_log.cpp
   src/eden_settings.cpp
@@ -149,8 +149,8 @@ target_sources(ia_core PRIVATE
 )
 
 # --- alvo principal ----------------------------------------------------------
-add_executable(ia src/main.cpp)
-target_link_libraries(ia PRIVATE ia_core)
+add_executable(g610 src/main.cpp)
+target_link_libraries(g610 PRIVATE g610_core)
 
 # --- testes ------------------------------------------------------------------
 enable_testing()
@@ -175,60 +175,60 @@ add_custom_command(
   VERBATIM)
 add_custom_target(guest_sizes DEPENDS ${IA_GUEST_SIZES})
 
-add_executable(ia_tests tests/test_core.cpp)
-target_link_libraries(ia_tests PRIVATE ia_core)
+add_executable(g610_tests tests/test_core.cpp)
+target_link_libraries(g610_tests PRIVATE g610_core)
 
-add_executable(ia_exec
+add_executable(g610_exec
   tests/test_exec.cpp
   tests/exec_mem.cpp
   $<TARGET_OBJECTS:guest_code>
 )
-target_link_libraries(ia_exec PRIVATE ia_core)
-target_include_directories(ia_exec PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
-add_dependencies(ia_exec guest_sizes)
-add_test(NAME exec COMMAND ia_exec)
-add_test(NAME core COMMAND ia_tests)
+target_link_libraries(g610_exec PRIVATE g610_core)
+target_include_directories(g610_exec PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+add_dependencies(g610_exec guest_sizes)
+add_test(NAME exec COMMAND g610_exec)
+add_test(NAME core COMMAND g610_tests)
 
 # Teste do programa multi-modulo. Precisa de um ExeFS real, por isso nao e'
 # um add_test sem argumentos: corre contra os ROMs do utilizador.
-add_executable(ia_program tests/test_program.cpp)
-target_link_libraries(ia_program PRIVATE ia_core)
+add_executable(g610_program tests/test_program.cpp)
+target_link_libraries(g610_program PRIVATE g610_core)
 
 # --- testes da ISA Maxwell ---------------------------------------------------
-add_executable(ia_maxwell_test tests/test_maxwell.cpp)
-target_link_libraries(ia_maxwell_test PRIVATE ia_core)
-add_test(NAME maxwell COMMAND ia_maxwell_test)
+add_executable(g610_maxwell_test tests/test_maxwell.cpp)
+target_link_libraries(g610_maxwell_test PRIVATE g610_core)
+add_test(NAME maxwell COMMAND g610_maxwell_test)
 
 # Teste da cadeia: SASS sintetico -> IR -> GLSL -> SPIR-V.
-add_executable(ia_translate_test tests/test_translate.cpp)
-target_link_libraries(ia_translate_test PRIVATE ia_core)
-add_test(NAME translate COMMAND ia_translate_test)
+add_executable(g610_translate_test tests/test_translate.cpp)
+target_link_libraries(g610_translate_test PRIVATE g610_core)
+add_test(NAME translate COMMAND g610_translate_test)
 
 # Executa o SPIR-V na Mali-G610 de verdade e le o pixel de volta.
-# Depende do ia_translate_test ter gerado /tmp/ia_min.frag.
+# Depende do g610_translate_test ter gerado /tmp/ia_min.frag.
 find_library(VULKAN_LIB vulkan)
 if(VULKAN_LIB)
-  add_executable(ia_gpu_exec tests/test_gpu_exec.cpp)
-  target_link_libraries(ia_gpu_exec PRIVATE ia_core ${VULKAN_LIB})
-  add_test(NAME gpu_exec COMMAND ia_gpu_exec)
+  add_executable(g610_gpu_exec tests/test_gpu_exec.cpp)
+  target_link_libraries(g610_gpu_exec PRIVATE g610_core ${VULKAN_LIB})
+  add_test(NAME gpu_exec COMMAND g610_gpu_exec)
 endif()
 
 # Teste de input: prova que a pilha SDL2 + evdev + mapeamento funciona.
 # Nao e' um teste do motor, e' um teste do INPUT.
-add_executable(ia_input tests/probe_input.cpp)
-target_link_libraries(ia_input PRIVATE ia_core)
+add_executable(g610_input tests/probe_input.cpp)
+target_link_libraries(g610_input PRIVATE g610_core)
 
 # Teste do mapeamento de input. Nao precisa de hardware: a logica do A/B
 # e' testada directamente, o que o torna um teste a serio em vez de um
 # teste que so' passa com o DS4 ligado.
-add_executable(ia_input_test tests/test_input.cpp)
-target_link_libraries(ia_input_test PRIVATE ia_core)
-add_test(NAME input COMMAND ia_input_test)
+add_executable(g610_input_test tests/test_input.cpp)
+target_link_libraries(g610_input_test PRIVATE g610_core)
+add_test(NAME input COMMAND g610_input_test)
 
 # Tracador de arranque: corre o rtld real e reporta os SVC que ele pede.
-add_executable(ia_boot tests/boot_trace.cpp)
-target_link_libraries(ia_boot PRIVATE ia_core)
+add_executable(g610_boot tests/boot_trace.cpp)
+target_link_libraries(g610_boot PRIVATE g610_core)
 
 # --- instalação --------------------------------------------------------------
-install(TARGETS ia RUNTIME DESTINATION bin)
-install(DIRECTORY tools/ DESTINATION share/edenmaliia/tools)
+install(TARGETS g610 RUNTIME DESTINATION bin)
+install(DIRECTORY tools/ DESTINATION share/edenmalig610/tools)

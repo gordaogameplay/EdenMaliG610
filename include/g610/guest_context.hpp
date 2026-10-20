@@ -1,11 +1,11 @@
-// EdenMaliIA — contexto do guest e do host.
+// EdenMaliG610 — contexto do guest e do host.
 //
 // A execução nativa funciona trocando de contexto: o guest tem registos
 // próprios, o host tem os seus. Quando o guest levanta uma trap, o estado do
 // host tem de ser salvo e o do guest carregado; e o inverso no regresso.
 //
 // O que torna isto seguro em vez de frágil é a verificação de offsets: o
-// assembly em `ia_trampoline.S` indexa directamente estes campos, e um
+// assembly em `g610_trampoline.S` indexa directamente estes campos, e um
 // `static_assert` em cada um garante que o C++ e o assembly concordam. Se um
 // campo mudar de lugar, o build falha em vez de correr lixo no A76.
 //
@@ -18,9 +18,9 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "ia/context_offsets.hpp"
+#include "g610/context_offsets.hpp"
 
-namespace ia {
+namespace g610 {
 
 // Marcador que distingue um tpidr_el0 de guest de um de host.
 //
@@ -61,7 +61,7 @@ enum class HaltReason : std::uint32_t {
 
 // O contexto completo do guest.
 //
-// A ordem dos campos NÃO é livre: `ia_trampoline.S` indexa-os por offset
+// A ordem dos campos NÃO é livre: `g610_trampoline.S` indexa-os por offset
 // constante. Os static_assert abaixo fixam essa correspondência — se um campo
 // mudar de sítio, o build falha em vez de o assembly escrever no sítio errado.
 struct alignas(16) GuestContext {
@@ -102,7 +102,7 @@ struct ThreadParameters {
 // fechada, o layout e completo e as comparacoes sao validas.
 //
 // Sao elas que tornam o assembly seguro: cada offset usado em
-// ia_trampoline.S e verificado contra a struct real. Se um campo mudar de
+// g610_trampoline.S e verificado contra a struct real. Se um campo mudar de
 // sitio, o build falha em vez de o assembly escrever no sitio errado.
 // ---------------------------------------------------------------------------
 static_assert(offsetof(HostContext, saved_regs)  == off::kHostRegs);
@@ -130,4 +130,4 @@ static_assert(offsetof(ThreadParameters, ctx)   == off::kTlsCtx);
 static_assert(offsetof(ThreadParameters, magic) == off::kTlsMagicWord);
 static_assert(offsetof(ThreadParameters, lock)  == off::kTlsLock);
 
-} // namespace ia
+} // namespace g610

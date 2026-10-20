@@ -1,4 +1,4 @@
-# PROGRESSO — EdenMaliIA
+# PROGRESSO — EdenMaliG610
 
 Motor de execução **nativa** (sem JIT) de ROMs de Nintendo Switch para o
 Orange Pi 5 Pro (RK3588 / Mali-G610).
@@ -16,7 +16,7 @@ mais caro:
 1. Ler o binário (`objdump -b binary -m aarch64`, `strings`, Python).
 2. Descompilar com o script em `/home/trebor/opi5-extract/nso.py` (NSO cru →
    segmentos descomprimidos), **sem** depender do Pi.
-3. Instrumentar o motor (`ia_boot --raw`, dumps de blocos de memória).
+3. Instrumentar o motor (`g610_boot --raw`, dumps de blocos de memória).
 4. Só depois mexer em código.
 
 ---
@@ -469,7 +469,7 @@ A frente 2 é a que o enunciado pede, e é testável hoje.
 
 **A tabela da ISA Maxwell, no nosso projecto.**
 
-`include/ia/gpu/maxwell_isa.inc` — 280 opcodes com máscara e valor, transcrita
+`include/g610/gpu/maxwell_isa.inc` — 280 opcodes com máscara e valor, transcrita
 de `maxwell.inc` do Eden. `src/gpu/maxwell_isa.cpp` descodifica uma palavra de
 64 bits. `tests/test_maxwell.cpp` valida.
 
@@ -841,7 +841,7 @@ casos especiais para "isto era um RZ".
 
 ## Estado
 
-24 verificações no `ia_translate_test`, 20 no `ia_gpu_exec`, 6 suites a
+24 verificações no `g610_translate_test`, 20 no `g610_gpu_exec`, 6 suites a
 passar. O pixel na G610 continua a dar 1.500000 com o shader agora escrito em
 `ISCADD`, que é o idioma real.
 
@@ -850,7 +850,7 @@ passar. O pixel na G610 continua a dar 1.500000 com o shader agora escrito em
 
 # O jogo a correr: onde para, e o que se confirmou
 
-Corrido com `ia_boot ~/piDroid/piDroid_Test_ARM/work/exefs`. O guest chega ao
+Corrido com `g610_boot ~/piDroid/piDroid_Test_ARM/work/exefs`. O guest chega ao
 primeiro IPC do programa inteiro e aborta logo a seguir.
 
 ```
@@ -1244,7 +1244,7 @@ Telemetria nova: `IA_STRINGS=main`.
 
 # A tabela de objectos, copiada do desenho do Eden
 
-`include/ia/kobject.hpp`. O Eden é GPL e este projecto não é: o que se copiou
+`include/g610/kobject.hpp`. O Eden é GPL e este projecto não é: o que se copiou
 é a **arquitetura**, e cada campo diz de onde veio.
 
 ## O handle
@@ -1512,7 +1512,7 @@ quilómetros do problema.
 ## Estado
 
 Suite: **6 testes, todos a passar**. `ia_translate` 24 verificações,
-`ia_gpu_exec` 20 (pixel 1.500000 na G610), `ia_maxwell` 13.
+`g610_gpu_exec` 20 (pixel 1.500000 na G610), `ia_maxwell` 13.
 
 O guest inicializa o SDK e vai buscar os serviços. O próximo na fila é o
 `appletOE` — que é o `am` do Eden, e o `am` é grande (8946 linhas) e
@@ -1721,7 +1721,7 @@ seja consultável, e o `ReceiveMessage` precisa de uma fila.
 ## O estado da suite
 
 Suite: **6 testes, todos a passar**. `ia_translate` 24 verificações,
-`ia_gpu_exec` 20 (pixel 1.500000 na G610), `ia_maxwell` 13.
+`g610_gpu_exec` 20 (pixel 1.500000 na G610), `ia_maxwell` 13.
 a fila de mensagens do am, e o multi-wait de dominio que falta
 
 O SDK ja recebe a mensagem de entrada no primeiro plano, e ja nao esta em
@@ -1838,4 +1838,4 @@ O SDK inicializa, pede o `apm` e o `appletOE`, recebe as nove
 sub-interfaces, recebe a mensagem de entrada no primeiro plano, e espera
 pelo multi-wait de dominio.
 
-Suite: 6 testes. ia_translate 24, ia_gpu_exec 20 (pixel 1.500000), ia_maxwell 13.
+Suite: 6 testes. ia_translate 24, g610_gpu_exec 20 (pixel 1.500000), ia_maxwell 13.

@@ -23,7 +23,7 @@ import os
 import re
 import sys
 
-ROOT = os.path.expanduser("~/EdenMaliIA")
+ROOT = os.path.expanduser("~/EdenMaliG610")
 CMAKE = os.path.join(ROOT, "CMakeLists.txt")
 
 # Ficheiros vendorizados que nao compilam contra a ponte. Ver

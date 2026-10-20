@@ -35,7 +35,7 @@ import os
 import re
 import sys
 
-ROOT = os.path.expanduser("~/EdenMaliIA")
+ROOT = os.path.expanduser("~/EdenMaliG610")
 VENDOR = os.path.join(ROOT, "vendor", "eden")
 INC_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
 
@@ -99,8 +99,8 @@ def alcancaveis(extra=()):
     #    incluem as cabeçalhos da ponte.
     for rel in ("src/eden_bridge.cpp", "src/eden_log.cpp",
                 "src/eden_synchronization_object.cpp",
-                "include/ia/eden_bridge.hpp", "include/ia/svc_dispatcher.hpp",
-                "include/ia/ipc_min.hpp") + tuple(extra):
+                "include/g610/eden_bridge.hpp", "include/g610/svc_dispatcher.hpp",
+                "include/g610/ipc_min.hpp") + tuple(extra):
         p = os.path.join(ROOT, rel)
         if os.path.exists(p):
             incluir_de(p, visitados, raizes)

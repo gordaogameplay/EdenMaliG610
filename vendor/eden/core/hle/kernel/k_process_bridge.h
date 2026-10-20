@@ -42,7 +42,7 @@
 #include <string>
 #include <vector>
 
-#include "ia/guest_memory.hpp"
+#include "g610/guest_memory.hpp"
 #include "vendor/eden/common/common_types.h"   // Vaddr, Handle
 #include "vendor/eden/core/memory_bridge.h"          // `Core::Memory::Memory`, a nossa
 #include "vendor/eden/core/hle/kernel/k_page_table_bridge.h"  // a pagina unica
@@ -133,7 +133,7 @@ class KProcess final : public KSynchronizationObject {
 
 public:
     KProcess(KernelCore& kernel, KHandleTable& handles, KResourceLimit& limits, u64 pid,
-             ::ia::GuestMemory& mem)
+             ::g610::GuestMemory& mem)
         : KSynchronizationObject(kernel), handles_(handles), limits_(limits), pid_(pid),
           memory_(mem) {}
 

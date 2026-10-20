@@ -14,20 +14,20 @@
 #include <cstdlib>
 #include <string>
 
-#include "ia/gpu/ir.hpp"
-#include "ia/gpu/maxwell_program.hpp"
+#include "g610/gpu/ir.hpp"
+#include "g610/gpu/maxwell_program.hpp"
 
-namespace ia::gpu {
+namespace g610::gpu {
 // Declaradas nos .cpp que acabámos de escrever. Declaradas aqui, e não num
 // header, porque este ainda é o unico consumidor e um header para duas
 // funcoes e' um header a mais.
 ir::Program translate(const maxwell::Program& prog);
 std::string    to_glsl(const ir::Program& p);
-} // namespace ia::gpu
+} // namespace g610::gpu
 
 // Definido no backend, e aqui só declarado. Vive no namespace global porque
 // é uma verdade sobre o GLSL emitido, não sobre o IR — e os dois testes que
-// a usam precisam de a ver sem `ia::gpu::` à frente.
+// a usam precisam de a ver sem `g610::gpu::` à frente.
 std::uint32_t glsl_cbuf_stride_bytes();
 
 namespace {
@@ -51,7 +51,7 @@ int run(const std::string& cmd) {
 } // namespace
 
 int main() {
-    using namespace ia::gpu;
+    using namespace g610::gpu;
 
     // ── 1. o programa sintetico ───────────────────────────────────────────
     std::printf("[1] programa Maxwell sintetico\n");
@@ -176,13 +176,13 @@ int main() {
     std::printf("\n----- GLSL gerado -----\n%s--------------------\n", glsl.c_str());
 
     {
-        std::FILE* f = std::fopen("/tmp/ia_min.frag", "wb");
+        std::FILE* f = std::fopen("/tmp/g610_min.frag", "wb");
         if (f == nullptr) {
             check(false, "escrever o GLSL em /tmp");
         } else {
             std::fwrite(glsl.data(), 1, glsl.size(), f);
             std::fclose(f);
-            check(true, "o GLSL foi escrito em /tmp/ia_min.frag");
+            check(true, "o GLSL foi escrito em /tmp/g610_min.frag");
         }
     }
 
@@ -192,16 +192,16 @@ int main() {
           "o glslang esta instalado");
 
     const int r = run("glslangValidator -V --target-env vulkan1.1 -S frag -o "
-                      "/tmp/ia_min.frag.spv /tmp/ia_min.frag");
+                      "/tmp/g610_min.frag.spv /tmp/g610_min.frag");
     check(r == 0, "o glslang ACEITA o GLSL que geramos");
     if (r != 0)
         std::printf("       (glslang disse o que acima; o GLSL esta impresso)\n");
 
     if (r == 0) {
-        const int v = run("spirv-val /tmp/ia_min.frag.spv");
+        const int v = run("spirv-val /tmp/g610_min.frag.spv");
         check(v == 0, "o spirv-val valida o binario");
 
-        const int d = run("spirv-dis /tmp/ia_min.frag.spv | grep -c OpCapability");
+        const int d = run("spirv-dis /tmp/g610_min.frag.spv | grep -c OpCapability");
         check(d >= 0, "o spirv-desassembla o binario");
     }
 

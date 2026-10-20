@@ -1,4 +1,4 @@
-// EdenMaliIA — bloco de argumentos do processo (argc/argv/environ).
+// EdenMaliG610 — bloco de argumentos do processo (argc/argv/environ).
 //
 // ---------------------------------------------------------------------------
 // O QUE É ISTO
@@ -42,7 +42,7 @@
 #include <string>
 #include <vector>
 
-namespace ia {
+namespace g610 {
 
 // O cabeçalho tem 0x20 bytes: dois u32 e 0x18 de padding. Confirmado por
 // static_assert no Eden (nso.h:72).
@@ -91,4 +91,4 @@ private:
     std::vector<std::uint8_t> bytes_;
 };
 
-} // namespace ia
+} // namespace g610

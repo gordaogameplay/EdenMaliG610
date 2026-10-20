@@ -1,4 +1,4 @@
-// EdenMaliIA — carregador de NSO.
+// EdenMaliG610 — carregador de NSO.
 //
 // Um NSO é um ELF64 AArch64 com cabeçalhos extra da Nintendo no fim do ficheiro
 // (.text, .rodata, .data, .bss). Não há ELF dinâmico: o guest é linkado
@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-namespace ia {
+namespace g610 {
 
 // Limites do espaço de endereçamento do Switch.
 inline constexpr std::uint64_t kGuestAddressMask = 0x0000'7FFF'FFFF'FFFFull; // 39 bits
@@ -243,4 +243,4 @@ public:
                                std::string& error);
 };
 
-} // namespace ia
+} // namespace g610

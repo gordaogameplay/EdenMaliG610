@@ -1,6 +1,6 @@
 // Onde o motor nativo se liga ao sistema do Eden.
 //
-// Ver `include/ia/eden_bridge.hpp` para a cadeia de montagem e o porque de
+// Ver `include/g610/eden_bridge.hpp` para a cadeia de montagem e o porque de
 // cada decisão; os ponteiros todos apontam para lá.
 //
 // ## Regra desta costura
@@ -17,7 +17,7 @@
 // Quando uma assinatura nossa difere da do Eden, isso está escrito no
 // cabeçalho da ponte com a razão — e é sempre no sentido de **nosso** lado
 // ser mudado, nunca o nome que o Eden usa.
-#include "ia/eden_bridge.hpp"
+#include "g610/eden_bridge.hpp"
 
 #include <array>
 #include <cstdio>
@@ -41,7 +41,7 @@
 #include "vendor/eden/core/hle/kernel/svc_results.h"
 #include "vendor/eden/core/hle/service/apm/apm.h"
 #include "vendor/eden/core/hle/service/apm/apm_controller.h"
-#include "ia/services/applet_oe.hpp"
+#include "g610/services/applet_oe.hpp"
 #include "vendor/eden/core/hle/service/lm/lm.h"
 #include "vendor/eden/core/hle/service/server_manager.h"
 #include "vendor/eden/core/hle/service/sm/sm.h"
@@ -143,11 +143,11 @@ void KProcess::ReleaseResource(KernelCore& kernel, Svc::LimitableResource which,
 // porquê. `m_name` e `m_object` são privados, e a alternativa (um `Find` por
 // nome conhecido) é exactamente a que destrói a porta.
 //
-// A definição vai **fora de `namespace ia`** e é a sua própria
+// A definição vai **fora de `namespace g610`** e é a sua própria
 // `namespace Kernel`.
 //
 // Foi a quarta vez nesta costura que um `namespace Kernel {` caiu dentro de um
-// `namespace ia {` e declarou `ia::Kernel`. Os erros são sempre os mesmos —
+// `namespace g610 {` e declarou `g610::Kernel`. Os erros são sempre os mesmos —
 // «KObjectName has not been declared», «KernelCore was not declared» — e
 // nenhum deles menciona namespaces, o que faz o problema parecer um include em
 // falta.
@@ -200,7 +200,7 @@ void KObjectName::DumpNames(KernelCore& kernel) {
 //
 // **Com o namespace qualificado**, e é a segunda vez hoje que um nome de
 // classe existe em dois sítios. Escrever `namespace Core { ... }` dentro de
-// `namespace ia { ... }` cria `ia::Core`, que não existe — o compilador diz
+// `namespace g610 { ... }` cria `g610::Core`, que não existe — o compilador diz
 // «not in namespace enclosing», que é uma forma muito roundabout de dizer
 // «este `Core` não é aquele». `::Core` não deixa dúvida: é o global.
 //
@@ -403,7 +403,7 @@ void Core::Reporter::SaveUnimplementedFunctionReport(
 
 // ── o sistema ──────────────────────────────────────────────────────────────
 
-namespace ia {
+namespace g610 {
 
 // Quantas entradas na tabela de handles.
 //
@@ -538,7 +538,7 @@ EdenSystem::EdenSystem(GuestMemory& memoria, std::uint64_t pid, std::uint64_t ti
     Service::APM::LoopProcess(*this);
 
     // O `appletOE` — o proxy do `am`. Ver `src/services/applet_oe.cpp`.
-    ia::services::registar_applet_oe(*this);
+    g610::services::registar_applet_oe(*this);
 
     // A verificacao que esteve aqui -- `KObjectName::Find("sm:")` -- **partiu
     // o jogo**.
@@ -744,4 +744,4 @@ bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_ha
     return R_SUCCEEDED(kernel.System().ProcessPendingSynchronously());
 }
 
-} // namespace ia
+} // namespace g610

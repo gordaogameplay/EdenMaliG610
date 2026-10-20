@@ -1,4 +1,4 @@
-// EdenMaliIA — espaço de endereçamento do guest.
+// EdenMaliG610 — espaço de endereçamento do guest.
 //
 // O guest de 39 bits corre NATIVO no A76: os endereços que ele calcula são os
 // endereços reais que o CPU usa. Não há tradução de endereços nem page tables
@@ -38,7 +38,7 @@
 #include <string>
 #include <vector>
 
-namespace ia {
+namespace g610 {
 
 // O espaço do guest é mapeado com permissões por região, não com RWX global.
 // Separar é o que permite ao patcher escrever no .text sem dar permissão de
@@ -148,4 +148,4 @@ private:
 // Fault no primeiro push — e a mensagem não diz nada sobre a causa.
 inline constexpr std::uint64_t kStackAlign = 16;
 
-} // namespace ia
+} // namespace g610

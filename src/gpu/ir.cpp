@@ -1,8 +1,8 @@
-#include "ia/gpu/ir.hpp"
+#include "g610/gpu/ir.hpp"
 
 #include <string_view>
 
-namespace ia::gpu::ir {
+namespace g610::gpu::ir {
 
 std::string_view type_name(Type t) noexcept {
     switch (t) {
@@ -31,4 +31,4 @@ std::string_view op_name(Op op) noexcept {
     return "?";
 }
 
-} // namespace ia::gpu::ir
+} // namespace g610::gpu::ir

@@ -1,7 +1,7 @@
-// EdenMaliIA — motor de execução nativa.
-#include "ia/guest_placement.hpp"
-#include "ia/native_engine.hpp"
-#include "ia/guest_program.hpp"
+// EdenMaliG610 — motor de execução nativa.
+#include "g610/guest_placement.hpp"
+#include "g610/native_engine.hpp"
+#include "g610/guest_program.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -12,7 +12,7 @@
 #include <unistd.h>
 #include <ucontext.h>
 
-namespace ia {
+namespace g610 {
 
 namespace {
 
@@ -123,7 +123,7 @@ struct sigaction g_old_trap{};
 struct sigaction g_old_segv{};
 struct sigaction g_old_bus{};
 
-// BRK emitido por `ia_guest_returned` (src/ia_call_guest.S) quando o guest
+// BRK emitido por `g610_guest_returned` (src/g610_call_guest.S) quando o guest
 // faz `ret` sem ter chamado ExitProcess. É uma trap para que este caso
 // patológico passe pelo mesmo mecanismo de recuperação dos restantes — só o
 // `siglongjmp` restaura o `sp` do host.
@@ -316,7 +316,7 @@ RunResult NativeEngine::run(void (*code)(), std::uint64_t sp) {
     // Todas as saídas do guest passam por aqui. Nunca por um retorno normal
     // da chamada: se o guest fizesse `ret`, o epílogo de `run()` verificaria o
     // canário do stack protector sobre a stack do guest (medido — ver
-    // src/ia_call_guest.S). `ia_guest_returned` transforma esse caso numa
+    // src/g610_call_guest.S). `g610_guest_returned` transforma esse caso numa
     // trap, e o trap é tratado aqui como os restantes.
     // x18 é a stack canary do guest (o "platform register" da AAPCS64). Sem
     // isto o guest verifica a canary contra lixo, a verificação falha, e o
@@ -395,7 +395,7 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
         if (g_hooks.guest_tls != 0)
             write_thread_pointer(g_hooks.guest_tls);
 
-        ia_call_guest(code, sp, platform_reg_, guest_x1_);
+        g610_call_guest(code, sp, platform_reg_, guest_x1_);
         g_have_run_jmp = false;
         // inalcançável em operação normal: se o guest tivesse regressado,
         // a stack estaria corrompida e isto nem sequer seria seguro escrever.
@@ -714,4 +714,4 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw) {
     }
 }
 
-} // namespace ia
+} // namespace g610

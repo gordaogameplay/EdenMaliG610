@@ -1,4 +1,4 @@
-// EdenMaliIA — onde o guest corre.
+// EdenMaliG610 — onde o guest corre.
 //
 // A short version: **nos núcleos grandes, e não onde calhou cair.**
 //
@@ -67,9 +67,9 @@
 #include <string>
 #include <vector>
 
-#include "ia/guest_placement.hpp"
+#include "g610/guest_placement.hpp"
 
-namespace ia {
+namespace g610 {
 
 namespace {
 
@@ -167,4 +167,4 @@ std::size_t fixar_guest_nos_nucleos_grandes() {
     return cpus.size();
 }
 
-} // namespace ia
+} // namespace g610

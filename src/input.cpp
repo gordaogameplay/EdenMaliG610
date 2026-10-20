@@ -1,5 +1,5 @@
-// EdenMaliIA — input do guest.
-#include "ia/input.hpp"
+// EdenMaliG610 — input do guest.
+#include "g610/input.hpp"
 
 #include <SDL2/SDL.h>
 
@@ -8,7 +8,7 @@
 #include <cstring>
 #include <utility>
 
-namespace ia::input {
+namespace g610::input {
 
 const char* to_string(Button b) noexcept {
     switch (b) {
@@ -238,4 +238,4 @@ void Controller::poll() {
     apply_swap_a_b();
 }
 
-} // namespace ia::input
+} // namespace g610::input

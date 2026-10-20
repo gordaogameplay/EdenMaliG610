@@ -1,5 +1,5 @@
-// EdenMaliIA — implementação da telemetria.
-#include "ia/telemetry.hpp"
+// EdenMaliG610 — implementação da telemetria.
+#include "g610/telemetry.hpp"
 
 #include <algorithm>
 #include <cinttypes>
@@ -9,7 +9,7 @@
 #include <iomanip>
 #include <sstream>
 
-namespace ia::tel {
+namespace g610::tel {
 
 namespace {
 constexpr const char* kBottleneckNames[] = {
@@ -318,7 +318,7 @@ bool Telemetry::flush(const std::string& tag) {
 
 std::string Telemetry::summary() const {
     std::ostringstream o;
-    o << "══════════ EdenMaliIA — telemetria ══════════\n";
+    o << "══════════ EdenMaliG610 — telemetria ══════════\n";
     if (!title_name_.empty())
         o << "  título      : " << title_name_ << "  [" << title_id_ << "]\n";
     o << std::fixed;
@@ -371,4 +371,4 @@ void Telemetry::maybe_print_live() {
     std::fflush(stdout);
 }
 
-} // namespace ia::tel
+} // namespace g610::tel

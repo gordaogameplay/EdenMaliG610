@@ -1,6 +1,6 @@
-#include "ia/gpu/maxwell_program.hpp"
+#include "g610/gpu/maxwell_program.hpp"
 
-namespace ia::gpu::maxwell {
+namespace g610::gpu::maxwell {
 
 namespace {
 
@@ -188,4 +188,4 @@ Program make_iscadd_shader() {
     return p;
 }
 
-} // namespace ia::gpu::maxwell
+} // namespace g610::gpu::maxwell

@@ -86,7 +86,7 @@ AUDREN, com os handles e a ordem de bootstrap. Isso é informação útil sobre 
 protocolo — não implementação.
 
 E os erros do runtime anterior são exactamente os erros que já encontrámos e
-corrigimos no EdenMaliIA:
+corrigimos no EdenMaliG610:
 
 - **`svcControlMemory`** — número de SVC que não existe. O nosso era
   `SetMemoryAttribute`; o correcto é `SetMemoryPermission` = `0x02`.

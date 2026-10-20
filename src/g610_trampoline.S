@@ -1,4 +1,4 @@
-/* EdenMaliIA — trampoline de execução nativa.
+/* EdenMaliG610 — trampoline de execução nativa.
  *
  * O mecanismo, numa frase: o tpidr_el0 do processador é a chave que diz, em
  * qualquer trap, se quem levantou a excepção foi o guest ou o host.
@@ -29,7 +29,7 @@
 
 #define __ASSEMBLY__
 
-#include "ia/context_offsets.hpp"
+#include "g610/context_offsets.hpp"
 
 /* Sinais usados pelo motor (valores Linux). */
 #define IA_SIGTRAP   5
@@ -44,9 +44,9 @@
 #define IA_NR_tgkill 234
 
 /* ------------------------------------------------------------------ */
-/* ia_enter_guest — host -> guest                                      */
+/* g610_enter_guest — host -> guest                                      */
 /*                                                                     */
-/* void ia_enter_guest(GuestContext* ctx, ThreadParameters* tp,        */
+/* void g610_enter_guest(GuestContext* ctx, ThreadParameters* tp,        */
 /*                     void (*code)(void))                             */
 /*                                                                     */
 /* x0 = ctx, x1 = tp, x2 = endereço de arranque do guest              */
@@ -55,10 +55,10 @@
 /* pelo caminho normal: `code` acaba com um BRK que devolve o controlo  */
 /* ao host.                                                            */
 /* ------------------------------------------------------------------ */
-.section .text.ia_enter_guest, "ax", %progbits
-.global ia_enter_guest
-.type ia_enter_guest, %function
-ia_enter_guest:
+.section .text.g610_enter_guest, "ax", %progbits
+.global g610_enter_guest
+.type g610_enter_guest, %function
+g610_enter_guest:
     /* Guardar o estado do host ANTES de mexer em sp: depois de escrever em
      * sp, o valor original só é recuperável a partir de um registo. */
     mov     x16, sp
@@ -130,21 +130,21 @@ ia_enter_guest:
 
     /* Saltar para o código do guest. */
     br      x2
-.size ia_enter_guest, . - ia_enter_guest
+.size g610_enter_guest, . - g610_enter_guest
 
 /* ------------------------------------------------------------------ */
-/* ia_yield_to_host — o guest devolve o controlo ao host              */
+/* g610_yield_to_host — o guest devolve o controlo ao host              */
 /*                                                                     */
 /* Envia um sinal a si próprio. A volta ao host é sempre feita por um    */
 /* handler, nunca por um retorno directo — é o que torna o contexto do  */
 /* host recuperável.                                                   */
 /*                                                                     */
-/* void ia_yield_to_host(void)                                         */
+/* void g610_yield_to_host(void)                                         */
 /* ------------------------------------------------------------------ */
-.section .text.ia_yield_to_host, "ax", %progbits
-.global ia_yield_to_host
-.type ia_yield_to_host, %function
-ia_yield_to_host:
+.section .text.g610_yield_to_host, "ax", %progbits
+.global g610_yield_to_host
+.type g610_yield_to_host, %function
+g610_yield_to_host:
     mov     x8, #IA_NR_gettid
     svc     #0
     mov     x1, x0                         /* tid */
@@ -152,20 +152,20 @@ ia_yield_to_host:
     mov     x8, #IA_NR_tgkill
     svc     #0
     brk     #1002                          /* inalcançável */
-.size ia_yield_to_host, . - ia_yield_to_host
+.size g610_yield_to_host, . - g610_yield_to_host
 
 /* ------------------------------------------------------------------ */
-/* ia_lock_thread_params — serializa o acesso ao ThreadParameters     */
+/* g610_lock_thread_params — serializa o acesso ao ThreadParameters     */
 /*                                                                     */
 /* Spinlock com LDAXR/STXR. Sem isto, duas threads a entrar e sair ao  */
 /* mesmo tempo corrompem o contexto uma da outra.                      */
 /*                                                                     */
-/* void ia_lock_thread_params(ThreadParameters* tp)                    */
+/* void g610_lock_thread_params(ThreadParameters* tp)                    */
 /* ------------------------------------------------------------------ */
-.section .text.ia_lock_thread_params, "ax", %progbits
-.global ia_lock_thread_params
-.type ia_lock_thread_params, %function
-ia_lock_thread_params:
+.section .text.g610_lock_thread_params, "ax", %progbits
+.global g610_lock_thread_params
+.type g610_lock_thread_params, %function
+g610_lock_thread_params:
     add     x0, x0, #(IA_TLS_LOCK)
 1:  clrex
 2:  ldaxr   w1, [x0]
@@ -173,21 +173,21 @@ ia_lock_thread_params:
     stxr    w1, wzr, [x0]
     cbnz    w1, 2b                         /* falhou: nova tentativa */
     ret
-.size ia_lock_thread_params, . - ia_lock_thread_params
+.size g610_lock_thread_params, . - g610_lock_thread_params
 
 /* ------------------------------------------------------------------ */
-/* ia_unlock_thread_params                                            */
+/* g610_unlock_thread_params                                            */
 /*                                                                     */
-/* void ia_unlock_thread_params(ThreadParameters* tp)                  */
+/* void g610_unlock_thread_params(ThreadParameters* tp)                  */
 /* ------------------------------------------------------------------ */
-.section .text.ia_unlock_thread_params, "ax", %progbits
-.global ia_unlock_thread_params
-.type ia_unlock_thread_params, %function
-ia_unlock_thread_params:
+.section .text.g610_unlock_thread_params, "ax", %progbits
+.global g610_unlock_thread_params
+.type g610_unlock_thread_params, %function
+g610_unlock_thread_params:
     add     x0, x0, #(IA_TLS_LOCK)
     mov     w1, #1                         /* desbloqueado */
     stlr    w1, [x0]
     ret
-.size ia_unlock_thread_params, . - ia_unlock_thread_params
+.size g610_unlock_thread_params, . - g610_unlock_thread_params
 
 .section .note.GNU-stack, "", %progbits
