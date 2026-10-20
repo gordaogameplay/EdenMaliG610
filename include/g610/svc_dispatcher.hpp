@@ -45,6 +45,18 @@ inline constexpr std::uint64_t kDefaultHeapBase = 0x0000'0000'9000'0000ull;
 // trouxer `main_thread_priority`, usa-se essa.
 inline constexpr std::uint32_t kDefaultMainPriority = 0x2C;
 
+// Núcleos virtuais que o guest vê. O Eden: `Core::Hardware::NUM_CPU_CORES`
+// (`hardware_properties.h:18`) = 4. O host (RK3588) tem 8; o guest vê 4,
+// como no Switch.
+inline constexpr std::uint32_t kVirtualCoreCount = 4;
+
+// A máscara de núcleos do processo. Um processo de jogo tem todos: os bits
+// de `KCapabilities::m_core_mask` são todos posts no arranque.
+inline constexpr std::uint64_t kProcessCoreMask = 0xF;
+
+// O handle pseudo da thread corrente, no Eden (`kobject.hpp`): -2.
+inline constexpr std::uint64_t kCurrentThreadHandle = 0xFFFFFFFFFFFFFFFEull;
+
 // Threads livres que o processo pode criar. O Eden nao impõe um limite ao
 // nosso motor — nao temos scheduler — mas o SDK le este numero ANTES de criar
 // threads, e zero e' uma resposta que o faria desistir.
@@ -139,6 +151,11 @@ enum class Result : std::uint32_t {
     // E' o que o `WaitSynchronization` devolve quando o prazo expira sem
     // nada acontecer — e o que o SDK sabe interpretar.
     TimedOut              = 1 | (117 << 9),
+    // `ResultInvalidCoreId` e `ResultInvalidCombination` do Eden
+    // (`kernel/svc_results.h:26` e `:29`): módulo Kernel (1), descrições
+    // 113 e 116.
+    InvalidCoreId         = 1 | (113 << 9),
+    InvalidCombination    = 1 | (116 << 9),
 };
 
 // Contexto de um SVC. x0–x5 são os argumentos (o kernel do Switch passa-os
@@ -519,6 +536,9 @@ private:
     // um erro como motivo para abortar, e um stub transparente deixa-o
     // seguir. A prioridade e' anotada para o relatorio.
     Result svc_set_thread_priority(SvcContext& ctx);
+    Result svc_get_thread_core_mask(SvcContext& ctx);
+    Result svc_set_thread_core_mask(SvcContext& ctx);
+    Result svc_get_current_processor_number(SvcContext& ctx);
 
     Result svc_unsupported(SvcContext&);
 
@@ -603,6 +623,11 @@ private:
     std::uint64_t    stack_base_   = 0;
     std::uint64_t    stack_size_   = 0;
     std::uint32_t    main_priority_ = 0;
+
+    // A máscara de núcleos e o "ideal core" da thread do guest, como o Eden
+    // os guarda (`KThread::m_core_mask`).
+    std::uint64_t    core_mask_ = kProcessCoreMask;
+    std::int32_t     core_id_   = 0;
     std::int32_t     last_priority_ = 0;
 
     // O id do processo e o da thread principal. Fixos: o SDK usa-os como

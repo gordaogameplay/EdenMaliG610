@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sched.h>
 #include <thread>
 
 namespace g610 {
@@ -92,6 +93,14 @@ std::string to_string(Svc s) {
     case Svc::QueryMemory:             return "QueryMemory";
     case Svc::ExitProcess:             return "ExitProcess";
     case Svc::ExitThread:              return "ExitThread";
+    case Svc::CreateThread:            return "CreateThread";
+    case Svc::StartThread:             return "StartThread";
+    case Svc::SleepThread:             return "SleepThread";
+    case Svc::GetThreadPriority:       return "GetThreadPriority";
+    case Svc::SetThreadPriority:       return "SetThreadPriority";
+    case Svc::GetThreadCoreMask:       return "GetThreadCoreMask";
+    case Svc::SetThreadCoreMask:       return "SetThreadCoreMask";
+    case Svc::GetCurrentProcessorNumber: return "GetCurrentProcessorNumber";
     case Svc::SignalEvent:             return "SignalEvent";
     case Svc::ClearEvent:              return "ClearEvent";
     case Svc::MapSharedMemory:         return "MapSharedMemory";
@@ -129,6 +138,9 @@ std::string to_string(Result r) {
     case Result::PermissionDenied:  return "PermissionDenied";
     case Result::OutOfResource:     return "OutOfResource";
     case Result::Unsupported:       return "Unsupported";
+    case Result::InvalidCoreId:    return "InvalidCoreId";
+    case Result::InvalidCombination: return "InvalidCombination";
+    case Result::TimedOut:         return "TimedOut";
     default:                        return "Result#" + std::to_string((std::uint32_t)r);
     }
 }
@@ -244,6 +256,9 @@ void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
     case Svc::SendSyncRequestLight: r = svc_send_sync_request_light(ctx); break;
     case Svc::GetThreadPriority:    r = svc_get_thread_priority(ctx); break;
     case Svc::SetThreadPriority:    r = svc_set_thread_priority(ctx); break;
+    case Svc::GetThreadCoreMask:    r = svc_get_thread_core_mask(ctx); break;
+    case Svc::SetThreadCoreMask:    r = svc_set_thread_core_mask(ctx); break;
+    case Svc::GetCurrentProcessorNumber: r = svc_get_current_processor_number(ctx); break;
     case Svc::SignalProcessWideKey: r = svc_signal_process_wide_key(ctx); break;
     default:                        r = svc_unsupported(ctx);    break;
     }
@@ -252,6 +267,20 @@ void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
     // Ver `SvcContext::has_ret`.
     if (!ctx.has_ret)
         ctx.ret = static_cast<std::uint64_t>(r);
+
+    // **Um SVC que devolve erro mata o jogo.** O SDK trata um Result
+    // inesperado como fatal: chama `SetTerminateResult` ao `am` e aborta.
+    // Foi o que aconteceu com o SVC 0x0f (`SetThreadCoreMask`), que nao
+    // estava implementado e devolvia `Unsupported` (64 = 0x40).
+    //
+    // Por isso o Result de cada SVC que falha fica no log: e' a unica
+    // pista que diz *qual* chamada matou o jogo.
+    if (r != Result::Success && std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[svc] #0x%02x %-24s devolveu ERRO %s (0x%x)\n", number,
+                     to_string(static_cast<Svc>(number)).c_str(), to_string(r).c_str(),
+                     static_cast<unsigned>(r));
+    }
 
     // A medição é o produto principal do motor: cada SVC entra no histograma
     // com o seu custo, e o resumo aponta o mais caro.
@@ -886,6 +915,121 @@ Result SvcDispatcher::svc_get_thread_priority(SvcContext& ctx) {
 // nao houver threads a schedular.
 Result SvcDispatcher::svc_set_thread_priority(SvcContext& ctx) {
     last_priority_ = static_cast<std::int32_t>(ctx.x[2]);
+    return Result::Success;
+}
+
+// SetThreadCoreMask — `SvcWrap_SetThreadCoreMask64` no Eden (svc.cpp:1356).
+//
+//     x0 = handle da thread    x1 = core_id    x2 = máscara de afinidade
+//     x0 = Result
+//
+// **Este SVC matava o jogo.** O SDK do jogo chamou-o com
+// (handle=0x81ff, core_id=0, máscara=1); o motor não o tinha implementado,
+// caiu no `default` e devolveu `Result::Unsupported` — que no nosso enum é
+// 64 = 0x40. O SDK trata esse erro como fatal: chamou `SetTerminateResult`
+// ao `am` com 0x40 e depois abortou (`brk #0x26`).
+//
+// A medição está no trace: o `svc #164` foi o `0x0f`, o `svc #166` foi o
+// `SetTerminateResult` com 0x40 no pedido, e o `svc #168` foi o `Break`.
+//
+// A validação é a do Eden (`kernel/svc/svc_thread.cpp:252-280`).
+Result SvcDispatcher::svc_set_thread_core_mask(SvcContext& ctx) {
+    const std::uint64_t handle = ctx.x[0];
+    std::int32_t  core_id = static_cast<std::int32_t>(ctx.x[1]);
+    std::uint64_t mask = ctx.x[2];
+
+    // Os valores mágicos são os do Eden (`kernel/svc_types.h:97-99`).
+    constexpr std::int32_t kIdealCoreDontCare   = -1;
+    constexpr std::int32_t kIdealCoreUseProcess = -2;
+    constexpr std::int32_t kIdealCoreNoUpdate   = -3;
+
+    if (core_id == kIdealCoreUseProcess) {
+        // O Eden usa o "ideal core" do processo. Não temos scheduler, e o
+        // processo não tem ideal core próprio: o núcleo 0.
+        core_id = 0;
+        mask    = 1;
+    } else {
+        // A máscara tem de ser um subconjunto da máscara do processo.
+        if ((mask | kProcessCoreMask) != kProcessCoreMask)
+            return Result::InvalidCoreId;
+        if (mask == 0)
+            return Result::InvalidCombination;
+        if (core_id >= 0 && core_id < static_cast<std::int32_t>(kVirtualCoreCount)) {
+            if (((std::uint64_t{1} << core_id) & mask) == 0)
+                return Result::InvalidCombination;
+        } else if (core_id != kIdealCoreNoUpdate && core_id != kIdealCoreDontCare) {
+            return Result::InvalidCoreId;
+        }
+    }
+
+    // O handle tem de existir. Só há uma thread de guest — a principal — e o
+    // Eden dá-lhe um handle na sua tabela (medido no guest: 0x81ff).
+    const std::uint32_t principal = main_thread_handle();
+    const bool pseudo = (handle == kCurrentThreadHandle);
+    if (eden_attached() && principal != 0 && handle != principal && !pseudo)
+        return Result::InvalidHandle;
+
+    core_mask_ = mask;
+    core_id_   = core_id;
+
+    // O guest é nativo: a máscara de núcleos do Switch mapeia-se
+    // directamente nos CPUs do host (núcleo virtual i -> CPU i). O jogo pediu
+    // só o núcleo 0, e é isso que passa a valer.
+    cpu_set_t cpus;
+    CPU_ZERO(&cpus);
+    for (std::uint32_t i = 0; i < kVirtualCoreCount; i++)
+        if ((mask >> i) & 1u)
+            CPU_SET(i, &cpus);
+    if (CPU_COUNT(&cpus) != 0)
+        ::sched_setaffinity(0, sizeof(cpus), &cpus);
+
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[svc] SetThreadCoreMask handle=0x%llx core_id=%d mask=0x%llx\n",
+                     static_cast<unsigned long long>(handle), core_id,
+                     static_cast<unsigned long long>(mask));
+    }
+
+    ctx.ret      = 0;
+    ctx.has_ret  = true;
+    return Result::Success;
+}
+
+// GetThreadCoreMask — `SvcWrap_GetThreadCoreMask64` no Eden (svc.cpp:1346).
+//
+//     x0 = Result    x1 = core_id (saída)    x2 = máscara (saída)
+//     x2 = handle da thread (entrada)
+//
+// O handle entra em x2 e a máscara sai em x2: é o que o Eden faz, e o Eden
+// é a fonte. Os SVCs que devolvem valores põem-nos no registo que era o
+// argumento.
+Result SvcDispatcher::svc_get_thread_core_mask(SvcContext& ctx) {
+    const std::uint64_t handle = ctx.x[2];
+
+    const std::uint32_t principal = main_thread_handle();
+    const bool pseudo = (handle == kCurrentThreadHandle);
+    if (eden_attached() && principal != 0 && handle != principal && !pseudo)
+        return Result::InvalidHandle;
+
+    ctx.x[1] = static_cast<std::uint64_t>(static_cast<std::uint32_t>(core_id_));
+    ctx.x[2] = core_mask_;
+    ctx.ret      = 0;
+    ctx.has_ret  = true;
+    return Result::Success;
+}
+
+// GetCurrentProcessorNumber — `SvcWrap_GetCurrentProcessorNumber64` no Eden
+// (svc.cpp:1364).
+//
+//     x0 = o número do núcleo (NÃO é um Result)
+//
+// O Eden põe o número do núcleo em x0 e não escreve Result nenhum. Fazer
+// como o Eden: x0 é o valor, não o código de erro.
+Result SvcDispatcher::svc_get_current_processor_number(SvcContext& ctx) {
+    const int cpu = ::sched_getcpu();
+    ctx.x[1] = static_cast<std::uint64_t>(static_cast<std::uint32_t>(cpu < 0 ? 0 : cpu));
+    ctx.ret      = static_cast<std::uint64_t>(static_cast<std::uint32_t>(cpu < 0 ? 0 : cpu));
+    ctx.has_ret  = true;
     return Result::Success;
 }
 
