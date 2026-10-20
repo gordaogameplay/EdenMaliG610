@@ -2450,3 +2450,95 @@ SDK percorre (o `x30` de todas as 527 chamadas é o mesmo —
 `sdk+0x332a13c`, uma função local, sem símbolo exportado), e ver o que
 ela lê. Ou, em alternativa, comparar com o mesmo jogo correndo no Eden
 completo, que é a fonte da verdade do projecto.
+
+---
+
+# Sessão 2026-10-20 (continuação) — o SDK precisa de espaço livre, e de uma thread
+
+A secção anterior parou num "Result de erro que vem de um serviço". A
+medição seguinte mostrou que **não vinha de nenhum**: o log novo (o Result
+de cada SVC, a resposta de cada IPC) diz que **nenhum SVC devolveu erro** e
+que **todas as respostas IPC têm `Result = 0`**.
+
+O que havia sobrado era o SDK a **procurar espaço** no espaço de endereçamento
+do processo.
+
+## O que o SDK estava a fazer (medido, no `sdk` desassemblado)
+
+A função que faz as 527 `svcQueryMemory` é
+`nn::os::detail::AddressSpaceAllocator::AllocateSpace` (offset `0x32c0b0` do
+`subsdk`/SDK). O código, lido:
+
+```
+ 32c0d0: ldr  x9, [x0, #24]        ; o[24]
+ 32c0d4: add  x8, x1, #0xfff
+ 32c0dc: add  x8, x9, x8, lsr #12  ; o total, em paginas
+ 32c0e0: ldp  x22, x9, [x0, #8]    ; o[8], o[16] — os limites da regiao
+ 32c0e8: subs x23, x9, x22        ; o span (ja com o total descontado)
+ 32c118: udiv x8, x0, x23
+ 32c120: msub x8, x8, x23, x0      ; x0 % span   <- ALEATORIO
+ 32c128: add  x8, x8, x22
+ 32c12c: and  x27, x8, x25        ; alinha
+ 32c130: lsl  x21, x27, #12       ; o endereco candidato
+ 32c138: bl   0x37ea24            ; svcQueryMemory(candidato)
+ 32c13c: ldr  w8, [sp, #24]       ; o ESTADO do bloco devolvido
+ 32c140: cbnz w8, 0x32c158        ; se nao for Free -> outra tentativa
+ 32c148: add  x8, x21, x26        ; candidato + total
+ 32c14c: add  x9, x10, x9         ; base + tamanho do bloco
+ 32c150: cmp  x8, x9
+ 32c154: b.ls 0x32c194            ; cabe -> sucesso
+ ...
+ 32c164: cmp  w24, #0x200          ; ate 512 tentativas
+```
+
+Três coisas, todas medidas:
+
+1. O candidato é **aleatório** (daí os endereços espalhados) e está dentro da
+   **região da stack** (os limites `o[8]`/`o[16]`).
+2. O SDK **exige um bloco com estado `Free`** — o `ldr w8, [sp, #24]` lê o
+   campo `state` do `MemoryInfo` que o SVC devolve.
+3. Tenta **512 vezes** e depois desiste.
+
+## Os três bugs que daí saíram
+
+| | o que estava | o que é (fonte) |
+|---|---|---|
+| o bloco livre | `base=0, size=0` | o bloco `Free` **com o tamanho** (`k_memory_block_manager.h:129`) |
+| a região da stack | 8 MiB, toda `Stack` | **2 GiB**, e só a stack da thread (1 MiB, do NPDM) é `Stack`; o resto é `Free` (`k_address_space_info.cpp:56`) |
+| o alias | `Normal RW-` (mapeado) | `Free` — é de lá que o SDK aloca |
+
+Medido: a tempestade de **527 `svcQueryMemory` desapareceu** e o arranque
+passou de 39,8 ms para **62,8 ms**.
+
+## E depois: a thread
+
+O SDK cria uma thread logo a seguir (o `entry point` medido está no
+`subsdk1`, `0x83abb240`) e arranca-a. Nem o `CreateThread` (0x08) nem o
+`StartThread` (0x09) existiam no motor: devolviam `Unsupported` (64 =
+0x40) — e o SDK trata isso como fatal.
+
+Implementados **como stubs**, com a ABI do Eden (`svc.cpp:1304` e `:1367`):
+a thread fica na nossa tabela de handles (para o handle ser válido), mas
+**não corre**.
+
+Duas correções que a medição obrigou no caminho:
+
+- a prioridade vai de **0 a 63** (`kernel/svc_types.h:101-102`), não de 0 a
+  31 — o guest passou 0x2C (44);
+- o `SetThreadCoreMask` que vem a seguir ao `CreateThread` traz **o handle
+  da thread nova**, e devolvia `InvalidHandle`.
+
+## Onde estamos
+
+| | no início da sessão | agora |
+|---|---|---|
+| arranque | 32 ms / 168 SVCs | **62,8 ms / 218 SVCs** |
+| SVCs com erro | (não medido) | **0** |
+| respostas IPC com erro | (não medido) | **0** |
+
+O que falta: **a thread de guest tem de correr**. O SDK cria-a, arranca-a,
+e depois espera por ela (e o jogo morre à espera). Este motor corre o guest
+nativamente, numa thread do host, com as traps resolvidas por sinais: uma
+segunda thread de guest exige que o estado do despachante, o TLS e o
+`TPIDR_EL0` sejam **por thread** — e hoje não são. Esse é o próximo passo,
+e é o mesmo trabalho que falta para o motor ter scheduler.
