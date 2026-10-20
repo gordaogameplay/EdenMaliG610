@@ -111,19 +111,21 @@ set(IA_EDEN_SOURCES
   vendor/eden/core/hle/kernel/k_session.cpp
   vendor/eden/core/hle/kernel/k_session_request.cpp
   vendor/eden/core/hle/kernel/k_spin_lock.cpp
+  vendor/eden/core/hle/service/aoc/addon_content_manager.cpp
+  vendor/eden/core/hle/service/aoc/purchase_event_manager.cpp
   vendor/eden/core/hle/service/apm/apm.cpp
   vendor/eden/core/hle/service/apm/apm_controller.cpp
-  vendor/eden/core/hle/service/kernel_helpers.cpp
-  vendor/eden/core/hle/service/os/event.cpp
-  vendor/eden/core/hle/service/pctl/parental_control_service.cpp
-  vendor/eden/core/hle/service/pctl/parental_control_service_factory.cpp
-  vendor/eden/core/hle/service/pctl/pctl.cpp
   vendor/eden/core/hle/service/apm/apm_interface.cpp
   vendor/eden/core/hle/service/hle_ipc.cpp
+  vendor/eden/core/hle/service/kernel_helpers.cpp
   vendor/eden/core/hle/service/lm/lm.cpp
+  vendor/eden/core/hle/service/os/event.cpp
   vendor/eden/core/hle/service/os/multi_wait.cpp
   vendor/eden/core/hle/service/os/multi_wait_holder.cpp
   vendor/eden/core/hle/service/os/mutex.cpp
+  vendor/eden/core/hle/service/pctl/parental_control_service.cpp
+  vendor/eden/core/hle/service/pctl/parental_control_service_factory.cpp
+  vendor/eden/core/hle/service/pctl/pctl.cpp
   vendor/eden/core/hle/service/server_manager.cpp
   vendor/eden/core/hle/service/service.cpp
   vendor/eden/core/hle/service/sm/sm.cpp

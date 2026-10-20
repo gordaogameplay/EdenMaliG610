@@ -43,6 +43,7 @@
 #include "vendor/eden/core/hle/kernel/svc_results.h"
 #include "vendor/eden/core/hle/service/apm/apm.h"
 #include "vendor/eden/core/hle/service/apm/apm_controller.h"
+#include "vendor/eden/core/hle/service/aoc/addon_content_manager.h"
 #include "g610/services/applet_oe.hpp"
 #include "vendor/eden/core/hle/service/lm/lm.h"
 #include "vendor/eden/core/hle/service/pctl/pctl.h"
@@ -553,6 +554,21 @@ EdenSystem::EdenSystem(GuestMemory& memoria, std::uint64_t pid, std::uint64_t ti
     // codigo estava compilado e nunca executado — e o guest nao dizia
     // nada, porque um pedido pendente nao e' um erro: e' uma espera.
     Service::PCTL::LoopProcess(*this);
+
+    // O `aoc:u` (os DLC). Este e' o **ultimo** servico que faltava, e o
+    // mais importante: enquanto o `sm:` fica a espera por ele, **nenhum**
+    // pedido seguinte do guest e' atendido.
+    //
+    // Medido: o guest pede `aoc:u` logo a seguir ao `appletOE`, o `sm:`
+    // responde "Waiting for service aoc:u to become available" e fica
+    // bloqueado. Os pedidos seguintes (`pctl`, `pctl:s`, `pctl:a`,
+    // `pctl:r`) ficam **na fila** — e o log do `sm:` nunca mostra o nome
+    // deles.
+    //
+    // O servico esta vendorizado do Eden, sem o `ContentProvider`: um
+    // motor de execucao nativa nao tem DLC, e a lista vazia e' a
+    // resposta honesta. O que o guest precisa e' que o servico **exista**.
+    Service::AOC::LoopProcess(*this);
 
     // A verificacao que esteve aqui -- `KObjectName::Find("sm:")` -- **partiu
     // o jogo**.
