@@ -534,3 +534,85 @@ Duas vias para o meio da cadeia:
 
 A 1 é rápida e de risco desconhecido. A 2 é lenta e controlada. É uma decisão
 de arquitectura — não a tomo sozinho.
+
+
+---
+
+# Frente 2 — marco 1: a cadeia inteira, sem o jogo
+
+```
+Maxwell SASS sintetico  ->  IR  ->  GLSL  ->  SPIR-V
+   [feito]                 [feito] [feito]  [feito, pelo glslang real]
+```
+
+**17 verificações, 0 falhas. Suite completa: 5 testes, todos a passar.**
+
+O shader que passa:
+
+```glsl
+void main() {
+    uint R2 = uint(0);   uint R3 = uint(0);   float R4 = float(0);
+    R2 = uint(u_c[0][16]);        // MOV R2, c[0][0x10]
+    R3 = uint(u_c[0][20]);        // MOV R3, c[0][0x14]
+    R4 = float(float(R2) * float(R3));   // FMUL R4, R2, R3
+    R4 = float(float(R4) + float(R2));   // FADD R4, R4, R2
+    o_color = vec4(R4);
+}
+```
+
+O `glslang` aceita, o `spirv-val` valida, o `spirv-dis` desassembla.
+
+## A codificação dos operandos (medida, não de memória)
+
+De `impl.cpp` e `move_register.cpp` do Eden:
+
+| campo | bits |
+|---|---|
+| `Ra` | [0, 8) |
+| `Rb` | [8, 16) |
+| predicado | [16, 20) |
+| `Rd` nos aritméticos | [20, 28) |
+| `Rc` | [39, 47) |
+| cbuf offset (palavras) | [20, 34) |
+| cbuf binding | [34, 39) |
+| imm 20 (sinal no bit 56) | [20, 39) |
+| imm 32 | [20, 52) |
+| opcode | [63, 48) |
+
+## Quatro bugs que os testes apanharam
+
+Nenhum deles dava erro. Todos davam GLSL que **compilava**.
+
+1. **`make()` com a máscara dos wildcards invertida.** `payload & wild` em vez
+   de `payload & ~wild` — todos os operandos liam zero. O GLSL dizia
+   `R0 = R0 * R0`.
+2. **O destino do `MOV` não está em [20:28).** Está em **[0, 8)** — o Maxwell
+   usa um layout de operandos diferente para `MOV` e para os aritméticos.
+   Confirma-se em `move_register.cpp` (`BitField<0, 8> dest_reg`).
+3. **O bit de "vou buscar a uma constante" não existe para o `MOV`.**
+   `MOV (reg)` e `MOV (cbuf)` são opcodes distintos. Pôr `is_cbuf` à mão
+   arruinou o destino duas vezes — com o bit 0 escrevia em R3, com o bit 5
+   escrevia em R34.
+4. **Em Maxwell um registo não tem tipo.** O tipo vem do uso: R2 escrito por
+   um `MOV` inteiro e lido por um `FMUL` como float. O GLSL não tem isso, e
+   `float + uint` é erro de compilação. Os operandos levam conversão explícita.
+
+O ponto comum: **um tradutor de shaders que produz saída válida com a
+semântica errada é o pior tipo de bug possível.** Compila, executa, e dá uma
+imagem errada que ninguém consegue explicar.
+
+## `IMAD` ficou de fora, e é de propósito
+
+`IMAD.MOV.U32 Rd, RZ, RZ, c[bank][off]` é a forma canónica de carregar uma
+constante, mas o destino do IMAD **não** está em [20:28) — esse campo é o
+offset do banco. A posição certa não foi confirmada, e adivinhá-la produziria
+constantes erradas com o GLSL a compilar.
+
+Fica para quando se confirmar em `integer_scaled_add.cpp`.
+
+## O passo seguinte
+
+**Executar o SPIR-V na G610 de verdade.** Falta um device Vulkan, um UBO com
+as constantes, um render pass e um readback de um pixel — e comparar o valor
+com o que o shader deveria produzir. É o que fecha o ciclo, e é medível:
+`R4 = 1.0f * 0.5f + 1.0f = 1.5`, e o pixel tem de dar 1.5.

@@ -45,8 +45,11 @@ add_library(ia_core STATIC
   src/input.cpp
   src/svc_dispatcher.cpp
   src/ipc_min.cpp
+  src/gpu/ir.cpp
   src/gpu/maxwell_isa.cpp
   src/gpu/maxwell_program.cpp
+  src/gpu/maxwell_frontend.cpp
+  src/gpu/glsl_backend.cpp
   src/gpu/maxwell_translator.cpp
   src/patcher.cpp
   src/native_engine.cpp
@@ -105,6 +108,11 @@ target_link_libraries(ia_program PRIVATE ia_core)
 add_executable(ia_maxwell_test tests/test_maxwell.cpp)
 target_link_libraries(ia_maxwell_test PRIVATE ia_core)
 add_test(NAME maxwell COMMAND ia_maxwell_test)
+
+# Teste da cadeia: SASS sintetico -> IR -> GLSL -> SPIR-V.
+add_executable(ia_translate_test tests/test_translate.cpp)
+target_link_libraries(ia_translate_test PRIVATE ia_core)
+add_test(NAME translate COMMAND ia_translate_test)
 
 # Teste de input: prova que a pilha SDL2 + evdev + mapeamento funciona.
 # Nao e' um teste do motor, e' um teste do INPUT.

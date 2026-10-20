@@ -42,4 +42,18 @@ Program make_trivial_program();
 // descodificador em volume sem escrever um assembler.
 Program make_burst_program(std::size_t n);
 
+// Um programa real, dentro do subconjunto que o frontend suporta, e que
+// produz pixels.
+//
+// ESTE é o programa que vai ao G610. É deliberadamente SEM texturas: a
+// cadeia inteira — descodificar, IR, GLSL, SPIR-V, executar na Mali — prova-se
+// com um shader que lê constantes e escreve uma cor. Texturas vêm depois, e
+// quando vierem sabe-se que a cadeia já funcionava antes delas.
+Program make_minimal_shader();
+
+// Um programa escrito com operandos explícitos, para testar o codificador
+// de operandos sem depender do gerador.
+Program make_program(const std::vector<maxwell::Insn>& code,
+                     const char* stage);
+
 } // namespace ia::gpu::maxwell
