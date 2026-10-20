@@ -24,14 +24,29 @@ EngineHooks g_hooks{};
 // TPIDR_EL0: o TLS da thread, lido e escrito pelo guest
 // ---------------------------------------------------------------------------
 //
-// O registo de software `tpidrro_el0` é o `fs` do AArch64: é onde o guest vai
-// buscar o seu TLS com `mrs x, tpidrro_el0`. Numa execução nativa, quem o
-// escreve é o host. Ver `EngineHooks::guest_tls`.
+// O guest vai buscar o seu TLS com `mrs x, tpidrro_el0`. Esse registo não
+// existe para o guest neste kernel — medido quatro vias, ver PROGRESSO.md —
+// por isso o patcher reescreve essa instrução para `mrs x, tpidr_el0`, e é
+// este registo que o motor programa.
+//
+// `TPIDR_EL0` é o `fs` do AArch64 e é por thread de hardware, o que dá a
+// multi-thread de graça: cada thread de host guarda o seu e instala o seu
+// bloco de TLS de guest.
+//
+// Consequência que obriga a cuidado: enquanto o guest corre, `TPIDR_EL0` não é
+// o TLS da libc. Qualquer código de host que corra nesse intervalo e use TLS
+// rebenta — medido: `snprintf` com o `fs` apontado para o bloco do guest dá
+// segfault. O único código de host que corre aí dentro é o handler de sinais,
+// e é por isso que a troca vive aí e não só à volta de `run()`.
 
 inline std::uint64_t read_thread_pointer() {
     std::uint64_t v = 0;
-    __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(v));
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(v));
     return v;
+}
+
+inline void write_thread_pointer(std::uint64_t v) {
+    __asm__ volatile("msr tpidr_el0, %0" ::"r"(v) : "memory");
 }
 
 
@@ -325,9 +340,9 @@ RunResult NativeEngine::run(void (*code)(), std::uint64_t sp) {
         ssize_t w = ::write(2, b, (size_t)k); (void)w;
     }
 
-    // A base do TLS que o guest espera ver em `tpidrro_el0`. Registada aqui para
-// que `emulate_tls_read` a possa injectar quando a instruçãofaultar.
-g_hooks.guest_tls = layout::kTlsBase;
+    // A base do TLS do guest, decidida pelo boot (`set_guest_tls`). Zero quando
+// não há programa — e nesse caso o `TPIDR_EL0` não é tocado.
+g_hooks.guest_tls = hooks_.guest_tls;
 g_hooks.host_tls  = read_thread_pointer();
 
 const int jumped = sigsetjmp(g_run_jmp, 1);
@@ -356,8 +371,19 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
     hooks_.fault_addr  = g_hooks.fault_addr;
     hooks_.fault_sp    = g_hooks.fault_sp;
 
+    // Já estamos no host. O `siglongjmp` deixou o TLS do guest instalado, e o
+    // resto de `run()` — telemetria, relatório — é código de host.
+    if (g_hooks.guest_tls != 0)
+        write_thread_pointer(g_hooks.host_tls);
+
     if (jumped == 0) {
         g_have_run_jmp = true;
+
+        // Instalar o TLS do guest. Daqui até ao `sigreturn` que segue
+        // qualquer trap, o `mrs x, tpidr_el0` do guest devolve a base do TLS
+        // DELE — e não o da libc.
+        if (g_hooks.guest_tls != 0)
+            write_thread_pointer(g_hooks.guest_tls);
 
         ia_call_guest(code, sp, platform_reg_);
         g_have_run_jmp = false;
@@ -427,7 +453,27 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
 // ---------------------------------------------------------------------------
 
 void NativeEngine::signal_trampoline(int sig, siginfo_t* info, void* raw) {
+    // Duas trocas, e o motivo é o mesmo nos dois sentidos: quem executa
+    // decide de quem é o registo.
+    //
+    //   - o handler é código do HOST (printf, telemetria, despacho de SVC) e
+    //     precisa do TLS da libc.
+    //   - o `sigreturn` que se segue põe o guest a correr, e o guest espera o
+    //     SEU TLS em `TPIDR_EL0`.
+    //
+    // Se a troca do fim faltar, o guest retoma com o TLS da libc e lê o
+    // ThreadLocalRegion no sítio errado — um fault que não parece um fault.
+    if (g_hooks.guest_tls == 0) {
+        // Sem programa carregado não há bloco de TLS de guest — e instalar
+        // um endereço não mapeado rebenta a libc dentro do handler. Os testes
+        // unitários correm um guest sintético sem programa, e ficavam a
+        // bloquear por causa disto.
+        handle_guest_signal(sig, info, raw);
+        return;
+    }
+    write_thread_pointer(g_hooks.host_tls);
     handle_guest_signal(sig, info, raw);
+    write_thread_pointer(g_hooks.guest_tls);
 }
 
 void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw) {

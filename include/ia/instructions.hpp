@@ -119,6 +119,52 @@ static_assert(MRS{0xD53BE020}.rt() == 0, "Rt = 0");
 static_assert(MRS{0xD53BE020}.sysreg() == 0x5F01, "CNTPCT_EL0 = 0x5F01");
 
 // ---------------------------------------------------------------------------
+// MRS <Xt>, TPIDRRO_EL0  ->  MRS <Xt>, TPIDR_EL0
+// ---------------------------------------------------------------------------
+//
+// Um bit. É tudo.
+//
+// Os encodings não foram escritos a olho — foram montados com o assembler e
+// lidos do `.o`:
+//
+//     mrs x0, tpidrro_el0   ->  d53bd060
+//     mrs x5, tpidr_el0     ->  d53bd045
+//
+// A diferença é o bit 6 (valor 0x20). Os 4 bytes mantêm-se, o registo destino
+// mantem-se, e o alcance é o mesmo. Sem pool de literais, sem relocação, sem
+// reposicionar os 25 MB do `.text` do `main`.
+//
+// Porque é preciso: neste kernel `TPIDRRO_EL0` não existe para o guest.
+// Medido — `mrs` devolve sempre 0, `msr` dá SIGILL, e `arch_prctl`
+// (ARCH_SET_FS) devolve EINVAL. `TPIDR_EL0`, esse sim, é programável e
+// devolve um valor real por thread de hardware. Trocar o registo na
+//instruction, em vez de a emular por trap, custa zero por acesso.
+constexpr std::uint32_t kMrsTpidrroEl0 = 0xD53BD060u;  // "d53bd060 | Rt"
+constexpr std::uint32_t kMrsTpidrEl0   = 0xD53BD040u;  // "d53bd045 | Rt"
+constexpr std::uint32_t kSysregMask    = 0xFFFFFFE0u;  // apaga Rt (bits 0-4)
+
+[[nodiscard]] constexpr bool is_mrs_tpidrro(std::uint32_t insn) noexcept {
+    return (insn & kSysregMask) == kMrsTpidrroEl0;
+}
+
+// O bit 5 (0x20) é o que distingue os dois registos. Apagá-lo traduz
+// `MRS <Xt>, TPIDRRO_EL0` em `MRS <Xt>, TPIDR_EL0` sem tocar em Rt (bits
+// 0-4) nem em mais nada.
+[[nodiscard]] constexpr std::uint32_t tpidrro_to_tpidr(std::uint32_t insn) noexcept {
+    return is_mrs_tpidrro(insn) ? (insn & ~0x20u) : insn;
+}
+
+// Os dois encodings confirmados com o assembler, como `static_assert`, para
+// que uma alteração futura não os desfaça em silêncio.
+static_assert((0xD53BD060u & kSysregMask) == kMrsTpidrroEl0);
+static_assert((0xD53BD045u & kSysregMask) == kMrsTpidrEl0);
+static_assert(kMrsTpidrroEl0 != kMrsTpidrEl0);
+static_assert(tpidrro_to_tpidr(0xD53BD068u) == 0xD53BD048u,
+              "mrs x8, tpidrro_el0  ->  mrs x8, tpidr_el0");
+static_assert(tpidrro_to_tpidr(0xD53BD045u) == 0xD53BD045u,
+              "ja e' tpidr_el0, fica como esta");
+
+// ---------------------------------------------------------------------------
 // MSR — Move System Register (a partir de registo)
 // ---------------------------------------------------------------------------
 struct MSR {

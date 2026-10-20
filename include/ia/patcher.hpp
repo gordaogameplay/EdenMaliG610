@@ -40,6 +40,9 @@ struct PatchReport {
     std::uint64_t svc_patched     = 0;
     std::uint64_t hints_nop       = 0; // WFI/YIELD/SEV neutralizados
     std::uint64_t mrs_seen        = 0;
+    // `MRS <Xt>, TPIDRRO_EL0` reescritos como `MRS <Xt>, TPIDR_EL0`. Se for
+    // 0 e o guest faultar a ler o TLS, o patch não foi aplicado.
+    std::uint64_t tpidrro_to_tpidr = 0;
     std::uint64_t msr_seen        = 0;
     std::uint64_t exclusives_seen = 0;
     std::uint32_t first_svc       = 0;

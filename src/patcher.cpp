@@ -25,6 +25,7 @@ std::string PatchReport::summary() const {
     o << "\n"
       << "hints -> NOP       : " << hints_nop << "\n"
       << "MRS / MSR vistos   : " << mrs_seen << " / " << msr_seen << "\n"
+      << "MRS TPIDRRO->TPIDR : " << tpidrro_to_tpidr << "\n"
       << "exclusivos vistos  : " << exclusives_seen << "\n";
     return o.str();
 }
@@ -52,12 +53,28 @@ bool StaticPatcher::patch_word(std::uint32_t& insn, PatchSite& site) {
         site.after = insn;
         return true;
     }
-    case Disposition::TrapToHost:
-        // MRS/MSR e load/store exclusivos ficam como estão: a trap trata-os.
-        // Reescrever MRS exigiria uma sequência multi-instrução num sítio
-        // arbitrário, o que é mais arriscado do que tratar a trap.
+    case Disposition::TrapToHost: {
+        // `MRS <Xt>, TPIDRRO_EL0` passa a `MRS <Xt>, TPIDR_EL0`. Um bit.
+        //
+        // O comentário que estava aqui dizia que reescrever MRS exigiria uma
+        // sequência multi-instrução num sítio arbitrário, "mais arriscoso do
+        // que tratar a trap". Era verdade para os MRS que precisavam de ser
+        // emulados com um estado por thread — o Eden faz isso com
+        // `MRS` + `LDR`, e daí 8 bytes no lugar de 4 e 25 MB a reposicionar.
+        //
+        // Este não precisa de estado nenhum: o registo de destino é o mesmo,
+        // a largura é a mesma, e o valor que o guest quer é precisamente o
+        // que `TPIDR_EL0` devolve — desde que o motor instale lá a base do
+        // TLS do guest. Ver `NativeEngine`.
+        if (arm::MRS{insn}.verify() && arm::is_mrs_tpidrro(insn)) {
+            insn = arm::tpidrro_to_tpidr(insn);
+            site.after = insn;
+            return true;
+        }
+        // Os restantes MRS/MSR e os load/store exclusivos ficam como estão.
         site.after = insn;
         return false;
+    }
     case Disposition::RunNatively:
         site.after = insn;
         return false;
@@ -116,10 +133,15 @@ bool StaticPatcher::patch(std::vector<std::uint8_t>& image,
             changed = true;
             ++report_.hints_nop;
         } else if (changed) {
-            ++report_.svc_patched;
-            if (!report_.saw_any_svc) {
-                report_.first_svc = site.svc;
-                report_.saw_any_svc = true;
+            // Distingue o patch de TLS do patch de SVC pelo encoding original.
+            if (arm::is_mrs_tpidrro(site.before))
+                ++report_.tpidrro_to_tpidr;
+            else {
+                ++report_.svc_patched;
+                if (!report_.saw_any_svc) {
+                    report_.first_svc = site.svc;
+                    report_.saw_any_svc = true;
+                }
             }
         } else {
             // Trap ao host: observa-se para o relatório, não se reescreve.

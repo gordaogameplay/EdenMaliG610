@@ -339,6 +339,8 @@ int main(int argc, char** argv) {
 
     // ── 3. motor, com o traçador ligado ───────────────────────────────────
     ia::NativeEngine engine(tel, svc);
+    // O bloco de TLS do guest só existe depois de `map_into()`.
+    engine.set_guest_tls(ia::layout::kTlsBase);
     // Poucos traps: este tracer é para ver os PRIMEIROS serviços pedidos, e
     // um guest em spin de código não levanta traps nenhum. O limite não o
     // apanha, mas garante que o programa acaba e imprime relatório — em vez

@@ -153,6 +153,15 @@ public:
     NativeEngine(const NativeEngine&) = delete;
     NativeEngine& operator=(const NativeEngine&) = delete;
 
+    // A base do TLS do guest, que o motor vai instalar em `TPIDR_EL0`.
+    //
+    // Só o boot o sabe: o motor não conhece o layout do programa, e um teste
+    // unitário que corra um guest sintético não tem bloco nenhum. Deixar a 0
+    // significa "não tocar no `TPIDR_EL0`", que é o comportamento certo
+    // quando não há guest — e é o que evita que a libc do host fique com um
+    // `fs` a apontar para memória que não existe.
+    void set_guest_tls(std::uint64_t base) noexcept { hooks_.guest_tls = base; }
+
     // Instala os handlers. Uma vez. Sem isto um BRK mata o processo.
     bool install_handlers(std::string& error);
 
