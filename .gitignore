@@ -1,3 +1,7 @@
 build/
 *.o
 *.a
+
+# O clone que o GitHub Desktop gere: e' um repositorio dentro deste, e
+# nao faz parte do projecto.
+/EdenMaliG610/
