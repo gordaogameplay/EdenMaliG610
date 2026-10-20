@@ -42,9 +42,43 @@ Quando uma hipótese é refutada, escreve-se. A lista está em
 | Telemetria por frame e por serviço | feito |
 | Descoberta de módulos (MOD0 + QueryMemory) | feito |
 | ThreadLocalRegion da thread principal | feito |
-| Patch de `MRS TPIDRRO_EL0` | **em curso** |
-| Passar o crt0 | **não** |
-| Serviços / nvdrv / GPU | fora de âmbito |
+| Patch de `MRS TPIDRRO_EL0` | feito |
+| **Passar o crt0** | **feito** |
+| Serviços / nvdrv / GPU | **bloqueio declarado** |
+
+---
+
+## Onde paramos
+
+O guest passou o crt0 e pediu a porta **`sm:`** (o service manager), seguida de
+`SendSyncRequest`. Daí em diante é IPC a sério, que é a fronteira combinada.
+
+**164 verificações, 0 falhas.**
+
+---
+
+## As SVCs que o guest pediu no arranque (medido, por ordem)
+
+| # | SVC | x1 | Para quê |
+|---|---|---|---|
+| 1–12 | `QueryMemory` (0x06) | — | a varrura de módulos do rtld |
+| 13,14 | `GetInfo` (0x29) | 0x0b | `RandomEntropy`, duas vezes |
+| 15,16 | `GetInfo` | 0x0c | `AslrRegionAddress` |
+| 17 | `GetInfo` | 0x0d | `AslrRegionSize` |
+| 18,19 | `GetInfo` | 0x0e | `StackRegionAddress` |
+| 20 | `GetInfo` | 0x0f | `StackRegionSize` |
+| 21 | `QueryMemory` | — | a própria stack do guest |
+| 22 | `GetThreadPriority` (0x0c) | — | prioridade da thread principal |
+| 23 | `GetThreadId` (0x25) | — | id de thread |
+| 24 | `GetInfo` | 0x02 | `AliasRegionAddress` |
+| 25 | `GetInfo` | 0x03 | `AliasRegionSize` |
+| 26 | `GetInfo` | 0x16 | `SystemResourceSizeTotal` |
+| 27 | `GetInfo` | 0x15 | `StackRegionSize` |
+| 28 | `QueryMemory` | — | a região de código |
+| 29 | `ConnectToNamedPort` (0x1f) | — | **`"sm:"`** |
+| 30 | `SendSyncRequest` (0x21) | — | o pedido em si |
+
+Nenhuma delas é `nvdrv`, GPU ou tela. O jogo ainda não tocou nagraficos.
 
 ---
 
@@ -176,11 +210,56 @@ host à entrada e reinstalar o do guest à saída.
 `TPIDRRO` quando devia ter usado `TPIDR_EL0`, e obtive SIGILL em vez de
 sucesso.
 
+### 7. SVCs do arranque
+
+Encadeado, um obstáculo por vez, cada um medido antes do seguinte.
+
+**`GetThreadPriority` (0x0C)** — devolve a prioridade do NPDM. A forma: o valor
+volta em **x1**, no registo que era o handle (`SvcWrap_GetThreadPriority64`,
+eden svc.cpp:1331).
+
+**`GetInfo` (0x29)** — reescrita com o enum **real** do Eden
+(`svc_types.h:130-159`).
+
+> **Bug meu, e o pior dos dois tipos.** A primeira versão tinha
+> `case 16: value = 4; // PersonalWordSize`. **`PersonalWordSize` não existe**
+> — nem no Eden, nem no switchbrew, nem na Terra. 16 é
+> `SystemResourceSizeTotal` e 22 é `UsedNonSystemMemorySize`. O SDK pedia o 22
+> e recebia **quatro bytes de "memória em uso"**, e depois desreferenciava o
+> resultado. Um número inventado não dá erro nenhum: só dá segfault mais
+> tarde, e o culpado parece ser o guest.
+
+**`GetProcessId` / `GetThreadId`** — duas formas erradas ao mesmo tempo:
+devolviam o id em **x0** (que é o Result), e o `GetProcessId` *lia* oito
+bytes do guest em vez de escrever o valor. Agora em x1, e fixos — o SDK usa-os
+como chave do estado por-thread.
+
+**`ConnectToNamedPort` (0x1F)** — a assinatura **não tem ponteiro de saída nem
+comprimento**. `x1` é o apontador para o nome, terminado em NUL, e o handle
+volta no **mesmo registo** (eden svc.cpp:1470). A versão anterior lia o
+comprimento de `x2` — que vem sempre a zero — e escrevia o handle num
+ponteiro em x0. Eram dois erros que se cancelavam por acidente num teste com
+ponteiros do host.
+
+**Região de alias** — `GetInfo(2/3)` devolvia 0, e o SDK aloca dali: null
+dereference. Mapeámos [0x6000'0000, 0x8000'0000).
+
+> O tamanho **não é redondo de propósito**: termina exactamente em
+> `kCodeBase`. Com 256 MiB ficou um buraco, o rtld caiu lá durante a varredura
+> de módulos e o jogo deixou de arrancar — uma mudança que parecia não ter
+> nada a ver com a mudança que a fez.
+
 ---
 
 ## Não confirmado (não inventar)
 
 - `__tls_align` do SDK oficial → usamos 16 como mínimo.
 - `Handle` válido para a thread principal → usamos `1`.
+- `InfoType::ProgramId` (18) → **devolvemos erro de propósito**. Não está no
+  NPDM (o meta tem `ProductCode` a zero — switchbrew/NPDM 0x30); vem do title
+  id do NCA, que se perdeu ao extrair o ExeFS. Só é usado para dados de save.
+- `InfoType::ResourceLimit` (9) → idem, não implementado.
+- Os valores de `SystemResourceSizeTotal` e `UsedNonSystemMemorySize` são
+  plausíveis, **não medidos contra hardware real**.
 - Como o kernel do Switch dimensiona o bloco estático de TLS da thread
   principal a partir do NPDM → **não investigado**.
