@@ -754,6 +754,20 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
         }
     }
 
+    // O `CreateThread`: despejar o codigo do entry point, **tal como o
+    // motor o tem em memoria**. E' a forma de comparar a nossa
+    // descompressao com a do `hactool`.
+    if (number == 0x08 && ctx.x[1] != 0 && g_mem != nullptr) {
+        std::uint8_t buf[64]{};
+        std::string e6;
+        if (g_mem->read(ctx.x[1], buf, sizeof buf, e6)) {
+            std::printf("[thrd] entry point 0x%llx:", (unsigned long long)ctx.x[1]);
+            for (auto b : buf)
+                std::printf(" %02x", b);
+            std::printf("\n");
+        }
+    }
+
     if (number == 0x21) {
         g_ultimo_req     = ctx.x[1];
         g_ultimo_resposta = ctx.x[3];

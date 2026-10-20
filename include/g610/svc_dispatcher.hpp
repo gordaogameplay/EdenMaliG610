@@ -636,6 +636,10 @@ private:
     // A máscara de núcleos e o "ideal core" da thread do guest, como o Eden
     // os guarda (`KThread::m_core_mask`).
     std::uint64_t    core_mask_ = kProcessCoreMask;
+
+    // A base do TLS da thread principal. Cada thread de guest vai precisar
+    // da sua (o Eden escreve o handle da thread em TLS+0x110).
+    std::uint64_t    tls_base_     = 0;
     std::int32_t     core_id_   = 0;
     std::int32_t     last_priority_ = 0;
 

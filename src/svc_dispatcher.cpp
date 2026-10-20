@@ -430,6 +430,7 @@ void SvcDispatcher::set_eden_tls(std::uint64_t endereco) noexcept {
         return;
 
     eden_->set_tls(endereco);
+    tls_base_ = endereco;
 
     // O handle da thread principal, em TLS+0x110. Ver a nota no cabecalho.
     const std::uint32_t handle = eden_->main_thread_handle();
@@ -1155,6 +1156,30 @@ Result SvcDispatcher::svc_create_thread(SvcContext& ctx) {
     ctx.ret      = 0;
     ctx.has_ret  = true;
 
+    // **A thread NAO corre, ainda.** O codigo do guest e' nativo, logo uma
+    // thread de guest e' uma thread do host — e ai estao as tres coisas que
+    // tem de ser **por thread**:
+    //
+    //   - o `TPIDR_EL0` (o guest le o TLS com `mrs x, tpidrro_el0`);
+    //   - o ponto de regresso do `sigsetjmp` (um `siglongjmp` para o buffer
+    //     de outra thread e' comportamento indefinido);
+    //   - o ponto de recuperacao de faults.
+    //
+    // O Eden resolve isto com objectos de kernel (`KThread` com TLS e
+    // contexto proprios) e um scheduler; o nosso `vendor` **nao tem
+    // `KThread`** (medido: `ls vendor/eden/core/hle/kernel/ | grep -i
+    // thread` nao da nada), o que tambem significa que um IPC feito por esta
+    // thread usaria o buffer de mensagem da principal.
+    //
+    // O prototipo foi feito e **revertido**: com a thread a correr, o codigo
+    // do guest nela dava fault logo a entrar, e o fault matava o processo
+    // (o `sigsetjmp` tem de estar numa frame que sobreviva ao guest). O
+    // entry point que o SDK passa (`0x83abb240`, no `subsdk1`) e' uma
+    // funcao valida — medido no dump do boot_trace — e le o TLS do guest,
+    // por isso o proximo passo e' dar-lhe um `TPIDR_EL0` correcto e um `sp`
+    // de thread, e ver ONDE ela da fault.
+    //
+    // ate la, a thread fica como esta: um handle valido, e o guest vivo.
     if (std::getenv("IA_IPC_TRACE") != nullptr) {
         std::fprintf(stderr,
                      "[svc] CreateThread handle=0x%x entry=0x%llx arg=0x%llx "
