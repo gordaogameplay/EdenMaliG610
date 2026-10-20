@@ -2278,6 +2278,11 @@ mostrava "timeout=2222980920 ns", que era o ponteiro.
 
 ## O abort que resta e' do jogo, e e' um ficheiro em falta
 
+> **Refutado** em 2026-10-20 — ver a sessão no fim deste ficheiro. O
+> ficheiro nao esta no NSP, a string do abort e' do SDK e nao do jogo, e
+> o abort e' uma excepcion C++ por apanhar. A leitura abaixo fica como
+> registo do caminho, nao como diagnostico.
+
 O guest aborta num assert **seu** — a mensagem e'
 *"SuperStripe instance is null"*, mas o `x3` (o endereco que o SDK
 reporta) aponta para o fim de outra string:
@@ -2322,3 +2327,126 @@ responda com um directorio vazio pode ser suficiente.
 | 5 | `bsd`/`ns`/`pm`/`time`/`hid`, conforme o jogo pedir | ? |
 
 **O passo 1 e' o proximo.**
+
+---
+
+# Sessão 2026-10-20 — o abort não é um ficheiro em falta
+
+## O que a hipótese anterior dizia, e o que a medição diz
+
+A secção anterior fechou com *"o abort que resta é do jogo, e é um ficheiro
+em falta"* (`pane_L_btlspot_button_00_T_button_l_00.bin`). **Essa hipótese
+está refutada**, por três medições independentes:
+
+1. O ficheiro **não está** no NSP. A listagem do PFS0 (script próprio no Pi)
+   não devolve nenhum nome assim — o NSP é um PFS0 com NCAs, e a busca por
+   essa string dá 0.
+2. A string do abort **não é** do jogo. O `x7` do `Break` aponta para
+   `0x831c7f6d`, que é o `.rodata` do **SDK** (offset do módulo `0x9c9f6d`).
+3. O abort **não é um assert do jogo**: é uma **excepção C++ por apanhar**
+   (ver abaixo).
+
+O que o abort é, medido:
+
+    [brk] registos: x0=0x0 x1=0x84c639f8 x2=0x4 x3=0xe ...
+    [msg ] strings na stack do guest:
+    () called _Unwind_RaiseException() which unexpectedly returned
+
+O SDK lança uma excepção, o *unwinder* chega ao fim da stack sem encontrar
+quem a apanhe, e o `std::terminate` aborta. A string
+*"() called `_Unwind_RaiseException()` which unexpectedly returned"* é do
+próprio *unwinder* (libunwind), e **não** é a mensagem do erro: está a
+0x40 bytes de outra string no mesmo `.rodata`.
+
+## Quem resolve as importações do `main`: o `rtld` do próprio jogo
+
+Medido no GOT do `main` (`0x8249'49a0`, 821 slots de PLT):
+
+* **43 dos 821** slots estão resolvidos; os outros 778 valem `0x817e8f90`,
+  que é o **PLT0** — o *lazy binding* do `rtld`.
+* Os resolvidos batem certo com os símbolos do SDK, verificado por
+  desassemblagem: o slot 4 aponta para `0x82cf5a70`, que é a `memset` do
+  SDK (código de `memset`, byte a byte); o slot 16 para `0x82b25f80`, que é
+  `nn::os::GetTlsValue` (`mrs x8, tpidr_el0`); o slot 9 para
+  `nn::os::QueryMemoryInfo`.
+
+**Conclusão: o nosso motor não resolve importações — e não deve.** O `rtld`
+do jogo faz isso, por nome, contra as tabelas `api_info` do SDK. (O
+resolver do motor foi removido no commit `2d195c3`: a correspondência
+PLT↔`dynsym` não é posicional.)
+
+## O SVC 0x0f era o que matava o jogo
+
+O SDK chama `nn::os::SetThreadCoreMask` (SVC `0x0f`). O motor não o tinha
+implementado: caía no `default` e devolvia `Result::Unsupported` — que no
+nosso enum é **64 = 0x40**.
+
+E o SDK trata esse Result como fatal. Medido, pela ordem:
+
+| SVC | o que é |
+|---|---|
+| `#164` | `0x0f` `SetThreadCoreMask` → `Unsupported` (0x40) |
+| `#166` | `SendSyncRequest` → `IApplicationFunctions` comando 22 (`SetTerminateResult`) com **0x40** no pedido |
+| `#168` | `0x26` `Break` — o abort |
+
+O `0x40` do `SetTerminateResult` **é** o nosso `Unsupported`: não há outra
+fonte para ele. Implementado o SVC (com a validação do Eden,
+`kernel/svc/svc_thread.cpp:252-280`), o jogo passa a andar.
+
+## Os sub-SDKs, e a stack
+
+O ExeFS tem `subsdk0` e `subsdk1`; o Eden carrega-os
+(`deconstructed_rom_directory.cpp:191`). Passaram a ser carregados, e a
+stack passou a ser colocada **depois** do código (no Switch a região da
+stack é sorteada pelo kernel — o que o guest sabe é o endereço que o
+kernel lhe deu).
+
+| | antes | depois |
+|---|---|---|
+| arranque | 39,8 ms | **68,2 ms** |
+| SVCs | 680 | 686 |
+| módulos mapeados | 3 | 5 |
+
+## Onde estamos agora: uma excepção do SDK, sem nenhum Result de erro
+
+Com o log novo (o Result de cada SVC, e a resposta de cada IPC):
+
+* **Nenhum SVC devolve erro.**
+* **Todas as respostas IPC têm `Result = 0`** (o Result está na palavra 10
+  da resposta, depois do `DataPayloadHeader` "SFCO").
+
+E, na mesma medida, o que o SDK faz antes de abortar:
+
+* `IParentalControlService` comando 1 (`Initialize`) → **sucesso**
+  (`[pctl] Initialize: capability=303`).
+* `GetInfo(22)`, `GetInfo(21)`, `SetHeapSize(0x1ffe00000)`.
+* **527 chamadas a `svcQueryMemory`** — esta é a recolha de informação do
+  relatório de crash do SDK (`nn::diag::GetAllModuleInfo`, que varre o
+  espaço do processo a procurar módulos com cabeçalho `MOD0`). É
+  **sintoma**, não causa: é o SDK a preparar o relatório.
+* `SetTerminateResult` com `0x2a2` (módulo Kernel, descrição 162) e o
+  `Break`.
+
+### Hipóteses refutadas hoje
+
+| Hipótese | Como foi refutada |
+|---|---|
+| `GetInfo(10)` (`IdleTickCount`) é o que falha | O trace **não tem** nenhuma chamada `GetInfo` com tipo `0xa`. |
+| O `pctl.Initialize` devolve um Result mau | A resposta tem `Result = 0`; o Eden registou `capability=303` e não houve log de erro. |
+| O caminho é o das `nn::friends` | O GOT do `main` não tem **nenhum** símbolo de `friends` resolvido. As strings `nn::friends::GetFriendCandidateList` e `nn::friends::SyncUserSe` estão simply **vizinhas** no `.rodata` do SDK. |
+| O `rtld` do jogo não resolve as importações | 43 slots resolvidos, verificados por desassemblagem. |
+
+### O que falta saber
+
+As 527 chamadas a `svcQueryMemory` do relatório de crash probed **endereços
+espalhados dentro da região da stack** (medido: `0x8411a000`,
+`0x8412a000`, `0x84185000`, `0x84200000`, `0x8428e000`, `0x842a4000`,
+`0x8448f000`, `0x845e7000`, …). Endereços espalhados = o SDK está a
+**seguir ponteiros**, e a lista está na stack. Isso aponta para uma
+estrutura do SDK com conteúdo errado — mas *onde* ainda não está medido.
+
+**O passo seguinte, e é uma decisão:** seguir a lista de ponteiros que o
+SDK percorre (o `x30` de todas as 527 chamadas é o mesmo —
+`sdk+0x332a13c`, uma função local, sem símbolo exportado), e ver o que
+ela lê. Ou, em alternativa, comparar com o mesmo jogo correndo no Eden
+completo, que é a fonte da verdade do projecto.
