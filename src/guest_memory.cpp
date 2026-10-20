@@ -1,0 +1,161 @@
+// EdenMaliIA — espaço de endereçamento do guest.
+#include "ia/guest_memory.hpp"
+
+#include "ia/nso_loader.hpp" // kGuestPageSize
+
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <utility>
+
+namespace ia {
+
+int to_posix(Prot p) noexcept {
+    int flags = 0;
+    if (static_cast<std::uint8_t>(p) & static_cast<std::uint8_t>(Prot::Read))
+        flags |= PROT_READ;
+    if (static_cast<std::uint8_t>(p) & static_cast<std::uint8_t>(Prot::Write))
+        flags |= PROT_WRITE;
+    if (static_cast<std::uint8_t>(p) & static_cast<std::uint8_t>(Prot::Exec))
+        flags |= PROT_EXEC;
+    return flags;
+}
+
+GuestMemory::~GuestMemory() { unmap(); }
+
+GuestMemory::GuestMemory(GuestMemory&& o) noexcept
+    : base_(std::exchange(o.base_, 0)),
+      size_(std::exchange(o.size_, 0)),
+      exec_reads_(std::exchange(o.exec_reads_, 0)),
+      exec_writes_(std::exchange(o.exec_writes_, 0)) {}
+
+GuestMemory& GuestMemory::operator=(GuestMemory&& o) noexcept {
+    if (this == &o)
+        return *this;
+    unmap();
+    base_       = std::exchange(o.base_, 0);
+    size_       = std::exchange(o.size_, 0);
+    exec_reads_ = std::exchange(o.exec_reads_, 0);
+    exec_writes_= std::exchange(o.exec_writes_, 0);
+    return *this;
+}
+
+void GuestMemory::unmap() noexcept {
+    if (base_ == 0)
+        return;
+    ::munmap(reinterpret_cast<void*>(base_), static_cast<std::size_t>(size_));
+    base_ = 0;
+    size_ = 0;
+}
+
+bool GuestMemory::map(std::uint64_t base, std::uint64_t size, Prot prot,
+                      std::string& error) {
+    if (base == 0 || (base % kGuestPageSize) != 0) {
+        error = "base do guest não alinhada a 4096: 0x" + std::to_string(base);
+        return false;
+    }
+    if (size == 0 || (size % kGuestPageSize) != 0) {
+        error = "tamanho do guest não múltiplo de 4096: " + std::to_string(size);
+        return false;
+    }
+
+    // MAP_FIXED_NOREPLACE falha se o endereço já estiver ocupado. MAP_FIXED
+    // sobrepunha em silêncio — e um mapeamento cego a este nível pode
+    // destruir a memória de outra biblioteca sem nenhum sintoma até muito
+    // depois.
+    void* p = ::mmap(reinterpret_cast<void*>(base),
+                     static_cast<std::size_t>(size), to_posix(prot),
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+
+    if (p == MAP_FAILED) {
+        // MAP_FIXED_NOREPLACE devolve o endereço pedido em caso de falha, o
+        // que não serve para diagnóstico. Reproduzir a falha com MAP_FIXED
+        // numa janela descartável à parte não ajuda; o que ajuda é dizer qual
+        // é o endereço e o tamanho, para o erro ser accionável.
+        char buf[256];
+        std::snprintf(buf, sizeof buf,
+                      "não consegui mapear 0x%llx + %llu bytes (%s)",
+                      static_cast<unsigned long long>(base),
+                      static_cast<unsigned long long>(size), std::strerror(errno));
+        error = buf;
+        return false;
+    }
+
+    base_ = base;
+    size_ = size;
+    return true;
+}
+
+bool GuestMemory::protect(std::uint64_t base, std::uint64_t size, Prot prot,
+                          std::string& error) {
+    if (!mapped()) {
+        error = "espaço do guest não mapeado";
+        return false;
+    }
+    if (!owns(base) || !owns(base + size)) {
+        error = "mprotect fora do espaço do guest";
+        return false;
+    }
+    if (::mprotect(reinterpret_cast<void*>(base), static_cast<std::size_t>(size),
+                   to_posix(prot)) != 0) {
+        error = std::string("mprotect falhou: ") + std::strerror(errno);
+        return false;
+    }
+    return true;
+}
+
+bool GuestMemory::write(std::uint64_t dst, const void* src, std::uint64_t size,
+                        std::string& error) {
+    if (!mapped()) {
+        error = "espaço do guest não mapeado";
+        return false;
+    }
+    if (size == 0)
+        return true;
+    if (!owns(dst) || !owns(dst + size)) {
+        char buf[192];
+        std::snprintf(buf, sizeof buf,
+                      "escrita fora do espaço do guest: 0x%llx + %llu",
+                      static_cast<unsigned long long>(dst),
+                      static_cast<unsigned long long>(size));
+        error = buf;
+        return false;
+    }
+    std::memcpy(reinterpret_cast<void*>(dst), src, static_cast<std::size_t>(size));
+    return true;
+}
+
+bool GuestMemory::read(std::uint64_t src, void* dst, std::uint64_t size,
+                       std::string& error) {
+    if (!mapped()) {
+        error = "espaço do guest não mapeado";
+        return false;
+    }
+    if (size == 0)
+        return true;
+    if (!owns(src) || !owns(src + size)) {
+        char buf[192];
+        std::snprintf(buf, sizeof buf,
+                      "leitura fora do espaço do guest: 0x%llx + %llu",
+                      static_cast<unsigned long long>(src),
+                      static_cast<unsigned long long>(size));
+        error = buf;
+        return false;
+    }
+    std::memcpy(dst, reinterpret_cast<const void*>(src),
+                static_cast<std::size_t>(size));
+    return true;
+}
+
+bool GuestMemory::owns(std::uint64_t addr) const noexcept {
+    if (base_ == 0)
+        return false;
+    // `addr < base + size` tem de ser escrito sem overflow: um addr muito
+    // grande (o guest a calcular fora das paredes) somaria e daria dentro.
+    return addr >= base_ && addr - base_ < size_;
+}
+
+} // namespace ia
