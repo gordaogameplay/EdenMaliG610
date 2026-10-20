@@ -1051,3 +1051,127 @@ seja uma string. Um global em `.bss` é um alvo perfeitamente normal para
 | a resposta IPC, isolada | `IA_IPC_VARIANT` (16 variantes) |
 
 Suite: **6 testes, todos a passar**.
+
+
+---
+
+# Parar de descobrir a roda: o que o Eden já sabe
+
+O aviso certo. Vinte variantes de formato de resposta e três offsets adivinhados
+são o caminho lento quando ao lado está um emulador a correr o mesmo jogo.
+
+## 1. O payload calcula-se; não se procura
+
+A versão anterior **varria o buffer à procura da assinatura "SFCI"**. Era
+robusto e era o caminho errado: estava a esconder a aritmética que o Eden faz
+por escrito.
+
+`HLERequestContext::ParseCommandBuffer` (`hle_ipc.cpp:142`) diz tudo, com o
+índice contado em palavras de 32 bits:
+
+```
+índice = 2                              // o CommandHeader
+se enable_handle_descriptor:
+    índice += 1                         // o HandleDescriptorHeader
+    se send_current_pid:
+        índice += 2                     // <<<< a peça que faltava
+    índice += num_handles_to_copy + num_handles_to_move
+índice += descritores X (1), A (3), B (3), W (3)
+índice  = arredondar(index) para múltiplo de 4      // 16 bytes
+payload = índice * 4
+índice += 2                             // o DataPayloadHeader
+corpo   = índice * 4
+```
+
+Para o pedido real do jogo:
+
+```
+CommandHeader       0..1  -> 2
+HandleDescriptor    2     -> 3
+send_current_pid    skip 2 -> 5
+alinhamento a 16    5 -> 8          (5 & 3 = 1, salta 3)
+DataPayloadHeader   8     = 0x20    <-- medido
+corpo               0x30
+```
+
+**O `Skip(2, false)` do `send_current_pid` é a linha que faltava.** Sem ela o
+índice dá 4 e o payload cairia em 0x10. Com ela dá 8 e cai em 0x20 — que é
+onde o jogo o põe. A aritmética está agora no código, e uma comparação
+contra a assinatura diz logo se algum dia divergir.
+
+O `CommandHeader` completo, de `ipc.h:51`:
+
+| raw_low | bits | |
+|---|---|---|
+| `type` | [0,16) | Request=4, Control=5, **RequestWithContext=6**, ControlWithContext=7 |
+| `num_buf_x_descriptors` | [16,20) | 1 palavra cada |
+| `num_buf_a_descriptors` | [20,24) | 3 palavras |
+| `num_buf_b_descriptors` | [24,28) | 3 palavras |
+| `num_buf_w_descriptors` | [28,32) | 3 palavras |
+
+| raw_high | bits | |
+|---|---|---|
+| `data_size` | [0,10) | |
+| `buf_c_descriptor_flags` | [10,14) | Disabled=0, Inline=1, One=2 |
+| `enable_handle_descriptor` | [31] | |
+
+## 2. `ConnectToNamedPort` devolve uma SESSÃO, não uma porta
+
+`svc_port.cpp:19-55`:
+
+```cpp
+Result ConnectToNamedPort(Core::System& system, Handle* out, u64 user_name) {
+    ...
+    // Reserve a handle for the port.
+    // NOTE: Nintendo really does write directly to the output handle here.
+    R_TRY(handle_table.Reserve(system.Kernel(), out));
+
+    // Create a session.
+    KClientSession* session;
+    R_TRY(port->CreateSession(system.Kernel(), std::addressof(session)));
+
+    // Register the session in the table, close the extra reference.
+    handle_table.Register(system.Kernel(), *out, session);
+    session->Close(system.Kernel());
+}
+```
+
+Duas coisas que se leram ao contrário:
+
+**Cria uma sessão por dentro.** É por isso que o guest vai directo do
+`ConnectToNamedPort` para o `SendSyncRequest` **sem `OpenSession`** — e é
+por isso que o handle 0x1000 tem de servir de sessão. O nosso handle
+fabricado está estruturalmente certo; o que falta é a tabela de objectos.
+
+**Escreve o handle no ponteiro do guest (`out`, que é o nosso x0), e não
+só em x1.** Implementado. Não mudou o resultado porque o SDK lê de x1 (o
+handle que passou a seguir foi o nosso) — mas o comentário do Eden é
+explícito e não havia razão para o ignorar.
+
+## 3. `SendSyncRequest` usa o buffer da thread
+
+```cpp
+Result SendSyncRequest(Core::System& system, Handle session_handle) {
+    R_RETURN(SendSyncRequestImpl(system.Kernel(), 0, 0, session_handle));
+}
+```
+
+Mensagem e tamanho a **zero**: o kernel usa o `message_buffer` da thread. O
+`x1`/`x2` que o SDK deixou no registo são lixo, e nós estávamos a tratá-los
+como se fossem argumentos.
+
+E `SendSyncRequestImpl` resolve o handle como `KClientSession` da tabela do
+processo. **É a tabela de objectos que falta** — a parte grande.
+
+## O que muda a arquitectura
+
+Não é mais um offset. É: **portos, sessões e tabela de handles**, como o
+Eden tem, e depois o registo de serviços. Deixado escrito porque é a decisão
+que muda o resto do projecto, e porque sem ela cada serviço novo obriga a
+inventar um caminho novo.
+
+## Estado
+
+Suite: **6 testes, todos a passar**. GPU medido: 1.500000 na G610. O jogo
+continua a abortar no primeiro IPC, e continua a não ser por causa do
+formato da resposta — as 16 variantes já o provaram.

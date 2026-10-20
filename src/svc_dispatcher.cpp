@@ -305,6 +305,34 @@ Result SvcDispatcher::svc_connect_port(SvcContext& ctx) {
     ctx.x[1]    = h;
     ctx.ret     = 0;
     ctx.has_ret = true;
+
+    // E escreve TAMBÉM no ponteiro que o guest passou em x0.
+    //
+    // De `svc_port.cpp:37-50` no Eden:
+    //
+    //     // Reserve a handle for the port.
+    //     // NOTE: Nintendo really does write directly to the output handle here.
+    //     R_TRY(handle_table.Reserve(system.Kernel(), out));
+    //     ...
+    //     handle_table.Register(system.Kernel(), *out, session);
+    //
+    // O `out` é o ponteiro do guest (o nosso x0), e a Nintendo escreve lá
+    // directamente. O wrapper tambem põe o handle em x1
+    // (`SetArg32(args, 1, out_handle)`, svc.cpp:1473) — sao os dois sitios,
+    // e nós so escreveÃ§amos no segundo.
+    //
+    // Se o SDK ler o handle pelo ponteiro, estava a ler o que estivesse na
+    // stack — lixo — e a Sessão seguinte era uma Sessão que não existe.
+    //
+    // Duas escritas para o mesmo valor, e uma delas é um Commentário no Eden
+    // a dizer para não a esquecer.
+    std::uint32_t h32 = h;
+    if (!write_guest(ctx.x[0], &h32, sizeof h32)) {
+        last_ipc_ = "ConnectToNamedPort(\"" + name +
+                    "\"): handle " + std::to_string(h) +
+                    " em x1, mas NAO em x0 — o guest vai ler o lixo da stack";
+        return Result::Success;
+    }
     return Result::Success;
 }
 

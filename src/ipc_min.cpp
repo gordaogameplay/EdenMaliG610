@@ -226,73 +226,93 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
         m[off + 3] = static_cast<std::uint8_t>(v >> 24);
     };
 
+    // ── o CommandHeader, lido como o Eden o lê ───────────────────────────
+    //
+    // De `core/hle/ipc.h:51`:
+    //
+    //     struct CommandHeader {
+    //         u32_le raw_low;
+    //         BitField<0, 16, CommandType> type;
+    //         BitField<16, 4, u32> num_buf_x_descriptors;
+    //         BitField<20, 4, u32> num_buf_a_descriptors;
+    //         BitField<24, 4, u32> num_buf_b_descriptors;
+    //         BitField<28, 4, u32> num_buf_w_descriptors;
+    //
+    //         u32_le raw_high;
+    //         BitField<0, 10, u32> data_size;
+    //         BitField<10, 4, BufferDescriptorCFlag> buf_c_descriptor_flags;
+    //         BitField<31, 1, u32> enable_handle_descriptor;
+    //     };
+    //
+    //     union HandleDescriptorHeader {
+    //         BitField<0, 1, u32> send_current_pid;
+    //         BitField<1, 4, u32> num_handles_to_copy;
+    //         BitField<5, 4, u32> num_handles_to_move;
+    //     };
+    //
+    // E o `CommandType` (ipc.h:38): Request = 4, Control = 5,
+    // RequestWithContext = 6, ControlWithContext = 7.
+
     // O pedido é do tipo certo? Não responder a um pedido que não é um pedido
     // é pior do que não responder.
-    const std::uint32_t type = le32(kOffCommandHeader) & 0xFFFF;
+    const std::uint32_t raw_low  = le32(kOffCommandHeader);
+    const std::uint32_t raw_high = le32(kOffCommandHeader + 4);
+    const std::uint32_t type = raw_low & 0xFFFFu;
     if (type != kCmdRequestWithContext) {
         last_ipc_ = "tipo de comando inesperado: " + std::to_string(type);
         return false;
     }
 
-    // Onde está o payload? Não é uma constante — é uma ARITMÉTICA que depende
-    // dos descritores que o pedido traz.
-    //
-    // Medido nos dois pedidos reais do jogo:
-    //
-    //   pedido 1 (Initialize): CommandHeader + BufferDescriptorC +
-    //                           HandleDescriptorHeader  -> payload em 0x20
-    //   pedido 2 (GetService "lm"): CommandHeader + um bloco de 8 bytes
-    //                           -> payload em 0x10
-    //
-    // Duas tentativas com uma constante fixa (0x28, depois 0x18) falharam as
-    // duas, e era porque o valor não é fixo.
-    //
-    // Em vez de Reproduzir a aritmética dos descritores — que tem três casos
-    // e um alinhamento de 16 bytes — procura-se a assinatura. É mais barato,
-    // é à prova de um descritor que não conhecemos, e se um dia aparecer uma
-    // geometria nova o código continua a funcionar em vez de escrever por
-    // cima do sítio errado.
-    std::size_t payload = 0;
-    bool achou = false;
-    for (std::size_t k = 0; k + 4 <= n && k < kPayloadScanMax; k += 4) {
-        if (le32(k) == kSfcIMagic) {
-            payload = k;
-            achou = true;
-            break;
-        }
-    }
-    if (!achou) {
-        last_ipc_ = "assinatura SFCI nao encontrada nos primeiros " +
-                    std::to_string(kPayloadScanMax) + " bytes";
-        return false;
-    }
+    const std::uint32_t data_size = raw_high & 0x3FFu;
+    const std::uint32_t send_pid  = (raw_high & 0x80000000u) ? 1u : 0u;
 
-    // O command id é um u64, e o DataPayloadHeader tem OITO bytes.
+    // ── o payload NÃO se procura: calcula-se ─────────────────────────────
     //
-    //     struct DataPayloadHeader {   // ipc.h:174
-    //         u32_le magic;
-    //         INSERT_PADDING_WORDS_NOINIT(1);
-    //     };
-    //     static_assert(sizeof(DataPayloadHeader) == 8, ...);
+    // A versão anterior varria o buffer à procura da assinatura "SFCI". Era
+    // robusto e era o caminho errado:estava a esconder a
+    // aritmética que o Eden faz, e um formato de pedido diferente ter-se-ia
+    // de resolver por tentativa em vez de por leitura.
     //
-    // e o servidor salta-o assim (ipc_helpers.h:298):
+    // A aritmética é `HLERequestContext::ParseCommandBuffer` (hle_ipc.cpp:142),
+    // palavra a palavra. O índice é contado em PALAVRAS de 32 bits:
     //
-    //     // Skip the u64 command id, it's already stored in the context
-    //     static constexpr u32 CommandIdSize = 2;
-    //     Skip(CommandIdSize, false);
+    //     índice = 2                       // o CommandHeader
+    //     se enable_handle_descriptor:
+    //         índice += 1                  // o HandleDescriptorHeader
+    //         se send_current_pid:
+    //             índice += 2              // <<<< a peça que faltava
+    //         índice += num_copy + num_move
+    //     índice += os descritores X/A/B/W (4, 3, 3, 3 palavras cada)
+    //     índice  = arredondar(index) para multiplo de 4      // 16 bytes
+    //     payload = índice * 4
+    //     índice += 2                      // o DataPayloadHeader
+    //     corpo   = índice * 4
     //
-    // `CommandIdSize = 2` são DOIS u32 — o id é um u64. A versão anterior
-    // lia o id em `payload + 4`, ou seja dentro da palavra de enchimento, e
-    // via o número que estivesse lá por acaso.
+    // E o `Skip(2, false)` do `send_current_pid` é a linha que faltava. Sem
+    // ela o índice dá 4 e o payload cairia em 0x10; com ela dá 8 e cai em
+    // **0x20** — que é onde o jogo o põe, medido.
     //
-    // O que isso produziu, medido: o guest envia `sm: Initialize` (cmd_id 0),
-    // nós lemos 1 — a palavra de enchimento — e respondemos a um
-    // `GetService` que ninguém pediu, com `InvalidServiceName`. O SDK recebe
-    // uma resposta para um comando que não enviou e aborta.
-    //
-    // Isto não era um palpite: era um offset de 4 bytes, e
-    // nenhuma matriz de variantes o apanharia, porque todas elas respondiam
-    // ao comando errado com a mesma confiança.
+    // Isto não é dedução: é o `static_assert`-por-dedo do Eden, com a conta
+    // conferida contra o pedido real.
+    std::size_t idx = 2;                       // em palavras
+
+    if (raw_high & 0x80000000u) {              // enable_handle_descriptor
+        idx += 1;                              // HandleDescriptorHeader
+        if (send_pid)
+            idx += 2;                          // o pid que o kernel escreve
+        idx += 0;                              // num_copy + num_move: 0 medido
+    }
+    idx += (raw_low >> 16 & 0xFu) * 1;         // descritores X (1 palavra)
+    idx += (raw_low >> 20 & 0xFu) * 3;         // descritores A
+    idx += (raw_low >> 24 & 0xFu) * 3;         // descritores B
+    idx += (raw_low >> 28 & 0xFu) * 3;         // descritores W
+    if (idx & 3)
+        idx += 4 - (idx & 3);                  // alinhamento a 16 bytes
+
+    const std::size_t payload = idx * 4;
+    idx += 2;                                  // o DataPayloadHeader
+    const std::size_t cmd_off_calc = idx * 4;
+
     // ── a geometria, toda ────────────────────────────────────────────────
     //
     // Vem de três lugares do Eden, e nenhum deles é de memória:
@@ -330,6 +350,19 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
     // Nenhuma variante da matriz apanharia isto: respondiam todas ao comando
     // errado, com a mesma confiança e o mesmo formato. Só o offset certo,
     // medido no ficheiro que o escreve, resolve.
+    // Confirmado contra a assinatura. Se a aritmética alguma vez divergir do
+    // que o Eden faz, esta comparação diz logo — em vez de o guest receber
+    // uma resposta com o corpo no sítio errado e abortar sem dizer nada.
+    if (n >= 4 && le32(payload) != kSfcIMagic) {
+        char h[16];
+        std::snprintf(h, sizeof h, "0x%02zx", payload);
+        last_ipc_ = std::string("a aritmetica do payload calculou ") + h +
+                    " e nao ha assinatura la (o Eden daria o mesmo sitio; se "
+                    "isto dispara, o CommandHeader leu-se mal)";
+        return false;
+    }
+    (void)cmd_off_calc;
+
     const std::size_t cmd_off    = payload + 0x08;   // u64
     const std::size_t nome_off   = payload + 0x10;   // no PEDIDO, o corpo e' o nome
 
@@ -351,9 +384,6 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
     // `CommandHeader.raw_high` bits [0:10] (Eden, ipc.h:58-61), e no pedido
     // real do jogo vale 10 — muito menos do que os 0x1000 que o SDK passa
     // como tamanho do buffer.
-    const std::uint32_t raw_high  = le32(kOffCommandHeader + 4);
-    const std::uint32_t data_size = raw_high & 0x3FFu;
-
     // Limite de escrita: o fim da IPC dentro do buffer, e nunca além da
     // MessageBuffer.
     std::size_t limite = kOffBody + data_size;
