@@ -137,9 +137,20 @@ struct EstadoDoApplet {
     // As mensagens, por ordem. `AppletMessage`, do Eden (`am_types.h`).
     std::vector<u32> mensagens;
 
-    // A mensagem que o `am` entrega quando o applet e' lanado:
-    // `ChangeIntoForeground` = 1.
-    static constexpr u32 kChangeIntoForeground = 1;
+    // A mensagem da **mudanca de foco**.
+    //
+    // **Este motor corre um jogo, e um jogo e' uma aplicacao** — nao um
+    // applet. E o Eden distingue os dois (`lifecycle_manager.cpp:47-63`):
+    //
+    //     if (!m_is_application) {
+    //         ... return AppletMessage::ChangeIntoForeground;  // = 1
+    //     } else if (m_has_focus_state_changed) {
+    //         m_has_focus_state_changed = false;
+    //         return AppletMessage::FocusStateChanged;       // = 15
+    //     }
+    //
+    // Logo a mensagem e' `FocusStateChanged` (15).
+    static constexpr u32 kFocusStateChanged = 15;
 
     // O evento do sistema: o que o `GetEventHandle` devolve, e o que e'
     // sinalizado quando o estado muda.
@@ -197,14 +208,11 @@ struct EstadoDoApplet {
     // applet entra em primeiro plano, e o SDK (que espera do evento de
     // inter-processo) prossegue.
     bool deve_estar_sinalizado() const {
-        return !mensagens.empty() || foco_mudou;
+        return !mensagens.empty();
     }
 
     // A mudanca de foco: o applet foi para o primeiro plano.
     //
-    // No Eden e' o `m_has_focus_state_changed`, que o
-    // `LifecycleManager::SetFocusState` poe (`lifecycle_manager.h:72-78`).
-    bool foco_mudou = false;
 
     // Tira a proxima. Devolve `None` (= 0) quando nao ha nenhuma.
     u32 proxima() {
@@ -401,8 +409,21 @@ private:
             //
             // Sem isto, o guest consome o sinal na espera e fica a
             // espera para sempre.
+            // **A mudanca de foco e' consumida com a mensagem** — como
+            // o Eden (`lifecycle_manager.cpp:60-63`):
+            //
+            //     } else if (m_has_focus_state_changed) {
+            //         m_has_focus_state_changed = false;
+            //         return AppletMessage::FocusStateChanged;
+            //     }
+            //
+            // Sem este consumo, o `foco_mudou` fica a `true` para
+            // sempre, o `ShouldSignalSystemEvent` continua a dizer "sim",
+            // o evento fica sinalizado, e o SDK volta a pedir o
+            // `ReceiveMessage` — **1311 pedidos em ciclo**, e o motor a
+            // 100% de CPU a fazer nada.
             estado_->sinalizar_se_precisa(system.Kernel());
-            ResponseBuilder rb{ctx, 5};
+            ResponseBuilder rb{ctx, 3};
             rb.Push(ResultSuccess);
             rb.Push(mensagem);
             return;
@@ -410,14 +431,14 @@ private:
 
         // `ResultNoMessages`, como o Eden (`common_state_getter.cpp:99-104`).
         // E' um Result **valido**, e o SDK sabe o que significa.
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(kResultNoMessages);
     }
 
     // `OperationMode`: 0 = Handheld, 1 = Console.
     void GetOperationMode(HLERequestContext& ctx) {
         LOG_DEBUG(Service_AM, "GetOperationMode: Handheld");
-        ResponseBuilder rb{ctx, 5};
+        ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u32>(0));
     }
@@ -427,14 +448,14 @@ private:
     // está docked.
     void GetPerformanceMode(HLERequestContext& ctx) {
         LOG_DEBUG(Service_AM, "GetPerformanceMode: Normal");
-        ResponseBuilder rb{ctx, 5};
+        ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u32>(0));
     }
 
     // `SystemBootMode`: 0 = NormalBoot.
     void GetBootMode(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 5};
+        ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u32>(0));
     }
@@ -442,23 +463,23 @@ private:
     // `FocusState`: 0 = NotFocused, 1 = Focused. Um jogo que está a correr
     // tem o foco.
     void GetCurrentFocusState(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 5};
+        ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u32>(1));
     }
 
     void RequestToAcquireSleepLock(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void ReleaseSleepLock(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void ReleaseSleepLockTransiently(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
@@ -478,55 +499,55 @@ private:
     }
 
     void PushToGeneralChannel(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void GetReaderLockAccessorEx(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void GetWriterLockAccessorEx(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void IsVrModeEnabled(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 5};
+        ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     void SetVrModeEnabled(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void SetLcdBacklighOffEnabled(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void BeginVrModeEx(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void EndVrModeEx(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void IsInControllerFirmwareUpdateSection(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 5};
+        ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     // A resolução por omissão do ecrã do Switch: 1280x720.
     void GetDefaultDisplayResolution(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 6};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<s32>(1280));
         rb.Push(static_cast<s32>(720));
@@ -596,27 +617,27 @@ private:
     // simplesmente regressar, e a telemetria regista.
     void Exit(HLERequestContext& ctx) {
         LOG_WARNING(Service_AM, "Exit: o jogo pediu para sair");
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void LockExit(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void UnlockExit(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void EnterFatalSection(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void LeaveFatalSection(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
@@ -636,42 +657,42 @@ private:
     }
 
     void SetScreenShotPermission(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void SetOperationModeChangedNotification(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void SetPerformanceModeChangedNotification(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void SetFocusHandlingMode(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void SetRestartMessageEnabled(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void SetScreenShotAppletIdentityInfo(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void SetOutOfFocusSuspendingEnabled(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void SetAlbumImageOrientation(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
@@ -679,55 +700,55 @@ private:
     // layer para dar — e diz-se.
     void CreateManagedDisplayLayer(HLERequestContext& ctx) {
         LOG_WARNING(Service_AM, "CreateManagedDisplayLayer: sem subsistema de video");
-        ResponseBuilder rb{ctx, 6};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u64>(0));
     }
 
     void IsSystemBufferSharingEnabled(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 5};
+        ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     void GetSystemSharedLayerHandle(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 8};
+        ResponseBuilder rb{ctx, 6};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u64>(0));
         rb.Push(static_cast<u64>(0));
     }
 
     void GetSystemSharedBufferHandle(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 6};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u64>(0));
     }
 
     void CreateManagedDisplaySeparableLayer(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 6};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u64>(0));
     }
 
     void SetHandlesRequestToDisplay(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void ApproveToDisplay(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void OverrideAutoSleepTimeAndDimmingTime(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     // O numero de ticks que o applet passou suspenso. Nao ha suspensao
     // aqui, e' zero.
     void GetAccumulatedSuspendedTickValue(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 6};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u64>(0));
     }
@@ -774,7 +795,7 @@ private:
     // explicito, porque uma ausencia de resposta deixa o guest a ler lixo
     // (ver a nota sobre o auto-stub em `settings_bridge.h`).
     void CreateWindow(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
@@ -782,39 +803,39 @@ private:
     // `AppletManager`, que o associa ao applet; aqui e' o nosso PID, que e'
     // o unico que existe.
     void GetAppletResourceUserId(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 6};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u64>(1));
     }
 
     void GetAppletResourceUserIdOfCallerApplet(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 6};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u64>(1));
     }
 
     void AcquireForegroundRights(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void ReleaseForegroundRights(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void RejectToChangeIntoBackground(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void SetAppletWindowVisibility(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void SetAppletGpuTimeSlice(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 };
@@ -838,29 +859,29 @@ public:
 
 private:
     void SetExpectedMasterVolume(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void GetMainAppletExpectedMasterVolume(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 5};
+        ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(1.0f);
     }
 
     void GetLibraryAppletExpectedMasterVolume(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 5};
+        ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(1.0f);
     }
 
     void ChangeMainAppletMasterVolume(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void SetTransparentVolumeRate(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 };
@@ -894,57 +915,57 @@ public:
 private:
     // Todas as capturas dependem do subsistema de vídeo. Não o há.
     void GetLastForegroundCaptureImageEx(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 5};
+        ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     void GetCallerAppletCaptureImageEx(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 5};
+        ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     void TakeScreenShotOfOwnLayer(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void ClearCaptureBuffer(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void AcquireLastApplicationCaptureSharedBuffer(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 5};
+        ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     void ReleaseLastApplicationCaptureSharedBuffer(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void AcquireLastForegroundCaptureSharedBuffer(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 5};
+        ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     void ReleaseLastForegroundCaptureSharedBuffer(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void AcquireCallerAppletCaptureSharedBuffer(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 5};
+        ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     void ReleaseCallerAppletCaptureSharedBuffer(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 };
@@ -987,109 +1008,109 @@ public:
 
 private:
     void PopLaunchParameter(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void CreateApplicationAndRequestToStart(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     // O armazenamento é o sistema de ficheiros, que não existe ainda.
     void EnsureSaveData(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     // O idioma: o do sistema. `nn::oe::Language::AmericanEnglish` = 1.
     void GetDesiredLanguage(HLERequestContext& ctx) {
         LOG_DEBUG(Service_AM, "GetDesiredLanguage: 1 (AmericanEnglish)");
-        ResponseBuilder rb{ctx, 6};
+        ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u64>(1));
     }
 
     void SetTerminateResult(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void GetDisplayVersion(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 5};
+        ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u32>(0));
     }
 
     void ExtendSaveData(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void GetSaveDataSize(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void CreateCacheStorage(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void GetSaveDataSizeMax(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void GetCacheStorageMax(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void BeginBlockingHomeButtonShortAndLongPressed(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void EndBlockingHomeButtonShortAndLongPressed(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void BeginBlockingHomeButton(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void EndBlockingHomeButton(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void NotifyRunning(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 5};
+        ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     void GetPseudoDeviceId(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void SetMediaPlaybackStateForApplication(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void IsGamePlayRecordingSupported(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 5};
+        ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(false);
     }
 
     void InitializeGamePlayRecording(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 };
@@ -1116,43 +1137,43 @@ public:
 private:
     // `AppletProcessLaunchReason`: 0 = Normal, 1 = ApplicationRequested.
     void GetLaunchReason(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 5};
+        ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(static_cast<u32>(0));
     }
 
     void OpenCallingLibraryApplet(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void PushContext(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void PopContext(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void CancelWindingReservation(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void WindAndDoReserved(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void ReserveToStartAndWaitAndUnwindThis(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void ReserveToStartAndWait(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 };
@@ -1174,7 +1195,7 @@ public:
 
 private:
     void Reservado(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 };
@@ -1196,27 +1217,27 @@ public:
 
 private:
     void CreateLibraryApplet(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void CreateLibraryAppletEx(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void CreateStorage(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void CreateTransferMemoryStorage(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     void CreateHandleStorage(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 4};
+        ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 };
@@ -1366,8 +1387,7 @@ public:
         // E o `SetFocusState` poe o `m_has_focus_state_changed` — que e'
         // o que faz o `ShouldSignalSystemEvent` devolver verdadeiro, e o
         // que sinaliza o evento do sistema.
-        estado_->foco_mudou = true;
-        estado_->empurrar(system.Kernel(), EstadoDoApplet::kChangeIntoForeground);
+        estado_->empurrar(system.Kernel(), EstadoDoApplet::kFocusStateChanged);
         static const FunctionInfo functions[] = {
             {0, &AppletOE::OpenApplicationProxy, "OpenApplicationProxy"},
         };
