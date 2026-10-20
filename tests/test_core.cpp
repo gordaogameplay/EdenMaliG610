@@ -204,41 +204,48 @@ void test_svc_dispatch() {
     }
     svc.bind_memory(&mem);
 
-    // ConnectToNamedPort (0x1F) — ABI real: x0=out, x1=nome, x2=len.
+    // ConnectToNamedPort (0x1F).
+    //
+    // A ABI real NAO tem ponteiro de saida nem comprimento: `x1` e' o
+    // apontador para o nome, terminado em NUL, e o handle volta no MESMO
+    // registo — ver `SvcWrap_ConnectToNamedPort64` no Eden (svc.cpp:1470).
+    //
+    // Este teste codificava a forma errada (x0=out, x2=len) e passava, o que
+    // é a pior sorte: um teste que valida uma ABI inventada dá confiança a
+    // uma coisa falsa. Corrigido aqui e no `svc_dispatcher.cpp`.
     {
-        const std::uint64_t out_addr = kBase + 0x1000;
         const std::uint64_t name_addr = kBase + 0x2000;
         const char* nome = "nvdrv";
-        if (!mem.write(name_addr, nome, 5, err)) {
+        // Com o NUL: a assinatura é só um ponteiro.
+        if (!mem.write(name_addr, nome, 6, err)) {
             check(false, "escrever o nome da porta: " + err);
             return;
         }
 
         ia::SvcContext c;
-        c.x[0] = out_addr;
+        c.x[0] = 0;
         c.x[1] = name_addr;
-        c.x[2] = 5; // strlen("nvdrv")
         svc.dispatch(static_cast<std::uint32_t>(ia::Svc::ConnectToNamedPort), c);
-        // Success == 0. E o handle vai para *out, no espaço do GUEST — não
-        // para x0, que é o registo de retorno.
-        check(c.ret == 0, "ConnectToNamedPort devolve Success");
-        check(c.x[0] == out_addr,
-              "x0 não é o retorno: fica o ponteiro de saída");
 
-        std::uint32_t handle = 0;
-        mem.read(out_addr, &handle, sizeof(handle), err);
-        check(handle != 0, "handle da porta escrito no ponteiro do guest");
+        check(c.ret == 0, "ConnectToNamedPort devolve Success");
+        check(c.x[1] != 0, "o handle volta em x1, no registo que era o nome");
+        check(c.x[1] != name_addr,
+              "x1 foi MESMO sobrescrito (não é o ponteiro de entrada)");
+        check(svc.last_port() == "nvdrv", "o nome da porta foi lido do guest");
     }
 
-    // Nome com comprimento zero não pode ser aceite: daria origem a um handle
-    // sem porta associada.
+    // Um nome vazio (NUL imediato) tem de ser recusado: daria origem a um
+    // handle sem porta associada.
     {
+        const std::uint64_t vazio = kBase + 0x2800;
+        if (!mem.write(vazio, "", 1, err))
+            return;
+
         ia::SvcContext c;
         c.x[0] = 0;
-        c.x[1] = kBase + 0x2000;
-        c.x[2] = 0;
+        c.x[1] = vazio;
         svc.dispatch(static_cast<std::uint32_t>(ia::Svc::ConnectToNamedPort), c);
-        check(c.ret != 0, "ConnectToNamedPort com len=0 é recusado");
+        check(c.ret != 0, "ConnectToNamedPort com nome vazio é recusado");
     }
 
     // MapMemory (0x04) — o serviço de que o rtld depende para arrancar.

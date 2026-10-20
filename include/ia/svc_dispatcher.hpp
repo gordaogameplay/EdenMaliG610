@@ -20,6 +20,7 @@
 #include "ia/guest_memory.hpp"
 
 #include <cstdint>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <unordered_map>
@@ -32,6 +33,18 @@ namespace ia {
 // Heap por omissão quando não há programa ligado. Dentro dos 39 bits e longe
 // do zero, porque devolver 0 faz o guest faultar no primeiro acesso.
 inline constexpr std::uint64_t kDefaultHeapBase = 0x0000'0000'9000'0000ull;
+
+// Prioridade da thread principal quando o NPDM nao diz nada.
+//
+// O libnx diz que 0x2C e' "a prioridade habitual da thread principal"
+// (thread.h:39). E' um valor de referência, nao uma medicao: se o NPDM
+// trouxer `main_thread_priority`, usa-se essa.
+inline constexpr std::uint32_t kDefaultMainPriority = 0x2C;
+
+// Threads livres que o processo pode criar. O Eden nao impõe um limite ao
+// nosso motor — nao temos scheduler — mas o SDK le este numero ANTES de criar
+// threads, e zero e' uma resposta que o faria desistir.
+inline constexpr std::uint64_t kFreeThreadCount = 0x3E;
 
 // Números de SVC do Horizon OS (ABI Nintendo). Só os que este motor
 // implementa directamente; o resto devolve Result::Unsupported.
@@ -237,10 +250,31 @@ public:
     // `guest_program.hpp` inclui este header, e ler o layout aqui seria um
     // include circular. A dependencia fica na mao de quem chama, que e quem
     // sabe o layout.
+    // A região de alias, para `GetInfo(AliasRegionAddress/Size)`.
+    void set_alias_region(std::uint64_t base, std::uint64_t size) noexcept {
+        alias_base_ = base;
+        alias_size_ = size;
+    }
+
+    // O que `GetInfo` responde a "TotalMemorySize" e "UsedMemorySize".
+    void set_memory_totals(std::uint64_t total, std::uint64_t used) noexcept {
+        mem_total_ = total;
+        mem_used_  = used;
+    }
+
+    // `SystemResourceSizeTotal` vem do NPDM (`system_resource_size`, 0x14).
+    void set_system_resource_size(std::uint64_t v) noexcept { system_resource_size_ = v; }
+
     void set_stack_region(std::uint64_t base, std::uint64_t size) noexcept {
         stack_base_ = base;
         stack_size_ = size;
     }
+
+    // A prioridade da thread principal, vinda do NPDM (`main_thread_priority`).
+    // E' o que `GetThreadPriority(handle 0)` devolve: handle 0 e' a thread
+    // corrente, e a thread corrente no arranque e' a principal.
+    void set_main_thread_priority(std::uint32_t p) noexcept { main_priority_ = p; }
+    std::uint32_t main_thread_priority() const noexcept { return main_priority_; }
 
     // As regiões do espaço de endereçamento, por ordem de base.
     //
@@ -268,6 +302,7 @@ public:
 
     // Portas de serviço nomeadas. Devolve um handle ou 0.
     std::uint32_t connect_named_port(const std::string& name);
+    const std::string& last_port() const noexcept { return last_port_; }
     void          close_handle(std::uint32_t handle);
 
     // O jogo pediu para terminar?
@@ -341,6 +376,14 @@ private:
     // chamada: sao duas por arranque, e nenhum estado para gerir.
     std::uint64_t random_u64();
 
+    // GetThreadPriority (0x0C). O valor volta em x1, como no GetInfo.
+    Result svc_get_thread_priority(SvcContext& ctx);
+
+    // SetThreadPriority (0x0D). Aceitar e' melhor que falhar: o guest trata
+    // um erro como motivo para abortar, e um stub transparente deixa-o
+    // seguir. A prioridade e' anotada para o relatorio.
+    Result svc_set_thread_priority(SvcContext& ctx);
+
     Result svc_unsupported(SvcContext&);
 
 
@@ -357,8 +400,25 @@ private:
     std::unordered_map<std::uint32_t, std::string> name_by_handle_;
     std::uint32_t    next_handle_ = 0x1000;
     std::uint64_t    entropy_counter_ = 0x9E3779B97F4A7C15ull;
+    // A última porta a que o guest se ligou, para o relatório. STUB: não há
+    // IPC por trás do handle.
+    std::string       last_port_;
+
+    std::uint64_t    mem_total_   = 0;
+    std::uint64_t    mem_used_    = 0;
+    std::uint64_t    system_resource_size_ = 0;
+    std::uint64_t    alias_base_   = 0;
+    std::uint64_t    alias_size_   = 0;
     std::uint64_t    stack_base_   = 0;
     std::uint64_t    stack_size_   = 0;
+    std::uint32_t    main_priority_ = 0;
+    std::int32_t     last_priority_ = 0;
+
+    // O id do processo e o da thread principal. Fixos: o SDK usa-os como
+    // chave do estado por-thread, e um id que muda entre chamadas faz o jogo
+    // achar que está numa thread diferente.
+    std::uint64_t    process_id_ = 1;
+    std::uint64_t    thread_id_  = 1;
     std::uint64_t    heap_size_   = 0;
     std::uint64_t    heap_base_   = 0;
     std::uint64_t    map_memory_calls_   = 0;

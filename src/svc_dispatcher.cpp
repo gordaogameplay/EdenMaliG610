@@ -53,6 +53,27 @@ bool safe_copy_string(SvcDispatcher& d, std::uint64_t guest_addr, std::string& o
     // Switch passa o comprimento, não um strlen.
     return true;
 }
+
+// Copia uma string terminada em NUL do espaço do guest.
+//
+// Para as SVCs cuja assinatura é só um ponteiro — `ConnectToNamedPort` não
+// leva comprimento (Eden, svc.cpp:1470). Ler `max` bytes e parar no primeiro
+// zero é o que o kernel faz.
+bool safe_copy_cstring(SvcDispatcher& d, std::uint64_t guest_addr,
+                       std::string& out, std::size_t max) {
+    if (guest_addr == 0)
+        return false;
+    out.clear();
+    for (std::size_t i = 0; i < max; ++i) {
+        char c = 0;
+        if (!d.read_guest(guest_addr + i, &c, 1))
+            return false;
+        if (c == '\0')
+            return true;
+        out.push_back(c);
+    }
+    return false;   // sem terminador dentro do limite
+}
 } // namespace
 
 std::string to_string(Svc s) {
@@ -153,6 +174,8 @@ void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
     case Svc::UnmapSharedMemory:    r = svc_unmap_memory(ctx);   break;
     case Svc::QueryMemory:          r = svc_query_memory(ctx);   break;
     case Svc::GetInfo:              r = svc_get_info(ctx);       break;
+    case Svc::GetThreadPriority:    r = svc_get_thread_priority(ctx); break;
+    case Svc::SetThreadPriority:    r = svc_set_thread_priority(ctx); break;
     default:                        r = svc_unsupported(ctx);    break;
     }
 
@@ -243,38 +266,43 @@ Result SvcDispatcher::svc_get_process_info(SvcContext& ctx) {
 }
 
 Result SvcDispatcher::svc_get_thread_id(SvcContext& ctx) {
-    ctx.ret     = static_cast<std::uint64_t>(
-        std::hash<std::thread::id>{}(std::this_thread::get_id()));
-    ctx.has_ret = true;
+    ctx.x[1]     = thread_id_;
+    ctx.ret      = 0;
+    ctx.has_ret  = true;
     return Result::Success;
 }
 
 Result SvcDispatcher::svc_connect_port(SvcContext& ctx) {
-    // ABI do Switch: svcConnectToNamedPort(u32* out_port, const char* name,
-    // u32 name_len) — x0 é o ponteiro de saída, x1 o nome, x2 o comprimento.
+    // A forma é `SvcWrap_ConnectToNamedPort64` no Eden (svc.cpp:1470-1476):
+    //
+    //     x1 = apontador para o nome (sem comprimento!)
+    //     x0 = Result
+    //     x1 = handle                <- no mesmo registo que a entrada
+    //
+    // Duas coisas que a versão anterior errou, e ambas calavam a falha:
+    //
+    //   1. lia o COMPRIMENTO de x2. Não existe comprimento nesta SVC, e x2
+    //      vinha a zero — pelo que devolvia sempre `Result::Invalid`.
+    //   2. escrevia o handle num ponteiro em x0. Aqui x0 é o Result, e a
+    //      escrita ia para um endereço do guest que ninguém pediu.
+    //
+    // STUB, declarado: `connect_named_port` fabrica um handle e não há IPC
+    // nenhum por trás. O SDK recebe um handle plausível e continua a correr;
+    // quando pedir o conteúdo da resposta (`SendSyncRequest`) é que a
+    // ilusão acaba. Preferível a um erro: o guest trata um erro de
+    // `ConnectToNamedPort` como motivo para abortar.
     std::string name;
-    const std::size_t len = static_cast<std::size_t>(ctx.x[2]);
-    if (len == 0 || len > 256)
-        return Result::Invalid;
-    if (!safe_copy_string(*this, ctx.x[1], name, len))
+    if (!safe_copy_cstring(*this, ctx.x[1], name, 256))
         return Result::Invalid;
 
     const std::uint32_t h = connect_named_port(name);
     if (h == 0)
         return Result::NotFound;
 
-    // Escrever no ESPAÇO DO GUEST, não num ponteiro do host.
-    //
-    // A versão anterior fazia `*reinterpret_cast<u32*>(ctx.x[0]) = h`. Numa
-    // configuração de teste, onde x0 é um ponteiro do host, isso funciona. Em
-    // produção x0 é um endereço de 39 bits do guest e a escrita vai para o
-    // sítio errado — ou, pior, para memória viva do processo do host.
-    //
-    // Um teste com ponteiros do host passa e o jogo rebenta. A mesma classe
-    // de erro do `x[18]`: um valor que parece funcionar porque o teste está
-    // a testar outra coisa.
-    if (ctx.x[0] != 0 && !write_guest(ctx.x[0], &h, sizeof(h)))
-        return Result::Invalid;
+    last_port_ = name;
+    ctx.x[1]    = h;
+    ctx.ret     = 0;
+    ctx.has_ret = true;
     return Result::Success;
 }
 
@@ -454,14 +482,31 @@ Result SvcDispatcher::svc_query_memory(SvcContext& ctx) {
     return Result::Success;
 }
 
+// GetProcessId e GetThreadId.
+//
+// A forma vem de `SvcWrap_GetProcessId64` / `SvcWrap_GetThreadId64` no Eden
+// (svc.cpp:1500-1516):
+//
+//     x1 = handle        x0 = Result
+//     x1 = o id          <- no mesmo registo que a entrada
+//
+// Duas formas de errar, e ambas estavam cá:
+//
+//   1. devolver o id em x0 (via `ctx.ret`). O guest lia o Result e Treaty-o
+//      como o id, e o id verdadeiro como o Result.
+//   2. tratar x0 como um ponteiro de SAÍDA e escrever lá. No Switch os ids
+//      voltam em registo; x0 é o Result. Escrever num endereço que o guest
+//      não pediu é corruption silenciosa — e era literalmente o que o
+//      `GetProcessId` fazia, mas ao contrário: lia 8 bytes do guest e
+//      deitava-os fora.
+//
+// O valor tem de ser ESTÁVEL: o SDK usa o id como chave do seu estado
+// por-thread, e um id que muda entre chamadas faz o jogo achar que é outra
+// thread.
 Result SvcDispatcher::svc_get_process_id(SvcContext& ctx) {
-    // x0 = ponteiro de saída (u64). O rtld grava o id do processo e volta a
-    // usá-lo em chamadas IPC; um valor inventado serve, desde que estável
-    // dentro da execução — e é escrito no espaço do guest, que é o que
-    // interessa.
-    std::uint64_t out = 1;
-    if (!read_guest(ctx.x[0], &out, sizeof(out)))
-        return Result::Invalid;
+    ctx.x[1]     = process_id_;
+    ctx.ret      = 0;
+    ctx.has_ret  = true;
     return Result::Success;
 }
 
@@ -498,26 +543,47 @@ Result SvcDispatcher::svc_get_info(SvcContext& ctx) {
     const std::uint32_t type    = static_cast<std::uint32_t>(ctx.x[1]);
     const std::uint32_t subtype = static_cast<std::uint32_t>(ctx.x[3]);
 
-    const std::uint64_t heap_base = heap_base_ != 0 ? heap_base_ : kDefaultHeapBase;
-    const std::uint64_t heap_size = heap_size_  != 0 ? heap_size_  : 0x0800'0000ull;
 
     std::uint64_t value = 0;
     switch (type) {
-    case 2:  value = 0;                    break;  // AliasRegionAddress
-    case 3:  value = 0x4000'0000ull;       break;  // AliasRegionSize
-    case 4:  value = heap_base;            break;  // HeapRegionAddress
-    case 5:  value = heap_size;            break;  // HeapRegionSize
-    case 6:  value = heap_base + heap_size;break;  // TotalMemorySize
-    case 7:  value = 0;                    break;  // UsedMemorySize
-    case 11: value = random_u64();         break;  // RandomEntropy
-    case 12: value = heap_base;            break;  // AslrRegionAddress
-    case 13: value = heap_size;            break;  // AslrRegionSize
-    case 14: value = stack_base_;         break;  // StackRegionAddress
-    case 15: value = stack_size_;         break;  // StackRegionSize
-    case 16: value = 4;                    break;  // PersonalWordSize (AArch64)
+    // Os números são `InfoType` do Eden (svc_types.h:130-159), copiados um a
+    // um. Uma versão anterior desta função tinha `case 16: value = 4;` com um
+    // comentário a dizer "PersonalWordSize" — um tipo que não existe em lado
+    // nenhum. 16 é `SystemResourceSizeTotal` e 22 é `UsedNonSystemMemorySize`.
+    // O SDK do jogo pedia o 22 e recebia 4: quatro bytes de "memória em uso",
+    // e depois desreferenciava o resultado. Um número inventado aqui não dá
+    // erro nenhum — é o pior tipo de bug, e é o que a regra de "medir, não
+    // adivinhar" existe para apanhar.
+    case 2:  value = alias_base_;           break;  // AliasRegionAddress
+    case 3:  value = alias_size_;           break;  // AliasRegionSize
+    case 4:  value = heap_base_;            break;  // HeapRegionAddress
+    case 5:  value = heap_size_;            break;  // HeapRegionSize
+    case 6:  value = mem_total_;            break;  // TotalMemorySize
+    case 7:  value = mem_used_;             break;  // UsedMemorySize
+    case 11: value = random_u64();          break;  // RandomEntropy
+    case 12: value = heap_base_;            break;  // AslrRegionAddress
+    case 13: value = heap_size_;            break;  // AslrRegionSize
+    case 14: value = stack_base_;           break;  // StackRegionAddress
+    case 15: value = stack_size_;           break;  // StackRegionSize
+    case 16: value = system_resource_size_; break;  // SystemResourceSizeTotal
+    case 17: value = 0;                     break;  // SystemResourceSizeUsed
+    case 20: value = 0;                     break;  // UserExceptionContextAddress
+    case 21: value = mem_total_;            break;  // TotalNonSystemMemorySize
+    case 22: value = mem_used_;             break;  // UsedNonSystemMemorySize
+    case 23: value = 1;                     break;  // IsApplication
+    case 24: value = kFreeThreadCount;      break;  // FreeThreadCount
+    case 25: value = 0;                     break;  // ThreadTickCount
+    case 26: value = 1;                     break;  // IsSvcPermitted
+    case 28: value = 0;                     break;  // AliasRegionExtraSize
+
+    // 18 (ProgramId) e 9 (ResourceLimit) ficam de fora de propósito.
+    //
+    // O ProgramId NÃO está no NPDM — o NPDM meta tem ProductCode a zero
+    // (switchbrew/NPDM: 0x30). Vem do title id do NCA, e nós carregamos um
+    // ExeFS já extraído, que perdeu essa informação. Devolver 0 seria
+    // inventar; devolver um erro é honesto, e o SDK só o usa para dados de
+    // save, não para arrancar.
     default:
-        // Um tipo que não sabemos é melhor assim do que com um valor
-        // inventado: o guest vê um Result de erro e pode livrar-se.
         return Result::Unsupported;
     }
     (void)subtype;
@@ -528,6 +594,35 @@ Result SvcDispatcher::svc_get_info(SvcContext& ctx) {
     ctx.x[1]  = value;
     ctx.ret   = 0;
     ctx.has_ret = true;
+    return Result::Success;
+}
+
+// GetThreadPriority — `SvcWrap_GetThreadPriority64` no Eden (svc.cpp:1331).
+//
+//     x1 = handle da thread        x0 = Result
+//     x1 = prioridade (saida)      <- no mesmo registo que a entrada
+//
+// É a mesma forma do GetInfo: o valor sai no registo que era o argumento.
+// Tratar x1 como ponteiro devolveria lixo sem erro nenhum.
+Result SvcDispatcher::svc_get_thread_priority(SvcContext& ctx) {
+    const std::uint32_t handle = static_cast<std::uint32_t>(ctx.x[1]);
+
+    // Handle 0 e' a thread corrente. Uma thread que o guest criou tem outra
+    // prioridade, mas ainda não sabemos qual — e mentir com um valor errado
+    // seria pior do que devolver a da principal, que é o que o guest tem
+    // enquanto não cria nenhuma.
+    ctx.x[1]     = main_priority_ != 0 ? main_priority_ : kDefaultMainPriority;
+    ctx.ret      = 0;
+    ctx.has_ret  = true;
+    (void)handle;
+    return Result::Success;
+}
+
+// SetThreadPriority — stub transparente. O guest chama-a durante o arranque;
+// recusar com um erro aborta o jogo, e a prioridade nao muda nada enquanto
+// nao houver threads a schedular.
+Result SvcDispatcher::svc_set_thread_priority(SvcContext& ctx) {
+    last_priority_ = static_cast<std::int32_t>(ctx.x[2]);
     return Result::Success;
 }
 

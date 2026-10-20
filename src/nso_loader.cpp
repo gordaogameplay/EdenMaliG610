@@ -206,6 +206,7 @@ bool NsoLoader::load_npdm(const std::string& path, LoadedModule& out,
     out.address_space_type =
         (h.flags0 & kNpdmAddressSpaceMask) >> kNpdmAddressSpaceShift;
     out.main_thread_priority = h.main_thread_priority;
+    out.system_resource_size = h.system_resource_size;
     out.main_thread_core     = h.main_thread_core;
     out.stack_size           = h.main_thread_stack_size;
 

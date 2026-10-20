@@ -169,6 +169,7 @@ bool GuestProgram::plan_layout(std::uint64_t heap_reserve, std::string& error) {
     // Verificação de sobreposição.
     struct Span { std::uint64_t lo, hi; const char* what; };
     const Span spans[] = {
+        {layout::kAliasBase, layout::kAliasBase + layout::kAliasSize, "alias"},
         {layout::kCodeBase,  code_end_,                              "code"},
         {layout::kStackBase, layout::kStackTop(),                    "stack"},
         {layout::kTlsBase,   layout::kTlsBase + layout::kTlsSize,     "tls"},
@@ -251,7 +252,7 @@ bool GuestProgram::map_into(std::uint64_t heap_reserve, std::string& error) {
 
     // Uma reserva única que cobre tudo: o `owns()` passa a ser uma comparação
     // só, e um módulo nunca fica a meio de uma reserva.
-    const std::uint64_t lo = layout::kCodeBase;
+    const std::uint64_t lo = layout::kAliasBase;
     const std::uint64_t hi = heap_base_ + heap_size_;
     (void)code_end_;
     const std::uint64_t span = page_align_up(hi - lo);
@@ -444,7 +445,14 @@ std::vector<GuestRegion> GuestProgram::memory_regions() const {
     std::vector<GuestRegion> out;
 
     using G = GuestRegion;
-    out.push_back({0, layout::kCodeBase, G::kStatic, G::kReadOnly});
+    out.push_back({0, layout::kAliasBase, G::kStatic, G::kReadOnly});
+
+    // A região de alias. `GetInfo(AliasRegionAddress)` devolve o início
+    // DELA, e o SDK aloca dali — se devolvêssemos 0, o `AddressSpaceAllocator`
+    // ficava com uma região nula e desreferenciava-a. Foi o que aconteceu
+    // antes de isto existir: `svc Break(x0=0)`.
+    out.push_back({layout::kAliasBase, layout::kAliasSize, G::kNormal,
+                   G::kReadWrite});
 
     // Cada módulo em três regiões, à medida dos segmentos. Os gaps entre
     // segmentos (medidos: 3328 bytes no `main`) ficam absorbidos na região

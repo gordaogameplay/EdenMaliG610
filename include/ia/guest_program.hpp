@@ -189,6 +189,25 @@ namespace layout {
 // coincidência do jogo actual, não uma propriedade do formato.
 inline constexpr std::uint64_t kCodeBase  = 0x0000'0000'8000'0000ull;
 
+// A região de alias do processo.
+//
+// O Eden, para um endereço de 39 bits, reserva **64 GiB** de alias
+// (`k_address_space_info.cpp:36`). Isso são páginas virtuais, que o Eden
+// mapeia a preguiçoso; nós somos **nativos**, e 64 GiB seria mais memória
+// virtual do que a máquina tem. Logo reservamos uma fracção — o que interessa
+// ao SDK é que a região seja válida e esteja no nosso espaço.
+//
+// Abaixo do código, como no Switch, onde o alias fica antes da região de
+// código.
+inline constexpr std::uint64_t kAliasBase = 0x0000'0000'6000'0000ull;
+//
+// O tamanho não é redondo de propósito: termina **exactamente** em
+// `kCodeBase`. Um buraco entre a região de alias e o código faz a varrura de
+// módulos do rtld parar a meio — ele avança `base + size` e, ao cair num
+// endereço não descrito, recebe "Free" e desiste. Foi o que aconteceu na
+// primeira versão, com 256 MiB.
+inline constexpr std::uint64_t kAliasSize = 0x2000'0000ull;  // 512 MiB
+
 inline constexpr std::uint64_t kStackBase = 0x0000'0000'8400'0000ull;
 inline constexpr std::uint64_t kStackSize = 0x0080'0000ull;   // 8 MiB
 

@@ -299,7 +299,18 @@ int main(int argc, char** argv) {
     ia::SvcDispatcher svc(tel);
     svc.bind_memory(&prog.memory());
     svc.set_heap_base(ia::layout::kHeapBase);
+    svc.set_alias_region(ia::layout::kAliasBase, ia::layout::kAliasSize);
+    svc.set_memory_totals(prog.memory().base() + prog.memory().size(),
+                          prog.modules().empty()
+                              ? 0
+                              : prog.modules().front().nso.image.size());
+    svc.set_system_resource_size(prog.modules().empty()
+                                     ? 0
+                                     : prog.modules().front().nso.system_resource_size);
     svc.set_stack_region(ia::layout::kStackBase, ia::layout::kStackSize);
+    // A prioridade da thread principal vem do NPDM (`main_thread_priority`).
+    if (!prog.modules().empty())
+        svc.set_main_thread_priority(prog.modules().front().nso.main_thread_priority);
     svc.set_regions(prog.memory_regions());
 
     // A tabela que o rtld vai=varrer. Dumpada porque uma região com o
@@ -639,6 +650,9 @@ int main(int argc, char** argv) {
     std::printf("  svcs vistas : %d\n", g_svcs);
     std::printf("  amostras    : %d  (último PC 0x%llx)\n", g_samples,
                 (unsigned long long)g_sample_pc);
+    if (!svc.last_port().empty())
+        std::printf("  ultima porta: \"%s\"  (STUB: handle fabricado, sem IPC)\n",
+                    svc.last_port().c_str());
     std::printf("  MapMemory   : %llu chamadas\n",
                 (unsigned long long)svc.map_memory_calls());
 

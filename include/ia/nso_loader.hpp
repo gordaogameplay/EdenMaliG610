@@ -156,6 +156,11 @@ struct LoadedModule {
     std::uint8_t  main_thread_core = 0;
     std::uint32_t stack_size = 0;
 
+    // `SystemResourceSize` do NPDM meta (offset 0x14). O kernel reserva
+    // esta memória para as suas estruturas internas conforme o processo
+    // precisa dela. É o que `GetInfo(SystemResourceSizeTotal)` devolve.
+    std::uint32_t system_resource_size = 0;
+
     // Imagem do módulo lays out no ESPAÇO VIRTUAL, não concatenada.
     //
     // Os vaddr dos segmentos são absolutos dentro do módulo e NÃO são
