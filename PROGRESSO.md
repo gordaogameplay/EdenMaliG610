@@ -844,3 +844,101 @@ casos especiais para "isto era um RZ".
 24 verificações no `ia_translate_test`, 20 no `ia_gpu_exec`, 6 suites a
 passar. O pixel na G610 continua a dar 1.500000 com o shader agora escrito em
 `ISCADD`, que é o idioma real.
+
+
+---
+
+# O jogo a correr: onde para, e o que se confirmou
+
+Corrido com `ia_boot ~/piDroid/piDroid_Test_ARM/work/exefs`. O guest chega ao
+primeiro IPC do programa inteiro e aborta logo a seguir.
+
+```
+ConnectToNamedPort  x1=0x834593c9        -> "sm:"     (handle fabricado 0x1000)
+SendSyncRequest     x0=0x1000 x1=0x88000000 x2=0x1000
+Break               x0=0x0                (abort deliberado do SDK)
+```
+
+## O pedido, byte a byte
+
+`IA_IPC_DUMP=1` despeja o buffer do IPC. O pedido completo são 4096 bytes e
+só quatro têm alguma coisa:
+
+```
+0000  06 00 00 00   type = 6 (RequestWithContext)
+0004  0a 00 00 80   data_size = 10, flags = 0, enable_handle_descriptor = 1
+0008  01 00 00 00   HandleDescriptorHeader: send_current_pid = 1
+0020  53 46 43 49   "SFCI"
+0024  01 00 00 00   <-- a palavra de enchimento, que valia 1
+01e0  24 56 54 21   "$VT!" — a nossa ThreadLocalRegion
+```
+
+## Três erros de 4 bytes, todos confirmados na fonte
+
+**O `command id` é um `u64` e o `DataPayloadHeader` tem 8 bytes.**
+
+```cpp
+// core/hle/ipc.h:174
+struct DataPayloadHeader {
+    u32_le magic;
+    INSERT_PADDING_WORDS_NOINIT(1);
+};
+static_assert(sizeof(DataPayloadHeader) == 8, ...);
+
+// core/hle/service/ipc_helpers.h:298 — o servidor ao LER um pedido
+// Skip the u64 command id, it's already stored in the context
+static constexpr u32 CommandIdSize = 2;   // dois u32
+Skip(CommandIdSize, false);
+```
+
+Líamos o command id em `payload+4` — dentro da palavra de enchimento, que
+por acaso valia **1**. Ou seja: o guest enviava `Initialize` (0) e nós
+respondíamos a `GetService`. **Respondíamos a um comando que ninguém tinha
+enviado.** Corrigido.
+
+**O `Result` também estava 4 bytes a menos.** Vai em `payload+0x10`, não em
+`payload+4`.
+
+**E o payload da resposta não é no sítio do pedido.** O `ResponseBuilder`
+(ipc_helpers.h:36-101) alinha o índice de palavras a um múltiplo de 4 — 16
+bytes — depois do `CommandHeader` e do descritor de handles. Dá sempre **0x10**,
+com zero ou com um handle. Medido no pedido: **0x20**. A resposta anterior era
+escrita a ecoar o pedido. E o Eden faz `memset` do buffer inteiro antes de
+escrever, sem o que sobram bytes do pedido — uma resposta feita de remendos.
+
+Também ficou certo o `data_size` da resposta: `normal_params + 2 + 4 +
+normal_params` = 10 para 2 parâmetros. O valor anterior, 8, saiu do ar. E o
+pedido real do jogo tem 10, o que confirma a conta por um caminho
+independente.
+
+## A resposta NÃO é a causa — medido
+
+Matriz de 16 variantes de formato de resposta, incluindo **não escrever
+nada**:
+
+| variante | SendSyncRequest | Break |
+|---|---|---|
+| 0 (regra do ResponseBuilder) | 1 | 1 |
+| 8 (sem resposta nenhuma) | 1 | 1 |
+| 1, 2, 3, 9, 15 | 1 | 1 |
+
+Todas iguais. A resposta IPC sai da lista de hipóteses.
+
+## O que NÃO se confirmou
+
+- **Porque é que o guest aborta.** Não é o formato da resposta. Pode ser o
+  `send_current_pid`, o handle de sessão fabricado, o `Result` da SVC
+  `SendSyncRequest`, ou outra coisa entirely fora do IPC.
+- **O `tid` que o guest envia no `Initialize` é 0.** Vem do nosso
+  `GetThreadId`. Não se sabe se isso é um problema ou se é o que o guest
+  espera.
+- **Se o abort é do `nn::oe` ou do `libnx`.** O `x30` do `Break` é
+  `0x82b7b1e8`, dentro do `sdk` (0x829fb000–0x83529000), sem símbolos.
+
+## Estado
+
+Suite: **6 testes, todos a passar**. A frente do GPU continua intacta: o pixel
+na G610 dá 1.500000.
+
+O motor, a telemetria e o tradutor estão bons. O que falta é o OS — e o
+`sm:` é o primeiro serviço de que o jogo depende.

@@ -128,7 +128,20 @@ constexpr std::uint32_t kCmdRequestWithContext = 6;
 
 // `data_size` da resposta: `normal_params(2) + DataPayloadHeader/4(2) + 4`.
 // Os 4 u32 são os 16 bytes de padding obrigatório (`ipc_helpers.h:48-51`).
-constexpr std::uint32_t kReplyDataSize = 8;
+// O `data_size` de uma resposta, em palavras de 32 bits.
+//
+// Do `ResponseBuilder` do Eden (ipc_helpers.h:93):
+//
+//     raw_data_size = normal_params_size;
+//     raw_data_size += sizeof(DataPayloadHeader)/4 + 4 + normal_params_size;
+//
+// que são `2 + 4` de cabeçalho/enchimento mais os parâmetros duas vezes — uma
+// para o tamanho que o guest vai ler e outra para o que o servidor escreve.
+// Para uma resposta de 2 parâmetros dá 2 + 2 + 4 + 2 = **10**.
+//
+// O valor que estava aqui era 8, tirado do ar. E o pedido real do jogo tem
+// data_size = 10, o que confirma a conta por um caminho independente.
+constexpr std::uint32_t kReplyDataSize = 10;
 
 // Os comandos do `sm:`, pelos números do Eden.
 constexpr std::uint32_t kSmInitialize       = 0;
@@ -152,6 +165,54 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
     if (!read_guest(buffer, m, n))
         return false;
 
+    // ── despejar o pedido ───────────────────────────────────────────────
+    //
+    // Isto não é depuração: é a medição que está em falta. O guest pede
+    // `sm: GetService`, nós lemos um nome vazio e respondemos
+    // InvalidServiceName — e não se sabe se o nome está mesmo vazio ou se
+    // é a NOSSA leitura que está errada. São duas coisas que produzem
+    // exactamente o mesmo sintoma, e sem os bytes do pedido não há como
+    // distinguir. Foi o que aconteceu.
+    //
+    // Liga-se com IA_IPC_DUMP=1. Offset, hex e ASCII, porque "o nome não
+    // aparece" e "o nome aparece mas deslocado 8 bytes" são conclusões
+    // diferentes e precisam de se ver para se decidir entre elas.
+    static const bool dump = std::getenv("IA_IPC_DUMP") != nullptr;
+    if (dump) {
+        // Despeja o buffer INTEIRO, e não só os `n` bytes que a aritmética
+        // do IPC nos obrigam a ler. Os primeiros 512 bytes estão quase todos
+        // a zeros e o nome do serviço não está lá — leer mais é a diferença
+        // entre "o nome não veio" e "o nome veio e nós não o procurámos onde
+        // estava".
+        std::uint8_t cheio[0x1000];
+        std::size_t total = 0;
+        if (read_guest(buffer, cheio, sizeof cheio))
+            total = sizeof cheio;
+
+        std::printf("\n──── pedido IPC: buffer 0x%llx, size %zu, %zu lidos ────\n",
+                    (unsigned long long)buffer, size, total);
+        for (std::size_t i = 0; i < total; i += 16) {
+            const std::size_t fim = (i + 16 <= total) ? i + 16 : total;
+            bool alguma_coisa = false;
+            for (std::size_t j = i; j < fim; ++j)
+                if (cheio[j] != 0)
+                    alguma_coisa = true;
+            if (!alguma_coisa)
+                continue;
+            std::printf("  %04zx  ", i);
+            for (std::size_t j = i; j < fim; ++j)
+                std::printf("%02x ", cheio[j]);
+            for (std::size_t j = fim; j < i + 16; ++j)
+                std::printf("   ");
+            std::printf(" |");
+            for (std::size_t j = i; j < fim; ++j) {
+                const unsigned char ch = static_cast<unsigned char>(cheio[j]);
+                std::putchar((ch >= 0x20 && ch < 0x7F) ? static_cast<int>(ch) : '.');
+            }
+            std::printf("|\n");
+        }
+        std::printf("──────────────────────────────────────────────────\n");
+    }
     auto le32 = [&m](std::size_t off) {
         return static_cast<std::uint32_t>(m[off]) |
                (static_cast<std::uint32_t>(m[off + 1]) << 8) |
@@ -206,10 +267,82 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
         return false;
     }
 
-    const std::size_t cmd_off = payload + 4;   // cmd_id logo apos o magic
-    const std::size_t name_off = payload + 0x10;  // o nome do servico
+    // O command id é um u64, e o DataPayloadHeader tem OITO bytes.
+    //
+    //     struct DataPayloadHeader {   // ipc.h:174
+    //         u32_le magic;
+    //         INSERT_PADDING_WORDS_NOINIT(1);
+    //     };
+    //     static_assert(sizeof(DataPayloadHeader) == 8, ...);
+    //
+    // e o servidor salta-o assim (ipc_helpers.h:298):
+    //
+    //     // Skip the u64 command id, it's already stored in the context
+    //     static constexpr u32 CommandIdSize = 2;
+    //     Skip(CommandIdSize, false);
+    //
+    // `CommandIdSize = 2` são DOIS u32 — o id é um u64. A versão anterior
+    // lia o id em `payload + 4`, ou seja dentro da palavra de enchimento, e
+    // via o número que estivesse lá por acaso.
+    //
+    // O que isso produziu, medido: o guest envia `sm: Initialize` (cmd_id 0),
+    // nós lemos 1 — a palavra de enchimento — e respondemos a um
+    // `GetService` que ninguém pediu, com `InvalidServiceName`. O SDK recebe
+    // uma resposta para um comando que não enviou e aborta.
+    //
+    // Isto não era um palpite: era um offset de 4 bytes, e
+    // nenhuma matriz de variantes o apanharia, porque todas elas respondiam
+    // ao comando errado com a mesma confiança.
+    // ── a geometria, toda ────────────────────────────────────────────────
+    //
+    // Vem de três lugares do Eden, e nenhum deles é de memória:
+    //
+    //     // ipc.h:174
+    //     struct DataPayloadHeader {
+    //         u32_le magic;
+    //         INSERT_PADDING_WORDS_NOINIT(1);
+    //     };
+    //     static_assert(sizeof(DataPayloadHeader) == 8, ...);
+    //
+    //     // ipc_helpers.h:298, no servidor ao LER um pedido
+    //     // Skip the u64 command id, it's already stored in the context
+    //     static constexpr u32 CommandIdSize = 2;   // dois u32 = 8 bytes
+    //     Skip(CommandIdSize, false);
+    //
+    //     // ipc_helpers.h:93, no servidor ao ESCREVER uma resposta
+    //     raw_data_size += sizeof(DataPayloadHeader)/4 + 4 + normal_params_size;
+    //
+    // O que daí sai, em bytes a partir do início do payload:
+    //
+    //     +0x00  magic "SFCI"  (na resposta, "SFCO")
+    //     +0x04  enchimento    (1 u32)
+    //     +0x08  command id    (u64)
+    //     +0x10  corpo         — Result primeiro, e para o `sm: GetService`
+    //                           o nome do serviço é o que o pedido põe aqui
+    //                           (`PopServiceName`, sm.cpp:163)
+    //
+    // A versão anterior lia o command id em `payload+4` e escrevia o Result
+    // em `payload+4`: os dois 4 bytes a menos. Como o `payload+4` era uma
+    // palavra de enchimento com o valor 1, o comando lido era 1 — GetService —
+    // quando o guest tinha enviado Initialize (0). Respondíamos a um comando
+    // que ninguém tinha enviado.
+    //
+    // Nenhuma variante da matriz apanharia isto: respondiam todas ao comando
+    // errado, com a mesma confiança e o mesmo formato. Só o offset certo,
+    // medido no ficheiro que o escreve, resolve.
+    const std::size_t cmd_off    = payload + 0x08;   // u64
+    const std::size_t nome_off   = payload + 0x10;   // no PEDIDO, o corpo e' o nome
 
-    if (name_off + 8 > n) {
+    // O `result_off` da RESPOSTA é calculado mais abaixo, a partir de
+    // `pay_r`. Não é o mesmo: o payload do pedido foi medido em 0x20 e o da
+    // resposta é 0x10, pela regra de alinhamento do `ResponseBuilder`. Usar o
+    // offset do pedido para escrever na resposta põe o Result 16 bytes fora —
+    // e foi exactamente o que aconteceu na primeira tentativa desta
+    // mudança, com a resposta a mostrar `SFCO` em 0x10 e o Result em 0x30,
+    // que é o sítio onde o PEDIDO queria o nome do serviço.
+    std::size_t result_off = 0;
+
+    if (nome_off + 8 > n) {
         last_ipc_ = "pedido truncado antes do nome do servico";
         return false;
     }
@@ -265,9 +398,35 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
     // e ele procura-a onde a deixou estar. Ecoar o offset do pedido é o que
     // garante isso, sem ter de reproduzir a aritmética dos descritores duas
     // vezes.
-    const std::size_t pay_r = v_payload ? (payload + 0x10) : payload;
+    // Onde vai o payload da RESPOSTA. Não é o mesmo sítio do pedido.
+    //
+    // O `ResponseBuilder` do Eden (ipc_helpers.h:36-101) faz, por ordem:
+    //
+    //     PushRaw(header);                      -> indice = 2 palavras
+    //     se houver handles:
+    //         PushRaw(HandleDescriptorHeader);  -> indice = 3
+    //         ctx.handles_offset = index;
+    //         Skip(n_handles);
+    //     AlignWithPadding();                   -> indice multiplo de 4
+    //     PushRaw(DataPayloadHeader);           -> indice += 2
+    //
+    // `AlignWithPadding` arredonda o indice para um multiplo de 4 palavras,
+    // que sao 16 bytes. Com 0 handles o indice e' 2 e sobe para 4; com 1
+    // handle o indice ja e' 4. Nos dois casos o payload da resposta fica em
+    // **0x10**.
+    //
+    // O pedido foi medido em 0x20 e a resposta anterior era escrita a ecoar o
+    // pedido. Sao sitios diferentes e o Eden nao tem nada que sugira que sejam
+    // iguais — a resposta e' montada do zero, com `memset` antes.
+    // `v_payload` passa a ser a variante de POSICAO: 0 = a regra do
+    // `ResponseBuilder` (0x10), 1 = ecoar o payload do pedido (0x20). As duas
+    // continuam a ser testadas porque só uma é correcta e qual delas é
+    // depende do que o cliente faz, e isso não está escrito em lado nenhum
+    // que este projecto possa ler.
+    const std::size_t pay_r = v_payload ? payload : 0x10;
+    result_off = pay_r + 0x10;
 
-    std::size_t lim_r = pay_r + kReplyDataSize + 4;
+    std::size_t lim_r = pay_r + kReplyDataSize * 4;
     if (lim_r > limite)
         lim_r = limite;
 
@@ -289,19 +448,33 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
     put32(kOffCommandHeader, hdr_type);
     put32(kOffCommandHeader + 4, hdr_high);
 
+    // O Eden faz `memset(cmdbuf, 0, sizeof(u32) * COMMAND_BUFFER_LENGTH)` no
+    // começo do `ResponseBuilder` — o buffer INTEIRO, não só a parte que vai
+    // ser escrita. Sem isso sobram bytes do pedido, e uma resposta feita de
+    // remendos é uma coisa que o guest consegue ver.
+    for (std::size_t i = 0; i < n && i < kMessageBufferEnd; ++i)
+        m[i] = 0;
+
+    // Cabeçalho do payload: magic + enchimento. O command id e' um u64 e vai
+    // a seguir, ecoado do pedido — o servidor salta-o para chegar ao corpo.
     for (int i = 0; i < 4; ++i)
         m[pay_r + i] = static_cast<std::uint8_t>(kMagicResponse[i]);
-    put32(pay_r + 4, 0);                       // o Result
+    put32(pay_r + 4, 0);                       // a palavra de enchimento
+    put32(pay_r + 8, cmd_id);                  // o command id, u64 (baixa)
+    put32(pay_r + 12, 0);                      // o command id, u64 (alta)
 
     if (v_handles) {
-        // O handle vai no descritor: logo a seguir ao `CommandHeader`, como o
-        // `ResponseBuilder` faz (`ctx.handles_offset = index` logo depois de
-        // escrever o `HandleDescriptorHeader`).
+        // O handle vai no descritor, logo a seguir ao `CommandHeader`, como o
+        // `ResponseBuilder` faz: `ctx.handles_offset = index` logo depois de
+        // escrever o `HandleDescriptorHeader`.
         put32(kOffCommandHeader + 8, 0);       // HandleDescriptorHeader
         put32(kOffCommandHeader + 12, 0);      // o handle movido
-    } else {
-        put32(pay_r + 8, 0);                   // sem handles
     }
+
+    // O Result vive no CORPO, ou seja em `payload + 0x10` — e nao em
+    // `payload + 4`, que e' a palavra de enchimento do DataPayloadHeader. Foi
+    // ai que esteve durante mais tempo do que devia.
+    put32(result_off, 0);
 
     std::string nome;
 
@@ -315,7 +488,7 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
         // (`PopServiceName`, Eden sm.cpp:163-172: só mantém os caracteres
         // imprimíveis).
         for (std::uint32_t k = 0; k < 8; ++k) {
-            const char c = static_cast<char>(m[name_off + k]);
+            const char c = static_cast<char>(m[nome_off + k]);
             if (c >= ' ' && c <= '~')
                 nome.push_back(c);
         }
@@ -333,16 +506,13 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
             //
             // Aexperiência fica escrita porque um palpite que não funcionou
             // é informação: significa que a resposta NÃO é o problema.
-            put32(pay_r + 4, kSmResultInvalidServiceName);
+            put32(result_off, kSmResultInvalidServiceName);
             break;
         }
 
         const std::uint32_t h = connect_named_port(nome);
-        put32(pay_r + 4, 0);
         if (v_handles)
-            put32(kOffCommandHeader + 12, h);
-        else
-            put32(pay_r + 8, h);
+            put32(kOffCommandHeader + 12, h);   // handle no descritor
         break;
     }
 
@@ -357,14 +527,14 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
     default:
         last_ipc_ = "sm: comando " + std::to_string(cmd_id) +
                     " (desconhecido — resposta de erro, não um palpite)";
-        put32(pay_r + 4, 0x202);
+        put32(result_off, 0x202);
         break;
     }
 
     last_ipc_ += "  [variante " + std::to_string(variante) +
                 (v_handles ? ": handle no descritor" : ": handle inline") +
                 (v_tipo ? ", type ecoado" : ", type=0") +
-                (v_payload ? ", payload+0x10" : ", payload ecoado") +
+                (v_payload ? ", payload ecoado (0x20)" : ", payload em 0x10 (regra do ResponseBuilder)") +
                 (v_silencio ? ", SEM RESPOSTA" : "") + "]";
 
     if (v_silencio) {
@@ -373,10 +543,35 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
         return true;
     }
 
-    std::string err;
     if (!write_guest(buffer, m, lim_r)) {
         last_ipc_ += "  [ESCRITA FALHOU]";
         return false;
+    }
+
+    // Despejo da RESPOSTA, lado a lado com o pedido. Um pedido sem a
+    // resposta ao lado obriga a recordar a estrutura de memória; os dois
+    // juntos mostram logo se um campo está no sítio errado, que é
+    // precisamente o que esteve a acontecer com o command id e com o Result.
+    if (std::getenv("IA_IPC_DUMP") != nullptr) {
+        std::printf("\n──── resposta IPC: cmd_id %u ────\n", cmd_id);
+        for (std::size_t i = 0; i < lim_r && i < 0x60; i += 16) {
+            const std::size_t fim = (i + 16 <= lim_r) ? i + 16 : lim_r;
+            bool alguma_coisa = false;
+            for (std::size_t j = i; j < fim; ++j)
+                if (m[j] != 0)
+                    alguma_coisa = true;
+            if (!alguma_coisa)
+                continue;
+            std::printf("  %04zx  ", i);
+            for (std::size_t j = i; j < fim; ++j)
+                std::printf("%02x ", m[j]);
+            for (std::size_t j = fim; j < i + 16; ++j)
+                std::printf("   ");
+            std::printf("\n");
+        }
+        std::printf("  (payload em 0x%02zx, Result em 0x%02zx)\n",
+                    (unsigned)pay_r, (unsigned)result_off);
+        std::printf("──────────────────────────────────────────────────\n");
     }
     return true;
 }
