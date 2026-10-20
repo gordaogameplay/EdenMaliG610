@@ -2728,3 +2728,61 @@ comportamento do SDK, mas para o **ver**.
 
 O passo 1 fica escrito e **medido**, mas não publicado: só entra no
 histórico quando passar nos testes.
+
+---
+
+# Sessão 2026-10-20 (sexta parte) — o OOM era o `thread_local` no handler
+
+## A pista: o crash era no primeiro `SendSyncRequest`
+
+O WIP do passo 1 (o estado por thread) fazia o processo morrer de OOM no
+**primeiro** `SendSyncRequest` — o `sm: Initialize`, que não tem nada a ver
+com threads. Logo, não era a thread: era o **estado por thread em si**.
+
+## A causa: `thread_local` (e `__thread`) lidos **dentro do handler de sinais**
+
+O `t_thread_de_guest` era lido no handler, para saber se a trap vinha de
+uma thread de guest. E:
+
+| | o que acontece |
+|---|---|
+| `thread_local` | em modo PIC o acesso passa por `__tls_get_addr`, que **pode alocar** — e alocar dentro de um handler de sinais é um caminho para o OOM |
+| `__thread` | num executável **PIE** o acesso é local-exec, com o offset resolvido no *link* — e o binário é PIE, logo o offset está errado e o valor lido é lixo |
+
+Em ambos os casos o mesmo sintoma: o motor pensa que está numa thread de
+guest, o handler põe o TLS da `libc` a zero, e o processo morre.
+
+**A correcção: variáveis simples, globais.** O Eden também tem um "current
+thread" global (`GetCurrentThreadPointer`), e nós temos uma thread de guest;
+a corrida entre a thread principal e a de guest é limitada ao flag e aos
+dois endereços de TLS.
+
+**Medido:** com as três mudanças por thread (o `emulate_tls_read`, o
+`exit_recovery` e o trampoline) e as variáveis globais, o motor fica
+**estável** (61,8 ms, 218 SVCs) — e, com a thread a correr, o guest **não
+morre de OOM**.
+
+## E a thread corre
+
+Com o `CreateThread` a arrancar a thread (uma thread do host a correr o
+entry point, com o `sp` que o guest deu e o `TPIDR_EL0` no TLS dela):
+
+    [thrd] a thread de guest faultou: pc=0x0 addr=0x0 sp=0x0
+
+O `pc=0` e o `addr=0` com todos os registos a zero dizem que **não houve
+SIGSEGV**: o que houve foi um `brk #0` — a rotina em ensamblador, depois
+de a função do guest **voltar**. Ou seja: **a thread do guest correu e
+terminou** ✓ (o que resolve a dúvida sobre o *entry point* ser uma
+continuação: não é ✗ — ou é, mas o caminho é o certo ✗).
+
+O que falta agora é a **medida fina**: os registos no momento do `brk #0`
+(dizem o que o guest esperava ✗) e o porque de o guest morrer logo a
+seguir (o `Break` #191 ✗ — o mesmo abort de sempre ✗, mas com 189 SVCs em
+vez de 218 ✗, porque a thread morreu mais cedo ✗).
+
+## Estado
+
+| | |
+|---|---|
+| `main` | **estável**: 62,0 ms, 218 SVCs, 0 SVCs com erro, 6/6 testes |
+| `wip/passo-1-thread` | o passo 1 + a thread a correr; falta a medida fina |
