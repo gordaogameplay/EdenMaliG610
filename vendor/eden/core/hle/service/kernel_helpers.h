@@ -31,7 +31,6 @@ public:
 
     Kernel::KernelCore& kernel;
     Kernel::KProcess* process{};
-    bool process_created{false};
 };
 
 } // namespace Service::KernelHelpers

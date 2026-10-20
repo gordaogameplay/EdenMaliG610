@@ -213,6 +213,25 @@ public:
     // não tem (e porque).
     Service::APM::Controller& GetAPMController();
 
+    // O `ProgramId` do processo da aplicacao — o id do **titulo** (o
+    // NCA).
+    //
+    // No Eden (`core.cpp:729-731`):
+    //
+    //     u64 System::GetApplicationProcessProgramID() const {
+    //         return impl->kernel.ApplicationProcess()->GetProgramId();
+    //     }
+    //
+    // **Este motor nao tem o id do NCA**: e' uma coisa do emulador de
+    // ficheiros (vem do `.nca` que o rtld carrega), e um motor de
+    // execucao nativa carrega o programa ja decomposto.
+    //
+    // O `pctl` usa-o para encher a `ApplicationInfo` do estado, e essa
+    // leitura e' **opcional no Eden tambem** (`if (program_id != 0)`).
+    // Com zero, e' o caso de um jogo sem classificacao parental — o
+    // normal.
+    u64 GetApplicationProcessProgramID() const { return 0; }
+
     // Liga as duas pontas depois de ambas existirem.
     //
     // Separado do construtor porque não pode estar nele: o `KernelCore`

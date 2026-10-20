@@ -147,6 +147,22 @@ public:
 
     u64 GetProcessId() const { return pid_; }
 
+    // O `ProgramId` — o id do **titulo** (o NCA), que no Eden vem do
+    // `k_process.h` e e' lido pelo `Core::System::GetApplicationProcessProgramID`
+    // (`core.cpp:729-731`).
+    //
+    // **Este motor nao tem o id do NCA.** O `ProgramId` e' uma coisa do
+    // emulador de ficheiros (vem do `.nca` que o rtld carrega), e um
+    // motor de execucao nativa carrega o programa ja decomposto, sem
+    // metadados de titulo.
+    //
+    // O `pctl` usa-o para encher a `ApplicationInfo` do estado — e essa
+    // leitura e' **opcional no Eden tambem** (`if (program_id != 0)`).
+    // Com zero, o Eden nao preenche a `ApplicationInfo`, e o `pctl`
+    // comporta-se como se o jogo nao tivesse classificacao parental — que
+    // e' o caso normal.
+    u64 GetProgramId() const { return 0; }
+
     // O tamanho do buffer de ponteiros, que no Eden e' um campo do `KProcess`
     // (k_process.h:104, 262-268) e nao da thread. Le-o o `Controller` do `sm`
     // (sm_controller.cpp:78), que e' construido no construtor do

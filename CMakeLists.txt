@@ -113,6 +113,11 @@ set(IA_EDEN_SOURCES
   vendor/eden/core/hle/kernel/k_spin_lock.cpp
   vendor/eden/core/hle/service/apm/apm.cpp
   vendor/eden/core/hle/service/apm/apm_controller.cpp
+  vendor/eden/core/hle/service/kernel_helpers.cpp
+  vendor/eden/core/hle/service/os/event.cpp
+  vendor/eden/core/hle/service/pctl/parental_control_service.cpp
+  vendor/eden/core/hle/service/pctl/parental_control_service_factory.cpp
+  vendor/eden/core/hle/service/pctl/pctl.cpp
   vendor/eden/core/hle/service/apm/apm_interface.cpp
   vendor/eden/core/hle/service/hle_ipc.cpp
   vendor/eden/core/hle/service/lm/lm.cpp
