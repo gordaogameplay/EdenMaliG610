@@ -41,7 +41,7 @@ def main() -> int:
     n = 0
     for raiz, _dirs, ficheiros in os.walk(OVERRIDES):
         for nome in sorted(ficheiros):
-            if nome.endswith(".md"):
+            if nome.endswith(".md") or nome == ".aplicados":
                 continue
             origem = os.path.join(raiz, nome)
             relativo = os.path.relpath(origem, OVERRIDES)
@@ -62,6 +62,19 @@ def main() -> int:
             shutil.copyfile(destino, origem)
             print("sincronizado: %s" % relativo)
             n += 1
+
+    # **A lista de overrides e' a autoridade** — e e' o `aplicar_overrides.py`
+    # que a usa. Sem ela, um override que desapareceu continuaria a ser
+    # aplicado em silencio (e o `tar` nao apaga ficheiros).
+    lista = []
+    for raiz, _dirs, ficheiros in os.walk(OVERRIDES):
+        for nome in sorted(ficheiros):
+            if nome.endswith(".md") or nome == ".aplicados":
+                continue
+            lista.append(os.path.relpath(os.path.join(raiz, nome), OVERRIDES))
+    with open(os.path.join(OVERRIDES, ".aplicados"), "w", encoding="utf-8") as f:
+        for relativo in sorted(lista):
+            f.write(relativo + "\n")
 
     print("%d ficheiro(s) sincronizado(s)" % n)
     if n:
