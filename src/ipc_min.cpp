@@ -75,7 +75,37 @@ constexpr std::uint32_t kOffCommandHeader = 0x00;
 constexpr std::uint32_t kOffBufferDescC   = 0x08;
 constexpr std::uint32_t kOffHandleDesc    = 0x10;
 constexpr std::uint32_t kOffPayloadMagic  = 0x20;
+
+// O corpo do PEDIDO está em 0x28 — medido, não deduzido.
+//
+// O corpo da RESPOSTA **não tem a mesma Morada**, e é aqui que a coisa está
+// mais susceptível de estar errada.
+//
+// A resposta é montada pelo `ResponseBuilder` (Eden, `ipc_helpers.h:36-95`),
+// que empilha a partir do zero e NÃO repõe os descritores que o pedido tinha:
+//
+//     PushRaw(header)                    -> índice 2
+//     (sem handle descriptor, o Header não tem enable_handle_descriptor)
+//     AlignWithPadding()                  -> 2 alinha para 4
+//     PushRaw(data_payload_header)        -> índice 6
+//
+// Com 16 bytes de alinhamento, o payload do `ResponseBuilder` cai em
+// **0x18**, e não nos 0x20 que o pedido usa. O pedido tem um descritor C e um
+// descritor de handles a mais, e é isso que o empurra para 0x20.
+//
+// Duas leituras possíveis do mesmo ficheiro, e a medição é que decide — por
+// isso isto é uma constante e não uma inline no meio do código: trocar
+// 0x18 por 0x20 e recompilar é a experiência.
 constexpr std::uint32_t kOffBody          = 0x28;
+
+// Onde o corpo do `GetService` está, a contar do magic. O nome do serviço vem
+// depois de `cmd_id` e de mais duas palavras — medido no pedido 2 ("lm" em
+// magic+0x10).
+constexpr std::uint32_t kNameOffFromMagic = 0x10;
+
+// Até onde se procura a assinatura. O maior payload medido está em 0x20; 0x40
+// dá margem para um descritor a mais sem chegar a varrer o buffer todo.
+constexpr std::size_t kPayloadScanMax = 0x40;
 
 // Os magics, lidos como bytes na mesma ordem em que estão no buffer.
 //
@@ -141,9 +171,44 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
         return false;
     }
 
-    const std::uint32_t magic = le32(kOffPayloadMagic);
-    if (magic != kSfcIMagic) {
-        last_ipc_ = "magic SFCI ausente (0x" + std::to_string(magic) + ")";
+    // Onde está o payload? Não é uma constante — é uma ARITMÉTICA que depende
+    // dos descritores que o pedido traz.
+    //
+    // Medido nos dois pedidos reais do jogo:
+    //
+    //   pedido 1 (Initialize): CommandHeader + BufferDescriptorC +
+    //                           HandleDescriptorHeader  -> payload em 0x20
+    //   pedido 2 (GetService "lm"): CommandHeader + um bloco de 8 bytes
+    //                           -> payload em 0x10
+    //
+    // Duas tentativas com uma constante fixa (0x28, depois 0x18) falharam as
+    // duas, e era porque o valor não é fixo.
+    //
+    // Em vez de Reproduzir a aritmética dos descritores — que tem três casos
+    // e um alinhamento de 16 bytes — procura-se a assinatura. É mais barato,
+    // é à prova de um descritor que não conhecemos, e se um dia aparecer uma
+    // geometria nova o código continua a funcionar em vez de escrever por
+    // cima do sítio errado.
+    std::size_t payload = 0;
+    bool achou = false;
+    for (std::size_t k = 0; k + 4 <= n && k < kPayloadScanMax; k += 4) {
+        if (le32(k) == kSfcIMagic) {
+            payload = k;
+            achou = true;
+            break;
+        }
+    }
+    if (!achou) {
+        last_ipc_ = "assinatura SFCI nao encontrada nos primeiros " +
+                    std::to_string(kPayloadScanMax) + " bytes";
+        return false;
+    }
+
+    const std::size_t cmd_off = payload + 4;   // cmd_id logo apos o magic
+    const std::size_t name_off = payload + 0x10;  // o nome do servico
+
+    if (name_off + 8 > n) {
+        last_ipc_ = "pedido truncado antes do nome do servico";
         return false;
     }
 
@@ -164,7 +229,7 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
     if (limite < kOffBody + 8)
         limite = (n < kOffBody + 8 ? n : kOffBody + 8);
 
-    const std::uint32_t cmd_id = le32(kOffBody);
+    const std::uint32_t cmd_id = le32(cmd_off);
 
     // ── resposta ────────────────────────────────────────────────────────
     // Reconstruir como o `ResponseBuilder` faz: o MESMO `CommandHeader` (o
@@ -173,7 +238,20 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
     // O corpo tem de ser limpo. O Eden faz `memset(cmdbuf, 0, ...)` antes de
     // escrever, e sem isso sobram bytes do pedido — que é como um guest
     // descobre que a resposta é feita de remendos.
-    for (std::size_t i = kOffBody; i < limite; ++i)
+    // A resposta usa a MESMA geometria do pedido.
+    //
+    // O `ResponseBuilder` do Eden reconstrói o payload a partir do zero, mas
+    // o que interessa ao guest é encontrar a assinatura onde ele a procura —
+    // e ele procura-a onde a deixou estar. Ecoar o offset do pedido é o que
+    // garante isso, sem ter de reproduzir a aritmética dos descritores duas
+    // vezes.
+    const std::size_t pay_r = payload;
+
+    std::size_t lim_r = pay_r + kReplyDataSize + 4;
+    if (lim_r > limite)
+        lim_r = limite;
+
+    for (std::size_t i = pay_r; i < lim_r; ++i)
         m[i] = 0;
 
     // O `CommandHeader` da resposta: `type = 0`.
@@ -187,10 +265,9 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
     put32(kOffCommandHeader + 4, kReplyDataSize);
 
     for (int i = 0; i < 4; ++i)
-        m[kOffPayloadMagic + i] = static_cast<std::uint8_t>(kMagicResponse[i]);
-    put32(kOffPayloadMagic + 4, 0);
-    put32(kOffBody, 0);                        // o Result
-    put32(kOffBody + 4, 0);                    // sem handles
+        m[pay_r + i] = static_cast<std::uint8_t>(kMagicResponse[i]);
+    put32(pay_r + 4, 0);                       // o Result
+    put32(pay_r + 8, 0);                       // sem handles
 
     std::string nome;
 
@@ -204,22 +281,31 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
         // (`PopServiceName`, Eden sm.cpp:163-172: só mantém os caracteres
         // imprimíveis).
         for (std::uint32_t k = 0; k < 8; ++k) {
-            const char c = static_cast<char>(m[kOffBody + 8 + k]);
+            const char c = static_cast<char>(m[name_off + k]);
             if (c >= ' ' && c <= '~')
                 nome.push_back(c);
         }
         last_ipc_ = "sm: GetService \"" + nome + "\"";
 
         if (nome.empty()) {
-            // Nome vazio: o Eden devolve ResultInvalidServiceName em vez de
-            // adivinhar. É o honesto — e é o que o guest sabe tratar.
-            put32(kOffBody, kSmResultInvalidServiceName);
+            // O primeiro `GetService` do jogo vem com o nome vazio — oito
+            // zeros em magic+0x10, medido.
+            //
+            // Responder com sucesso e um handle fabricado foi a experiência:
+            // o guest continuou a dar `Break(x0=0)`, exactamente como com o
+            // erro. Logo, ou o nome vazio não é um "serviço por omissão", ou
+            // a falha é noutro sítio. Volta-se à resposta honesta, que é o que
+            // o Eden faz quando o nome não existe: `ResultInvalidServiceName`.
+            //
+            // Aexperiência fica escrita porque um palpite que não funcionou
+            // é informação: significa que a resposta NÃO é o problema.
+            put32(pay_r + 4, kSmResultInvalidServiceName);
             break;
         }
 
         const std::uint32_t h = connect_named_port(nome);
-        put32(kOffBody, 0);
-        put32(kOffBody + 4, h);
+        put32(pay_r + 4, 0);
+        put32(pay_r + 8, h);
         break;
     }
 
@@ -234,12 +320,12 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
     default:
         last_ipc_ = "sm: comando " + std::to_string(cmd_id) +
                     " (desconhecido — resposta de erro, não um palpite)";
-        put32(kOffBody, 0x202);
+        put32(pay_r + 4, 0x202);
         break;
     }
 
     std::string err;
-    if (!write_guest(buffer, m, limite)) {
+    if (!write_guest(buffer, m, lim_r)) {
         last_ipc_ += "  [ESCRITA FALHOU]";
         return false;
     }

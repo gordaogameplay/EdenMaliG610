@@ -77,31 +77,63 @@ E a resposta, de `ResponseBuilder` (`ipc_helpers.h:36-95`):
 Os comandos do `sm:` e os seus números são os do Eden (`sm.cpp:270-278`):
 `0 Initialize`, `1 GetService`, `2 RegisterService`, `3 UnregisterService`.
 
-### Três tentativas, sem avanço
+### A geometria do payload NÃO é uma constante
+
+Duas tentativas com offsets fixos (0x28, depois 0x18) falharam as duas, e o
+motivo é que **o payload não está sempre no mesmo sítio**:
+
+```
+pedido 1 (GetService, nome vazio):  payload em 0x20
+pedido 2 (GetService "lm")        :  payload em 0x10
+```
+
+A diferença vem dos descritores que cada pedido traz. Em vez de reproduzir a
+aritmética — que tem três casos e um alinhamento de 16 bytes, e que é
+perfeitamente capaz de estar errada — **procura-se a assinatura `SFCI`**. É
+mais barato, é à prova de um descritor que não conhecemos, e se aparecer uma
+geometria nova o código continua a funcionar em vez de escrever por cima do
+sítio errado.
+
+E assim discovered-se que **`cmd_id` está em `magic + 4`** e **o nome do
+serviço em `magic + 0x10`**. Uma versão anterior lia o `cmd_id` de 0x28 e
+achava que o primeiro pedido era `Initialize`; era `GetService`, e o
+`Initialize` nunca chegou a ser pedido.
+
+### Quatro tentativas, sem o guest avançar
 
 | # | O que mudei | Resultado |
 |---|---|---|
 | 1 | resposta com magic `SFCI`, `type = 6` | `Break(x0=0)` |
-| 2 | limite de escrita à MessageBuffer (0x100) | `Break(x0=0)` — mas **fixou uma regressão real** |
-| 3 | magic `SFCO`, `type = 0`, `data_size = 8` | `Break(x0=0)` |
+| 2 | limite de escrita à MessageBuffer (0x100) | `Break(x0=0)` — **fixou uma regressão real** |
+| 3 | magic `SFCO`, `type = 0`, `data_size = 8`, payload em 0x18 | segundo pedido! mas `Break(x0=0)` |
+| 4 | procura da assinatura em vez de offset fixo | `Break(x0=0)` |
+| 5 | responder sucesso ao nome vazio | `Break(x0=0)` — revertido |
 
-A tentativa 2 valeu a pena por si: o buffer de IPC **é** a MessageBuffer do
-ThreadLocalRegion, e a primeira versão limpava `size` = 0x1000 bytes a partir
-do corpo — o que apagava os ThreadVars em +0x1E0 e partia o TLS. Um sucesso
-falso teria sido pior que o `Break`.
+A tentativa 5 é a mais informativa: **a resposta não é o problema.** Com
+sucesso e com erro o guest falha igual. Logo o que falta é a leitura da
+resposta pelo guest estar a apanhar outra coisa, ou o pedido não ser o que
+parece.
 
 ### O que NÃO está resolvido
 
-O `Break(x0=0)` continua. **Não sei se é**:
-- o `CommandHeader` da resposta (a posição do payload depende de quantos
-  descritores há, e a resposta não tem nenhum — o `ResponseBuilder` alinharia
-  o payload em 0x18, não em 0x20);
-- o SDK precisar de mais do que um Result de `Initialize`;
-- ou a resposta ter de ser escrita noutro sítio (o Eden, em modo HLE, tem
-  `ctx.CommandBuffer()` a apontar para o buffer do cliente — que é o que
-  fazemos — mas não confirmei que a geometria é a mesma).
+O `Break(x0=0)` continua, e a tentativa 5 diz que **não é a resposta**. As
+hipóteses que sobram, por ordem deuche:
 
-Paro aqui pela regra das três tentativas.
+1. **O handle devolvido não vai onde o guest o lê.** Para `GetService`, o Eden
+   usa `ResponseBuilder{ctx, 2, 0, 1, AlwaysMoveHandles}` — o handle é
+   MOVIDO, e handles movidos vão no descritor de handles
+   (`enable_handle_descriptor`), não na secção de dados. A nossa resposta tem
+   o handle inline e `enable_handle_descriptor = 0`. **Esta é a hipótese
+   mais forte e é a próxima a testar.**
+2. O `cmd_id` estar em `magic + 4` é medido, mas os 8 bytes entre o `cmd_id` e
+   o nome não foram identificados — podem ser um campo que o guest preenche e
+   que o servidor devolve.
+3. Pode faltar o `svcReplyAndReceive` / deferral: o Eden, quando um serviço
+   não está pronto, faz `ctx.SetIsDeferred()` e o kernel continua a thread
+   depois. Nós respondemos sempre de imediato.
+
+Paro aqui pela regra das três tentativas — e a tentativa 5 deu-nos o
+diagnóstico que faltava para escolher bem a próxima.
 
 ---
 
