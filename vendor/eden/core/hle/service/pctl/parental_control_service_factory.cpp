@@ -15,8 +15,8 @@ IParentalControlServiceFactory::IParentalControlServiceFactory(Core::System& sys
                                                                Capability capability_)
     : ServiceFramework{system_, name_}, capability{capability_} {
     static const FunctionInfo functions[] = {
-        {0, C<&IParentalControlServiceFactory::CreateService>, "CreateService"},
-        {1, C<&IParentalControlServiceFactory::CreateServiceWithoutInitialize>,
+        {0, D<&IParentalControlServiceFactory::CreateService>, "CreateService"},
+        {1, D<&IParentalControlServiceFactory::CreateServiceWithoutInitialize>,
          "CreateServiceWithoutInitialize"},
     };
     RegisterHandlers(functions);

@@ -12,6 +12,25 @@
 #include "vendor/eden/core/hle/service/pctl/parental_control_service.h"
 #include "vendor/eden/core/hle/service/pctl/pctl_results.h"
 
+// **nota sobre o `D<>`**
+//
+// Os handlers deste servico usam `D<>` (dominio) e nao `C<>` (sessao
+// normal). **O Eden usa `D<>` em todos** (`parental_control_service.cpp:22`
+// e `parental_control_service_factory.cpp:16`), e a razao e' mecanica: o
+// `sm:` e' convertido a **dominio** (`ConvertCurrentObjectToDomain`), e um
+// pedido que vem por um dominio tem de devolver **objectos de dominio**.
+//
+// **Uma versao anterior deste ficheiro usava `C<>`.** A troca foi feita por
+// inferencia — a resposta saia com 0 palavras — e a inferencia estava
+// errada. Medido: com `C<>`, o comando 1 (`CreateServiceWithoutInitialize`)
+// respondia, o SDK recebia um ponteiro que nao era um objecto de dominio,
+// e abortava com a assercao `this == NULL` (o ficheiro da assercao e' NULL
+// e a linha e' 4 — a assinatura de um assert do **SDK**, nao do jogo).
+//
+// A regra que sai daqui: **`C<>` e `D<>` nao sao equivalentes**, e a
+// diferenca so aparece quando o pedido vem por um dominio.
+
+
 namespace Service::PCTL {
 
 IParentalControlService::IParentalControlService(Core::System& system_, Capability capability_)
@@ -20,38 +39,38 @@ IParentalControlService::IParentalControlService(Core::System& system_, Capabili
       unlinked_event{service_context}, request_suspension_event{service_context} {
     // clang-format off
     static const FunctionInfo functions[] = {
-        {1, C<&IParentalControlService::Initialize>, "Initialize"},
-        {1001, C<&IParentalControlService::CheckFreeCommunicationPermission>, "CheckFreeCommunicationPermission"},
-        {1002, C<&IParentalControlService::ConfirmLaunchApplicationPermission>, "ConfirmLaunchApplicationPermission"},
-        {1003, C<&IParentalControlService::ConfirmResumeApplicationPermission>, "ConfirmResumeApplicationPermission"},
-        {1004, C<&IParentalControlService::ConfirmSnsPostPermission>, "ConfirmSnsPostPermission"},
-        {1005, C<&IParentalControlService::ConfirmSystemSettingsPermission>, "ConfirmSystemSettingsPermission"},
-        {1006, C<&IParentalControlService::IsRestrictionTemporaryUnlocked>, "IsRestrictionTemporaryUnlocked"},
+        {1, D<&IParentalControlService::Initialize>, "Initialize"},
+        {1001, D<&IParentalControlService::CheckFreeCommunicationPermission>, "CheckFreeCommunicationPermission"},
+        {1002, D<&IParentalControlService::ConfirmLaunchApplicationPermission>, "ConfirmLaunchApplicationPermission"},
+        {1003, D<&IParentalControlService::ConfirmResumeApplicationPermission>, "ConfirmResumeApplicationPermission"},
+        {1004, D<&IParentalControlService::ConfirmSnsPostPermission>, "ConfirmSnsPostPermission"},
+        {1005, D<&IParentalControlService::ConfirmSystemSettingsPermission>, "ConfirmSystemSettingsPermission"},
+        {1006, D<&IParentalControlService::IsRestrictionTemporaryUnlocked>, "IsRestrictionTemporaryUnlocked"},
         {1007, nullptr, "RevertRestrictionTemporaryUnlocked"},
         {1008, nullptr, "EnterRestrictedSystemSettings"},
         {1009, nullptr, "LeaveRestrictedSystemSettings"},
-        {1010, C<&IParentalControlService::IsRestrictedSystemSettingsEntered>, "IsRestrictedSystemSettingsEntered"},
+        {1010, D<&IParentalControlService::IsRestrictedSystemSettingsEntered>, "IsRestrictedSystemSettingsEntered"},
         {1011, nullptr, "RevertRestrictedSystemSettingsEntered"},
         {1012, nullptr, "GetRestrictedFeatures"},
-        {1013, C<&IParentalControlService::ConfirmStereoVisionPermission>, "ConfirmStereoVisionPermission"},
+        {1013, D<&IParentalControlService::ConfirmStereoVisionPermission>, "ConfirmStereoVisionPermission"},
         {1014, nullptr, "ConfirmPlayableApplicationVideoOld"},
         {1015, nullptr, "ConfirmPlayableApplicationVideo"},
         {1016, nullptr, "ConfirmShowNewsPermission"},
-        {1017, C<&IParentalControlService::EndFreeCommunication>, "EndFreeCommunication"},
-        {1018, C<&IParentalControlService::IsFreeCommunicationAvailable>, "IsFreeCommunicationAvailable"},
-        {1019, C<&IParentalControlService::ConfirmLaunchApplicationPermission>, "ConfirmLaunchApplicationPermission"},
+        {1017, D<&IParentalControlService::EndFreeCommunication>, "EndFreeCommunication"},
+        {1018, D<&IParentalControlService::IsFreeCommunicationAvailable>, "IsFreeCommunicationAvailable"},
+        {1019, D<&IParentalControlService::ConfirmLaunchApplicationPermission>, "ConfirmLaunchApplicationPermission"},
         {1020, nullptr, "ConfirmLaunchSharedApplicationPermission"}, //20.0.0+
         {1021, nullptr, "TryBeginFreeCommunicationForStreamPlay"}, //21.0.0+
         {1022, nullptr, "EndFreeCommunicationForStreamPlay"}, //21.0.0+
-        {1031, C<&IParentalControlService::IsRestrictionEnabled>, "IsRestrictionEnabled"},
-        {1032, C<&IParentalControlService::GetSafetyLevel>, "GetSafetyLevel"},
+        {1031, D<&IParentalControlService::IsRestrictionEnabled>, "IsRestrictionEnabled"},
+        {1032, D<&IParentalControlService::GetSafetyLevel>, "GetSafetyLevel"},
         {1033, nullptr, "SetSafetyLevel"},
         {1034, nullptr, "GetSafetyLevelSettings"},
-        {1035, C<&IParentalControlService::GetCurrentSettings>, "GetCurrentSettings"},
+        {1035, D<&IParentalControlService::GetCurrentSettings>, "GetCurrentSettings"},
         {1036, nullptr, "SetCustomSafetyLevelSettings"},
         {1037, nullptr, "GetDefaultRatingOrganization"},
         {1038, nullptr, "SetDefaultRatingOrganization"},
-        {1039, C<&IParentalControlService::GetFreeCommunicationApplicationListCount>, "GetFreeCommunicationApplicationListCount"},
+        {1039, D<&IParentalControlService::GetFreeCommunicationApplicationListCount>, "GetFreeCommunicationApplicationListCount"},
         {1042, nullptr, "AddToFreeCommunicationApplicationList"},
         {1043, nullptr, "DeleteSettings"},
         {1044, nullptr, "GetFreeCommunicationApplicationList"},
@@ -62,20 +81,20 @@ IParentalControlService::IParentalControlService(Core::System& system_, Capabili
         {1049, nullptr, "ResetFreeCommunicationApplicationList"},
         {1050, nullptr, "AddToFreeCommunicationApplicationList"}, //20.0.0+
         {1051, nullptr, "NotifyApplicationDownloadStarted"}, //20.0.0+
-        {1061, C<&IParentalControlService::ConfirmStereoVisionRestrictionConfigurable>, "ConfirmStereoVisionRestrictionConfigurable"},
-        {1062, C<&IParentalControlService::GetStereoVisionRestriction>, "GetStereoVisionRestriction"},
-        {1063, C<&IParentalControlService::SetStereoVisionRestriction>, "SetStereoVisionRestriction"},
-        {1064, C<&IParentalControlService::ResetConfirmedStereoVisionPermission>, "ResetConfirmedStereoVisionPermission"},
-        {1065, C<&IParentalControlService::IsStereoVisionPermitted>, "IsStereoVisionPermitted"},
+        {1061, D<&IParentalControlService::ConfirmStereoVisionRestrictionConfigurable>, "ConfirmStereoVisionRestrictionConfigurable"},
+        {1062, D<&IParentalControlService::GetStereoVisionRestriction>, "GetStereoVisionRestriction"},
+        {1063, D<&IParentalControlService::SetStereoVisionRestriction>, "SetStereoVisionRestriction"},
+        {1064, D<&IParentalControlService::ResetConfirmedStereoVisionPermission>, "ResetConfirmedStereoVisionPermission"},
+        {1065, D<&IParentalControlService::IsStereoVisionPermitted>, "IsStereoVisionPermitted"},
         {1201, nullptr, "UnlockRestrictionTemporarily"},
         {1202, nullptr, "UnlockSystemSettingsRestriction"},
         {1203, nullptr, "SetPinCode"},
         {1204, nullptr, "GenerateInquiryCode"},
         {1205, nullptr, "CheckMasterKey"},
-        {1206, C<&IParentalControlService::GetPinCodeLength>, "GetPinCodeLength"},
+        {1206, D<&IParentalControlService::GetPinCodeLength>, "GetPinCodeLength"},
         {1207, nullptr, "GetPinCodeChangedEvent"},
         {1208, nullptr, "GetPinCode"},
-        {1403, C<&IParentalControlService::IsPairingActive>, "IsPairingActive"},
+        {1403, D<&IParentalControlService::IsPairingActive>, "IsPairingActive"},
         {1406, nullptr, "GetSettingsLastUpdated"},
         {1411, nullptr, "GetPairingAccountInfo"},
         {1421, nullptr, "GetAccountNickname"},
@@ -83,19 +102,19 @@ IParentalControlService::IParentalControlService(Core::System& system_, Capabili
         {1425, nullptr, "RequestPostEvents"},
         {1426, nullptr, "GetPostEventInterval"},
         {1427, nullptr, "SetPostEventInterval"},
-        {1432, C<&IParentalControlService::GetSynchronizationEvent>, "GetSynchronizationEvent"},
-        {1451, C<&IParentalControlService::StartPlayTimer>, "StartPlayTimer"},
-        {1452, C<&IParentalControlService::StopPlayTimer>, "StopPlayTimer"},
-        {1453, C<&IParentalControlService::IsPlayTimerEnabled>, "IsPlayTimerEnabled"},
-        {1454, C<&IParentalControlService::GetPlayTimerRemainingTime>, "GetPlayTimerRemainingTime"},
-        {1455, C<&IParentalControlService::IsRestrictedByPlayTimer>, "IsRestrictedByPlayTimer"},
-        {1456, C<&IParentalControlService::GetPlayTimerSettingsOld>, "GetPlayTimerSettingsOld"},
-        {1457, C<&IParentalControlService::GetPlayTimerEventToRequestSuspension>, "GetPlayTimerEventToRequestSuspension"},
-        {1458, C<&IParentalControlService::IsPlayTimerAlarmDisabled>, "IsPlayTimerAlarmDisabled"},
-        {1459, C<&IParentalControlService::GetPlayTimerRemainingTimeDisplayInfo>, "GetPlayTimerRemainingTimeDisplayInfo"},
+        {1432, D<&IParentalControlService::GetSynchronizationEvent>, "GetSynchronizationEvent"},
+        {1451, D<&IParentalControlService::StartPlayTimer>, "StartPlayTimer"},
+        {1452, D<&IParentalControlService::StopPlayTimer>, "StopPlayTimer"},
+        {1453, D<&IParentalControlService::IsPlayTimerEnabled>, "IsPlayTimerEnabled"},
+        {1454, D<&IParentalControlService::GetPlayTimerRemainingTime>, "GetPlayTimerRemainingTime"},
+        {1455, D<&IParentalControlService::IsRestrictedByPlayTimer>, "IsRestrictedByPlayTimer"},
+        {1456, D<&IParentalControlService::GetPlayTimerSettingsOld>, "GetPlayTimerSettingsOld"},
+        {1457, D<&IParentalControlService::GetPlayTimerEventToRequestSuspension>, "GetPlayTimerEventToRequestSuspension"},
+        {1458, D<&IParentalControlService::IsPlayTimerAlarmDisabled>, "IsPlayTimerAlarmDisabled"},
+        {1459, D<&IParentalControlService::GetPlayTimerRemainingTimeDisplayInfo>, "GetPlayTimerRemainingTimeDisplayInfo"},
         {1471, nullptr, "NotifyWrongPinCodeInputManyTimes"},
         {1472, nullptr, "CancelNetworkRequest"},
-        {1473, C<&IParentalControlService::GetUnlinkedEvent>, "GetUnlinkedEvent"},
+        {1473, D<&IParentalControlService::GetUnlinkedEvent>, "GetUnlinkedEvent"},
         {1474, nullptr, "ClearUnlinkedEvent"},
         {1475, nullptr, "GetExtendedPlayTimerEvent"}, // 18.0.0+
         {1601, nullptr, "DisableAllFeatures"},
@@ -133,7 +152,7 @@ IParentalControlService::IParentalControlService(Core::System& system_, Capabili
         {2014, nullptr, "FinishSynchronizeParentalControlSettings"},
         {2015, nullptr, "FinishSynchronizeParentalControlSettingsWithLastUpdated"},
         {2016, nullptr, "RequestUpdateExemptionListAsync"}, //5.0.0+
-        {145601, C<&IParentalControlService::GetPlayTimerSettings>, "GetPlayTimerSettings"}, // 18.0.0+
+        {145601, D<&IParentalControlService::GetPlayTimerSettings>, "GetPlayTimerSettings"}, // 18.0.0+
         {2017, nullptr, "AuthorizePairingAsync"}, //19.0.0+
         {2019, nullptr, "RequestUpdateDeviceUsersBackground"}, //19.0.0+
         {2021, nullptr, "RequestCopyPairingAsync"}, //20.0.0+
@@ -141,8 +160,8 @@ IParentalControlService::IParentalControlService(Core::System& system_, Capabili
         {2023, nullptr, "IsFromPairingActiveDevice"}, //20.0.0+
         {2024, nullptr, "RollbackCopyPairing"}, //21.0.0+
         {3001, nullptr, "GetErrorContextChangedEvent"}, //20.0.0+
-        {145601, C<&IParentalControlService::GetPlayTimerSettings>, "GetPlayTimerSettings"}, // 18.0.0+
-        {195101, C<&IParentalControlService::SetPlayTimerSettings>, "SetPlayTimerSettingsForDebug"}, //18.0.0+
+        {145601, D<&IParentalControlService::GetPlayTimerSettings>, "GetPlayTimerSettings"}, // 18.0.0+
+        {195101, D<&IParentalControlService::SetPlayTimerSettings>, "SetPlayTimerSettingsForDebug"}, //18.0.0+
     };
     // clang-format on
     RegisterHandlers(functions);

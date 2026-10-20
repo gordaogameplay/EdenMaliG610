@@ -45,6 +45,7 @@
 #include "vendor/eden/core/hle/service/apm/apm_controller.h"
 #include "g610/services/applet_oe.hpp"
 #include "vendor/eden/core/hle/service/lm/lm.h"
+#include "vendor/eden/core/hle/service/pctl/pctl.h"
 #include "vendor/eden/core/hle/service/server_manager.h"
 #include "vendor/eden/core/hle/service/sm/sm.h"
 
@@ -541,6 +542,17 @@ EdenSystem::EdenSystem(GuestMemory& memoria, std::uint64_t pid, std::uint64_t ti
 
     // O `appletOE` — o proxy do `am`. Ver `src/services/applet_oe.cpp`.
     g610::services::registar_applet_oe(*this);
+
+    // O `pctl` (o controlo parental). O guest pede-o ao `sm:` no arranque —
+    // `pctl`, `pctl:s`, `pctl:a` e `pctl:r` — e **os quatro pedidos ficam
+    // pendentes** se o servico nao existir (`sm.cpp:200-203`:
+    // `ctx.SetIsDeferred()`).
+    //
+    // O `pctl` ja estava vendorizado, mas o `LoopProcess` nunca era
+    // chamado: no Eden e' ele que regista as quatro portas no `sm:`. O
+    // codigo estava compilado e nunca executado — e o guest nao dizia
+    // nada, porque um pedido pendente nao e' um erro: e' uma espera.
+    Service::PCTL::LoopProcess(*this);
 
     // A verificacao que esteve aqui -- `KObjectName::Find("sm:")` -- **partiu
     // o jogo**.
