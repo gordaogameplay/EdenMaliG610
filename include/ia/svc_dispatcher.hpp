@@ -20,6 +20,7 @@
 #include "ia/guest_memory.hpp"
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -230,6 +231,17 @@ public:
     void set_heap_base(std::uint64_t base) noexcept { heap_base_ = base; }
     std::uint64_t heap_base() const noexcept { return heap_base_; }
 
+    // A pilha do guest, para `GetInfo(StackRegionAddress/Size)`.
+    //
+    // Passado por setter como o heap, e nao lido de `layout::` directamente:
+    // `guest_program.hpp` inclui este header, e ler o layout aqui seria um
+    // include circular. A dependencia fica na mao de quem chama, que e quem
+    // sabe o layout.
+    void set_stack_region(std::uint64_t base, std::uint64_t size) noexcept {
+        stack_base_ = base;
+        stack_size_ = size;
+    }
+
     // As regiões do espaço de endereçamento, por ordem de base.
     //
     // `svcQueryMemory` responde a partir desta tabela, e a resposta é o que o
@@ -320,6 +332,15 @@ private:
     Result svc_unmap_memory(SvcContext&);
     Result svc_map_shared_memory(SvcContext&);
     Result svc_query_memory(SvcContext&);
+
+    // `svcGetInfo`. O VALOR volta em x1, o Result em x0 — ver a
+    // implementacao para o porque de isso ser contra-intuitivo.
+    Result svc_get_info(SvcContext&);
+
+    // Entropia para `InfoType::RandomEntropy`. Reabre `/dev/urandom` a cada
+    // chamada: sao duas por arranque, e nenhum estado para gerir.
+    std::uint64_t random_u64();
+
     Result svc_unsupported(SvcContext&);
 
 
@@ -335,6 +356,9 @@ private:
     std::unordered_map<std::string, std::uint32_t> port_by_name_;
     std::unordered_map<std::uint32_t, std::string> name_by_handle_;
     std::uint32_t    next_handle_ = 0x1000;
+    std::uint64_t    entropy_counter_ = 0x9E3779B97F4A7C15ull;
+    std::uint64_t    stack_base_   = 0;
+    std::uint64_t    stack_size_   = 0;
     std::uint64_t    heap_size_   = 0;
     std::uint64_t    heap_base_   = 0;
     std::uint64_t    map_memory_calls_   = 0;

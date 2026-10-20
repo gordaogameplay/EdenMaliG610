@@ -299,6 +299,7 @@ int main(int argc, char** argv) {
     ia::SvcDispatcher svc(tel);
     svc.bind_memory(&prog.memory());
     svc.set_heap_base(ia::layout::kHeapBase);
+    svc.set_stack_region(ia::layout::kStackBase, ia::layout::kStackSize);
     svc.set_regions(prog.memory_regions());
 
     // A tabela que o rtld vai=varrer. Dumpada porque uma região com o

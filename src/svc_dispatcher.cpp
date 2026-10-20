@@ -152,6 +152,7 @@ void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
     case Svc::MapSharedMemory:      r = svc_map_shared_memory(ctx); break;
     case Svc::UnmapSharedMemory:    r = svc_unmap_memory(ctx);   break;
     case Svc::QueryMemory:          r = svc_query_memory(ctx);   break;
+    case Svc::GetInfo:              r = svc_get_info(ctx);       break;
     default:                        r = svc_unsupported(ctx);    break;
     }
 
@@ -462,6 +463,89 @@ Result SvcDispatcher::svc_get_process_id(SvcContext& ctx) {
     if (!read_guest(ctx.x[0], &out, sizeof(out)))
         return Result::Invalid;
     return Result::Success;
+}
+
+// ---------------------------------------------------------------------------
+// GetInfo
+// ---------------------------------------------------------------------------
+//
+// Porque é preciso já: o SDK do jogo pede isto no arranque, ANTES de qualquer
+// serviço. Pediu `RandomEntropy` duas vezes e `AslrRegionAddress` uma, e com
+// a resposta em erro ficou com a região ASLR a null — e desreferenciou-a.
+// O sintoma foi `svc Break(x0=0)`, o crash handler do próprio jogo.
+//
+// A forma do serviço não é adivinhada. Vem de `SvcWrap_GetInfo64` no Eden
+// (svc.cpp:1537-1545):
+//
+//     info_type   = GetArg64(args, 1);      // x1
+//     info_handle = GetArg64(args, 2);      // x2
+//     subtype     = GetArg64(args, 3);      // x3
+//     SetArg64(args, 0, ret);               // x0 = Result
+//     SetArg64(args, 1, out);               // x1 = o VALOR
+//
+// Ou seja: o valor volta em x1, no registo que era o tipo. Não é escrito num
+// ponteiro — e um palpite que o tratasse como `x0 = saída` devolveria lixo sem dar
+// erro.
+//
+// Os números dos InfoType são os do Eden (`svc_types.h:130-147`).
+//
+// STUB, e é preciso dizê-lo: a região ASLR que devolvemos é o NOSSO heap. No
+// Switch é uma região separada, gerida pelo `AslrSpaceManager` do SDK. Para
+// o crt0 chegar ao fim não interessa — o que interessa é que seja um endereço
+// dentro da reserva e que caiba. Se o SDK começar a alocar muito dali, é este
+// o número a suspectar.
+Result SvcDispatcher::svc_get_info(SvcContext& ctx) {
+    const std::uint32_t type    = static_cast<std::uint32_t>(ctx.x[1]);
+    const std::uint32_t subtype = static_cast<std::uint32_t>(ctx.x[3]);
+
+    const std::uint64_t heap_base = heap_base_ != 0 ? heap_base_ : kDefaultHeapBase;
+    const std::uint64_t heap_size = heap_size_  != 0 ? heap_size_  : 0x0800'0000ull;
+
+    std::uint64_t value = 0;
+    switch (type) {
+    case 2:  value = 0;                    break;  // AliasRegionAddress
+    case 3:  value = 0x4000'0000ull;       break;  // AliasRegionSize
+    case 4:  value = heap_base;            break;  // HeapRegionAddress
+    case 5:  value = heap_size;            break;  // HeapRegionSize
+    case 6:  value = heap_base + heap_size;break;  // TotalMemorySize
+    case 7:  value = 0;                    break;  // UsedMemorySize
+    case 11: value = random_u64();         break;  // RandomEntropy
+    case 12: value = heap_base;            break;  // AslrRegionAddress
+    case 13: value = heap_size;            break;  // AslrRegionSize
+    case 14: value = stack_base_;         break;  // StackRegionAddress
+    case 15: value = stack_size_;         break;  // StackRegionSize
+    case 16: value = 4;                    break;  // PersonalWordSize (AArch64)
+    default:
+        // Um tipo que não sabemos é melhor assim do que com um valor
+        // inventado: o guest vê um Result de erro e pode livrar-se.
+        return Result::Unsupported;
+    }
+    (void)subtype;
+
+    // O valor vai em x1. `ctx.ret` fica para o Result, que o motor escreve
+    // em x0 — são coisas diferentes, e é por aqui que esta SVC custa mais
+    // uma vez às outras: o mesmo erro que o `x0` nunca receber o Result.
+    ctx.x[1]  = value;
+    ctx.ret   = 0;
+    ctx.has_ret = true;
+    return Result::Success;
+}
+
+std::uint64_t SvcDispatcher::random_u64() {
+    // Sem estado, sem semente: `/dev/urandom` é a única fonte que não depende
+    // de nada que este motor ainda não tenha. E o SDK pede `RandomEntropy`
+    // duas vezes seguidas — se devolvêssemos o mesmo valor, o RNG do jogo
+    // arrancaria com uma semente previsível, o que é pior do que não ter RNG.
+    std::uint64_t v = 0;
+    std::FILE* f = std::fopen("/dev/urandom", "rb");
+    if (f != nullptr) {
+        if (std::fread(&v, 1, sizeof(v), f) != sizeof(v))
+            v = 0;
+        std::fclose(f);
+    } else {
+        v = entropy_counter_++;
+    }
+    return v;
 }
 
 Result SvcDispatcher::svc_unsupported(SvcContext&) {
