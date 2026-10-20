@@ -305,6 +305,25 @@ struct RequestParser {
     }
     /// @brief Aligns the current position forward to a 16-byte boundary, padding with zeros.
     inline void AlignWithPadding() { if (index & 3) Skip(u32(4 - (index & 3)), true); }
+
+    /// Os `bool`s do raw data, **empacotados**.
+    ///
+    /// O Eden le-os assim (`cmif_serialization.h:272`:
+    /// `memcpy(&arg, raw_data + ArgOffset, sizeof(bool))`) — **um byte
+    /// cada**, com o offset alinhado a `alignof(bool)`, que e' 1.
+    ///
+    /// O `Pop<u8>` **nao serve**: ele avanca uma **palavra** inteira
+    /// (`PopRaw`: `index += (sizeof(T) + 3) / 4`), e o segundo bool
+    /// ficaria no byte errado. Um `bool` lido no sitio errado e' o pior
+    /// tipo de bug: parece funcionar.
+    inline void PopBools(bool* out, u32 n) {
+        for (u32 i = 0; i < n; ++i) {
+            const u32 word = cmdbuf[index + i / 4];
+            out[i] = ((word >> (8 * (i % 4))) & 0xFF) != 0;
+        }
+        index += (n + 3) / 4;
+    }
+
     inline u32 GetCurrentOffset() const { return index; }
     inline void SetCurrentOffset(u32 offset) { index = offset; }
 

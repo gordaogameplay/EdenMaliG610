@@ -1,0 +1,7 @@
+core/hle/service/apm/apm_controller.cpp
+core/hle/service/apm/apm_controller.h
+core/hle/service/hle_ipc.cpp
+core/hle/service/ipc_helpers.h
+core/hle/service/service.cpp
+core/hle/service/sm/sm.cpp
+core/hle/service/sm/sm_controller.cpp
