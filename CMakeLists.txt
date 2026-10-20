@@ -44,7 +44,9 @@ add_library(ia_core STATIC
   src/guest_program.cpp
   src/input.cpp
   src/svc_dispatcher.cpp
-    src/ipc_min.cpp
+  src/ipc_min.cpp
+  src/gpu/maxwell_isa.cpp
+  src/gpu/maxwell_program.cpp
   src/gpu/maxwell_translator.cpp
   src/patcher.cpp
   src/native_engine.cpp
@@ -98,6 +100,11 @@ add_test(NAME core COMMAND ia_tests)
 # um add_test sem argumentos: corre contra os ROMs do utilizador.
 add_executable(ia_program tests/test_program.cpp)
 target_link_libraries(ia_program PRIVATE ia_core)
+
+# --- testes da ISA Maxwell ---------------------------------------------------
+add_executable(ia_maxwell_test tests/test_maxwell.cpp)
+target_link_libraries(ia_maxwell_test PRIVATE ia_core)
+add_test(NAME maxwell COMMAND ia_maxwell_test)
 
 # Teste de input: prova que a pilha SDL2 + evdev + mapeamento funciona.
 # Nao e' um teste do motor, e' um teste do INPUT.

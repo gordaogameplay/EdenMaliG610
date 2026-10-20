@@ -459,3 +459,78 @@ Duas frentes, e a segunda **não depende da primeira**:
    sintético antes de tocar no Pokémon Shield.
 
 A frente 2 é a que o enunciado pede, e é testável hoje.
+
+
+---
+
+# Frente 2: o tradutor Maxwell, com programas sintéticos
+
+## O que ficou feito
+
+**A tabela da ISA Maxwell, no nosso projecto.**
+
+`include/ia/gpu/maxwell_isa.inc` — 280 opcodes com máscara e valor, transcrita
+de `maxwell.inc` do Eden. `src/gpu/maxwell_isa.cpp` descodifica uma palavra de
+64 bits. `tests/test_maxwell.cpp` valida.
+
+**O que está medido, não suposto:**
+- a opcode ocupa os **bits [63:48]** da palavra de 64 bits, MSB primeiro
+  (`MaskValueFromEncoding` no Eden começa em `u64(1) << 63` e percorre 16 bits);
+- os wildcards do padrão são `-`;
+- o valor bruto de uma opcode é o **seu índice na tabela**, não um campo
+  numérico da codificação.
+
+**13 verificações, 0 falhas.** Suite completa: 4 testes, todos a passar.
+
+## O que o round-trip apanhou
+
+A primeira versão do teste afirmava "todas as 280 opacodes fazem ida e volta" e
+**falhou**. A opcode `LD` não voltava a `LD`.
+
+Investigado, e **o descodificador está certo**: `LD` tem máscara `0xE000` — só
+três bits — e está no fim da tabela de propósito. É uma **classe prefixo**, não
+uma instrução. O descodificador é uma varredura linear que devolve a primeira
+que casa, e `IMAD32I` (máscara `0xFC00`) vem antes, por isso qualquer coisa com
+o topo `0x8000` é `IMAD32I` e nunca chega a `LD`. É a mesma semântica do Eden.
+
+O teste passou a medir a lista de classes em vez de assumir que é vazia, e a
+verificar que é pequena e que cada uma é mesmo sombreada por outra. Uma lista
+de nomes written à mão seria o tipo de memória que este projecto proíbe.
+
+## Um bug meu, registado
+
+Guardei `std::string(name_of(op)).c_str()` numa estrutura — um `c_str()` de um
+temporário que morre no fim da linha. Imprimiu "classe 0" em vez de "classe LD".
+Corrigido para `std::string`. O sintoma foi inofensivo desta vez; a próxima vez
+pode não ser.
+
+## O que falta para o tradutor
+
+A cadeia real, e onde está cada peça:
+
+```
+Maxwell SASS  ──►  IR  ──►  SPIR-V  ──►  PanVK  ──►  Valhall (G610)
+   [feito]        [?]      [?]          [existe]     [existe]
+```
+
+- **IR**: o Eden tem `frontend/ir/`. Não é grande, mas depende do `common` do
+  yuzu (fmt, boost::container).
+- **SPIR-V**: o Eden tem `backend/spirv/`, ~5 000 linhas. Há uma via mais
+  barata: se o IR consegue ir a **GLSL**, o `glslang` (instalado) faz
+  GLSL → SPIR-V e não é preciso escrever o emissor.
+- **Painel**: PanVK está activo no Pi. Falta vulkaninfo a um shader.
+
+## O passo seguinte, e é uma decisão
+
+Duas vias para o meio da cadeia:
+
+1. **Trazer o `shader_recompiler` do Eden** (~19 000 linhas, com a dependência
+   do `common` do yuzu). Rápido se compilar; arrasta uma árvore grande.
+   Pergunta de licença: GPL-3.0-or-later.
+
+2. **Escrever o nosso**, começando por um subconjunto: os opcodes de que um
+   fragment shader mínimo precisa (MOV, FADD, FMUL, TEX, EXIT), IR próprio,
+   e saída em GLSL para o glslang.
+
+A 1 é rápida e de risco desconhecido. A 2 é lenta e controlada. É uma decisão
+de arquitectura — não a tomo sozinho.
