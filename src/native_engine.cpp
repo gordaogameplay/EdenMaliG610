@@ -1,4 +1,5 @@
 // EdenMaliIA — motor de execução nativa.
+#include "ia/guest_placement.hpp"
 #include "ia/native_engine.hpp"
 #include "ia/guest_program.hpp"
 
@@ -280,6 +281,14 @@ bool NativeEngine::install_handlers(std::string& error) {
 
 RunResult NativeEngine::run(void (*code)(), std::uint64_t sp) {
     RunResult r;
+
+    // O guest corre NESTA thread — o motor e' um loop de traps sincrono, e
+    // nao ha `pthread_create` em lado nenhum. Sem isto o jogo herda o nucleo
+    // onde o processo calhou, e o RK3588 pode calhar num A55.
+    //
+    // O Switch corre o jogo em 3 A57 a 1.020 MHz. Um A76 a 2.4 GHz e' outra
+    // coisa, e e' por isso que se vai la. Ver `guest_placement.cpp`.
+    fixar_guest_nos_nucleos_grandes();
 
     if (!hooks_.armed) {
         r.error = "handlers nao instalados";

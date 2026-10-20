@@ -45,6 +45,7 @@ add_library(ia_core STATIC
   src/input.cpp
   src/svc_dispatcher.cpp
   src/ipc_min.cpp
+  src/guest_placement.cpp
   src/gpu/ir.cpp
   src/gpu/maxwell_isa.cpp
   src/gpu/maxwell_program.cpp

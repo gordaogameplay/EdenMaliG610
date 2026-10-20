@@ -1346,3 +1346,102 @@ Suite: **6 testes, todos a passar**. GPU: 1.500000 na G610.
 
 Telemetria nova: `IA_FIND=<magic>` procura um magic na imagem
 descomprimida, e imprime os 64 bytes a seguir.
+
+
+---
+
+# A camada de sistema do Eden, vendorizada
+
+## O gargalo do CPU: a resposta
+
+Os teus dados invertem a conta. O Switch **não** usa 8 núcleos:
+
+| | Switch (Nintendo) | RK3588 (medido) |
+|---|---|---|
+| jogo | **3 × A57 @ 1020 MHz** (1785 no loading) | **4 × A76 @ 2400 MHz** |
+| sistema | 1 × A57 @ 1020 MHz | 4 × A55 @ 1800 MHz |
+| mortos | **4 × A53 @ 0 MHz** — desactivados | 0 |
+
+Um A76 fora-de-ordem a 2.4 GHz contra um A57 a 1.02 GHz é uma margem de
+várias vezes, e são quatro contra três. **O CPU não é o gargalo — é a
+maior vantagem que temos.**
+
+Mas daí sai uma consequência concreta, e implementada: o guest tem de correr
+nos A76.
+
+**Medido: o guest corre na thread principal.** O motor é um loop de traps
+síncrono em `NativeEngine::run()` — não há `pthread_create` em lado nenhum —
+e portanto o jogo herdava o núcleo onde o processo calhasse.
+
+`src/guest_placement.cpp` fixa-o. Por omissão descobre os núcleos grandes
+lendo `cpuinfo_max_freq` de cada um (funciona num Pi 4 com A72, não só
+neste), e `IA_BIG_CORES=0-3` sobrepõe. **Medido: `guest fixado nos nucleos
+grandes: 4 5 6 7`.**
+
+## A camada de sistema
+
+`vendor/eden/` — **115 ficheiros, 24.650 linhas**, com os headers SPDX
+originais intactos e `README.md` a listar o que foi tirado, o que não foi, e
+cada corte.
+
+## O que a medição mudou
+
+Vendorizar o fecho **tal e qual** foi um erro, e a medição disse-o logo: de
+6 ficheiros para **130** e 25.000 linhas, arrastando `cpu_manager`,
+`k_scheduler`, `physical_core`, `page_table` (dez ficheiros), `fiber`,
+`device_memory` e `arm_interface`. Ou seja, **o emulador inteiro** — o que
+este projecto não quer.
+
+A causa era um include: `k_process.h` puxa page tables, e page tables puxam
+o layout de memória, e o layout puxa o hardware. **Tudo por causa de um
+`#include`.**
+
+## A ponte
+
+`k_process_bridge.h`. O IPC pede ao processo **quatro coisas**, e só:
+
+```cpp
+GetOwnerProcess()->GetHandleTable()
+GetOwnerProcess()->GetProcessId()
+GetCurrentProcess(...).GetResourceLimit()
+GetCurrentMemory(...)  ->  ReadCString(), Read<T>(), Write<T>()
+```
+
+Page tables, reserva de recursos, metadata do programa, interfaces de CPU —
+a camada de IPC não toca em nada disso. A ponte é o `KProcess`, o `KThread` e
+o `GetCurrent*` que o IPC usa, sustentados pela nossa `GuestMemory` e pela
+nossa thread. **O processo aqui é o nosso motor nativo, não o do Eden**, e o
+ficheiro diz isso no topo.
+
+`KScopedDisableDispatch` é a primeira adaptação onde se *remove*
+comportamento: desliga a troca de contexto enquanto se segura o lock da
+tabela. Sem scheduler, é um no-op com o nome certo.
+
+## Onde está
+
+| ficheiro vendorizado | erros de compilação |
+|---|---|
+| `k_handle_table.cpp` | **3** |
+| `hle_ipc.cpp` | **9** |
+| `sm.cpp` | 19 |
+| `server_manager.cpp` | 42 |
+
+Não está a compilar. De 92 para 3 no `k_handle_table.cpp`, e o que resta já
+não é falta de código do Eden: é a costura entre os tipos completos dele
+(`KernelCore`, `Handle`) e os tipos mínimos da ponte.
+
+Três armadilhas que ficaram escritas, porque custaram tempo:
+
+- **Ciclos de include.** `ponte → k_handle_table.h → ponte`. Com `#pragma
+  once` num ciclo, um dos dois fica com o corpo vazio e o compilador diz que
+  o tipo não existe, sem nenhuma pista de que a causa é o ciclo.
+- **`Vaddr` não existe no fecho copiado** — vem de um pacote externo que não
+  está aqui. Em vez de o caçar, a ponte usa `std::uint64_t`, que é o que
+  `Vaddr` é.
+- **Contar chaves em cada edição.** Duas vezes uma edição deixou o ficheiro
+  com uma chave a mais.
+
+## O que não mudou
+
+A frente do GPU intacta: SASS → IR → GLSL → SPIR-V medido na **Mali-G610**,
+pixel lido `1.500000`. Suite de 6 testes a passar.
