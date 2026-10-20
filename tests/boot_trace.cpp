@@ -118,6 +118,16 @@ static std::string g_scratch;
 
 static volatile int g_samples = 0;
 static volatile std::uint64_t g_sample_pc = 0;
+
+// O ultimo `SendSyncRequest`: o buffer do pedido (x1) e o da resposta (x3).
+//
+// A resposta do servico vai para x3, no espaco do guest. E' ai que o SDK le
+// o Result. Se o nosso motor escrever a resposta no sitio errado, o SDK le
+// lixo — e um Result invalido e' exactamente o que mata um jogo.
+static std::uint64_t g_ultimo_req = 0;
+static std::uint64_t g_ultimo_resposta = 0;
+static std::uint64_t g_ultimo_handle = 0;
+static bool g_havia_sync = false;
 // Salta para aqui para parar o guest: um BRK, que o motor reconhece.
 extern "C" void force_stop() { __asm__ volatile("brk #0xFFFC"); }
 
@@ -339,6 +349,44 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
         }
         std::printf("[msg] w2 = %u\n",
                     (unsigned)(ctx.gpr[2] & 0xFFFFFFFFu));
+
+        // A ZONA: a mensagem do assert nao esta no ponteiro, esta num
+        // buffer perto. Despeja a janela a volta de cada ponteiro, para
+        // ver a string que o SDK esta a apontar.
+        //
+        // No abort deste jogo, `x1` aponta para um buffer com 1 byte
+        // legivel ("@"), e o `x3` (o comprimento) e' 0xe. A string esta
+        // algures nas vizinhas. Uma janela de 0x100 em volta de cada
+        // ponteiro mostra a string, e o offset dela diz o que o SDK
+        // codificou.
+        for (int arg = 0; arg <= 7; ++arg) {
+            const std::uint64_t p = ctx.gpr[arg];
+            if (p < 0x80000000ull || p >= 0x98000000ull)
+                continue;
+            const std::uint64_t inicio = p - 0x40;
+            unsigned char janela[0x100];
+            std::string e2;
+            if (!g_mem->read(inicio, janela, sizeof janela, e2))
+                continue;
+            // As strings legiveis na janela, com o seu offset.
+            std::uint64_t off = 0;
+            while (off < sizeof janela) {
+                std::uint64_t n = 0;
+                while (off + n < sizeof janela && janela[off + n] >= 0x20 &&
+                       janela[off + n] < 0x7F)
+                    ++n;
+                if (n >= 6) {
+                    std::printf("[zona] +0x%04llx (ptr+0x%llx): \"%.*s\"\n",
+                                (unsigned long long)(inicio - p + off),
+                                (unsigned long long)(off - (p - inicio)), (int)n,
+                                (const char*)janela + off);
+                }
+                ++off;
+                while (off < sizeof janela && janela[off] != 0)
+                    ++off;
+                ++off;
+            }
+        }
     }
 
     // ── o CHAMADOR, pela stack ──────────────────────────────────────────
@@ -655,12 +703,143 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
         std::uint64_t slots[96];
         std::string e;
         if (g_mem->read(sp, slots, sizeof slots, e)) {
-            std::printf("[stk] retorno a partir de Break:\\n");
+            std::printf("[stk] retorno a partir de Break:\n");
             for (int i = 0; i < 96; ++i) {
                 const std::uint64_t v = slots[i];
                 if (v >= 0x80000000ull && v < 0x98000000ull)
-                    std::printf("      sp+%4d  0x%016llx\\n", i * 8,
+                    std::printf("      sp+%4d  0x%016llx\n", i * 8,
                                 (unsigned long long)v);
+            }
+        }
+    }
+
+    // A mensagem do abort, em texto.
+    //
+    // O SDK chama o abort assim (medido no `sdk` desassemblado, offset
+    // 0x1801d0):
+    //
+    //     mov  x1, x0        ; x1 = a mensagem
+    //     orr  w2, wzr, #4
+    //     mov  w0, wzr
+    //     bl   Break
+    //
+    // Logo o `x1` do `Break` e' o ponteiro para a mensagem que o SDK
+    // construiu — e ela diz o que falhou, em texto. E' a unica pista que
+    // nao passa por adivinhar codigo a desassemblar.
+    // A resposta do IPC anterior: o observer corre ANTES do SVC ser
+    // despachado, portanto quando chega um SVC novo o buffer de mensagem
+    // ja tem a resposta do anterior. E' o unico sitio onde se pode ver o
+    // Result que o guest vai ler.
+    if (g_havia_sync && g_mem != nullptr) {
+        std::uint8_t buf[96]{};
+        std::string e5;
+        if (g_mem->read(g_ultimo_req, buf, sizeof buf, e5)) {
+            std::printf("[ipcR] handle=0x%llx  resposta: ", (unsigned long long)g_ultimo_handle);
+            for (std::size_t i = 0; i < sizeof buf; i += 16) {
+                std::printf("  ");
+                for (std::size_t j = 0; j < 16; ++j)
+                    std::printf("%02x ", buf[i + j]);
+                std::printf(" |");
+                for (std::size_t j = 0; j < 16; ++j) {
+                    const char c = (char)buf[i + j];
+                    std::printf("%c", (c >= ' ' && c <= '~') ? c : '.');
+                }
+                std::printf("|\n");
+            }
+            const std::uint32_t result = (std::uint32_t)buf[0x30] |
+                                         ((std::uint32_t)buf[0x31] << 8) |
+                                         ((std::uint32_t)buf[0x32] << 16) |
+                                         ((std::uint32_t)buf[0x33] << 24);
+            std::printf("[ipcR]   Result em +0x30 = 0x%08x\n", result);
+        }
+    }
+
+    if (number == 0x21) {
+        g_ultimo_req     = ctx.x[1];
+        g_ultimo_resposta = ctx.x[3];
+        g_ultimo_handle  = ctx.x[0];
+        g_havia_sync     = true;
+    } else {
+        g_havia_sync = false;
+    }
+
+    if (number == 0x26 && ctx.x[1] != 0 && g_mem != nullptr) {
+        char txt[600];
+        const std::size_t n = 560;
+        std::string e2;
+        if (g_mem->read(ctx.x[1], txt, n, e2)) {
+            txt[n] = 0;
+            std::size_t fim = 0;
+            while (fim < n && txt[fim] != 0 && txt[fim] >= ' ' && txt[fim] <= '~')
+                ++fim;
+            std::printf("[msg ] Break: x1=0x%llx  \"%s\"\n",
+                        (unsigned long long)ctx.x[1], std::string(txt, fim).c_str());
+            // Hexdump: a mensagem pode nao comecar no x1 (pode ter um
+            // cabecalho), e o que interessa e' ver os bytes.
+            std::printf("[msg ] bytes em x1:\n");
+            for (std::size_t i = 0; i < 128; i += 16) {
+                std::printf("      ");
+                for (std::size_t j = 0; j < 16; ++j)
+                    std::printf("%02x ", (unsigned char)txt[i + j]);
+                std::printf(" |");
+                for (std::size_t j = 0; j < 16; ++j) {
+                    const char c = txt[i + j];
+                    std::printf("%c", (c >= ' ' && c <= '~') ? c : '.');
+                }
+                std::printf("|\n");
+            }
+            // As strings da stack do guest. A mensagem do SDK e' uma
+            // string construida na stack; e' a unica forma de saber o que
+            // falhou sem adivinhar codigo a desassemblar.
+            {
+                const std::uint64_t base = 0x847f0000ull;
+                const std::size_t   n    = 0x10000;
+                std::vector<char> buf(n);
+                std::string e4;
+                if (g_mem->read(base, buf.data(), n, e4)) {
+                    std::printf("[msg ] strings na stack do guest:\n");
+                    std::size_t i = 0;
+                    while (i < n) {
+                        if (buf[i] >= ' ' && buf[i] <= '~') {
+                            std::size_t j = i;
+                            while (j < n && buf[j] >= ' ' && buf[j] <= '~')
+                                ++j;
+                            if (j - i >= 8) {
+                                std::printf("      0x%llx  \"%.*s\"\n",
+                                            (unsigned long long)(base + i),
+                                            (int)(j - i), buf.data() + i);
+                            }
+                            i = j;
+                        } else {
+                            ++i;
+                        }
+                    }
+                }
+            }
+            // O pedido e a resposta do ultimo IPC.
+            for (int k = 0; k < 2; ++k) {
+                const std::uint64_t end = k == 0 ? g_ultimo_req : g_ultimo_resposta;
+                if (end == 0)
+                    continue;
+                std::printf("[msg ] %s em 0x%llx:\n", k == 0 ? "pedido" : "resposta",
+                            (unsigned long long)end);
+                std::uint8_t buf[128]{};
+                std::string e3;
+                if (!g_mem->read(end, buf, sizeof buf, e3)) {
+                    std::printf("      (leitura falhou: %s)\n", e3.c_str());
+                    continue;
+                }
+                for (std::size_t i = 0; i < sizeof buf; i += 16) {
+                    std::printf("      ");
+                    for (std::size_t j = 0; j < 16; ++j)
+                        std::printf("%02x ", buf[i + j]);
+                    std::printf(" |");
+                    for (std::size_t j = 0; j < 16; ++j) {
+                        const char c = (char)buf[i + j];
+                        std::printf("%c", (c >= ' ' && c <= '~') ? c : '.');
+                    }
+                    std::printf("|\n");
+                }
             }
         }
     }
@@ -958,20 +1137,20 @@ int main(int argc, char** argv) {
             std::snprintf(geom, sizeof geom, "%s/g610_%s.geom", dump_dir(), module.name());
             std::FILE* g = std::fopen(geom, "w");
             if (g != nullptr) {
-                std::fprintf(g, "base 0x%llx\\n", static_cast<unsigned long long>(module.vaddr_base));
+                std::fprintf(g, "base 0x%llx\n", static_cast<unsigned long long>(module.vaddr_base));
                 for (int k = 0; k < 3; ++k) {
-                    std::fprintf(g, "seg %d vaddr 0x%llx size 0x%llx offset %zu\\n", k,
+                    std::fprintf(g, "seg %d vaddr 0x%llx size 0x%llx offset %zu\n", k,
                                  static_cast<unsigned long long>(module.nso.segments[k].vaddr),
                                  static_cast<unsigned long long>(module.nso.segments[k].size),
                                  static_cast<std::size_t>(module.nso.seg_offset[k]));
                 }
                 const auto* h = module.nso.nso_header();
                 if (h != nullptr) {
-                    std::fprintf(g, "dynsym %u %u\\ndynstr %u %u\\n", h->dynsym_offset,
+                    std::fprintf(g, "dynsym %u %u\ndynstr %u %u\n", h->dynsym_offset,
                                  h->dynsym_size, h->dynstr_offset, h->dynstr_size);
                 }
                 std::fclose(g);
-                std::printf("[dump] %s: geometria em %s\\n", module.name(), geom);
+                std::printf("[dump] %s: geometria em %s\n", module.name(), geom);
             }
         }
     }
@@ -1066,7 +1245,11 @@ int main(int argc, char** argv) {
     svc.set_system_resource_size(prog.modules().empty()
                                      ? 0
                                      : prog.modules().front().nso.system_resource_size);
-    svc.set_stack_region(g610::layout::kStackBase, g610::layout::kStackSize);
+    // A regiao da stack tem de ser a do PROGRAMA: o SDK pergunta o endereco
+    // pelo SVC 0x29 (tipo 14) e usa-o. Se o motor responder com um
+    // endereco diferente do que o guest esta a usar, a stack do guest fica
+    // noutro sitio.
+    svc.set_stack_region(prog.stack_base(), g610::layout::kStackSize);
     // A prioridade da thread principal vem do NPDM (`main_thread_priority`).
     if (!prog.modules().empty())
         svc.set_main_thread_priority(prog.modules().front().nso.main_thread_priority);
@@ -1644,6 +1827,30 @@ int main(int argc, char** argv) {
                     (unsigned long long)got);
         for (int i = 0; i < 8; i++) {
             std::printf("    [%d] 0x%016llx\n", i, (unsigned long long)slots[i]);
+        }
+
+        // Todos os slots, para correlacionar com as chamadas do jogo.
+        //
+        // Cada stub de PLT salta atraves de um slot do GOT, e o GOT e' a
+        // saida do `rtld` do proprio jogo: os slots que ainda valem o
+        // endereco do `PLT0` (0x17e8f90) sao os que ainda nao foram
+        // chamados; os outros ja tem o endereco da funcao do SDK.
+        {
+            std::vector<std::uint64_t> todos(melhor_n);
+            std::string e3;
+            if (g_mem->read(got, todos.data(), todos.size() * 8, e3)) {
+                char caminho[64];
+                std::snprintf(caminho, sizeof caminho, "/tmp/g610_got_main.txt");
+                std::FILE* f = std::fopen(caminho, "w");
+                if (f != nullptr) {
+                    for (std::size_t i = 0; i < todos.size(); i++)
+                        std::fprintf(f, "%zu 0x%llx\n", i,
+                                     (unsigned long long)todos[i]);
+                    std::fclose(f);
+                    std::printf("  GOT do main: %zu slots em %s\n", todos.size(),
+                                caminho);
+                }
+            }
         }
         break;
     }
