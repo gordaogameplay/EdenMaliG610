@@ -231,7 +231,18 @@ inline constexpr std::uint64_t kSdkBase   = 0x0000'0000'8500'0000ull;
 inline constexpr std::uint64_t kSdkSize   = 0x0400'0000ull;   // 64 MiB
 
 inline constexpr std::uint64_t kHeapBase  = 0x0000'0000'9000'0000ull;
-inline constexpr std::uint64_t kHeapSize  = 0x0800'0000ull;   // 128 MiB
+// O tamanho da regiao do heap.
+//
+// **O Eden, para um endereco de 39 bits, reserva 8 GiB**
+// (`k_address_space_info.cpp:36`: `.size = 8_GiB, .type = Heap`). E o
+// `GetInfo(21)` (`TotalNonSystemMemorySize`) devolve
+// `m_max_process_memory` = `GetHeapRegionSize()` — logo, **8 GiB**.
+//
+// Com 128 MiB, o SDK dimensiona as suas estruturas por um numero que nao
+// corresponde ao que o Eden devolve, e o guest acaba sem memoria para o que
+// precisa. Medido: o jogo aborta num assert seu ("SuperStripe instance is
+// null") com 128 MiB.
+inline constexpr std::uint64_t kHeapSize  = 0x2'0000'0000ull; // 8 GiB
 
 // O topo da pilha tem de estar alinhado a 16 bytes (AAPCS64).
 constexpr std::uint64_t kStackTop() noexcept { return kStackBase + kStackSize; }

@@ -68,9 +68,19 @@ bool GuestMemory::map(std::uint64_t base, std::uint64_t size, Prot prot,
     // sobrepunha em silêncio — e um mapeamento cego a este nível pode
     // destruir a memória de outra biblioteca sem nenhum sintoma até muito
     // depois.
+    // **MAP_NORESERVE**: o guest tem um espaco de enderecos de 39 bits, e
+    // a reserva e' de varios gigabytes. O overcommit do Linux (heuristico)
+    // pode recusar uma reserva tao grande — e o guest so' toca nas paginas
+    // que usa. `MAP_NORESERVE` diz ao kernel para nao contar a reserva
+    // para o overcommit: as paginas so' sao contabilizadas quando o guest
+    // as toca, e nesse momento ha RAM ou nao ha.
+    //
+    // Medido: sem isto, o `mmap` de 0x60000000 + 8,75 GiB falha com
+    // ENOMEM num Pi de 7,7 GiB — e o guest nem chega a arrancar.
     void* p = ::mmap(reinterpret_cast<void*>(base),
                      static_cast<std::size_t>(size), to_posix(prot),
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE,
+                     -1, 0);
 
     if (p == MAP_FAILED) {
         // MAP_FIXED_NOREPLACE devolve o endereço pedido em caso de falha, o
