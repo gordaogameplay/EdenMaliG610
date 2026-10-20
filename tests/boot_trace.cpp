@@ -43,6 +43,11 @@
 
 namespace {
 
+// A medicao do arranque: o instante em que o guest comecou, o contador de
+// SVCs, e o instante do `Break`.
+long long g_inicio_ns = 0;
+
+
 // Registo de cada SVC pedido, na ordem.
 struct SvcCall {
     std::uint32_t number;
@@ -457,6 +462,20 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
     // A mensagem esta no x5 (o quinto argumento), e o ficheiro no x2/x3.
     // E' a unica forma de saber **o que** falhou: o SDK aborta por uma
     // assercao, e a assercao tem o ficheiro e a linha.
+    // **O instante do `Break`** — o guest abortou. E o que separa o
+    // tempo do **arranque** (o que o nosso motor custou) do tempo do
+    // **loop infinito do `Abort`** (que nao e' nosso).
+    if (number == 0x26) {
+        struct timespec agora {};
+        clock_gettime(CLOCK_MONOTONIC, &agora);
+        const auto ns = static_cast<long long>(agora.tv_sec) * 1000000000LL + agora.tv_nsec;
+        if (g_inicio_ns != 0) {
+            std::printf("[arranque] o guest abortou em %.3f ms, apos %llu SVC(s)\n",
+                        (ns - g_inicio_ns) / 1e6,
+                        (unsigned long long)g_svcs);
+        }
+    }
+
     if (number == 0x26 && g_mem != nullptr) {
         // Todos os registos: a assercao do SDK passa (type, file, line,
         // msg, ...) e nao sabemos qual o que interessa.
@@ -1147,7 +1166,25 @@ int main(int argc, char** argv) {
     // `SendSyncRequest` a espera que o evento de notificacao dispare. Com
     // 40 traps, o motor parava a meio dessa espera — e o sintoma era
     // "o guest esta em ciclo", que é o que o polling **parece** e não é.
-    engine.set_trap_limit(4000);
+    // **O limite de traps.** Medido: o SDK faz polling — 74
+    // `SignalProcessWideKey` e 53 `SendSyncRequest` antes de o jogo
+    // chegar ao primeiro assert. Com 4000 traps, o motor parava a meio
+    // dessa espera.
+    //
+    // Este valor e' **parametrizavel** (`G610_TRAP_LIMIT`), porque o
+    // limite e' uma ferramenta de diagnostico e nao uma propriedade do
+    // motor: para medir o desempenho do arranque do jogo, o que interessa
+    // e' ate onde o guest chega, e nao onde o motor desiste.
+    {
+        struct timespec agora {};
+        clock_gettime(CLOCK_MONOTONIC, &agora);
+        g_inicio_ns = static_cast<long long>(agora.tv_sec) * 1000000000LL + agora.tv_nsec;
+    }
+    if (const char* limite = std::getenv("G610_TRAP_LIMIT")) {
+        engine.set_trap_limit(std::strtoull(limite, nullptr, 0));
+    } else {
+        engine.set_trap_limit(4000);
+    }
     engine.set_observer(&on_svc, nullptr);
     engine.set_trapper(&on_trap, nullptr);
     if (!engine.install_handlers(err)) {
