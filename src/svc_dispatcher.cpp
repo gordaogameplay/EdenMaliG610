@@ -607,7 +607,6 @@ Result SvcDispatcher::svc_query_memory(SvcContext& ctx) {
     const std::uint64_t out_info  = ctx.x[0];
     const std::uint64_t out_page  = ctx.x[1];
     const std::uint64_t query     = ctx.x[2];
-
     if (mem_ == nullptr)
         return Result::NotInitialized;
 
@@ -649,6 +648,16 @@ Result SvcDispatcher::svc_query_memory(SvcContext& ctx) {
             if (r.size == 0)
                 continue;
             if (query >= r.base && query < r.base + r.size) {
+                // O **bloco**, não a página.
+                //
+                // O Eden (`k_page_table_base.cpp:904`, `QueryInfoImpl`)
+                // devolve o `KMemoryBlock` que contém o endereço — e o
+                // bloco é a região, não a página de 4 KiB. A medição
+                // confirma: com a página, o `rtld` do jogo percorria o
+                // espaço do processo a 4 KiB de cada vez (3999
+                // interrogações e a varredura não terminava); com a
+                // região, são 10 interrogações — uma por região — e o
+                // `rtld` encontra os módulos.
                 info.base_address = r.base;
                 info.size         = r.size;
                 info.state        = r.state;
