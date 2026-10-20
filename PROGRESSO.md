@@ -1445,3 +1445,89 @@ Três armadilhas que ficaram escritas, porque custaram tempo:
 
 A frente do GPU intacta: SASS → IR → GLSL → SPIR-V medido na **Mali-G610**,
 pixel lido `1.500000`. Suite de 6 testes a passar.
+
+
+---
+
+# A ideia dos A55 como auxiliares de tradução — registada, com as suas reservas
+
+Dada por ti a partir da pesquisa sobre como o Switch usa os núcleos. Vale a
+pena写下 porque é boa e porque tem um custo escondido.
+
+**A ideia.** O Switch dá 3 × A57 a 1020 MHz ao jogo. O RK3588 dá-nos
+4 × A76 a 2400 MHz para o guest — e ficam **4 × A55 a 1800 MHz sem fazer
+nada**. Usá-los como auxiliares da tradução Maxwell → Valhall, em paralelo
+com a GPU, daria mais computação do que o próprio Switch.
+
+**Porque é plausível.** Os quatro A55 estão literalmente ociosos. O Switch
+tem três A57 com trabalho; nós temos quatro A55 sem. A tradução é trabalho
+real, e é paralelizável por shader.
+
+**As três reservas, todas honestas:**
+
+1. **Largura de banda.** A traduz��ão precisa de dados que depois vão para
+   os A76 e para a GPU. Os A55 competiriam pela mesma DRAM. Num SoC em que
+   a memória é o recurso mais disputado — e a GPU é a que mais puxa — pôr
+   quatro núcleos a mais a lerem e escreverem pode **piorar** o resultado.
+   Isto não se resolve com um perfil; resolve-se medindo o throughput da
+   memória antes e depois.
+
+2. **A tradução é quase sempre custo de arranque.** Um shader é traduzido
+   uma vez e fica em cache. O steady state só tem tradução se houver
+   variantes, shaders gerados em runtime, ou computação. O `glslc` gera
+   em runtime — mas uma vez por shader, não por frame. O ganho real é
+   sobretudo no **arranque** e nos **loads**, não no jogo a correr.
+
+3. **A coordenação custa.** Passar um shader traduzido dos A55 para os A76 e
+   daí para a GPU tem latência de troca de cluster, e sincronização. Em
+   shaders pequenos o custo pode ser maior que o trabalho.
+
+**Onde isto encaixa.** É uma decisão de arquitectura, não uma optimização.
+Fica registada com as reservas ao lado, porque uma ideia boa anotada sem as
+suas reservas vira uma ideia má implementada seis meses depois.
+
+---
+
+# A costura: onde está
+
+O `KernelCore` do Eden chama `Core::Timing`, `system.GetCpuManager()` e
+`KDynamicPageManager` — infra de emulação. A camada de IPC, medida:
+
+```
+Kernel().RunOnHostCoreThread(...)   -- a espera adiada do ServerManager
+System()                             -- para chegar à memória
+UnregisterInUseObject(...)
+```
+
+**Três métodos.** Substituído por `k_kernel_core_bridge.h`, com os três e
+sem o resto. `kernel.h` e `kernel.cpp` saíram, e com eles `k_scheduler`,
+`page_table`, `cpu_manager`, `physical_core` e `arm_interface`.
+
+**Estado, medido:**
+
+| ficheiro vendorizado | erros |
+|---|---|
+| `k_handle_table.cpp` | **2** |
+| `hle_ipc.cpp` | 87 |
+| `sm.cpp` | 98 |
+| `server_manager.cpp` | 121 |
+
+`k_handle_table.cpp` está a dois erros: `KScopedAutoObject<KAutoObject>`
+exige que `KProcess` e `KThread` herdem de `KAutoObject`, o que exige traits
+de class-token. Os outros três têm uma causa única: `slab_helpers.h` quer
+`KResourceLimit` completo, e a ponte só o declara à frente para quebrar o
+ciclo.
+
+## Quatro armadilhas desta costura
+
+- **Sombreamento de nome.** Dentro de `namespace Kernel`, `Core::System`
+  resolvia para `Kernel::Core` — a minha própria classe. O compilador
+  apontava uma linha onde não havia nada de errado. A classe chama-se agora
+  `HostCore`.
+- **Ciclos de include.** `ponte → k_handle_table.h → ponte`. Com `#pragma
+  once`, um dos dois fica vazio e o erro diz que o tipo não existe.
+- **Assinaturas.** `GetOwnerProcess()` tem de devolver `KProcess*`, não
+  `KProcess&`, porque o Eden escreve `auto* const x = ...`. Uma assinatura
+  diferente dá "unable to deduce" e nada mais.
+- **`Vaddr`** não está em nenhum ficheiro do fecho — vem de um pacote
+  externo. Substituído por `std::uint64_t`, que é o que é.

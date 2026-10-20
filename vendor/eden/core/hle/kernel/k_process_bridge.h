@@ -205,7 +205,15 @@ public:
     // sempre, e o host que cede e' o nosso motor, nao o Eden.
     void DisableDispatch(KernelCore&) {}
 
-    KProcess& GetOwnerProcess() const { return process_; }
+    // PONTEIRO, e nao referencia.
+    //
+    // O Eden devolve `KProcess*` e em `k_handle_table.cpp` usa-se
+    // `auto* const cur_process = cur_thread->GetOwnerProcess();` — que com
+    // uma referencia nao deduz nada e da "unable to deduce 'auto* const'".
+    //
+    // A assinatura tem de bater com a do Eden. Nao e' um detalhe: e' o que
+    // distingue "a ponte e' compativel" de "a ponte e' parecida".
+    KProcess* GetOwnerProcess() const { return &process_; }
     u64 GetThreadId() const { return thread_id_; }
     void SetThreadId(u64 id) { thread_id_ = id; }
 

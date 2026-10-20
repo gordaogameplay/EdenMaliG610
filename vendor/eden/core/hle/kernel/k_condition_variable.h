@@ -11,7 +11,7 @@
 #include "vendor/eden/core/hle/kernel/k_scheduler.h"
 #include "vendor/eden/core/hle/kernel/k_process_bridge.h"  // PONTE: ver README
 #include "vendor/eden/core/hle/kernel/k_typed_address.h"
-#include "vendor/eden/core/hle/kernel/kernel.h"
+#include "vendor/eden/core/hle/kernel/k_kernel_core_bridge.h"  // PONTE
 #include "vendor/eden/core/hle/result.h"
 
 namespace Core {

@@ -14,7 +14,7 @@
 #include "vendor/eden/core/hle/kernel/k_auto_object.h"
 #include "vendor/eden/core/hle/kernel/k_spin_lock.h"
 #include "vendor/eden/core/hle/kernel/k_process_bridge.h"  // PONTE: ver README
-#include "vendor/eden/core/hle/kernel/kernel.h"
+#include "vendor/eden/core/hle/kernel/k_kernel_core_bridge.h"  // PONTE
 #include "vendor/eden/core/hle/kernel/svc_common.h"
 #include "vendor/eden/core/hle/kernel/svc_results.h"
 #include "vendor/eden/core/hle/result.h"

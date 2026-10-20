@@ -22,7 +22,7 @@
 #include "vendor/eden/core/hle/kernel/k_server_port.h"
 #include "vendor/eden/core/hle/kernel/k_server_session.h"
 #include "vendor/eden/core/hle/kernel/k_process_bridge.h"  // PONTE: ver README
-#include "vendor/eden/core/hle/kernel/kernel.h"
+#include "vendor/eden/core/hle/kernel/k_kernel_core_bridge.h"  // PONTE
 #include "vendor/eden/core/hle/service/hle_ipc.h"
 #include "vendor/eden/core/hle/service/ipc_helpers.h"
 #include "vendor/eden/core/memory.h"

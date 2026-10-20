@@ -18,7 +18,7 @@
 #include "vendor/eden/core/hle/kernel/k_memory_layout.h"
 #include "vendor/eden/core/hle/kernel/k_memory_manager.h"
 #include "vendor/eden/core/hle/kernel/k_typed_address.h"
-#include "vendor/eden/core/hle/kernel/kernel.h"
+#include "vendor/eden/core/hle/kernel/k_kernel_core_bridge.h"  // PONTE
 #include "vendor/eden/core/hle/result.h"
 #include "vendor/eden/core/memory.h"
 

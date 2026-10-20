@@ -8,7 +8,7 @@
 
 #include "vendor/eden/core/hle/kernel/k_auto_object.h"
 #include "vendor/eden/core/hle/kernel/k_auto_object_container.h"
-#include "vendor/eden/core/hle/kernel/kernel.h"
+#include "vendor/eden/core/hle/kernel/k_kernel_core_bridge.h"  // PONTE
 
 namespace Kernel {
 
