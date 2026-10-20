@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
 // O controller do `apm`, **nosso**.
 //
 // Substitui `core/hle/service/apm/apm_controller.{h,cpp}` do Eden.

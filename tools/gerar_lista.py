@@ -26,7 +26,10 @@ import os
 import re
 import sys
 
-ROOT = os.path.expanduser("~/EdenMaliG610")
+# O repositorio e este directorio: o do script, nao um caminho fixo.
+# O caminho fixo era o do Pi, e o `gerar_lista.py` no laptop falhava
+# com "FileNotFoundError: /home/trebor/EdenMaliG610/CMakeLists.txt".
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CMAKE = os.path.join(ROOT, "CMakeLists.txt")
 
 # Ficheiros vendorizados que nao compilam contra a ponte. Ver

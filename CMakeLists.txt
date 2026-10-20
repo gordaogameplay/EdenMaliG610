@@ -201,6 +201,11 @@ add_test(NAME core COMMAND g610_tests)
 add_executable(g610_program tests/test_program.cpp)
 target_link_libraries(g610_program PRIVATE g610_core)
 
+# A medicao do custo do despacho. Nao e' um `add_test`: mede tempo, e
+# um teste que mede tempo falha em maquinas carregadas.
+add_executable(g610_bench_svc tests/bench_svc.cpp)
+target_link_libraries(g610_bench_svc PRIVATE g610_core)
+
 # --- testes da ISA Maxwell ---------------------------------------------------
 add_executable(g610_maxwell_test tests/test_maxwell.cpp)
 target_link_libraries(g610_maxwell_test PRIVATE g610_core)
