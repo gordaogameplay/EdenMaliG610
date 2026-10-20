@@ -94,6 +94,11 @@ static bool g_slots_quiet = false;
 static std::vector<std::uint64_t> g_slot_offsets;
 // Ponteiros que o observer usa para ler memória do guest. Postos pelo main.
 static ia::GuestMemory* g_mem = nullptr;
+
+// O programa, para o observer poder percorrer os modulos e varrer o .text
+// quando o guest aborta. Sem simbolos, achar quem chamou a funcao que
+// abortou e a unica forma de saber o que falhou.
+static const ia::GuestProgram* g_prog = nullptr;
 static std::string g_scratch;
 
 static volatile int g_samples = 0;
@@ -236,6 +241,227 @@ void on_svc(std::uint32_t number, ia::SvcContext& ctx, std::uint64_t pc,
    // Endereços de retorno do guest na stack, para seguir de onde veio o
     // abort. Um `Break(x0=0)` diz QUE valor estava a zero; a stack diz
     // QUEM o tinha.
+    // ── a janela de CODIGO a volta do abort ────────────────────────────
+    //
+    // `Break(x0=0)` diz que um valor era zero. A stack diz quem o tinha. E o
+    // que descobre o PORQUE e' o codigo a volta da chamada — e la que se ve
+    // que comparacao falhou.
+    //
+    // Sem simbolos, o `x30` aponta para a instrucao a seguir ao `bl Break`, e
+    // os bytes a volta dizem o que a funcao estava a testar. E a diferenca entre
+    // "o SDK abortou" e "o SDK abortou porque X era zero".
+    //
+    // gpr[] e nao x[]: x[] so tem 6 entradas e x[30] seria memoria a mais.
+    if (number == 0x26 && ctx.gpr[30] >= 0x80000000ull &&
+        ctx.gpr[30] < 0x98000000ull && g_mem != nullptr) {
+        const std::uint64_t inicio = ctx.gpr[30] - 0x80;
+        unsigned char janela[0x100];
+        std::string e;
+        if (g_mem->read(inicio, janela, sizeof janela, e)) {
+            char caminho[64];
+            std::snprintf(caminho, sizeof caminho, "/tmp/ia_break_%llx.bin",
+                          (unsigned long long)inicio);
+            std::FILE* f = std::fopen(caminho, "wb");
+            if (f != nullptr) {
+                std::fwrite(janela, 1, sizeof janela, f);
+                std::fclose(f);
+                std::printf("[cod] janela 0x%llx..0x%llx -> %s\n",
+                            (unsigned long long)inicio,
+                            (unsigned long long)(inicio + sizeof janela), caminho);
+            }
+        } else {
+            std::printf("[cod] nao consegui ler 0x%llx: %s\n",
+                        (unsigned long long)inicio, e.c_str());
+        }
+    }
+
+    // ── a MENSAGEM do abort ─────────────────────────────────────────────
+    //
+    // O codigo desassemblado do sitio da chamada diz o que se passa:
+    //
+    //     stp x29, x30, [sp, #-16]!
+    //     mov x1, x0            ; x1 = o argumento recebido
+    //     orr w2, wzr, #4
+    //     mov w0, wzr           ; x0 = 0
+    //     bl  Break
+    //
+    // Ou seja: a funcao passa o seu argumento para x1. Se esse argumento for
+    // uma string, entao a mensagem do abort esta na memoria do guest e
+    // pode ler-se. Nao e preciso seguir a cadeia de chamadas: a mensagem diz o
+    // que falhou, em portugues do SDK, com o nome da funcao e o ficheiro.
+    //
+    // E uma string a readable que vale mais do que vinte palpites sobre o
+    // formato da resposta IPC.
+    if (number == 0x26 && g_mem != nullptr) {
+        for (int arg = 1; arg <= 3; ++arg) {
+            const std::uint64_t p = ctx.gpr[arg];
+            if (p < 0x80000000ull || p >= 0x98000000ull)
+                continue;
+            char buf[256];
+            std::string e;
+            if (!g_mem->read(p, buf, sizeof buf - 1, e))
+                continue;
+            buf[sizeof buf - 1] = 0;
+            // So interessa se for mesmo texto.
+            int legiveis = 0;
+            for (const char* q = buf; *q; ++q)
+                if (*q >= 0x20 && *q < 0x7F)
+                    ++legiveis;
+                else
+                    break;
+            if (legiveis < 4)
+                continue;
+            std::printf("[msg] x%d = 0x%llx -> \"%s\"\n", arg,
+                        (unsigned long long)p, buf);
+        }
+        std::printf("[msg] w2 = %u\n",
+                    (unsigned)(ctx.gpr[2] & 0xFFFFFFFFu));
+    }
+
+    // ── o CHAMADOR, pela stack ──────────────────────────────────────────
+    //
+    // A função que abortou e' `stp x29, x30, [sp, #-16]!` seguida de
+    // `mov x1, x0` / `orr w2, wzr, #4` / `mov w0, wzr` / `bl Break`. Logo o
+    // x30 dela esta no topo da stack — e o x30 e' o endereco de RETORNO, que
+    // e' o chamador.
+    //
+    // Nao ha `bl` nenhum para essa função em nenhum dos três módulos: a
+    // chamada e' indirecta, por um stub tipo PLT. Varrer 25 MB de `.text` a
+    // procurar o alvo deu "nenhuma chamada directa encontrada", e a stack
+    // deu a resposta à primeira. A stack e' o caminho que nao depende de haver
+    // símbolos, e é muito mais barato.
+    if (number == 0x26 && sp != 0 && g_mem != nullptr) {
+        std::uint64_t words[4] = {0, 0, 0, 0};
+        std::string e;
+        if (g_mem->read(sp, words, sizeof words, e)) {
+            for (int k = 0; k < 4; ++k) {
+                const std::uint64_t v = words[k];
+                if (v < 0x80000000ull || v >= 0x98000000ull)
+                    continue;
+                // Centrada no endereco de retorno, e larga. A primeira
+                // janela media 0x100 e terminava exactamente no endereço de
+                // retorno; o objdump mostrava um `...` que parecia um buraco
+                // de zeros e era só o fim dos dados.
+                const std::uint64_t inicio = v - 0x80;
+                unsigned char janela[0x200];
+                if (!g_mem->read(inicio, janela, sizeof janela, e))
+                    continue;
+                char caminho[64];
+                std::snprintf(caminho, sizeof caminho, "/tmp/ia_chamador_%llx.bin",
+                              (unsigned long long)inicio);
+                std::FILE* f = std::fopen(caminho, "wb");
+                if (f == nullptr)
+                    continue;
+                std::fwrite(janela, 1, sizeof janela, f);
+                std::fclose(f);
+                std::printf("[quem] stack+%d = 0x%llx (retorno) -> %s\n",
+                            k * 8, (unsigned long long)v, caminho);
+            }
+        }
+    }
+
+    if (number == 0x26 && sp != 0 && g_mem != nullptr) {
+        std::uint64_t words[4] = {0, 0, 0, 0};
+        std::string e;
+        if (g_mem->read(sp, words, sizeof words, e)) {
+            for (int k = 0; k < 4; ++k) {
+                const std::uint64_t v = words[k];
+                if (v < 0x80000000ull || v >= 0x98000000ull)
+                    continue;
+                // O endereco de retorno aponta para a instrucao a seguir
+                // ao `bl`; a janela e' centrada nele.
+                // Centrada no endereco de retorno, e larga: a janela
+                // anterior terminava exactamente nele, e o objdump mostrava
+                // um `...` que parecia um buraco de zeros e nao era o fim dos
+                // dados. Um ficheiro de despejo que acaba onde o olho esta a
+                // olhar e' pior do que um ficheiro menor mas completo.
+                const std::uint64_t inicio = v - 0x80;
+                unsigned char janela[0x200];
+                if (!g_mem->read(inicio, janela, sizeof janela, e))
+                    continue;
+                char caminho[64];
+                std::snprintf(caminho, sizeof caminho, "/tmp/ia_chamador_%llx.bin",
+                              (unsigned long long)inicio);
+                auto cod_de = [&](std::size_t i) {
+                    return static_cast<std::uint32_t>(janela[i * 4]) |
+                           (static_cast<std::uint32_t>(janela[i * 4 + 1]) << 8) |
+                           (static_cast<std::uint32_t>(janela[i * 4 + 2]) << 16) |
+                           (static_cast<std::uint32_t>(janela[i * 4 + 3]) << 24);
+                };
+                std::FILE* f = std::fopen(caminho, "wb");
+                if (f == nullptr)
+                    continue;
+                std::fwrite(janela, 1, sizeof janela, f);
+                std::fclose(f);
+                std::printf("[quem] stack+%d = 0x%llx (retorno) -> %s\n",
+                            k * 8, (unsigned long long)v, caminho);
+
+                // As STRINGS que a função usa.
+                //
+                // Num SDK sem símbolos, o nome de uma função não existe — mas
+                // o texto que ela imprime existe, e está na `.rodata`. O
+                // código forma esses endereços com o par classico
+                //
+                //     adrp xN, pagina
+                //     add  xN, xN, #offset
+                //
+                // Varrendo o par e lendo o que está lá, sai o nome da
+                // função sem uma tabela de símbolos. E o nome diz o que
+                // falhou melhor do que vinte palpites sobre o formato de uma
+                // resposta IPC.
+                for (std::size_t j = 0; j + 1 < sizeof janela / 4; ++j) {
+                    const std::uint32_t w0 = cod_de(j);
+                    if ((w0 & 0x9F000000u) != 0x90000000u)   // nao e' um ADRP
+                        continue;
+                    const std::uint32_t w1 = cod_de(j + 1);
+                    if ((w1 & 0xFFC00000u) != 0x91000000u)   // nao e' um ADD imm
+                        continue;
+                    // Rd do ADRP tem de ser o Rn do ADD — é o mesmo
+                    // registo. A primeira versão comparava `(w1 >> 5)` sem
+                    // máscara, que includes os 12 bits do imediato, com o
+                    // número do registo: nunca dava certo e o bloco
+                    // silenciosamente não encontrava nada.
+                    const std::uint32_t rd_adrp = w0 & 0x1Fu;
+                    const std::uint32_t rn_add = (w1 >> 5) & 0x1Fu;
+                    if (rd_adrp != rn_add)
+                        continue;
+
+                    // ADRP: immlo em [30:29], immhi em [23:5], 21 bits no
+                    // total, com sinal, deslocados 12 — e o alvo e' a pagina
+                    // do PC mais esse deslocamento. Sem sinal, quase todos os
+                    // enderecos saem errados e a lista fica vazia sem dizer
+                    // porque.
+                    const std::int64_t immlo = static_cast<std::int64_t>((w0 >> 29) & 3u);
+                    const std::int64_t immhi = static_cast<std::int64_t>((w0 >> 5) & 0x7FFFFu);
+                    std::int64_t imm = ((immhi << 2) | immlo) << 12;
+                    if (imm & (1ll << 32))
+                        imm |= ~((1ll << 33) - 1);          // sinal a 21 bits
+                    const std::int64_t off = static_cast<std::int64_t>(w1 & 0x000FFFFFu);
+                    const std::uint64_t pc = inicio + j * 4;
+                    const std::uint64_t alvo =
+                        static_cast<std::uint64_t>(static_cast<std::int64_t>(pc & ~0xFFFull) +
+                                                   imm + off);
+                    if (alvo < 0x80000000ull || alvo >= 0x98000000ull)
+                        continue;
+                    char txt[200];
+                    std::string e2;
+                    if (!g_mem->read(alvo, txt, sizeof txt - 1, e2))
+                        continue;
+                    txt[sizeof txt - 1] = 0;
+                    int n = 0;
+                    while (txt[n] >= 0x20 && txt[n] < 0x7F)
+                        ++n;
+                    if (n < 4)
+                        continue;
+                    txt[n] = 0;
+                    std::printf("[str] 0x%llx -> \"%s\"\n",
+                                (unsigned long long)alvo, txt);
+                }                std::printf("[quem] stack+%d = 0x%llx (retorno) -> %s\n",
+                            k * 8, (unsigned long long)v, caminho);
+            }
+        }
+    }
+
     if (number == 0x26 && sp != 0 && g_mem != nullptr) {
         std::uint64_t slots[96];
         std::string e;
@@ -370,6 +596,7 @@ int main(int argc, char** argv) {
 
     // ── 2. despachante ligado ao espaço do guest ──────────────────────────
     g_mem = &prog.memory();
+    g_prog = &prog;
 
     ia::SvcDispatcher svc(tel);
     svc.bind_memory(&prog.memory());

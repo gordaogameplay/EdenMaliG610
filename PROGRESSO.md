@@ -942,3 +942,112 @@ na G610 dá 1.500000.
 
 O motor, a telemetria e o tradutor estão bons. O que falta é o OS — e o
 `sm:` é o primeiro serviço de que o jogo depende.
+
+
+---
+
+# Seguir o abort: a cadeia de chamadas
+
+Sem símbolos e sem、断点 no debugger, a pergunta e' "que comparacao falhou".
+Resposta: chegar ao codigo.
+
+## A janela do abort
+
+`[cod]` despeja 0x100 bytes à volta do `x30` do `Break`. Desassemblado:
+
+```
+82b7b1d0: stp  x29, x30, [sp, #-16]!
+82b7b1d4: mov  x29, sp
+82b7b1d8: mov  x1, x0            ; o argumento da função
+82b7b1dc: orr  w2, wzr, #4
+82b7b1e0: mov  w0, wzr           ; x0 = 0
+82b7b1e4: bl   0x82d79ba4        ; Break
+82b7b1e8: b    0x82b7b1e8        ; nunca sai
+```
+
+A função de abort começa em `0x82b7b1d0`, e `x1` NÃO é texto — o guess da
+string de asserção estava errado. (`[msg]` ficou no código e mostra `w2 = 4`
+e mais nada, que é o que há.)
+
+## Quem a chamou — pela stack, não pelo `.text`
+
+Primeiro o caminho óbvio: varrer o `.text` dos três módulos à procura de um
+`BL` cujo alvo fosse `0x82b7b1d0`. Imagem pequena dá 6.656 bytes, `main`
+dá 25 MB. Resultado: **nenhuma chamada directa**.
+
+E a razão é boa: a chamada é **indirecta**, por um stub tipo PLT. Os `bl` do
+SDK apontam para uma coluna de stubs em `0x82f13xxx`, que depois saltam para
+o destino real.
+
+O caminho que funciona é a **stack**. A função fez `stp x29, x30, [sp,#-16]!`,
+logo o x30 dela está no topo da stack — e o x30 é o endereço de retorno:
+
+```
+[quem] stack+8 = 0x82b79cc0 (retorno)
+```
+
+Vinte e cinco megabytes lidos para "nenhuma"; a stack deu a resposta à
+primeira. É sempre o caminho que não depende de haver símbolos.
+
+## O chamador
+
+```
+82b79c70: sub  sp, sp, #0xe0
+82b79c74: stp  x26, x25, [sp, #144]
+...
+82b79c88: add  x29, sp, #0xd0
+82b79c8c: mov  x24, x0
+82b79c90: adrp x0, 0x83658000
+82b79c94: add  x0, x0, #0x4d0     ; x0 = 0x836584d0
+82b79cb0: bl   0x82f138c0
+82b79cb4: tbz  w0, #0, 0x82b79cc0 ; se w0 bit0 == 0, NAO aborta
+82b79cb8: mov  x0, x19
+82b79cbc: bl   0x82f138d0          ; aborta
+82b79cc0: ...
+82b79cc4: adrp x0, 0x83658000     ; a MESMA referência
+82b79ccc: bl   0x82f0de60
+82b79cd0: orr  w8, wzr, #3         ; w8 = 3
+82b79cd4: str  w8, [sp, #80]      ; ... e constrói uma va_list
+```
+
+Isto é uma função de **log de erro** no formato do printf: guarda x0..x7, e
+depois de `0x82b79cd4` monta a lista de argumentos variáveis (`w8 = 3` é o
+`gp_offset`, e as seguintes movem `x25=x7`, `x20=x5`, `x19=x4`, `w21=x3`,
+`x22=x2`, `x23=x1` para os registos de argumento).
+
+**A condição do abort**: `bl 0x82f138c0` devolveu `w0` com o **bit 0 a 1**, e
+o `tbz` deixou passar.
+
+## O endereço `0x836584d0`
+
+O guess seguinte era "é uma string". Não é: os 64 bytes seguintes são todos
+zeros, e o offset dentro da imagem do sdk é `0x12ACD68` de `0xC72CC8` — ou
+seja, dentro da imagem, mas em `.bss`. **Um global inicializado a zero.**
+
+E a lição: `adrp`+`add` a formar um endereço não implica que esse endereço
+seja uma string. Um global em `.bss` é um alvo perfeitamente normal para
+`x0` numa função que depois chama outras com um contexto.
+
+## O que ficou de fora, e porquê
+
+- **Descodificar o `ADRP` à mão** para varrer strings da `.rodata` foi
+  tentado e **não funcionou** — com a conta certa dava sempre zero. O
+  `objdump` descode-o bem; a ferramenta certa para o trabalho é a
+  ferramenta certa, e não uma reimplementação à pressa. Ficou o `IA_STR=addr`,
+  que lê texto num endereço à escolha.
+- **A janela de código** media 0x100 e terminava exactamente no endereço de
+  retorno. O `objdump` mostrava um `...` que parecia um buraco de zeros e
+  era só o fim dos dados. Um ficheiro de despejo que acaba onde o olho está
+  a olhar é pior do que um ficheiro menor mas completo. Agora são 0x200.
+
+## Telemetria que ficou
+
+| o que | como |
+|---|---|
+| pedido e resposta IPC, byte a byte | `IA_IPC_DUMP=1` |
+| janela de código à volta do abort | `[cod]` |
+| quem chamou, pela stack | `[quem]` |
+| texto num endereço do guest | `IA_STR=0x...` |
+| a resposta IPC, isolada | `IA_IPC_VARIANT` (16 variantes) |
+
+Suite: **6 testes, todos a passar**.
