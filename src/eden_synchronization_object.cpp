@@ -60,6 +60,16 @@
 // `KThread` tem de estar COMPLETO para `NotifyAvailable`: a lista de nós é
 // `ThreadListNode`, que é um `KThread*`, e desreferenciá-lo precisa da classe.
 #include "vendor/eden/core/hle/kernel/k_process_bridge.h"
+// Os Results do kernel: `ResultInvalidHandle` e `ResultTimedOut`. O
+// `k_synchronization_object.h` do Eden inclui o `result.h` — que tem os
+// Results do **servico** — mas nao o `svc_results.h`, que e' onde o kernel
+// os tem.
+//
+// **A diferenca apareceu ao separar a historia.** Com o
+// `k_synchronization_object.cpp` listado no build, o `svc_results.h`
+// entrava por outro caminho e o ficheiro compilava. So, o include
+// falta.
+#include "vendor/eden/core/hle/kernel/svc_results.h"
 
 namespace Kernel {
 
