@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -217,9 +218,34 @@ struct GuestRegion {
     static constexpr std::uint32_t kReadWrite = kRead | kWrite;
 };
 
+// O sistema do Eden, quando está ligado. Ver `attach_eden`.
+//
+// **Declarado no namespace, e não dentro de `SvcDispatcher`.** Declarado
+// dentro, seria `SvcDispatcher::EdenSystem` — um tipo diferente do
+// `ia::EdenSystem` que `eden_bridge.cpp` define, e o `unique_ptr` daria
+// "invalid application of sizeof to incomplete type" ao destruir. É o mesmo
+// erro do `KObjectNameGlobalData`, e pela mesma razão: uma declaração à
+// frente dentro de uma classe nomeia a classe, não o namespace.
+class EdenSystem;
+
 class SvcDispatcher {
 public:
-    explicit SvcDispatcher(tel::Telemetry& tel) : tel_(tel) {}
+    // Declarado aqui e definido no `.cpp`, como o destructor: um construtor
+    // definido no cabeçalho tem de poder DESTRUIR os membros se algo
+    // disparar uma excepção a meio, e isso exige o `sizeof` do `EdenSystem`
+    // em cada translation unit.
+    explicit SvcDispatcher(tel::Telemetry& tel);
+
+    // Definido no `.cpp`, e não aqui.
+    //
+    // O `unique_ptr<EdenSystem>` tem de destruir um tipo que aqui só está
+    // declarado. O destructor implícito de `SvcDispatcher` seria gerado em
+    // EVERYWHERE este cabeçalho aparece — incluindo os testes, que não incluem
+    // `ia/eden_bridge.hpp` — e em cada um deles o `sizeof` de um tipo
+    // incompleto é um erro de compilação. Declarar o destructor aqui e
+    // defini-lo no `.cpp` é a forma de o `sizeof` só acontecer num sítio onde
+    // o tipo está completo.
+    ~SvcDispatcher();
 
     // Liga o espaço de endereçamento do guest.
     //
@@ -235,6 +261,20 @@ public:
     // explícita quando o despachante sabe qual é o espaço.
     void bind_memory(GuestMemory* mem) noexcept { mem_ = mem; }
     GuestMemory* memory() const noexcept { return mem_; }
+
+    // Liga a camada de IPC do Eden (o `sm:` a sério, as portas e as sessões).
+    //
+    // Devolve `false` — e fica tudo como estava — quando não há memória do
+    // guest ligada. É o caso dos testes que não montam um programa, e é
+    // melhor que uma falha: o dispatcher continua a responder com o caminho
+    // antigo, e o teste que estava a passar continua a passar.
+    //
+    // **Quando isto succeeds, `ConnectToNamedPort` e `SendSyncRequest` deixam
+    // de ser nossos.** Deixam de ser o `connect_named_port` (uma tabela
+    // handle→nome e quatro comandos de `sm` escritos à mão) e passam a ser o
+    // `KObjectName` e o `KClientSession` do Eden. Ver `vendor/eden/README.md`.
+    bool attach_eden(std::uint64_t pid, std::uint64_t tid);
+    bool eden_attached() const noexcept { return eden_ != nullptr; }
 
     // Onde começa o heap que SetHeapSize devolve.
     //
@@ -439,6 +479,9 @@ private:
 
     tel::Telemetry& tel_;
     GuestMemory* mem_ = nullptr;
+
+    // Ver `EdenSystem` acima, e `attach_eden`.
+    std::unique_ptr<EdenSystem> eden_;
 
     // A tabela de regiões que `svcQueryMemory` consulta. Ver `set_regions()`.
     std::vector<GuestRegion> regions_;

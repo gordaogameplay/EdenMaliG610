@@ -55,6 +55,8 @@
 
 #include "ia/svc_dispatcher.hpp"
 
+#include "ia/eden_bridge.hpp"
+
 #include <cstdlib>
 
 namespace ia {
@@ -616,6 +618,36 @@ int SvcDispatcher::ipc_variant() {
 }
 
 Result SvcDispatcher::svc_send_sync_request(SvcContext& ctx) {
+    // ── o caminho do Eden ────────────────────────────────────────────────
+    //
+    // `KClientSession::SendSyncRequest` do Eden, que é o mesmo caminho que
+    // `svc/svc_ipc.cpp:30-36` percorre. Duas coisas que ele faz e o nosso
+    // caminho antigo não:
+    //
+    //   1. **Usa o `MessageBuffer` do TLS da thread**, e ignora x1 e x2. Não
+    //      é uma optimização: o SDK manda o buffer nos registos, e o Eden
+    //      também não os olha. Ler o que estiver em x1/x2 e achar que é o
+    //      tamanho é a forma de escrever por cima do buffer.
+    //   2. **Devolve `false` quando o handle não é uma sessão.** O nosso
+    //      caminho antigo respondia a qualquer handle, e o guest passava a
+    //      ler lixo com um formato válido.
+    if (eden_) {
+        const std::uint32_t handle = static_cast<std::uint32_t>(ctx.x[0]);
+        ++sync_request_calls_;
+        if (eden_send_sync_request(eden_->Kernel(), handle)) {
+            ctx.ret     = 0;
+            ctx.has_ret = true;
+            return Result::Success;
+        }
+        last_ipc_ = "SendSyncRequest: o handle " + std::to_string(handle) +
+                    " nao e' uma sessao";
+        // `ResultInvalidHandle` (svc_ipc.cpp:32), pela nossa tabela de
+        // descrições — o mesmo valor que o resto do despachante devolve.
+        ctx.ret     = static_cast<std::uint64_t>(Result::InvalidHandle);
+        ctx.has_ret = true;
+        return Result::Success;
+    }
+
     // `SendSyncRequest(handle, buffer, size)` e `SendSyncRequestLight`.
     //
     // STUB declarado: isto não é uma sessão, é uma tabela handle→nome mais um

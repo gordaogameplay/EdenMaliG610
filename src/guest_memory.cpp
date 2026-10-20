@@ -158,4 +158,20 @@ bool GuestMemory::owns(std::uint64_t addr) const noexcept {
     return addr >= base_ && addr - base_ < size_;
 }
 
+std::uint8_t* GuestMemory::host_pointer(std::uint64_t addr, std::uint64_t size) const noexcept {
+    if (!owns(addr))
+        return nullptr;
+    // `addr - base_` cabe em `size_` porque `owns` já o verificou; falta
+    // garantir que o bloco pedido **termina** dentro da reserva.
+    //
+    // A verificação é escrita sem overflow pelo mesmo motivo que a de `owns`:
+    // `size` vem do guest e pode ser qualquer coisa, e `addr + size` a somar
+    // daria dentro quando quer dizer fora.
+    if (size > size_ || addr - base_ > size_ - size)
+        return nullptr;
+    // E o mapeamento é de gama fixa, feito pelo motor: o endereço do guest é
+    // o endereço do host. Ver a nota no cabeçalho.
+    return reinterpret_cast<std::uint8_t*>(addr);
+}
+
 } // namespace ia

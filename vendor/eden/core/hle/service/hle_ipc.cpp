@@ -25,7 +25,7 @@
 #include "vendor/eden/core/hle/kernel/k_kernel_core_bridge.h"  // PONTE
 #include "vendor/eden/core/hle/service/hle_ipc.h"
 #include "vendor/eden/core/hle/service/ipc_helpers.h"
-#include "vendor/eden/core/memory.h"
+#include "vendor/eden/core/memory_bridge.h"  // PONTE: substitui core/memory.h
 
 namespace Service {
 

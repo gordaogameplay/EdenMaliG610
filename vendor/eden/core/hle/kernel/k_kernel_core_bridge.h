@@ -58,6 +58,13 @@ namespace Kernel {
 class KAutoObject;
 class KernelCore;
 
+// Declarado aqui, e não junto do accessor, porque uma declaracao à frente
+// DENTRO da classe nomearia `KernelCore::KObjectNameGlobalData` -- um tipo
+// diferente do `Kernel::KObjectNameGlobalData` que `k_object_name.cpp` usa.
+// O compilador aceita-o na mesma e a falha só aparece quando o accessor é
+// chamado, com um nome de tipo que parece o certo.
+class KObjectNameGlobalData;
+
 // Um "core" do ponto de vista do Eden. Não há emulação de CPU, por isso um
 // único core virtual chega — e `GetID()` devolve sempre 0.
 //
@@ -73,6 +80,50 @@ public:
 
 private:
     KernelCore& kernel_;
+};
+
+// ── o relógio ─────────────────────────────────────────────────────────────
+//
+// `KResourceLimit::Reserve` é a única coisa da camada de IPC que pede tempo:
+//
+//     return Reserve(kernel, which, value,
+//                    kernel.HardwareTimer().GetTick() + DefaultTimeout);
+//
+// O timeout serve para quando o limite já está esgotado e o pedido fica à
+// espera de alguém o libertar. **Aqui esse caso não existe**: somos um guest
+// só, sem concorrência, e nada liberta limites a meio.
+//
+// Mas um relógio parado seria pior do que um que não existe: `GetTick()` a
+// menos de 0 dá `timeout` negativo, e `Reserve` compara-o com o tick
+// corrente. Um contador que só aumenta é o mais honesto que se pode oferecer.
+//
+// ## PORQUÊ ESTA CLASSE VIVE AQUI FORA
+//
+// A primeira versão era `KernelCore::HardwareTimer`, aninhada, com o
+// acessador `HardwareTimer()`. **Não compila**, e a causa é uma regra que
+// ninguém lembra:
+//
+//     uma função membro esconde, no resto da classe, qualquer coisa que se
+//     chame igual a ela — incluindo uma classe aninhada.
+//
+// O compilador aceitava `HardwareTimer& HardwareTimer()` porque ainda não
+// havia membro nenhum, e depois queixava-se da sobrecarga `const` a dizer que
+// `HardwareTimer` «não nomeia um tipo». A mensagem aponta para a linha
+// seguinte à que está errada, que é a forma mais cara de um bug de nome: o
+// sintoma e o sítio doorro estão em linhas diferentes.
+//
+// Fora da classe não há colisão, e fica a dizer o que é — um contador.
+class KernelTimer {
+public:
+    s64 GetTick() const { return tick_; }
+    s64 GetIntTickCount() const { return tick_ * 19200; }
+    void Increment() { ++tick_; }
+
+private:
+    // O tick 0 do Eden é o zero do timer de hardware. Começar em 1 e não em
+    // 0 evita o caso degenerado em que `GetTick() + timeout` colide com o
+    // início da contagem.
+    s64 tick_ = 1;
 };
 
 class KernelCore {
@@ -95,10 +146,25 @@ public:
     // ── o que o `KAutoObject` usa ────────────────────────────────────────
     //
     // `RegisterWithKernel` (k_auto_object.cpp) mete o objecto numa lista de
-    // "em uso" para o `UnregisterInUseObject` poder fechá-lo. O Eden usa um
+    // "em uso" para o `UnregisterKernelObject` poder fechá-lo. O Eden usa um
     // spin lock; aqui um mutex, que é o mesmo objecto pelo preço certo.
+    void RegisterKernelObject(KAutoObject* self);
+    void UnregisterKernelObject(KAutoObject* self);
     void RegisterInUseObject(KAutoObject* self);
     void UnregisterInUseObject(KAutoObject* self);
+
+    // ── o nome dos objectos ──────────────────────────────────────────────
+    //
+    // `KObjectName` é o registo que faz `ConnectToNamedPort("sm:")`
+    // encontrar a porta. É a peça que faz o `sm:` funcionar.
+    //
+    // **Só declarado aqui.** O accessor devolve uma referência, e uma
+    // referência a um tipo incompleto é uma declaração válida — o compilador
+    // só precisa do tipo no `.cpp`, e `eden_bridge.cpp` inclui o
+    // `k_object_name.h`. Incluir aqui fecharia o ciclo
+    // `ponte -> k_object_name.h -> k_auto_object.h -> ponte`, que é o erro
+    // que custou tempo mais cedo.
+    KObjectNameGlobalData& ObjectNameGlobalData();
 
     // ── o caminho de espera adiada ───────────────────────────────────────
     //
@@ -147,6 +213,9 @@ public:
         return object_list_;
     }
 
+    KernelTimer& HardwareTimer() { return hardware_timer_; }
+    const KernelTimer& HardwareTimer() const { return hardware_timer_; }
+
     // ── os slabs ─────────────────────────────────────────────────────────
     //
     // A MEDIDA que libertou isto: `KSlabHeap<T>` é `KSlabHeapBase<false>` —
@@ -190,9 +259,13 @@ private:
     ::Core::System& system_;
     HostCore core_{*this};
     u32 object_id_ = 0;
+    std::vector<KAutoObject*> registered_objects_;
+    std::mutex registered_objects_mutex_;
     std::vector<KAutoObject*> in_use_;
     std::mutex in_use_mutex_;
+    std::unique_ptr<KObjectNameGlobalData> object_name_global_data_;
     KAutoObjectWithListContainer object_list_{*this};
+    KernelTimer hardware_timer_;
 };
 
 // Desliga a troca de contexto enquanto se segura um lock (k_thread.h:981-993).
@@ -211,6 +284,23 @@ private:
 class KScopedDisableDispatch {
 public:
     explicit KScopedDisableDispatch(KernelCore&) {}
+};
+
+// O outro lado da mesma coisa.
+//
+// `KClientPort::Close`, `KPort::Initialize`, `KServerPort::DestroySession` e
+// companhia abrem um `KScopedSchedulerLock` antes de mexer na tabela de
+// handles. No Eden era para a tabela não mudar a meio de uma troca de
+// contexto. Aqui **não há troca de contexto**: o guest corre noutra thread
+// de forma nativa e síncrona, e esta thread não é preemptível pelo guest.
+//
+// A diferença em relação ao `KScopedDisableDispatch` é que aquele protege a
+// *tabela de handles* e este protege o *escalonador* — que não existe. Os
+// dois são o mesmo no-op com nomes diferentes, e ter os dois com o nome certo
+// vale mais do que um genérico que ninguém reconhece.
+class KScopedSchedulerLock {
+public:
+    explicit KScopedSchedulerLock(KernelCore&) {}
 };
 
 } // namespace Kernel

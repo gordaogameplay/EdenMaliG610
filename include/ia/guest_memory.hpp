@@ -96,6 +96,26 @@ public:
     // distinguido de um trap do host. Isto marca os limites da região guest.
     bool owns(std::uint64_t addr) const noexcept;
 
+    // O ponteiro do HOST para um endereço do guest.
+    //
+    // Existe porque a camada de IPC do Eden precisa de um `u32*` para a
+    // message buffer do TLS (`k_server_session.cpp:379`):
+    //
+    //     msg_ptr = GetCurrentMemory(kernel).GetPointer<u32>(thread.GetTlsAddress());
+    //
+    // E porque isso é verdade no nosso caso de forma particular: a reserva é
+    // um `mmap` de gama fixa, feito pelo próprio motor, e o endereço do guest
+    // **é** o endereço do host. Não há tradução nem page table — a reserva é
+    // plana e única.
+    //
+    // Devolve `nullptr` fora da reserva. Um ponteiro meio válido seria pior
+    // que nenhum: quem o usasse sem verificar escreveria no host.
+    //
+    // **Isto é uma optimização, não uma correcção.** Quem chama tem de tratar
+    // o `nullptr`, e o Eden trata — é a diferença entre `GetPointer` e
+    // `GetPointerSilent`.
+    std::uint8_t* host_pointer(std::uint64_t addr, std::uint64_t size) const noexcept;
+
     void unmap() noexcept;
 
     std::uint64_t base()  const noexcept { return base_; }

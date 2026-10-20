@@ -1,6 +1,8 @@
 // EdenMaliIA — implementação do despachante de SVC.
 #include "ia/svc_dispatcher.hpp"
 
+#include "ia/eden_bridge.hpp"
+
 #include <chrono>
 #include <cstring>
 #include <thread>
@@ -332,7 +334,55 @@ Result SvcDispatcher::svc_get_thread_id(SvcContext& ctx) {
     return Result::Success;
 }
 
+SvcDispatcher::SvcDispatcher(tel::Telemetry& tel) : tel_(tel) {}
+SvcDispatcher::~SvcDispatcher() = default;
+
+bool SvcDispatcher::attach_eden(std::uint64_t pid, std::uint64_t tid) {
+    if (mem_ == nullptr) {
+        // Sem memória não há `Kernel::Memory`, e `KProcess` não sobrevive sem
+        // ela. Falhar aqui é melhor do que construir um sistema que rebenta no
+        // primeiro IPC.
+        last_ipc_ = "attach_eden: o despachante nao tem memoria do guest";
+        return false;
+    }
+    eden_ = std::make_unique<EdenSystem>(*mem_, pid, tid);
+    return true;
+}
+
 Result SvcDispatcher::svc_connect_port(SvcContext& ctx) {
+    // ── o caminho do Eden ────────────────────────────────────────────────
+    //
+    // Se a camada de IPC do Eden está ligada, isto já não é uma tabela
+    // handle→nome: é o `KObjectName` do Eden a procurar a porta, e a
+    // devolver uma sessão de verdade.
+    if (eden_) {
+        std::uint32_t h = 0;
+        const bool ok = eden_connect_to_named_port(eden_->Kernel(), *mem_, ctx.x[1], &h);
+        if (!ok) {
+            // `ResultNotFound` é o que o Eden devolve quando não há porta com
+            // esse nome (svc_port.cpp:35). O guest aborta a um `ConnectToNamedPort`
+            // falhado, e aborta com mais clareza se o Result for o certo.
+            last_port_ = "?";
+            last_ipc_  = "ConnectToNamedPort: o Eden nao encontrou a porta";
+            ctx.ret     = static_cast<std::uint64_t>(Result::NotFound);
+            ctx.has_ret = true;
+            return Result::Success;
+        }
+
+        // As DUAS escritas, e ambas são o que o Eden faz. Ver a nota longa
+        // mais abaixo, que vale para as duas.
+        ctx.x[1] = h;
+        std::uint32_t h32 = h;
+        if (!write_guest(ctx.x[0], &h32, sizeof h32)) {
+            last_ipc_ = "ConnectToNamedPort: handle " + std::to_string(h) +
+                        " em x1, mas o ponteiro de x0 nao era gravavel";
+        }
+        ctx.ret     = 0;
+        ctx.has_ret = true;
+        return Result::Success;
+    }
+
+    // ── o caminho nosso, o de antes ──────────────────────────────────────
     // A forma é `SvcWrap_ConnectToNamedPort64` no Eden (svc.cpp:1470-1476):
     //
     //     x1 = apontador para o nome (sem comprimento!)

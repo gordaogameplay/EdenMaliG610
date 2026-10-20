@@ -32,6 +32,17 @@ find_package(Vulkan REQUIRED)
 # ruido e das diferencas entre dispositivos. Ver include/ia/input.hpp.
 find_package(SDL2 REQUIRED)
 
+# fmt: o motor de formatacao que o codigo vendorizado do Eden usa
+# (`fmt::format_to` no `service.cpp`, nos `LOG_*` do `logging.h`). O Eden
+# traz o fmt de sistema; trazemos o mesmo, em vez de vendorizar uma copia
+# dele para dentro do projecto.
+#
+# **Compilado, nao header-only.** Com `FMT_HEADER_ONLY` cada unidade de
+# traducao que inclui o `logging.h` geraria a sua propria copia das funcoes do
+# fmt — e a ligacao daria `undefined reference to fmt::v11::vformat`, que e'
+# o sintoma de duas copias que o linker nao consegue juntar.
+find_package(fmt REQUIRED)
+
 # --- núcleo reutilizável -----------------------------------------------------
 # Separado do executável para que os testes liguem as mesmas fontes e não uma
 # cópia — um teste que passa contra uma cópia não garante nada sobre o
@@ -56,8 +67,74 @@ add_library(ia_core STATIC
   src/native_engine.cpp
   src/ia_call_guest.S
 )
-target_include_directories(ia_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(ia_core PUBLIC Vulkan::Vulkan SDL2::SDL2 pthread)
+target_include_directories(ia_core PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}                # `vendor/eden/core/...`
+  ${CMAKE_CURRENT_SOURCE_DIR}/vendor/third_party
+)
+target_compile_definitions(ia_core PUBLIC ANKERL_UNORDERED_DENSE_STD_MODULE=1)
+target_link_libraries(ia_core PUBLIC Vulkan::Vulkan SDL2::SDL2 fmt::fmt pthread)
+
+# --- o Eden vendorizado ------------------------------------------------------
+# A parte SISTEMÁTICA do OS do Eden: a camada de IPC e os objectos de porta e
+# sessão de que ela depende. Ver vendor/eden/README.md para o inventário, para
+# o que foi deixado de fora e para cada corte.
+#
+# Entra no MESMO `ia_core` e não numa biblioteca à parte, porque o `KernelCore`
+# da ponte é o nosso `Core::System` e o `EdenSystem` é o nosso motor: as duas
+# metades dependem uma da outra, e duas bibliotecas a dependerem uma da outra
+# dariam ao linker um círculo para resolver em vez de uma ordem.
+#
+# A lista é explícita e não um glob, por duas razões: o README diz o que está
+# aqui, e a lista tem de poder ser conferida contra ele. Um glob esconderia um
+# ficheiro que alguém deitou lá sem querer — que foi exactamente como o
+# escalonador entrou na primeira volta. E `tools/podar_vendor.py` serve para
+# dizer o que é removível, não para remover o que é preciso.
+set(IA_EDEN_SOURCES
+  vendor/eden/common/assert.cpp
+  vendor/eden/core/hle/kernel/k_auto_object.cpp
+  vendor/eden/core/hle/kernel/k_auto_object_container.cpp
+  vendor/eden/core/hle/kernel/k_client_port.cpp
+  vendor/eden/core/hle/kernel/k_client_session.cpp
+  vendor/eden/core/hle/kernel/k_event.cpp
+  vendor/eden/core/hle/kernel/k_handle_table.cpp
+  vendor/eden/core/hle/kernel/k_light_client_session.cpp
+  vendor/eden/core/hle/kernel/k_light_server_session.cpp
+  vendor/eden/core/hle/kernel/k_light_session.cpp
+  vendor/eden/core/hle/kernel/k_object_name.cpp
+  vendor/eden/core/hle/kernel/k_port.cpp
+  vendor/eden/core/hle/kernel/k_readable_event.cpp
+  vendor/eden/core/hle/kernel/k_resource_limit.cpp
+  vendor/eden/core/hle/kernel/k_server_port.cpp
+  vendor/eden/core/hle/kernel/k_session.cpp
+  vendor/eden/core/hle/kernel/k_session_request.cpp
+  vendor/eden/core/hle/service/hle_ipc.cpp
+  vendor/eden/core/hle/service/server_manager.cpp
+  vendor/eden/core/hle/service/service.cpp
+  vendor/eden/core/hle/service/sm/sm.cpp
+  vendor/eden/core/hle/service/sm/sm_controller.cpp
+)
+
+# NAO vendorizado, e o porque:
+#
+#   core/hle/kernel/k_synchronization_object.cpp
+#   core/hle/kernel/k_server_session.cpp
+#
+# O `KSynchronizationObject::Wait` -- a funcao que **dorme uma thread** --
+# usa `KScopedSchedulerLockAndSleep`, que e' o escalonador. Nao e' um porto
+# mecanico: e' a unica coisa do Eden que este motor **nao pode ter**, porque
+# nao ha troca de contexto para dormir, e porque nao ha nada a acordar.
+#
+# Ver PROGRESSO.md, secao "A parede da espera".
+
+# `src/eden_log.cpp` substitui `vendor/eden/common/logging.cpp`: as duas
+# funções que o codigo vendorizado pede, a escrever no stderr em vez de num
+# ficheiro. Ver a nota no topo desse ficheiro.
+target_sources(ia_core PRIVATE
+  src/eden_bridge.cpp
+  src/eden_log.cpp
+  ${IA_EDEN_SOURCES}
+)
 
 # --- alvo principal ----------------------------------------------------------
 add_executable(ia src/main.cpp)

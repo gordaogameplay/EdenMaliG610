@@ -948,7 +948,8 @@ O motor, a telemetria e o tradutor estão bons. O que falta é o OS — e o
 
 # Seguir o abort: a cadeia de chamadas
 
-Sem símbolos e sem、断点 no debugger, a pergunta e' "que comparacao falhou".
+Sem símbolos e sem ponto de paragem no debugger, a pergunta e' "que comparacao
+falhou".
 Resposta: chegar ao codigo.
 
 ## A janela do abort
@@ -1347,172 +1348,207 @@ Suite: **6 testes, todos a passar**. GPU: 1.500000 na G610.
 Telemetria nova: `IA_FIND=<magic>` procura um magic na imagem
 descomprimida, e imprime os 64 bytes a seguir.
 
+# A costura: ligar o motor nativo ao sistema do Eden
 
----
+Estado medido com `python3 tools/verificar.py`, no Pi:
 
-# A camada de sistema do Eden, vendorizada
+    Eden vendorizado   119 ficheiros, 23956 linhas
+    a ponte (nosso)      4 ficheiros,   1263 linhas
+    cortes documentados  38 sitios com PONTE/CORTE no código
+    emulador no vendor   nenhum (lista negra de 19, nenhuma apanhou)
+    sintaxe              22 de 23 .cpp compilam
 
-## O gargalo do CPU: a resposta
+O que mudou desde a última entrada: **os 23 `.cpp` do Eden estão vendorizados e
+compilam contra a nossa ponte.** O IPC, os objectos de porta e sessão, o
+`ServiceManager` e o serviço `sm:` são o código do Eden, não uma reescrita.
 
-Os teus dados invertem a conta. O Switch **não** usa 8 núcleos:
+## A ponte, em quatro ficheiros
 
-| | Switch (Nintendo) | RK3588 (medido) |
+| ficheiro | linhas | substitui |
 |---|---|---|
-| jogo | **3 × A57 @ 1020 MHz** (1785 no loading) | **4 × A76 @ 2400 MHz** |
-| sistema | 1 × A57 @ 1020 MHz | 4 × A55 @ 1800 MHz |
-| mortos | **4 × A53 @ 0 MHz** — desactivados | 0 |
+| `k_kernel_core_bridge.h` | 305 | `kernel.h` + `kernel.cpp` |
+| `k_process_bridge.h` | 477 | `k_process.h` + `k_thread.h` |
+| `system_ref.h` | 229 | `core/core.h` |
+| `memory_bridge.h` | 252 | `core/memory.h` |
 
-Um A76 fora-de-ordem a 2.4 GHz contra um A57 a 1.02 GHz é uma margem de
-várias vezes, e são quatro contra três. **O CPU não é o gargalo — é a
-maior vantagem que temos.**
+Mais dois ficheiros nossos, que não são ponte mas estão no mesmo caminho:
 
-Mas daí sai uma consequência concreta, e implementada: o guest tem de correr
-nos A76.
+    src/eden_bridge.cpp   a cadeia de montagem e os dois SVCs
+    src/eden_log.cpp      substitui o logging.cpp do Eden
 
-**Medido: o guest corre na thread principal.** O motor é um loop de traps
-síncrono em `NativeEngine::run()` — não há `pthread_create` em lado nenhum —
-e portanto o jogo herdava o núcleo onde o processo calhasse.
+**1263 linhas contra 23956.** A desproporção é o resultado, não o ponto de
+partida: o Eden traz a semântica do sistema e nós trouxemos a forma de lhe
+dar a memória do guest.
 
-`src/guest_placement.cpp` fixa-o. Por omissão descobre os núcleos grandes
-lendo `cpuinfo_max_freq` de cada um (funciona num Pi 4 com A72, não só
-neste), e `IA_BIG_CORES=0-3` sobrepõe. **Medido: `guest fixado nos nucleos
-grandes: 4 5 6 7`.**
+## O que a ponte tem de mentira, e porquê
 
-## A camada de sistema
+Cada uma está escrita no sítio onde vive. A lista completa:
 
-`vendor/eden/` — **115 ficheiros, 24.650 linhas**, com os headers SPDX
-originais intactos e `README.md` a listar o que foi tirado, o que não foi, e
-cada corte.
+1. **`KScopedDisableDispatch` e `KScopedSchedulerLock` são no-ops.** Não há troca
+   de contexto: o guest corre noutra thread, de forma nativa e síncrona.
+2. **`RunServer` e `RunOnHostCoreThread` não correm nada.** Não há thread onde
+   correr; os pedidos são atendidos de dentro do `SendSyncRequest`. Guardam a
+   posse, que é obrigatório — sem isso o `KPort` da porta `sm:` fica pendurado.
+3. **`KLightConditionVariable::Broadcast` é um no-op e `Wait` só destrava.**
+   É o único ponto onde «ninguém bloqueia» é load-bearing. Ver «A parede da
+   espera».
+4. **`KLightLock::Lock`/`Unlock` é o caminho rápido do Eden sem o
+   `compare_exchange`.** O caminho rápido é o caminho todo quando não há uma
+   segunda thread. O Eden com contenção chama `LockSlowPath`, que precisa de
+   filas e temporizadores; a contenção é o que não existe.
+5. **`KThreadQueue` tem três virtuais vazias.** Mesma razão.
+6. **`KScheduler::IsSchedulerLockedByCurrentThread` devolve `true` sempre.** A
+   pergunta é sobre um bloqueio que é um no-op; um no-op sempre tomado é
+   sempre tomado.
+7. **`GetSpan` devolve `nullptr` sempre.** Previsto pelo Eden: `TrySetSpan()`
+   devolve `false` e o código cai para a cópia.
+8. **`Core::Memory::Memory` é plana.** A reserva é um `mmap` de gama fixa, o
+   endereço do guest é o do host, e não há tradução. Um «user buffer» traduz-se
+   pela identidade.
+9. **`IsPoweredOn` é `true` sempre.** Esta máquina está ligada.
+10. **`KThread::IsSignaled` e `KProcess::IsSignaled` são `false`.** Nada os
+    sinaliza. Devolver `true` seria pior: `Wait` trataria o processo como
+    pronto e devolveria sem ter esperado.
 
-## O que a medição mudou
+## Quatro armadilhas desta costura, todas medidas
 
-Vendorizar o fecho **tal e qual** foi um erro, e a medição disse-o logo: de
-6 ficheiros para **130** e 25.000 linhas, arrastando `cpu_manager`,
-`k_scheduler`, `physical_core`, `page_table` (dez ficheiros), `fiber`,
-`device_memory` e `arm_interface`. Ou seja, **o emulador inteiro** — o que
-este projecto não quer.
+### 1. Um `sed` meu criou o ciclo de includes
 
-A causa era um include: `k_process.h` puxa page tables, e page tables puxam
-o layout de memória, e o layout puxa o hardware. **Tudo por causa de um
-`#include`.**
-
-## A ponte
-
-`k_process_bridge.h`. O IPC pede ao processo **quatro coisas**, e só:
-
-```cpp
-GetOwnerProcess()->GetHandleTable()
-GetOwnerProcess()->GetProcessId()
-GetCurrentProcess(...).GetResourceLimit()
-GetCurrentMemory(...)  ->  ReadCString(), Read<T>(), Write<T>()
-```
-
-Page tables, reserva de recursos, metadata do programa, interfaces de CPU —
-a camada de IPC não toca em nada disso. A ponte é o `KProcess`, o `KThread` e
-o `GetCurrent*` que o IPC usa, sustentados pela nossa `GuestMemory` e pela
-nossa thread. **O processo aqui é o nosso motor nativo, não o do Eden**, e o
-ficheiro diz isso no topo.
-
-`KScopedDisableDispatch` é a primeira adaptação onde se *remove*
-comportamento: desliga a troca de contexto enquanto se segura o lock da
-tabela. Sem scheduler, é um no-op com o nome certo.
-
-## Onde está
-
-| ficheiro vendorizado | erros de compilação |
-|---|---|
-| `k_handle_table.cpp` | **3** |
-| `hle_ipc.cpp` | **9** |
-| `sm.cpp` | 19 |
-| `server_manager.cpp` | 42 |
-
-Não está a compilar. De 92 para 3 no `k_handle_table.cpp`, e o que resta já
-não é falta de código do Eden: é a costura entre os tipos completos dele
-(`KernelCore`, `Handle`) e os tipos mínimos da ponte.
-
-Três armadilhas que ficaram escritas, porque custaram tempo:
-
-- **Ciclos de include.** `ponte → k_handle_table.h → ponte`. Com `#pragma
-  once` num ciclo, um dos dois fica com o corpo vazio e o compilador diz que
-  o tipo não existe, sem nenhuma pista de que a causa é o ciclo.
-- **`Vaddr` não existe no fecho copiado** — vem de um pacote externo que não
-  está aqui. Em vez de o caçar, a ponte usa `std::uint64_t`, que é o que
-  `Vaddr` é.
-- **Contar chaves em cada edição.** Duas vezes uma edição deixou o ficheiro
-  com uma chave a mais.
-
-## O que não mudou
-
-A frente do GPU intacta: SASS → IR → GLSL → SPIR-V medido na **Mali-G610**,
-pixel lido `1.500000`. Suite de 6 testes a passar.
-
-
----
-
-# Os quatro núcleos livres
-
-**Nota de recurso, não de plano.** O RK3588 dá 4 × A76 ao guest e ficam
-**4 × A55 @ 1800 MHz sem fazer nada**. Ficam aqui registados para o dia em
-quealguma coisa precise deles.
-
-Proposta que foi feita e **descartada**: usá-los como auxiliares da tradução
-Maxwell → Valhall em paralelo com a GPU. A conta é boa — é mais computação do
-que o Switch tem — mas tem três custos que não se medem sem medir:
-
-1. **Largura de banda.** A tradução lê dados que depois vão para os A76 e para
-   a GPU. Os A55 competiriam pela mesma DRAM, e num SoC em que a memória é o
-   recurso mais disputado, e a GPU é a que mais puxa, pôr quatro núcleos a
-   mais pode **piorar** o resultado.
-2. **A tradução é custo de arranque, não steady state.** Um shader traduz-se
-   uma vez e fica em cache. O `glslc` gera em runtime, mas uma vez *por
-   shader*, não por frame. O ganho real é no arranque e nos loads.
-3. **Coordenação.** Passar um shader dos A55 → A76 → GPU tem latência de
-   troca de cluster. Em shaders pequenos custa mais do que o trabalho.
-
-Isto é decisão de arquitectura, não optimização. **Está anotado como recurso,
-não como plano** — porque uma ideia boa sem as reservas ao lado vira uma má
-implementação seis meses depois.
-
-# A costura: onde está
-
-O `KernelCore` do Eden chama `Core::Timing`, `system.GetCpuManager()` e
-`KDynamicPageManager` — infra de emulação. A camada de IPC, medida:
-
-```
-Kernel().RunOnHostCoreThread(...)   -- a espera adiada do ServerManager
-System()                             -- para chegar à memória
-UnregisterInUseObject(...)
-```
-
-**Três métodos.** Substituído por `k_kernel_core_bridge.h`, com os três e
-sem o resto. `kernel.h` e `kernel.cpp` saíram, e com eles `k_scheduler`,
-`page_table`, `cpu_manager`, `physical_core` e `arm_interface`.
-
-**Estado, medido:**
-
-| ficheiro vendorizado | erros |
-|---|---|
-| `k_handle_table.cpp` | **2** |
-| `hle_ipc.cpp` | 87 |
-| `sm.cpp` | 98 |
-| `server_manager.cpp` | 121 |
-
-`k_handle_table.cpp` está a dois erros: `KScopedAutoObject<KAutoObject>`
-exige que `KProcess` e `KThread` herdem de `KAutoObject`, o que exige traits
-de class-token. Os outros três têm uma causa única: `slab_helpers.h` quer
-`KResourceLimit` completo, e a ponte só o declara à frente para quebrar o
+O meu `sed` atirou `#include "k_process_bridge.h"` para dentro de
+`k_auto_object.h` e `k_synchronization_object.h` — e isso **era** o ciclo
+`ponte -> x.h -> ponte`. Com `#pragma once` um dos dois fica com o corpo vazio
+e o compilador diz que o tipo não existe, sem nenhuma pista de que a causa é um
 ciclo.
 
-## Quatro armadilhas desta costura
+A regra que fica: **o ficheiro que define o tipo-base vem primeiro, e quem
+precisa dele sobe na cadeia.**
 
-- **Sombreamento de nome.** Dentro de `namespace Kernel`, `Core::System`
-  resolvia para `Kernel::Core` — a minha própria classe. O compilador
-  apontava uma linha onde não havia nada de errado. A classe chama-se agora
-  `HostCore`.
-- **Ciclos de include.** `ponte → k_handle_table.h → ponte`. Com `#pragma
-  once`, um dos dois fica vazio e o erro diz que o tipo não existe.
-- **Assinaturas.** `GetOwnerProcess()` tem de devolver `KProcess*`, não
-  `KProcess&`, porque o Eden escreve `auto* const x = ...`. Uma assinatura
-  diferente dá "unable to deduce" e nada mais.
-- **`Vaddr`** não está em nenhum ficheiro do fecho — vem de um pacote
-  externo. Substituído por `std::uint64_t`, que é o que é.
+### 2. `KSlabHeap` não precisa de páginas
+
+Espera-se que precise — e portanto de uma page table, e portanto do emulador.
+Não precisa:
+
+    // k_slab_heap.h:177-186
+    template <typename T>
+    class KSlabHeap final : public KSlabHeapBase<false> {   // <-- false
+        void Initialize(void* memory, size_t memory_size)
+
+`KSlabHeapBase<false>` é **sem expansão dinâmica**. A página era precisely o
+que o Eden usava para *expandir*, e a expansão é a variante que não está em uso.
+Um slab é um bloco de memória e uma lista livre.
+
+### 3. `Core::System::Kernel()` não é virtual
+
+O Eden (`core.h:300`):
+
+    [[nodiscard]] Kernel::KernelCore& Kernel();
+
+Declarado `virtual` na primeira versão da nossa classe, **por(diff)** — e na
+ligação:
+
+    undefined reference to `Core::System::Kernel()'
+    undefined reference to `Core::System::ServiceManager()'
+
+Ser virtual muda o que o compilador emite, e o linker vai atrás de um símbolo
+que ninguém escreveu. Não é erro de compilação; é erro na última fase, com um
+nome de função que parece o certo.
+
+E ao defini-los **dentro** da classe, passam a ser `inline` por defeito, e uma
+função `inline` só é emitida se o compilador precisar — com `-O2` ele inlineia
+e não emite. Por isso vivem em `eden_bridge.cpp`.
+
+### 4. Um `unique_ptr` de tipo incompleto obriga a declarar, não a definir
+
+Esta deu quatro vezes seguidas, e em quatro formas diferentes:
+
+- o **destructor** implícito de `SvcDispatcher` — gerado em todos os TUs que
+  incluem o cabeçalho, e cada um deles a fazer `sizeof` de um tipo incompleto.
+- o **construtor** de `SvcDispatcher` — tem de poder destruir os membros se
+  algo disparar uma excepção a meio.
+- a **cópia e o movimento** de `Core::System` — apagar a cópia não chega, o
+  construtor de movimento continua a ser gerado.
+- o **corpo inline de `RunServer`** — `servidor_ = std::move(...)` chama
+  `default_delete<ServerManager>::operator()`, que faz `sizeof`. E o corpo de
+  uma função inline é verificado **mesmo que ninguém a chame**.
+
+Mais dois do mesmo tipo, por outra via:
+
+- uma declaração à frente **dentro** da classe nomeia `Classe::Tipo`, que é um
+  tipo diferente. Aconteceu duas vezes: `KernelCore::KObjectNameGlobalData` e
+  `SvcDispatcher::EdenSystem`. A mensagem de erro mostra um nome de tipo que
+  parece o certo — e esse é o pior tipo de erro, o que não denuncia nada.
+- `namespace Core { ... }` **dentro** de `namespace ia { ... }` cria
+  `ia::Core`. E `Core::System` dentro de `namespace Kernel` resolvia para
+  `Kernel::Core` — a classe do Eden que tentávamos substituir. Por isso a
+  classe chama-se `HostCore` e todos os nomes externos são qualificados.
+
+## A parede da espera
+
+`KSynchronizationObject::Wait` **dorme uma thread**. Usa
+`KScopedSchedulerLockAndSleep`, que é o escalonador. É a única coisa do Eden
+que este motor **não pode ter**: não há troca de contexto para dormir, e não há
+nada a acordar.
+
+O que medi antes de parar aí:
+
+    nm sobre a biblioteca ligada, depois de tirar o .cpp:
+      U Kernel::KSynchronizationObject::KSynchronizationObject(KernelCore&)
+      U Kernel::KSynchronizationObject::~KSynchronizationObject()
+      U Kernel::KSynchronizationObject::Finalize(KernelCore&)
+      U Kernel::KSynchronizationObject::NotifyAvailable(KernelCore&, Result)
+
+**`Wait` não está na lista.** Nenhum ficheiro que compilamos chama
+`KSynchronizationObject::Wait`. O que falta são quatro funções.
+
+Isto suggests a via curta: escrever o `k_synchronization_object.cpp` nosso com
+essas quatro e sem a espera. E é o que vou fazer a seguir.
+
+O que falta ao lado: `KServerSession` (6 métodos) e `KSpinLock` (2).
+`KServerSession` **é** preciso — é o despacho do lado servidor, e sem ele o
+`sm:` não atende ninguém. O seu `.cpp` usa a page table em 21 sítios, todos do
+caminho de *shared memory* (map aliases), que os quatro comandos do `sm:` não
+tocam.
+
+## O que fiz mal, e o que ficou escrito por causa disso
+
+Quatro vezes nesta sessão escrevi código com uma palavra de outra língua no meio
+de uma frase em português. Nenhuma delas partiu a build — todas as outras
+palavras eram válidas — e portanto nenhuma teria aparecido num teste. Passei a
+varrer o projecto em busca de caracteres CJK depois de cada edição.
+
+O mesmo dia, uma frase minha ficou a meio em inglês: «all the other words
+compiled». Escrevo em português com palavras de inglés misturadas há semanas e
+nunca reparei. As duas coisas são o mesmo sintoma: **a minha atenção é um
+recurso escasso, e o que escapa não aparece em nenhum teste.**
+
+O `str.replace` do Python **não avisa** quando o texto não está lá. Passou-me
+três vezes nesta sessão, sempre com a mesma consequência: um ficheiro que
+continuava a ter o código antigo e um erro de compilação a trinta linhas de
+distância. Passaram a ser `assert` antes de escrever.
+
+## Um erro de escrita que valeu a pena registar
+
+O meu `podar_vendor.py` declarava
+
+    def incluir_de(fichheiro, visitados, raizes_extra):
+
+e usava `ficheiro` no corpo. Um `h` a mais. Numa terminal monocromática os
+dois parecem iguais, e `NameError: name 'ficheiro' is not defined` não diz nada
+sobre o que aconteceu. Foi o `ast.parse` a mostrar a diferença que o terminal
+não mostrava — e um parameter rename tratou disto.
+
+## Ferramentas que ficaram
+
+    tools/vendorizar.py    copia um .cpp do Eden e fecha o fecho de headers
+    tools/podar_vendor.py   mede o fecho por ALCANÇABILIDADE e apaga o órfão
+    tools/verificar.py     conta o que é nosso, lista negra, compila tudo
+    tools/cortar_server_session.py   os cortes de page table, com o porque
+
+`podar_vendor.py` é o mais útil e é a resposta directa a «não copiar o
+emulador». Ele não apaga por critério; apaga o que **nenhuma fonte que
+compilamos alcança**, que é uma medida. Foi ele que apanhou 7.062 linhas de
+escalonador e page tables que o fecho transitivo tinha trazido na primeira
+volta.
+
+Regra que saiu daí: **não excluir uma hipótese sem a testar.** Podar, depois
+compilar os 23 `.cpp`, e só believing se continuarem todos a compilar.

@@ -34,12 +34,17 @@
 // ficheiro não inclui nenhum deles.
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include "ia/guest_memory.hpp"
 #include "vendor/eden/common/common_types.h"   // Vaddr, Handle
+#include "vendor/eden/core/memory_bridge.h"   // `Core::Memory::Memory`, a nossa
 #include "vendor/eden/core/hle/kernel/k_kernel_core_bridge.h"
 #include "vendor/eden/core/hle/kernel/k_synchronization_object.h"
 
@@ -47,6 +52,28 @@ namespace Kernel {
 
 class KProcess;
 class KThread;
+
+// Declarada aqui porque `KThread::BeginWait` a recebe como parametro, e a
+// classe vem **depois** no ficheiro. Um ponteiro para um tipo incompleto e'
+// valido numa declaracao -- e e' por isso que a declaracao chega.
+class KThreadQueue;
+
+// Copiado de `k_thread.h:108-116` do Eden, enumeradores e tudo.
+//
+// Não há aqui um `k_thread.h` para vir buscar, e o enum entra como **parâmetro**
+// de um método (`SetWaitReasonForDebugging`), o que obriga a que exista um tipo
+// com este nome e estes enumeradores. Copiar o enum é mais barato que vendorizar
+// o ficheiro inteiro, e é o que fica a menos divergir: se o Eden acrescentar um
+// enumerador, este ficheiro deixa de compilar — que é o aviso correcto.
+enum class ThreadWaitReasonForDebugging : u32 {
+    None,            ///< Thread is not waiting
+    Sleep,           ///< Thread is waiting due to a SleepThread SVC
+    IPC,             ///< Thread is waiting for the reply from an IPC request
+    Synchronization, ///< Thread is waiting due to a WaitSynchronization SVC
+    ConditionVar,    ///< Thread is waiting due to a WaitProcessWideKey SVC
+    Arbitration,     ///< Thread is waiting due to a SignalToAddress/WaitForAddress SVC
+    Suspended,       ///< Thread is waiting due to process suspension
+};
 
 // A tabela e os limites só são usados por REFERÊNCIA. Declarados à frente de
 // propósito: incluí-los aqui fecha o ciclo
@@ -66,63 +93,16 @@ using EnderecoGuest = std::uint64_t;
 
 // ── a memória ──────────────────────────────────────────────────────────────
 //
-// O Eden tem um `Memory` que sabe ler e escrever a memória do guest. O nosso
-// é o `GuestMemory`, que faz o mesmo sobre a reserva mapeada. Este adaptador
-// é a cola entre os dois nomes.
+// **A classe vive em `vendor/eden/core/memory_bridge.h`, no namespace
+// `Core::Memory`**, e aqui fica um `using` para não mudar o resto da ponte.
 //
-// Não é uma herança: o `Memory` do Eden tem operações que nós não temos
-// (páginas, protecções, tradução) porque não temos page tables — a memória
-// do guest é um bloco contíguo nosso. O que fica abaixo é **a parte de que a
-// camada de IPC usa**, e nada mais.
-class Memory {
-public:
-    explicit Memory(::ia::GuestMemory& mem) : mem_(mem) {}
-
-    template <typename T>
-    T Read(EnderecoGuest address) const {
-        T v{};
-        std::string err;
-        if (!mem_.read(address, &v, sizeof(T), err))
-            return T{};
-        return v;
-    }
-
-    template <typename T>
-    void Write(EnderecoGuest address, T value) {
-        std::string err;
-        (void)mem_.write(address, &value, sizeof(T), err);
-    }
-
-    // Usado pelo `sm:` para ler o nome do porto. O limite é o mesmo do Eden
-    // (`KObjectName::NameLengthMax`): um nome que não acaba é um nome
-    // inválido, e ler sem limite memória do guest é ler fora da reserva.
-    std::string ReadCString(EnderecoGuest address) const {
-        return ReadCString(address, 33);
-    }
-
-    std::string ReadCString(EnderecoGuest address, std::size_t max_length) const {
-        if (max_length == 0 || max_length > 256)
-            return {};
-        char buf[256];
-        std::string err;
-        if (!mem_.read(address, buf, max_length, err))
-            return {};
-        buf[max_length - 1] = '\0';
-        return std::string(buf);
-    }
-
-    bool ReadBytes(EnderecoGuest address, void* dest, std::size_t size) const {
-        std::string err;
-        return mem_.read(address, dest, size, err);
-    }
-    bool WriteBytes(EnderecoGuest address, const void* src, std::size_t size) {
-        std::string err;
-        return mem_.write(address, src, size, err);
-    }
-
-private:
-    ::ia::GuestMemory& mem_;
-};
+// O nome e o namespace não são nossos: `hle_ipc.h:427` tem um membro do tipo
+// `Core::Memory::Memory&`, e é esse nome que o código vendorizado escreve.
+// Ver a nota longa em `memory_bridge.h`.
+//
+// O `using` é, em vez de mover a classe para aqui, a diferença entre uma
+// classe que o Eden reconhece e uma classe que o nosso código reconhece.
+using Memory = ::Core::Memory::Memory;
 
 // ── o processo ─────────────────────────────────────────────────────────────
 //
@@ -154,12 +134,44 @@ public:
 
     u64 GetProcessId() const { return pid_; }
 
+    // O tamanho do buffer de ponteiros, que no Eden e' um campo do `KProcess`
+    // (k_process.h:104, 262-268) e nao da thread. Le-o o `Controller` do `sm`
+    // (sm_controller.cpp:78), que e' construido no construtor do
+    // `ServiceManager` -- ou seja, sempre.
+    //
+    // O valor por omissao e' o do Eden, 0x8000. Nao e' uma medicao para o
+    // nosso caso: e' o mesmo numero, e mudar a hora de meter um diferente
+    // seria uma diferenca sem motivo. Quem o muda e' o proprio Eden, a
+    // inicializar o processo.
+    u32 GetPointerBufferSize() const { return pointer_buffer_size_; }
+    void SetPointerBufferSize(u32 size) { pointer_buffer_size_ = size; }
+
+    // `KSynchronizationObject::IsSignaled` e' virtual puro
+    // (k_synchronization_object.h:35), e o Eden implementa-o em cada
+    // subclasse. Aqui o processo nunca e' sinalizado -- nao ha thread para
+    // esperar por nada -- e a resposta honesta e' `false`.
+    //
+    // Devolver `true` seria perigoso: `KSynchronizationObject::Wait` trataria
+    // o processo como pronto e devolveria na hora, e um pedido que devia ter
+    // esperado passaria sem ter esperado.
+    bool IsSignaled(KernelCore&) const override { return false; }
+
+    // `KLightSession::Close` chama isto (k_light_session.cpp:81). No Eden
+    // devolve o recurso reservado ao `KResourceLimit` (k_process.cpp:746-756).
+    // Aqui faz o mesmo — a Implementacao esta no `eden_bridge.cpp`, porque
+    // `KResourceLimit` so esta completo la: incluir `k_resource_limit.h` na
+    // ponte fecharia o ciclo
+    // `ponte -> k_resource_limit.h -> k_light_lock.h -> ponte`.
+    void ReleaseResource(KernelCore& kernel, Svc::LimitableResource which, s64 value);
+    void ReleaseResource(KernelCore& kernel, Svc::LimitableResource which, s64 value, s64 hint);
+
     Memory& GetMemory() { return memory_; }
 
 private:
     KHandleTable& handles_;
     KResourceLimit& limits_;
     u64 pid_;
+    u32 pointer_buffer_size_ = 0x8000;
     Memory memory_;
 };
 
@@ -178,17 +190,189 @@ public:
     KThread(KernelCore& kernel, KProcess& process) : KSynchronizationObject(kernel),
                                                     process_(process) {}
 
-    // A lista de quem espera por esta thread. O Eden usa-a para o
-    // escalonamento; aqui é um tipo que existe para o
-    // `k_light_condition_variable.h` compilar, e fica sempre vazia. Não é uma
-    // coisa que "falta" — não há nada para esperar, porque o guest corre noutra
-    // thread e quem espera aqui é o próprio motor.
-    struct WaiterList {};
+    // A lista de quem espera por esta thread.
+    //
+    // No Eden é uma lista intrusiva de `KThread`, e o
+    // `ThreadQueueImplForKLightServerSession` tira de lá a thread que acordou
+    // (`k_light_server_session.cpp:29-30`).
+    //
+    // **Aqui é uma lista a sério** — um `std::vector<void*>` com os mesmos
+    // nomes — e não um tipo vazio. A diferença é que, se alguma vez algo lhe
+    // empurrar uma thread, o `erase` a remove a sério. Um `struct {}` com
+    // operações vazias compilaria igual e seria uma mentira com pernas de
+    // não: o `erase` apagaria uma thread que se metesse na fila e o código
+    // continuaria a acreditar que não há ali ninguém.
+    //
+    // Num motor de execução nativa não há ninguém a empurrar nada. A lista
+    // fica vazia, e fica vazia de facto.
+    struct WaiterList {
+        // **Guarda `KThread*`, não `void*`.**
+        //
+        // A primeira versão guardava `void*`, e o compilador queixou-se em
+        // `k_light_server_session.cpp:178`: `cannot convert void** to
+        // KThread*`. A lista é iterada com `std::addressof(*head)`, e
+        // desreferenciar um `void*` não dá uma `KThread&` — dá um erro.
+        //
+        // Um vector de `void*` é mais simples de escrever e é uma lista sem
+        // tipo: guarda coisas, não threads. Como só há um tipo de coisa que
+        // entra nesta lista, guardá-lo é o mesmo trabalho com um tipo a menos
+        // de erro.
+        using value_type = KThread;
 
-    // **PONTEIRO, não referência.** O Eden devolve `KProcess*` e usa
-    // `auto* const cur_process = cur_thread->GetOwnerProcess();` — que com uma
-    // referência não deduz nada e dá "unable to deduce 'auto* const'".
-    // A assinatura tem de bater com a do Eden; não é um detalhe.
+        // O iterador **desreferencia para `KThread&`**, e não para
+        // `KThread*`.
+        //
+        // É a diferença entre um `std::vector` e uma lista intrusiva, e
+        // `k_light_server_session.cpp:178` depende dela:
+        //
+        //     m_current_request = std::addressof(*head);
+        //
+        // Com o iterador do `vector`, `*head` é um `KThread*`, e
+        // `std::addressof` de um `KThread*` é um `KThread**`. O erro é
+        // "cannot convert KThread** to KThread*" — que não diz nada sobre
+        // iteradores, e é por isso que custou tempo.
+        //
+        // Com `IntrusiveList` do Eden, `*head` já é a thread.
+        class iterator {
+        public:
+            using base = std::vector<KThread*>::iterator;
+
+            iterator() = default;
+            explicit iterator(base it) : it_(it) {}
+
+            KThread& operator*() const { return **it_; }
+            KThread* operator->() const { return *it_; }
+
+            iterator& operator++() {
+                ++it_;
+                return *this;
+            }
+            iterator operator++(int) {
+                iterator antes = *this;
+                ++it_;
+                return antes;
+            }
+
+            bool operator==(const iterator& o) const { return it_ == o.it_; }
+            bool operator!=(const iterator& o) const { return it_ != o.it_; }
+
+            base interno() const { return it_; }
+
+        private:
+            base it_{};
+        };
+
+        iterator begin() { return iterator(elementos_.begin()); }
+        iterator end() { return iterator(elementos_.end()); }
+
+        // Constante: `*head` dá `const KThread&`, como deve ser.
+        class const_iterator {
+        public:
+            using base = std::vector<KThread*>::const_iterator;
+
+            const_iterator() = default;
+            explicit const_iterator(base it) : it_(it) {}
+
+            const KThread& operator*() const { return **it_; }
+            const KThread* operator->() const { return *it_; }
+
+            const_iterator& operator++() {
+                ++it_;
+                return *this;
+            }
+            bool operator==(const const_iterator& o) const { return it_ == o.it_; }
+            bool operator!=(const const_iterator& o) const { return it_ != o.it_; }
+
+        private:
+            base it_{};
+        };
+        const_iterator begin() const { return const_iterator(elementos_.begin()); }
+        const_iterator end() const { return const_iterator(elementos_.end()); }
+
+        void push_back(KThread& thread) { elementos_.push_back(std::addressof(thread)); }
+
+        iterator iterator_to(KThread& thread) {
+            auto it = std::find(elementos_.begin(), elementos_.end(), std::addressof(thread));
+            return iterator(it == elementos_.end() ? elementos_.end() : it);
+        }
+
+        // O `erase` tem de voltar ao iterador do `vector` antes de apagar.
+        // Comparar o iterador adaptador com `elementos_.end()` daria "no
+        // match for operator!=(WaiterList::iterator, vector<KThread*>::iterator)",
+        // que é um erro escrito por um lado e por outro do mesmo tipo — o que
+        // é sempre um sinal de que falta uma conversão, e a conversão que
+        // falta chama-se `interno()`.
+        void erase(iterator it) {
+            auto interno = it.interno();
+            if (interno != elementos_.end())
+                elementos_.erase(interno);
+        }
+
+        bool empty() const { return elementos_.empty(); }
+        std::size_t size() const { return elementos_.size(); }
+
+    private:
+        std::vector<KThread*> elementos_;
+    };
+
+    // ── a espera ──────────────────────────────────────────────────────────
+    //
+    // Estes métodos existem porque o `KLightServerSession` os chama
+    // (`k_light_server_session.cpp:56-75`), e o `KLightServerSession` existe
+    // porque o `KClientPort` o menciona.
+    //
+    // **E é aqui que a costura quase caiu.** A resposta natural era puxar o
+    // `k_thread.h` do Eden e ficar com os métodos todos — e o `k_thread.h` tem
+    // 1001 linhas e arrasta o `k_scheduler`, as filas e os temporizadores.
+    //
+    // Em vez disso ficam aqui, e o que sobrevive é a **pergunta que cada um
+    // faz**, não o seu comportamento:
+    //
+    //     IsWaitCancelled()      -> nunca se cancela      -> false
+    //     IsCancellable()        -> nunca é cancelável    -> false
+    //     IsTerminationRequested -> nunca é terminado    -> false
+    //     GetWaitResult()        -> nunca se esperou      -> sucesso
+    //     BeginWait/EndWait      -> nunca há quem espere
+    //
+    // Cada resposta é a que o Eden daria **se ninguém esperasse**, e é isso que
+    // acontece: um pedido de serviço é atendido dentro do `SendSyncRequest` e
+    // a thread do guest não pára nunca.
+    void BeginWait(KernelCore& /*kernel*/, KThreadQueue* /*queue*/) {}
+    void EndWait(KernelCore& /*kernel*/, Result /*wait_result*/) {}
+    void CancelWait(KernelCore& /*kernel*/, Result /*wait_result*/, bool /*cancel_timer_task*/) {}
+    void NotifyAvailable(KernelCore& /*kernel*/, KSynchronizationObject* /*obj*/, Result) {}
+    void WaitCancel(KernelCore& /*kernel*/) {}
+
+    Result GetWaitResult() const { return ResultSuccess; }
+    bool IsWaitCancelled() const { return false; }
+    void ClearWaitCancelled() {}
+    bool IsCancellable() const { return false; }
+    void SetCancellable() {}
+    void ClearCancellable() {}
+    void SetWaitReasonForDebugging(ThreadWaitReasonForDebugging /*reason*/) {}
+    bool IsTerminationRequested() const { return false; }
+    s32 GetNumKernelWaiters() const { return 0; }
+
+    u32* GetLightSessionData() const { return light_session_data_; }
+    void SetLightSessionData(u32* data) { light_session_data_ = data; }
+
+    // `KSynchronizationObject::IsSignaled` é virtual puro
+    // (`k_synchronization_object.h:35`) e o Eden implementa-o em cada
+    // subclasse. Sem isto o `KThread` fica **abstracto** e o
+    // `make_unique<KThread>` dá "invalid new-expression of abstract class
+    // type" — que não diz que falta um método, e é por isso que vale a pena
+    // deixar o método no mesmo sítio do `KProcess` e não no fim do ficheiro.
+    //
+    // Mesma resposta que no `KProcess`: `false`. A thread do guest nunca está
+    // sinalizada, porque nada a sinaliza — um pedido de serviço é atendido
+    // dentro do `SendSyncRequest`, e a thread não pára nunca.
+    bool IsSignaled(KernelCore&) const override { return false; }
+
+    // **PONTEIRO, não referência.** O Eden devolve `KProcess*`
+    // (`k_thread.h:320`) e o código usa `auto* const cur_process = ...`, que
+    // com uma referência não deduce nada. Ver a nota no `KProcess` sobre
+    // assinaturas: uma assinatura diferente da do Eden dá "unable to deduce",
+    // e não dá nenhuma pista de que a assinatura é que está errada.
     KProcess* GetOwnerProcess() const { return &process_; }
 
     u64 GetThreadId() const { return thread_id_; }
@@ -200,7 +384,62 @@ public:
 private:
     KProcess& process_;
     u64 thread_id_ = 0;
+    u32* light_session_data_ = nullptr;
     EnderecoGuest tls_address_ = 0;
+};
+
+// O escalonador, em nome próprio.
+//
+// `k_readable_event.cpp:30` tem um `ASSERT(KScheduler::IsSchedulerLockedByCurrentThread(kernel))`
+// — e sem este tipo o ficheiro não compila.
+//
+// **A pergunta não tem resposta neste motor, e a resposta é sempre `true`.**
+// A pergunta é «esta thread tem o bloqueio do escalonador?», e o bloqueio do
+// escalonador é o nosso `KScopedSchedulerLock`, que é um no-op. Um no-op que
+// está sempre tomado é um no-op que está sempre tomado: a asserção que ele
+// protege não tem conteúdo num motor sem troca de contexto, e passa — como
+// uma asserção correcta passaria.
+class KScheduler {
+public:
+    static bool IsSchedulerLockedByCurrentThread(KernelCore&) { return true; }
+};
+
+// ── a fila de espera ───────────────────────────────────────────────────────
+//
+// `KThreadQueue` é a base de que o `KLightServerSession` deriva a sua fila de
+// pedidos (`k_light_server_session.cpp:19-32`). É a **única** vez que a camada
+// de IPC do Eden precisa da fila de esperas do escalonador, e o que precisa
+// é a interface — três virtuais e um construtor.
+//
+// A implementação são no-ops, pela razão que vale para o `Broadcast` e para o
+// `Wait`: **neste motor não há thread que espere**. O `KThread::WaiterList` da
+// ponte é um tipo vazio que existe para o código compilar, e esta fila é a
+// mesma coisa com mais métodos.
+//
+// Se algum dia aparecer uma segunda thread que espere por um pedido de serviço,
+// estas três funções passam a estar erradas — e o sintoma é um pedido que
+// nunca é atendido. É o sítio a mexer, e está marcado.
+class KThreadQueue {
+public:
+    // O Eden inicializa aqui o `m_hardware_timer` (`k_thread_queue.h:18`),
+    // que é o timer de hardware usado para os tempos limite de espera.
+    // Aqui **não há** esse membro: medido, `SetHardwareTimer` não é chamado
+    // por nada que vendorizámos, e o `KThreadQueue` do Eden — que é quem o
+    // tinha — ficou de fora. Um membro que ninguém escreve e ninguém lê é um
+    // membro que está a pedir para ser confundido com o timer que o
+    // `KernelCore` realmente tem, o `HardwareTimer()`.
+    explicit KThreadQueue(KernelCore& kernel) {}
+    virtual ~KThreadQueue() = default;
+
+    virtual void NotifyAvailable(KernelCore&, KThread*, KSynchronizationObject*, Result) {}
+    virtual void EndWait(KernelCore&, KThread*, Result) {}
+    virtual void CancelWait(KernelCore&, KThread*, Result, bool) {}
+};
+
+class KThreadQueueWithoutEndWait : public KThreadQueue {
+public:
+    explicit KThreadQueueWithoutEndWait(KernelCore& kernel) : KThreadQueue(kernel) {}
+    void EndWait(KernelCore& kernel, KThread* waiting_thread, Result wait_result) override final;
 };
 
 // ── a ponte ────────────────────────────────────────────────────────────────

@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "vendor/eden/common/intrusive_list.h"
+#include "vendor/eden/core/hle/kernel/slab_helpers.h"
 #include "vendor/eden/core/hle/kernel/k_auto_object.h"
 #include "vendor/eden/core/hle/kernel/k_process_bridge.h"  // PONTE: ver README
 #include "vendor/eden/core/hle/result.h"
