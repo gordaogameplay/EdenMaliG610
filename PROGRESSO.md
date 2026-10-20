@@ -2542,3 +2542,79 @@ nativamente, numa thread do host, com as traps resolvidas por sinais: uma
 segunda thread de guest exige que o estado do despachante, o TLS e o
 `TPIDR_EL0` sejam **por thread** — e hoje não são. Esse é o próximo passo,
 e é o mesmo trabalho que falta para o motor ter scheduler.
+
+---
+
+# Sessão 2026-10-20 (terceira parte) — a thread de guest
+
+## O que o SDK pede
+
+Com o `CreateThread` (0x08) e o `StartThread` (0x09) implementados, o guest
+chega mais longe: o SDK cria uma thread e **usa-a** (faz-lhe
+`GetThreadId` e `SetThreadCoreMask`), e só depois morre.
+
+O pedido medido:
+
+    [svc #180] 0x08 CreateThread  x0=0x30fffea08  x1=0x83abb240
+                                   x2=0x13f20fc60  x3=0x2d0e57fe0
+                                   x4=0x2c (prioridade)  x5=1 (nucleo)
+
+A ABI é a do Eden (`svc.cpp:1304`): `x0` = ponteiro de saída, `x1` = entry
+point, `x2` = argumento, `x3` = o topo da stack do utilizador
+(`k_thread.h:737` chama-lhe `user_stack_top`), `x4` = prioridade (0 a 63,
+`svc_types.h:101-102`), `x5` = núcleo.
+
+## O `entry point` é uma função válida
+
+Medido no dump do boot_trace (o código **tal como o motor o tem em
+memória**):
+
+    f3 0f 1e f8   stp  x24, x23, [sp, #-16]!
+    fd 7b 01 a9   stp  x29, x30, [sp, #984]!
+    fd 43 00 91   mov  x29, sp
+    41 d0 3b d5   mrs  x3, tpidrro_el0     ; o TLS do guest
+    21 e0 07 91   mov  x7, sp
+    20 00 00 f9   str  x0, [x0]
+    1f 20 03 d5   msr  tpidrro_el0, x3     ; restaurar o TLS do host
+    ...
+
+**O `hactool` descomprime o `subsdk1` de outra forma** — com ele, o
+endereço parecia o meio de uma função; com a nossa descompressão, é um
+prólogo. A nossa memória é a que conta.
+
+E a função diz o que a thread precisa: `mrs x3, tpidrro_el0` (que o
+patcher reescreve para `tpidr_el0`) — logo, **o `TPIDR_EL0` do guest**.
+
+## O prototipo foi revertido — e porque
+
+Com a thread a correr (uma thread do host a correr o entry point, com o
+`sp` que o guest deu e o `TPIDR_EL0` apontado para o TLS dela), o código do
+guest **dá fault logo a entrar** e o fault matava o processo. Duas
+medidas:
+
+| Sintoma | Causa |
+|---|---|
+| `exit 70` ("sem ponto de regresso") | o `sigsetjmp` estava numa frame que **já tinha regressado**; um `siglongjmp` para um `sigjmp_buf` de uma frame morta é comportamento indefinido |
+| o guest lia o TLS do *host* | o `TPIDR_EL0` era global, e o motor新聞 tinha ficado a 0 — o guest escrevia por cima da `libc` |
+
+E a lição de fundo, que é a resposta à pergunta "o Eden não faz?":
+
+**O Eden faz, e melhor.** Tem `KThread` (objecto de kernel com TLS e
+contexto próprios) e um *scheduler*. **O nosso `vendor` não tem
+`KThread`** (medido: `ls vendor/eden/core/hle/kernel/ | grep -i thread` não
+dá nada), e por isso:
+
+- o `TPIDR_EL0`, o `sigsetjmp` e a recuperação de faults têm de ser
+  **por thread** no nosso motor (o Eden não precisa: o estado do guest é o
+  estado do emulador, e o emulador tem um scheduler);
+- um IPC feito por uma thread de guest usaria o **buffer de mensagem da
+  thread principal** — porque o Eden lê o buffer do `KThread` corrente, e
+  nós só temos um.
+
+O que fica para o próximo passo, com o motor em estado bom (62,3 ms,
+218 SVCs, 0 SVCs com erro, 0 respostas IPC com erro):
+
+1. pôr o `TPIDR_EL0`, o `sigsetjmp` e a recuperação **por thread** (o
+   protótipo está feito, e revertido porque o fault matava o processo);
+2. dar à thread o `sp` certo e **ver onde ela dá fault** — que é a
+   informação que falta.
