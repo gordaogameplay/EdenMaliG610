@@ -128,17 +128,75 @@ std::string to_string(Result r) {
 
 // ---------------------------------------------------------------------------
 
+// `ConnectToNamedPort` cria uma PORTA e uma SESSÃO, e devolve o handle da
+// SESSÃO.
+//
+// De `svc_port.cpp:19-55` no Eden:
+//
+//     // Find the client port.
+//     auto port = KObjectName::Find<KClientPort>(system.Kernel(), name.data());
+//     R_UNLESS(port.IsNotNull(), ResultNotFound);
+//
+//     // Reserve a handle for the port.
+//     R_TRY(handle_table.Reserve(system.Kernel(), out));
+//
+//     // Create a session.
+//     KClientSession* session;
+//     R_TRY(port->CreateSession(system.Kernel(), std::addressof(session)));
+//
+//     // Register the session in the table, close the extra reference.
+//     handle_table.Register(system.Kernel(), *out, session);
+//
+// Duas coisas que a versão anterior não tinha, e as duas importam:
+//
+//   1. O handle devolvido é o de uma SESSÃO, não o de uma porta. É por isso
+//      que o guest vai directo do `ConnectToNamedPort` para o
+//      `SendSyncRequest` sem `OpenSession` nenhum — e é por isso que o
+//      handle tem de servir de sessão.
+//
+//   2. São DOIS objectos e DOIS handles. Antes havia um contador que
+//      fabricava os dois ao mesmo tempo, e um handle de porta acabava a ser
+//      usado como sessão sem ninguém dar por isso.
+//
+// A tabela é a do Eden: índice de 15 bits e geração de 15 bits
+// (`kobject.hpp`, com a fonte de cada campo). Os handles de antes
+// (`0x1000`, `0x1001`, ...) tinham `linear_id == 0`, que é INVÁLIDO pela
+// regra do Eden — nenhum passaria um `IsValidHandle`.
 std::uint32_t SvcDispatcher::connect_named_port(const std::string& name) {
     if (name.empty())
         return 0;
-    auto it = port_by_name_.find(name);
-    if (it != port_by_name_.end())
-        return it->second;
 
-    const std::uint32_t h = next_handle_++;
-    port_by_name_.emplace(name, h);
-    name_by_handle_.emplace(h, name);
-    return h;
+    // A porta. Uma porta por nome, como `KObjectName::Find<KClientPort>`.
+    Handle port_h{};
+    {
+        auto it = port_by_name_.find(name);
+        if (it != port_by_name_.end()) {
+            port_h = Handle{it->second};
+        } else {
+            auto* po = new KObject();
+            po->kind = KObject::Kind::Port;
+            po->name = name;
+            const Handle h = handles_.reservar();
+            if (!handles_.registar(h, po))
+                return 0;
+            port_by_name_.emplace(name, h);
+            port_h = h;
+        }
+    }
+
+    // A sessão. Nova a cada `ConnectToNamedPort`, como no Eden.
+    auto* so = new KObject();
+    so->kind   = KObject::Kind::Session;
+    so->name   = name;
+    so->parent = port_h;
+
+    const Handle h = handles_.reservar();
+    if (!handles_.registar(h, so)) {
+        delete so;
+        return 0;
+    }
+    ++vivos_;
+    return h.raw;
 }
 
 void SvcDispatcher::close_handle(std::uint32_t handle) {

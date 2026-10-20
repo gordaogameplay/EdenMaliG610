@@ -378,6 +378,47 @@ void on_svc(std::uint32_t number, ia::SvcContext& ctx, std::uint64_t pc,
             }
         }
 
+        // `IA_FIND=GshD` procura um magic na imagem JA DESCOMPRIMIDA de
+        // todos os modulos.
+        //
+        // Existe porque o `grep` no ficheiro NSO nao encontra o banco de
+        // shaders, e a primeira conclusao — "este programa nao tem shaders" —
+        // era errada: o programa foi ligado com `NX-NXFP2-a64` e com
+        // `glslc.nss`, que e' o compilador Maxwell da NVIDIA. O banco nao
+        // esta no ficheiro porque os segmentos estao comprimidos, e o que se
+        // procurou foi o ficheiro.
+        //
+        // O mesmo magic em dois sitios ditos de formas diferentes da a
+        // resposta correcta: um e' a coisa, o outro e' a mesma coisa.
+        const char* vf = std::getenv("IA_FIND");
+        if (vf != nullptr && std::strlen(vf) == 4) {
+            for (const auto& m : g_prog->modules()) {
+                const std::size_t tam = m.nso.image.size();
+                if (tam < 4)
+                    continue;
+                std::vector<char> img(tam);
+                std::string e6;
+                if (!g_mem->read(m.vaddr_base, img.data(), tam, e6))
+                    continue;
+                for (std::size_t k = 0; k + 4 <= tam; ++k) {
+                    if (std::memcmp(img.data() + k, vf, 4) != 0)
+                        continue;
+                    std::printf("[find] %-5s \"%s\" no offset 0x%zx "
+                                "(endereco 0x%llx)\n",
+                                m.name(), vf, k,
+                                (unsigned long long)(m.vaddr_base + k));
+                    // Os 64 bytes a seguir: um cabecalho de banco de shaders
+                    // diz quantos shaders tem e onde estao.
+                    std::printf("        ");
+                    for (int b = 0; b < 64 && k + 4 + b < tam; ++b)
+                        std::printf("%02x%s",
+                                    static_cast<unsigned char>(img[k + 4 + b]),
+                                    (b % 16 == 15) ? " " : " ");
+                    std::printf("\n");
+                }
+            }
+        }
+
         const char* vs = std::getenv("IA_STR");
         if (vs != nullptr) {
             const std::uint64_t p0 = std::strtoull(vs, nullptr, 0);

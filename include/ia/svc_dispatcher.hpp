@@ -18,6 +18,7 @@
 #pragma once
 
 #include "ia/guest_memory.hpp"
+#include "ia/kobject.hpp"
 
 #include <cstdint>
 #include <cstdint>
@@ -302,6 +303,12 @@ public:
 
     // Portas de serviço nomeadas. Devolve um handle ou 0.
     std::uint32_t connect_named_port(const std::string& name);
+
+    // A tabela de objectos. Substitui o contador `next_handle_`, que
+    // fabricava handles sem geração — e `linear_id == 0` é inválido pela
+    // regra do Eden, por isso nenhum deles era um handle a sério.
+    HandleTable handles_;
+    std::size_t vivos_ = 0;
     const std::string& last_port() const noexcept { return last_port_; }
 
     // O último comando IPC despachado, e quantos houve. O tracer usa isto
@@ -419,6 +426,10 @@ private:
     // um inteiro e um nome, e nada mais. STUB declarado.
     std::string service_name_for_handle(std::uint32_t handle) const;
 
+    // O objecto que um handle aponta, ou nullptr se o handle não for válido.
+    // `obter()` valida a forma, o índice e a geração.
+    KObject* object_for_handle(std::uint32_t handle) const;
+
     static constexpr std::uint32_t kResultNotImplemented = 0x00040001;
 
     std::string       last_ipc_;
@@ -434,7 +445,7 @@ private:
     // Scratch reutilizável para as mensagens de erro de read_guest(). Não é
     // const, e read_guest() é const porque é uma consulta.
     mutable std::string g_err_scratch;
-    std::unordered_map<std::string, std::uint32_t> port_by_name_;
+    std::unordered_map<std::string, Handle> port_by_name_;
     std::unordered_map<std::uint32_t, std::string> name_by_handle_;
     std::uint32_t    next_handle_ = 0x1000;
     std::uint64_t    entropy_counter_ = 0x9E3779B97F4A7C15ull;

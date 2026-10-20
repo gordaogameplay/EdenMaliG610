@@ -1238,3 +1238,111 @@ cria uma sessão por dentro — está no `svc_port.cpp` — e é por isso que o
 Suite: **6 testes, todos a passar**. GPU: 1.500000 na G610.
 
 Telemetria nova: `IA_STRINGS=main`.
+
+
+---
+
+# A tabela de objectos, copiada do desenho do Eden
+
+`include/ia/kobject.hpp`. O Eden é GPL e este projecto não é: o que se copiou
+é a **arquitetura**, e cada campo diz de onde veio.
+
+## O handle
+
+`k_handle_table.h:262-278`:
+
+```
+bits [0,15)   index
+bits [15,15)  linear_id     <- a GERAÇÃO
+bits [30,2)   reserved = 0
+```
+
+E `IsValidHandle` (linha 201-217) exige `raw != 0`, **`linear_id != 0`**,
+`reserved == 0`, `index < tamanho`.
+
+**Os handles de antes (`0x1000`, `0x1001`, ...) tinham `linear_id == 0`.**
+Nenhum passaria um `IsValidHandle` do Eden. Funcionavam porque o nosso
+dispatcher nunca os validava — e uma tabela que valida o que valida sozinha
+não é uma tabela, é um `switch` grande.
+
+O `linear_id` é uma geração: é o que faz um handle fechado ser reconhecido
+como fechado quando o índice já foi reatribuído. Sem ele, um handle antigo
+apontava para o objecto errado em silêncio.
+
+**Reserve e Register são dois passos** (`svc_port.cpp:37-50`): reserva-se o
+índice, cria-se o objecto, e só depois se regista. Se a criação falhasse com
+o índice já registado, ficava um handle válido a apontar para meio objecto.
+
+## Port ≠ Sessão
+
+`ConnectToNamedPort` cria uma **porta** e uma **sessão**, e devolve o handle
+da **sessão**. Antes havia um contador que fabricava os dois ao mesmo tempo,
+e um handle de porta acabava a ser usado como sessão sem ninguém dar por
+isso. É também por isso que o guest vai directo do `ConnectToNamedPort`
+para o `SendSyncRequest` sem `OpenSession` nenhum.
+
+O handle passou de `0x1000` para **`0x10001`** — índice 1, geração 2.
+
+## Onde estão os shaders SiGfx — e onde NÃO estão
+
+Procurei o banco de shaders e **não está em nenhum NSO**:
+
+| ficheiro | flags | `GshD` |
+|---|---|---|
+| main | 0x3f | não |
+| rtld | 0x3f | não |
+| sdk / subsdk0 / subsdk1 | 0x3f | não |
+
+E `IA_FIND=GshD` na imagem **já descomprimida** em memória também não
+encontra. O `0x3f` dos flags são as flags de compressão dos segmentos — um
+banco de shaders num `rtld` de 7 KB seria absurdo, e é o que é.
+
+O que as strings mostram é o mecanismo real:
+
+```
+SiGfx_NX_Common.mi_shader_pkg        <- o de Switch
+SiGfx_Vulkan_Common.mi_shader_pkg
+SiGfx_OGL_Common.mi_shader_pkg
+SiGfx_D3D11_Common.mi_shader_pkg
+SiGfx_PS4_Common_Subdiv.mi_shader_pkg
+...
+nvnCommandBufferDiscardColor
+nvnCommandBufferSetRasterizerDiscard
+IGPUTexture::CreateVolumeTexture()
+==== TEXSHADERSET::InitializeDevice() succeeded. ====
+```
+
+O SiGfx é uma camada da Nintendo **por cima do NVN**, com pacotes de shaders
+de biblioteca (`.mi_shader_pkg`) para cada backend — Vulkan, OGL, D3D11,
+PS4. E o programa liga o **`glslc.nss`**, o compilador de shaders da NVIDIA.
+
+## O que isto muda para o tradutor
+
+**A SASS que vamos traduzir não está num ficheiro — é gerada em runtime**
+pelo `glslc` da NVIDIA, a partir do GLSL que o programa embute. E as
+bibliotecas de shaders estão em pacotes `.mi_shader_pkg` que vivem noutro
+NCA, que não temos.
+
+Isto não desfaz o que está feito — a cadeia SASS → IR → GLSL → SPIR-V está
+medida na G610 e é exactamente a cadeia certa. Muda só **de onde vem a
+entrada**: em vez de um blob estático, vem do que o guest enviar à GPU.
+
+O caminho passa a ser:
+
+1. Deixar o guest passar o abort (falta o `sm:` a sério, e os serviços que o
+   `SiGfx` usa).
+2. Apanhar o comando NVN em que o shader é enviado, e despejar a SASS
+   **antes** de a traduzir.
+3. Passá-la pelo tradutor e devolver o GLSL.
+
+E é um caminho melhor, porque o passo 2 dá-nos a SASS de um shader que
+chegou a ser compilado de facto — não um que alguém possa ter gerado com
+outras flags. **É a mesma lógica do `ArrayStride`: medir o que o hardware
+vai ver em vez de supor.**
+
+## Estado
+
+Suite: **6 testes, todos a passar**. GPU: 1.500000 na G610.
+
+Telemetria nova: `IA_FIND=<magic>` procura um magic na imagem
+descomprimida, e imprime os 64 bytes a seguir.

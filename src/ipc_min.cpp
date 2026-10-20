@@ -691,8 +691,22 @@ void SvcDispatcher::write_empty_reply(std::uint64_t buffer, std::size_t size,
 }
 
 std::string SvcDispatcher::service_name_for_handle(std::uint32_t handle) const {
+    // Primeiro a tabela de objectos, que é a fonte de verdade: tem geração e
+    // valida. O mapa antigo fica como recurso, porque `sm: GetService` também
+    // fabrica handles e nesse caminho ainda não há sessão.
+    if (const KObject* o = object_for_handle(handle)) {
+        if (o->kind == KObject::Kind::Session && o->parent.raw != 0) {
+            if (const KObject* p = object_for_handle(o->parent.raw))
+                return p->name;
+        }
+        return o->name;
+    }
     auto it = name_by_handle_.find(handle);
     return it == name_by_handle_.end() ? std::string() : it->second;
+}
+
+KObject* SvcDispatcher::object_for_handle(std::uint32_t handle) const {
+    return const_cast<SvcDispatcher*>(this)->handles_.obter(Handle{handle});
 }
 
 } // namespace ia
