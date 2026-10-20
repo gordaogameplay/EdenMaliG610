@@ -21,6 +21,8 @@
 
 #include <array>
 #include <cstdio>
+#include <stdexcept>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -37,6 +39,7 @@
 #include "vendor/eden/core/hle/kernel/k_resource_limit.h"
 #include "vendor/eden/core/hle/kernel/k_session.h"
 #include "vendor/eden/core/hle/kernel/svc_results.h"
+#include "vendor/eden/core/hle/service/lm/lm.h"
 #include "vendor/eden/core/hle/service/server_manager.h"
 #include "vendor/eden/core/hle/service/sm/sm.h"
 
@@ -131,6 +134,64 @@ void KProcess::ReleaseResource(KernelCore& kernel, Svc::LimitableResource which,
 
 } // namespace Kernel
 
+// Implementa `KObjectName::DumpNames`, declarado no cabeçalho vendorizado.
+//
+// É `friend` do `KObjectName` — declarado assim no cabeçalho com a nota de
+// porquê. `m_name` e `m_object` são privados, e a alternativa (um `Find` por
+// nome conhecido) é exactamente a que destrói a porta.
+//
+// A definição vai **fora de `namespace ia`** e é a sua própria
+// `namespace Kernel`.
+//
+// Foi a quarta vez nesta costura que um `namespace Kernel {` caiu dentro de um
+// `namespace ia {` e declarou `ia::Kernel`. Os erros são sempre os mesmos —
+// «KObjectName has not been declared», «KernelCore was not declared» — e
+// nenhum deles menciona namespaces, o que faz o problema parecer um include em
+// falta.
+//
+// A regra, e que fica escrita porque já custou quatro vezes: **antes de abrir
+// um namespace, confirmar em que namespace se está.** `grep -n '^namespace'`
+// no ficheiro responde em meio segundo e poupa meia hora.
+namespace Kernel {
+
+void KObjectName::DumpNames(KernelCore& kernel) {
+    // A primeira linha é incondicional de propósito: um instrumento que
+    // imprime zero linhas não se distingue de um instrumento que não corre.
+    std::fprintf(stderr, "[ipc]   (DumpNames entrou)\n");
+    KObjectNameGlobalData& gd = kernel.ObjectNameGlobalData();
+    int n = 0;
+    for (const auto& nome : gd.GetObjectList()) {
+        // O objecto imprime-se pelo TIPO, que vem do class-token do Eden — e
+        // nao por um ponteiro, porque um ponteiro nao diz nada ao olho.
+        //
+        // `GetObjectType()` e' um template que cada subclasse define; sem ele
+        // o dynamic cast a `KClientPort` dava mais informacao sobre o que o
+        // registo contem.
+        const char* tipo = "(desconhecido)";
+        if (dynamic_cast<KClientPort*>(nome.m_object) != nullptr)
+            tipo = "KClientPort";
+        else if (dynamic_cast<KServerPort*>(nome.m_object) != nullptr)
+            tipo = "KServerPort";
+        else if (nome.m_object != nullptr)
+            tipo = "outro";
+        std::fprintf(stderr, "[ipc]   nome[%d] = \"%s\"  objecto=%s\n", n,
+                     nome.m_name.data(), tipo);
+        // Os 12 bytes, porque `MatchesName` compara 12 (k_object_name.cpp:25)
+        // e duas strings que parecem iguais nao o sao se uma delas tem lixo
+        // depois do NUL.
+        std::fprintf(stderr, "[ipc]     bytes:");
+        for (std::size_t b = 0; b < Kernel::KObjectName::NameLengthMax; ++b)
+            std::fprintf(stderr, " %02x", static_cast<unsigned>(nome.m_name[b]));
+        std::fprintf(stderr, "   strncmp(\"sm:\",12)=%d\n",
+                     std::strncmp(nome.m_name.data(), "sm:", Kernel::KObjectName::NameLengthMax));
+        ++n;
+    }
+    std::fprintf(stderr, "[ipc]   %d nome(s) registado(s)\n", n);
+}
+
+} // namespace Kernel
+
+
 // O destructor do `Core::System`. Aqui, e não no cabeçalho, porque é o único
 // sítio onde o `Service::ServerManager` está completo.
 //
@@ -178,7 +239,21 @@ const ::Service::SM::ServiceManager& ::Core::System::ServiceManager() const {
 
 void ::Core::System::RunServer(
     std::unique_ptr<Service::ServerManager>&& server_manager) {
-    servidor_ = std::move(server_manager);
+    server_manager->EnableSynchronousMode();
+    servidores_.push_back(std::move(server_manager));
+}
+
+auto ::Core::System::ProcessPendingSynchronously() -> ::Result {
+    bool progresso = false;
+    for (const auto& servidor : servidores_) {
+        const Result resultado = servidor->ProcessPendingSynchronously();
+        if (resultado == Kernel::ResultNotFound)
+            continue;
+        if (R_FAILED(resultado))
+            return resultado;
+        progresso = true;
+    }
+    return progresso ? ResultSuccess : Kernel::ResultNotFound;
 }
 
 void Kernel::KThreadQueueWithoutEndWait::EndWait(KernelCore&, KThread*, Result) {}
@@ -353,6 +428,50 @@ EdenSystem::EdenSystem(GuestMemory& memoria, std::uint64_t pid, std::uint64_t ti
     limites_ = std::make_unique<Kernel::KResourceLimit>(*kernel_);
     limites_->Initialize();
 
+    // ── os limites de recurso ─────────────────────────────────────────────
+    //
+    // Sem isto, **nenhuma** reserva é satisfeita. E a leitura do Eden é
+    // `k_resource_limit.cpp:100-104`:
+    //
+    //     if (m_current_hints[index] >= m_limit_values[index]) {
+    //         return false;
+    //     }
+    //
+    // Com os limites todos a zero — o valor por omissão de um `KResourceLimit`
+    // recém-construído — a comparação é `0 >= 0` e a reserva falha à entrada.
+    //
+    // Foi isto que fez `ConnectToNamedPort("sm:")` devolver
+    // `0x10801` = `ResultLimitReached`: o `KClientPort::CreateSession` reserva
+    // uma sessão, e a reserva falhava. O sintoma parecia o do registo de nomes,
+    // porque a minha mensagem de telemetria dizia «não encontrou a porta» para
+    // os três casos — e estava errada.
+    //
+    // Os números são os do Eden (`k_resource_limit.cpp:168-174`), que são os
+    // do sistema e não os do processo — o Eden diz isso no comentário, e não
+    // tem limites por serviço. A memória física é a nossa reserva, que é a
+    // única que existe.
+    //
+    // **Falha aqui é falha a sério.** O Eden faz `ASSERT(...IsSuccess())`. Nós
+    // não GuestsAssertamos: se um limite não couber, o `EdenSystem` não deve
+    // nascer, e o despachante fica com o caminho antigo — que é o que
+    // `attach_eden` devolve ao falhar.
+    struct Limite {
+        Kernel::LimitableResource recurso;
+        std::uint64_t valor;
+    };
+    const Limite limites[] = {
+        {Kernel::LimitableResource::PhysicalMemoryMax, memoria_.size()},
+        {Kernel::LimitableResource::ThreadCountMax, 800},
+        {Kernel::LimitableResource::EventCountMax, 900},
+        {Kernel::LimitableResource::TransferMemoryCountMax, 200},
+        {Kernel::LimitableResource::SessionCountMax, 1133},
+    };
+    for (const auto& l : limites) {
+        if (R_FAILED(limites_->SetLimitValue(l.recurso, static_cast<std::int64_t>(l.valor)))) {
+            throw std::runtime_error("EdenSystem: limite de recurso nao aceite");
+        }
+    }
+
     // 4. O processo e a thread. A thread precisa do processo, e o processo
     //    precisa da tabela e dos limites — por isso esta ordem.
     processo_ = std::make_unique<Kernel::KProcess>(*kernel_, *handles_, *limites_, pid_, memoria_);
@@ -361,6 +480,17 @@ EdenSystem::EdenSystem(GuestMemory& memoria, std::uint64_t pid, std::uint64_t ti
 
     // O `Bridge` é o "current" que o Eden guarda dentro do `KernelCore::Impl`.
     Kernel::Bridge::instalar(processo_.get(), thread_.get());
+
+    // A thread principal na tabela de handles do Eden.
+    //
+    // É o mesmo handle que o Eden passa no x1 do entry point, e é o que o
+    // SDK da Nintendo usa para saber qual é a sua thread. Ver a nota em
+    // `eden_bridge.hpp`.
+    {
+        Kernel::Handle handle{};
+        if (R_SUCCEEDED(handles_->Add(*kernel_, &handle, thread_.get())))
+            main_thread_handle_ = static_cast<std::uint32_t>(handle);
+    }
 
     // 5. O `sm:` a sério. `LoopProcess` cria o `ServerManager`, regista a porta
     //    "sm:" e chama-nos `RunServer` — que fica com a posse sem correr nada.
@@ -387,6 +517,28 @@ EdenSystem::EdenSystem(GuestMemory& memoria, std::uint64_t pid, std::uint64_t ti
     //    porta "sm:" e chama `RunServer`, que fica com a posse sem correr
     //    nada. Ver a nota em `system_ref.h`.
     Service::SM::LoopProcess(*this);
+
+    // `lm:` é o primeiro serviço que este programa pede depois de
+    // `sm:Initialize`. O Eden inicia-o num ServerManager próprio
+    // (`core/hle/service/lm/lm.cpp:360-364`); o Core::System guarda esse
+    // segundo manager para o dispatch síncrono.
+    Service::LM::LoopProcess(*this);
+
+    // A verificacao que esteve aqui -- `KObjectName::Find("sm:")` -- **partiu
+    // o jogo**.
+    //
+    // `Find` devolve um `KScopedAutoObject`, e sair de作用域 chama `Close()`
+    // no `KClientPort`. Se esse `Close` destruir a porta -- e no nosso motor
+    // pode, porque o `KPort` do `ServerManager` é o único dono e a contagem de
+    // referências vive no `KAutoObject` do Eden -- então a porta desaparece do
+    // registo entre o arranque e o primeiro `ConnectToNamedPort`.
+    //
+    // Medido: com a verificação, `Find` achava a porta no fim do construtor e
+    // devolvia vazio no primeiro pedido. Sem ela, o jogo continua.
+    //
+    // Um instrumento que muda aquilo que mede não é um instrumento: é uma
+    // alteração com comentários. Por isso a verificação fica escrita e não
+    // executada.
 }
 
 EdenSystem::~EdenSystem() {
@@ -403,12 +555,14 @@ EdenSystem::~EdenSystem() {
     kernel_.reset();
 }
 
-void EdenSystem::set_tls(std::uint64_t endereco) {
+void EdenSystem::set_tls(std::uint64_t endereco) noexcept {
     tls_ = endereco;
     if (thread_)
         thread_->SetTlsAddress(endereco);
 }
 
+// ── o instrumento ──────────────────────────────────────────────────────────
+//
 // ── os SVCs ────────────────────────────────────────────────────────────────
 
 // `ConnectToNamedPort`, de svc/svc_port.cpp:19-55.
@@ -434,7 +588,22 @@ bool eden_connect_to_named_port(Kernel::KernelCore& kernel, GuestMemory& memoria
     // `last_connect_result`, que a telemetria lê.
     auto& tabela = Kernel::GetCurrentProcess(kernel).GetHandleTable();
 
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr, "[ipc] ConnectToNamedPort nome=\"%s\" (%zu bytes)\n",
+                     nome.data(), nome_guest.size());
+        Kernel::KObjectName::DumpNames(kernel);
+    }
+
     auto porta = Kernel::KObjectName::Find<Kernel::KClientPort>(kernel, nome.data());
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr, "[ipc]   Find<KClientPort> devolveu %p (IsNull=%d)\n",
+                     static_cast<const void*>(porta.GetPointerUnsafe()),
+                     static_cast<int>(porta.IsNull()));
+        auto cru = Kernel::KObjectName::Find(kernel, nome.data());
+        std::fprintf(stderr, "[ipc]   Find<KAutoObject> devolveu %p (IsNull=%d)\n",
+                     static_cast<const void*>(cru.GetPointerUnsafe()),
+                     static_cast<int>(cru.IsNull()));
+    }
     if (porta.IsNull()) {
         // O Eden: `R_UNLESS(port.IsNotNull(), ResultNotFound)`.
         if (out_handle)
@@ -443,22 +612,41 @@ bool eden_connect_to_named_port(Kernel::KernelCore& kernel, GuestMemory& memoria
     }
 
     Kernel::Handle handle{};
-    if (R_FAILED(tabela.Reserve(kernel, &handle))) {
+    const auto r_reserva = tabela.Reserve(kernel, &handle);
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr, "[ipc]   Reserve(handle) = %s\n",
+                     R_SUCCEEDED(r_reserva) ? "ok" : "FALHOU");
+    }
+    if (R_FAILED(r_reserva)) {
         if (out_handle)
             *out_handle = 0;
         return false;
     }
-    SCOPE_EXIT {
-        // Se falhar a seguir, o handle reservado tem de sair. Sem isto, um
-        // `CreateSession` falhado deixa um handle holeso na tabela, e o
-        // guest nunca mais o devolve — um vazamento que só aparece muito mais
-        // tarde, quando a tabela enche.
+    // **SCOPE_GUARD**, nao SCOPE_EXIT.
+    //
+    // A primeira versao usava `SCOPE_EXIT` e nunca o cancelava depois do
+    // `Register`. Consequencia medida: o trace dizia `handle devolvido =
+    // 0x81ff`, mas no primeiro `SendSyncRequest` a tabela tinha
+    // `GetCount() == 0` e `GetObject` devolvia nullptr. O `SCOPE_EXIT` estava
+    // a fazer exactamente o que lhe pedi — libertar o handle no fim — e o fim
+    // era o sucesso.
+    //
+    // O handle só deve sair se a reserva ou o CreateSession falharem. Em caso
+    // de sucesso, `Register` ocupa o slot e o guard é cancelado logo a seguir.
+    auto unreserve_handle = SCOPE_GUARD {
         if (handle != Kernel::Svc::InvalidHandle)
             tabela.Unreserve(kernel, handle);
     };
 
     Kernel::KClientSession* sessao = nullptr;
-    if (R_FAILED(porta->CreateSession(kernel, &sessao))) {
+    const auto r_sessao = porta->CreateSession(kernel, &sessao);
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr, "[ipc]   CreateSession = %s  valor=0x%x  (sessao=%p)\n",
+                     R_SUCCEEDED(r_sessao) ? "ok" : "FALHOU",
+                     static_cast<unsigned>(r_sessao.raw),
+                     static_cast<const void*>(sessao));
+    }
+    if (R_FAILED(r_sessao)) {
         if (out_handle)
             *out_handle = 0;
         return false;
@@ -469,9 +657,20 @@ bool eden_connect_to_named_port(Kernel::KernelCore& kernel, GuestMemory& memoria
     // certos — `raw != 0` E `linear_id != 0` — e um handle reservado mas não
     // registado tem `raw` com a geração a zero, ou seja, inválido.
     tabela.Register(kernel, handle, sessao);
+    // O slot agora pertence à tabela; a limpeza de falha já não se aplica.
+    unreserve_handle.Cancel();
 
     // O Eden fecha a referência extra que o `CreateSession` deu.
     sessao->Close(kernel);
+
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr, "[ipc]   handle devolvido = 0x%x  (indice=%u, geracao=%u)\n",
+                     static_cast<unsigned>(handle),
+                     static_cast<unsigned>(static_cast<std::uint32_t>(handle) & 0x7FFF),
+                     static_cast<unsigned>(static_cast<std::uint32_t>(handle) >> 15));
+        std::fprintf(stderr, "[ipc]   entradas da tabela = %zu (max %zu, size %zu)\n",
+                     tabela.GetCount(), tabela.GetMaxCount(), tabela.GetTableSize());
+    }
 
     if (out_handle)
         *out_handle = static_cast<std::uint32_t>(handle);
@@ -493,8 +692,24 @@ bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_ha
 
     Kernel::KScopedAutoObject<Kernel::KClientSession> sessao =
         tabela.GetObject<Kernel::KClientSession>(kernel, Kernel::Handle{session_handle});
-    if (sessao.IsNull())
+    if (sessao.IsNull()) {
+        if (std::getenv("IA_IPC_TRACE") != nullptr) {
+            // Diagnóstico sem possuir a sessão: a tabela abre e fecha referências
+            // temporárias e os dois pointers abaixo são só impressos. Não
+            // retém o objecto, nem altera o handle que se está a medir.
+            auto raw = tabela.GetObject<Kernel::KAutoObject>(
+                kernel, Kernel::Handle{session_handle});
+            std::fprintf(stderr,
+                         "[ipc] SendSyncRequest handle=0x%x count=%zu size=%zu raw=%p typed=null\n",
+                         session_handle, tabela.GetCount(), tabela.GetTableSize(),
+                         static_cast<const void*>(raw.GetPointerUnsafe()));
+        }
         return false;
+    }
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr, "[ipc] SendSyncRequest handle=0x%x typed=%p\n",
+                     session_handle, static_cast<const void*>(sessao.GetPointerUnsafe()));
+    }
 
     // A referência ao pai: o pai tem de sobreviver ao pedido. Sem este
     // `KScopedAutoObject` a sessão pode ser destruída a meio e o pedido
@@ -503,7 +718,14 @@ bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_ha
     if (pai.IsNull())
         return false;
 
-    return R_SUCCEEDED(sessao->SendSyncRequest(kernel, 0, 0));
+    if (R_FAILED(sessao->SendSyncRequest(kernel, 0, 0)))
+        return false;
+
+    // `KClientSession::SendSyncRequest` enfileirou o pedido. No Eden uma
+    // thread do ServerManager acordaria, receberia e responderia; aqui não há
+    // thread host, portanto fazemos exactamente essas duas fases agora, no
+    // fluxo síncrono do guest.
+    return R_SUCCEEDED(kernel.System().ProcessPendingSynchronously());
 }
 
 } // namespace ia

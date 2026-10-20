@@ -164,6 +164,24 @@ public:
     }
     u8* GetPointerSilent(Common::ProcessAddress vaddr) { return GetPointer(vaddr); }
 
+    // A base e o tamanho da reserva.
+    //
+    // Usados pela `KPageTableBase` da ponte (`k_page_table_bridge.h`) para
+    // saber se um bloco pedido cabe inteiro. É a **única** verificação de
+    // limites que resta, porque não há páginas nem estado de páginas — e é a
+    // que substitui a verificação de permissões que o Eden faz antes de cada
+    // cópia.
+    std::uint64_t base() const noexcept { return memoria_.base(); }
+    std::uint64_t size_bytes() const noexcept { return memoria_.size(); }
+
+    // O ponteiro do host para um endereço do guest, se o bloco inteiro couber.
+    // Devolve `nullptr` quando não couber — que é o mesmo contrato de
+    // `GetPointer`, e é o que permite a `KPageTableBase` decidir entre
+    // `memcpy` e `ResultInvalidAddress`.
+    std::uint8_t* host_pointer(std::uint64_t endereco, std::uint64_t size) const noexcept {
+        return memoria_.host_pointer(endereco, size);
+    }
+
     template <typename T>
     T* GetPointer(Common::ProcessAddress vaddr) {
         return reinterpret_cast<T*>(GetPointer(vaddr));

@@ -81,11 +81,35 @@
  * guest vai ler quando fizer `ret`.
  */
 
-/* void ia_call_guest(void (*code)(), unsigned long sp, unsigned long platform_reg)
+/* void ia_call_guest(void (*code)(), unsigned long sp, unsigned long platform_reg,
+ *                    unsigned long guest_x1)
  *
  * x0 = endereço de entrada do guest
  * x1 = valor para sp (topo da stack do guest)
  * x2 = valor para x18 (platform register = stack canary do guest)
+ * x3 = valor para x1 do guest (o handle da thread principal)
+ *
+ * ---------------------------------------------------------------------------
+ * O x1 DO GUEST
+ * ---------------------------------------------------------------------------
+ * O Eden passa o handle da thread principal no x1 do entry point
+ * (`k_process.cpp:1006-1010`):
+ *
+ *     } else {                                  // entrada NSO, sem ABI homebrew
+ *         main_thread->GetContext().r[0] = 0;
+ *         main_thread->GetContext().r[1] = thread_handle;
+ *     }
+ *
+ * E o SDK da Nintendo depende disso: o crt0 dele copia o handle para
+ * `nn::os::detail::g_OsBootParamter`, e o `SdkMutexType::TryLock` compara o
+ * dono do mutex com esse valor.
+ *
+ * Sem isto, o handle chegava a zero — e zero é **exactamente** o valor que um
+ * mutex livre tem no campo "dono". O SDK comparava 0 com 0, concluía que o
+ * mutex já era seu, e abortava com `this == NULL`.
+ *
+ * A medição que levou aqui: o `g_OsBootParamter` do SDK estava todo a zeros, e
+ * o dono do mutex também.
  */
 .section .text.ia_call_guest, "ax", %progbits
 .global ia_call_guest
@@ -101,10 +125,24 @@ ia_call_guest:
      * Layout, do topo para baixo:
      *   sp + 0   endereço de entrada (para o trampoline recuperar)
      *   sp + 16  endereço de retorno de segurança (para o guest)
+     *   sp + 32  handle da thread principal (nosso; lido antes do salto)
+     *
+     * A terceira palavra é a novidade: o handle do x1 do guest.
+     *
+     * **Não pode ir num registo.** A primeira versão punha-o em x16
+     * (`mov x16, x3`) e o loop de limpeza a seguir apagava-o — o x1 do guest
+     * chegava ao rtld a zero, e o SDK abortava. A medição: o
+     * `nn::os::detail::g_OsBootParamter` do SDK ficava a zeros e o dono do
+     * mutex também, e o `SdkMutexType::TryLock` comparava zero com zero.
+     *
+     * E **não muda o sp do guest**: a reserva passa a 48 bytes e o `add sp`
+     * final passa a 32, o que dá o mesmo `stack_top - 16` de antes. A palavra
+     * do handle fica ACIMA do sp do guest, numa zona que o entry não usa.
      */
-    sub     x1, x1, #32
+    sub     x1, x1, #48
     str     x0, [x1]          /* entrada */
     str     x4, [x1, #16]      /* retorno de segurança */
+    str     x3, [x1, #32]      /* handle da thread principal */
     mov     sp, x1
 
     mov     x18, x2            /* platform register: stack canary do guest */
@@ -161,8 +199,9 @@ ia_call_guest:
      * destino durante o cleaning.
      */
     mov     x0,  xzr          /* o argumento: 0 */
-    ldr     x17, [sp]         /* endereço de entrada */
-    add     sp,  sp, #16      /* sp do guest fica 16 bytes acima */
+    add     sp,  sp, #32      /* sp do guest fica 32 bytes acima */
+    ldr     x1,  [sp]         /* o handle da thread principal (ver o cabecalho) */
+    ldr     x17, [sp, #-32]   /* endereço de entrada ([sp-32], nao [sp-16]) */
     br      x17
 .size ia_call_guest, . - ia_call_guest
 

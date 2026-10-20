@@ -33,6 +33,21 @@ public:
 
     static KScopedAutoObject<KAutoObject> Find(KernelCore& kernel, const char* name);
 
+    // ── INSTRUMENTO ───────────────────────────────────────────────────────
+    //
+    // Lista os nomes registados e o objecto a que cada um aponta, **sem abrir
+    // nada**. A distinção é o que importa: `Find` devolve um
+    // `KScopedAutoObject`, e sair de âmbito chama `Close()` no objecto — o
+    // que destrói a porta se o `KServerManager` for o único dono. Um
+    // instrumento que abre aquilo que mede deixa de servir para medir.
+    //
+    // Só é chamado quando `IA_IPC_TRACE` está no ambiente.
+    static void DumpNames(KernelCore& kernel);
+
+    // Para a implementação do instrumento, que precisa de `m_name` e
+    // `m_object`. É uma excepção única e nomeada, e não um `#define friend`.
+    friend void DumpNames(KernelCore& kernel);
+
     template <typename Derived>
     static Result Delete(KernelCore& kernel, const char* name) {
         // Find the object.

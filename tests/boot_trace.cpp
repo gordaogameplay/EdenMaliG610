@@ -706,9 +706,194 @@ int main(int argc, char** argv) {
     std::printf("  entry do rtld : 0x%llx\n", (unsigned long long)entry);
     std::printf("  sp            : 0x%llx\n\n", (unsigned long long)sp);
 
+    // ── onde o rtld le o handle ────────────────────────────────────────────
+    //
+    // `IA_FIND_TLS=0x110` procura, no `.text` do `rtld`, os pares
+    // `mrs xN, tpidr_el0` seguidos de um `ldr` com o offset pedido.
+    //
+    // É a pergunta que decide o resto: o rtld é o que constrói os parâmetros
+    // de arranque que o crt0 do SDK consome, e o único canal que o kernel
+    // lhe dá é a ThreadLocalRegion.
+    if (const char* tls_alvo = std::getenv("IA_FIND_TLS")) {
+        const auto want = std::strtoull(tls_alvo, nullptr, 0);
+        std::printf("\n[varrimento] procuram-se mrs tpidr_el0 + ldr #%#llx\n",
+                    static_cast<unsigned long long>(want));
+        for (const auto& module : prog.modules()) {
+            const auto& img = module.nso.image;
+            const std::size_t ini = module.nso.seg_offset[0];
+            const std::size_t tam = static_cast<std::size_t>(module.nso.segments[0].size);
+            if (tam == 0 || ini + tam > img.size())
+                continue;
+            for (std::size_t i = 0; i + 8 <= tam; i += 4) {
+                std::uint32_t w;
+                std::memcpy(&w, img.data() + ini + i, 4);
+                // MRS Xt, TPIDR_EL0 = 0xD53BD040 | Rt
+                if ((w & 0xFFFFE0FFu) != 0xD53BD040u)
+                    continue;
+                // Procura um LDR (32 ou 64 bits) com o offset pedido nas 6
+                // instrucoes seguintes.
+                for (std::size_t k = 4; k <= 24 && i + k + 4 <= tam; k += 4) {
+                    std::uint32_t w2;
+                    std::memcpy(&w2, img.data() + ini + i + k, 4);
+                    std::size_t off = 0;
+                    bool casa = false;
+                    if ((w2 & 0xFFC00000u) == 0xB9400000u) {
+                        off = static_cast<std::size_t>(((w2 >> 10) & 0xFFF) * 4);
+                        casa = true;
+                    } else if ((w2 & 0xFFC00000u) == 0xF9400000u) {
+                        off = static_cast<std::size_t>((w2 >> 10) & 0xFFF);
+                        casa = true;
+                    }
+                    if (!casa || off != want)
+                        continue;
+                    const std::uint64_t pc = module.vaddr_base +
+                                             module.nso.segments[0].vaddr + i;
+                    std::printf("[varrimento] %s: mrs tpidr_el0 em 0x%llx, ldr #%#llx em +%zu\n",
+                                module.name(), static_cast<unsigned long long>(pc),
+                                static_cast<unsigned long long>(want), k);
+                }
+            }
+        }
+    }
+
+    // ── qualquer ldr com um offset ─────────────────────────────────────────
+    //
+    // `IA_FIND_LDR=0x110` lista todos os `ldr` com esse offset em cada
+    // modulo. E o complemento do scan anterior, que exigia um `mrs tpidr_el0`
+    // imediatamente antes — pressuposicao que o codigo pode nao cumprir (o
+    // registo pode vir de outro sitio, ou o offset pode estar num `ldp`).
+    if (const char* ldr_alvo = std::getenv("IA_FIND_LDR")) {
+        const auto want = std::strtoull(ldr_alvo, nullptr, 0);
+        std::printf("\n[varrimento] procuram-se ldr #%#llx\n",
+                    static_cast<unsigned long long>(want));
+        for (const auto& module : prog.modules()) {
+            const auto& img = module.nso.image;
+            const std::size_t ini = module.nso.seg_offset[0];
+            const std::size_t tam = static_cast<std::size_t>(module.nso.segments[0].size);
+            if (tam == 0 || ini + tam > img.size())
+                continue;
+            int n = 0;
+            for (std::size_t i = 0; i + 4 <= tam && n < 12; i += 4) {
+                std::uint32_t w;
+                std::memcpy(&w, img.data() + ini + i, 4);
+                std::size_t off = 0;
+                bool casa = false;
+                if ((w & 0xFFC00000u) == 0xB9400000u) {
+                    off = static_cast<std::size_t>(((w >> 10) & 0xFFF) * 4);
+                    casa = true;
+                } else if ((w & 0xFFC00000u) == 0xF9400000u) {
+                    off = static_cast<std::size_t>((w >> 10) & 0xFFF);
+                    casa = true;
+                }
+                if (!casa || off != want)
+                    continue;
+                const std::uint64_t pc = module.vaddr_base +
+                                         module.nso.segments[0].vaddr + i;
+                std::printf("[varrimento] %s: ldr #%#llx em 0x%llx\n", module.name(),
+                            static_cast<unsigned long long>(want),
+                            static_cast<unsigned long long>(pc));
+                ++n;
+            }
+        }
+    }
+
+    // ── despejar o .text de um modulo ──────────────────────────────────────
+    //
+    // `IA_DUMP_TEXT=rtld` escreve o `.text` do modulo em `/tmp/ia_<nome>.text`,
+    // para desassemblar com o objdump do host. É a forma de trabalhar com
+    // 15 KB de código em vez de 64 bytes de cada vez.
+    if (const char* dump_alvo = std::getenv("IA_DUMP_TEXT")) {
+        for (const auto& module : prog.modules()) {
+            if (dump_alvo[0] != 0 && std::strcmp(dump_alvo, module.name()) != 0)
+                continue;
+            const auto& img = module.nso.image;
+            const std::size_t ini = module.nso.seg_offset[0];
+            const std::size_t tam = static_cast<std::size_t>(module.nso.segments[0].size);
+            if (tam == 0 || ini + tam > img.size())
+                continue;
+            char caminho[128];
+            std::snprintf(caminho, sizeof caminho, "/tmp/ia_%s.text", module.name());
+            std::FILE* f = std::fopen(caminho, "wb");
+            if (f == nullptr)
+                continue;
+            std::fwrite(img.data() + ini, 1, tam, f);
+            std::fclose(f);
+            std::printf("[dump] %s: %zu bytes em %s (base 0x%llx)\n", module.name(), tam,
+                        caminho, static_cast<unsigned long long>(module.vaddr_base +
+                                                             module.nso.segments[0].vaddr));
+        }
+    }
+
+    // ── quem escreve num endereco concreto ──────────────────────────────────
+    //
+    // `IA_FIND_STORE=0x836a1038` procura, no `.text` de cada módulo, o par
+    // ADRP+ADD que forma o endereço pedido, e imprime o código à volta.
+    //
+    // É a alternativa a desassemblar PLTs e a ler entry points: o par
+    // ADRP/ADD é como o AArch64 forma um endereço de 32 bits, e o par é
+    // reconhecível numa passage.
+    if (const char* store_alvo = std::getenv("IA_FIND_STORE")) {
+        const auto alvo = std::strtoull(store_alvo, nullptr, 0);
+        const std::uint64_t pagina = alvo & ~0xFFFull;
+        const std::uint32_t off = static_cast<std::uint32_t>(alvo & 0xFFF);
+        std::printf("\n[varrimento] procuram-se ADRP+ADD para %#llx\n",
+                    static_cast<unsigned long long>(alvo));
+        for (const auto& module : prog.modules()) {
+            const auto& img = module.nso.image;
+            const std::size_t ini = module.nso.seg_offset[0];
+            const std::size_t tam = static_cast<std::size_t>(module.nso.segments[0].size);
+            if (tam == 0 || ini + tam > img.size())
+                continue;
+            for (std::size_t i = 0; i + 8 <= tam; i += 4) {
+                std::uint32_t w;
+                std::memcpy(&w, img.data() + ini + i, 4);
+                // ADRP: 1 immlo 10000 immhi Rd
+                if ((w & 0x9F000000u) != 0x90000000u)
+                    continue;
+                const std::uint64_t pc = module.vaddr_base +
+                                         module.nso.segments[0].vaddr + i;
+                const std::int64_t imm = ((w >> 29) & 3) | (((w >> 5) & 0x7FFFF) << 2);
+                const std::uint64_t pg = (pc & ~0xFFFull) + (static_cast<std::uint64_t>(imm) << 12);
+                if (pg != pagina)
+                    continue;
+                // ADD (immediate): 1 0 0 100010 shift imm12 Rn Rd
+                std::uint32_t w2;
+                std::memcpy(&w2, img.data() + ini + i + 4, 4);
+                if ((w2 & 0xFF800000u) != 0x91000000u)
+                    continue;
+                if ((w2 >> 10) & 0xFFF != off)
+                    continue;
+                std::printf("[varrimento] %s: ADRP+ADD para %#llx em 0x%llx\n",
+                            module.name(), static_cast<unsigned long long>(alvo),
+                            static_cast<unsigned long long>(pc));
+            }
+        }
+    }
+
     // ── 2. despachante ligado ao espaço do guest ──────────────────────────
     g_mem = &prog.memory();
     g_prog = &prog;
+
+    // O entry de cada modulo, lido do cabecalho `MOD0` que abre o segmento de
+    // texto. O `LoadedModule::entry_point` e' a BASE do texto, nao o entry —
+    // e essa distincao custou uma volta.
+    for (const auto& m : prog.modules()) {
+        // O `MOD0` abre o segmento de texto, e e' a primeira coisa da imagem
+        // do modulo (o texto esta no vaddr 0). Le-se da IMAGEM, que esta no
+        // host, e nao da memoria do guest — assim nao se depende de onde o
+        // modulo foi colocado.
+        const auto& img = m.nso.image;
+        if (img.size() < 8 || std::strncmp(reinterpret_cast<const char*>(img.data()), "MOD0", 4) != 0) {
+            std::printf("  entry do %-5s: (sem MOD0)\n", m.name());
+            continue;
+        }
+        std::uint32_t mod0 = 0;
+        std::memcpy(&mod0, img.data() + 4, sizeof mod0);
+        const std::uint64_t texto = m.vaddr_base + m.nso.segments[0].vaddr;
+        std::printf("  entry do %-5s: 0x%llx  (MOD0 em 0x%llx)\n", m.name(),
+                    static_cast<unsigned long long>(texto + mod0),
+                    static_cast<unsigned long long>(texto));
+    }
 
     ia::SvcDispatcher svc(tel);
     svc.bind_memory(&prog.memory());
@@ -726,6 +911,29 @@ int main(int argc, char** argv) {
     if (!prog.modules().empty())
         svc.set_main_thread_priority(prog.modules().front().nso.main_thread_priority);
     svc.set_regions(prog.memory_regions());
+
+    // A região ASLR: onde o código do processo está mapeado.
+    //
+    // No Eden é `process->GetPageTable().GetAliasCodeRegionStart()` e
+    // `GetAliasCodeRegionSize()` (`svc_info.cpp:76-82`), e é o que o SDK da
+    // Nintendo usa para instalar o seu heap e o seu estado. Ver a nota em
+    // `SvcDispatcher::set_aslr_region`.
+    //
+    // A base é a do primeiro módulo (o rtld, em 0x80000000) e o tamanho é a
+    // soma dos textos — o mesmo que o Eden calcula para a região de código.
+    {
+        std::uint64_t base = 0;
+        std::uint64_t fim = 0;
+        for (const auto& m : prog.modules()) {
+            const std::uint64_t ini = m.vaddr_base + m.nso.segments[0].vaddr;
+            const std::uint64_t f = ini + m.nso.segments[0].size;
+            if (base == 0 || ini < base)
+                base = ini;
+            if (f > fim)
+                fim = f;
+        }
+        svc.set_aslr_region(base, fim - base);
+    }
 
     // A tabela que o rtld vai=varrer. Dumpada porque uma região com o
     // `state`/`permission` errados não dá erro nenhum — o rtld simplesmente
@@ -765,6 +973,38 @@ int main(int argc, char** argv) {
 
     // ── 3. motor, com o traçador ligado ───────────────────────────────────
     ia::NativeEngine engine(tel, svc);
+
+    // ── a camada de IPC do Eden ───────────────────────────────────────────
+    //
+    // A partir daqui, `ConnectToNamedPort` e `SendSyncRequest` deixam de ser
+    // nossos: passam a ser o `KObjectName` e o `KClientSession` do Eden, e o
+    // `sm:` é o serviço a sério. Ver `vendor/eden/README.md`.
+    //
+    // **A ORDEM DESTA PARTE IMPORTA**, e foi o que custou a volta final:
+    //
+    //   1. `attach_eden` monta o sistema do Eden e regista a thread principal
+    //      na tabela de handles — é daqui que sai o handle verdadeiro.
+    //   2. `set_eden_tls` escreve esse handle em TLS+0x110, que é onde o Eden
+    //      o põe (`k_process.cpp:1014`).
+    //   3. `set_guest_x1` põe o MESMO handle no x1 do entry point, que é onde
+    //      o Eden o põe (`k_process.cpp:1006-1010`).
+    //
+    // Com o `set_guest_x1` antes do `attach_eden`, o handle era zero — e zero
+    // é o valor de um mutex livre, o que fazia o SDK abortar.
+    if (svc.attach_eden(1, 1)) {
+        std::printf("  IPC do Eden   : ligado (sm: a serio)\n");
+    } else {
+        std::printf("  IPC do Eden   : NAO ligado -- fica o caminho antigo\n");
+    }
+
+    // O bloco de TLS do guest só existe depois de `map_into()`.
+    engine.set_guest_tls(ia::layout::kTlsBase);
+    svc.set_eden_tls(ia::layout::kTlsBase);
+
+    // O x1 do entry point: o handle da thread principal. Ver `ia_call_guest.S`.
+    engine.set_guest_x1(svc.main_thread_handle());
+    std::printf("  handle da thread principal: 0x%x\n", svc.main_thread_handle());
+
     // O bloco de TLS do guest só existe depois de `map_into()`.
     engine.set_guest_tls(ia::layout::kTlsBase);
     // Poucos traps: este tracer é para ver os PRIMEIROS serviços pedidos, e

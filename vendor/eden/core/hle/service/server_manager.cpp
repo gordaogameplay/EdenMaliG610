@@ -99,9 +99,13 @@ ServerManager::~ServerManager() {
     m_stop_source.request_stop();
     m_wakeup_event->Signal(m_system.Kernel());
 
-    // Wait for processing to stop.
-    m_stopped.Wait();
-    m_threads.clear();
+    // Wait for processing to stop only when a host loop was started. In the
+    // native engine RunServer keeps this manager for synchronous dispatch,
+    // and no loop exists to signal m_stopped.
+    if (!m_synchronous_mode) {
+        m_stopped.Wait();
+        m_threads.clear();
+    }
 
     // Clean up ports.
     auto port_it = m_servers.begin();
@@ -329,6 +333,64 @@ Result ServerManager::LoopProcessImpl() {
     }
 
     R_SUCCEED();
+}
+
+Result ServerManager::ProcessPendingSynchronously() {
+    auto& kernel = m_system.Kernel();
+
+    // Um pedido inicial faz dois eventos distintos:
+    //
+    //   1. o KServerPort tem a sessão nova na fila;
+    //   2. depois de aceitar a sessão, o KServerSession tem o pedido na fila.
+    //
+    // O loop host do Eden acorda duas vezes. Este pump tem de percorrer ambos
+    // antes de devolver; sair depois do passo 1 deixava o cliente sem resposta
+    // e fazia o guest abortar no assert seguinte.
+    bool fez_progresso = false;
+    for (;;) {
+        bool fez_um_evento = false;
+
+        // Uma ligação recém-criada fica na fila do KServerPort até ser aceite.
+        for (auto& server : m_servers) {
+            auto* port = static_cast<Kernel::KServerPort*>(server.GetNativeHandle());
+            if (!port->IsSignaled(kernel))
+                continue;
+
+            // O loop normal faz isto em `WaitSignaled()` antes de chamar
+            // `Process()`. Sem o unlink, `OnPortEvent` volta a chamar
+            // `LinkToDeferredList(server)` e MultiWaitHolder aborta por já
+            // estar ligado.
+            server.UnlinkFromMultiWait();
+            R_TRY(this->OnPortEvent(std::addressof(server)));
+            fez_progresso = fez_um_evento = true;
+            break;
+        }
+        if (fez_um_evento)
+            continue;
+
+        // Depois da sessão ser registada, o pedido enfileirado pelo
+        // KServerSession::OnRequest torna-a sinalizada. A mesma rotina
+        // ReceiveRequestHLE -> CompleteSyncRequest -> SendReplyHLE atende CMIF.
+        for (auto& session : m_sessions) {
+            auto* server_session =
+                static_cast<Kernel::KServerSession*>(session.GetNativeHandle());
+            if (!server_session->IsSignaled(kernel))
+                continue;
+
+            // Idem ao caminho normal: WaitSignaled desvincula o holder antes
+            // de OnSessionEvent/CompleteSyncRequest o voltar a ligar.
+            session.UnlinkFromMultiWait();
+            R_TRY(this->OnSessionEvent(std::addressof(session)));
+            fez_progresso = fez_um_evento = true;
+            break;
+        }
+        if (fez_um_evento)
+            continue;
+
+        if (fez_progresso)
+            R_SUCCEED();
+        R_THROW(Kernel::ResultNotFound);
+    }
 }
 
 Result ServerManager::OnPortEvent(Port* server) {

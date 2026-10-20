@@ -2,109 +2,152 @@
 # -*- coding: utf-8 -*-
 """Mede o fecho de headers vendorizado e diz o que é peso morto.
 
-Porquê: o `tools/vendorizar.py` copia um `.cpp` e segue os `#include` dele.
+Porquê existe: o `vendorizar.py` copia um `.cpp` e segue os `#include` dele.
 Isso garante que nada falta, mas nada garante que não **sobe**. Na primeira
-vez que o corremos, ele brought `k_page_table_base.h`, `k_scheduler.h` e
-afins — o emulador, em forma de cabeçalho, que nunca chega a ser compilado
-mas fica no repositório e no `README.md` a dizer que está lá.
+vez que o corremos ele trouxe `k_page_table_base.h`, `k_scheduler.h` e afins —
+o emulador, em forma de cabeçalho, que nunca chega a ser compilado mas fica
+no repositório e no `README.md` a dizer que está lá.
 
 A regra que este script impõe é a mesma do projecto: **não excluir uma
-hipótese sem a testar**. Um header é removível se, e só se, nenhuma das fontes
-que compilamos o alcança. Isso é uma medida, não uma opinião.
+hipótese sem a testar**. Um header é removível se, e só se, **nenhuma fonte
+que o build realmente compila** o alcança.
+
+## O defeito que esta versão corrige
+
+A primeira versão media a partir de uma lista de raízes escrita à mão: os
+`.cpp` de `kernel/` e de `service/`, mais a ponte. **Não** incluía os `.cpp`
+que estão na lista do build, e por isso apanhou `common/assert.cpp` como
+órfão e apagou-o — e o build parou a ligar com `undefined reference to
+AssertFailSoftImpl`.
+
+Um podador que mede a partir de outra lista **apaga o que a build precisa**,
+e pior: apaga-o com a confiança de quem fez a medição. Por isso as raízes
+agora são lidas do `CMakeLists.txt` — a mesma lista, palavra por palavra. Se
+tiver de ser mudada à mão, é porque alguém mudou o build à mão, e o podador
+vê.
 
 Uso:
-    vendorizar.py --alcancavel     # imprime a lista do que compila
-    vendorizar.py --podar          # apaga o que nao e' alcancavel
+    podar_vendor.py              imprime o que é removível
+    podar_vendor.py --podar      apaga
+    podar_vendor.py --raiz X     acrescenta uma raiz extra (para testes)
 """
 import os
 import re
-import subprocess
 import sys
 
 ROOT = os.path.expanduser("~/EdenMaliIA")
 VENDOR = os.path.join(ROOT, "vendor", "eden")
-
 INC_RE = re.compile(r'^\s*#\s*include\s+"([^"]+)"')
 
 
-def incluir_de(ficheiro, visitados, raizes_extra):
-    """Segue os includes de `ficheiro`, em profundidade, e devolve o alcançado."""
-    if ficheiro in visitados or not os.path.exists(ficheiro):
-        return visitados
-    visitados.add(ficheiro)
-    with open(ficheiro, encoding="utf-8", errors="replace") as f:
-        for linha in f:
-            m = INC_RE.match(linha)
-            if not m:
-                continue
-            alvo = m.group(1)
-            if alvo.startswith("vendor/eden/"):
-                incluir_de(os.path.join(ROOT, alvo), visitados, raizes_extra)
-            elif alvo.startswith(".."):
-                seguir = os.path.normpath(os.path.join(os.path.dirname(ficheiro), alvo))
-                incluir_de(seguir, visitados, raizes_extra)
-            else:
-                for r in raizes_extra:
-                    cand = os.path.join(r, alvo)
-                    if os.path.exists(cand):
-                        incluir_de(cand, visitados, raizes_extra)
-                        break
-    return visitados
+def lista_do_build():
+    """As fontes vendorizadas que o build compila, lidas do CMakeLists.
+
+    Ler a lista em vez de a reescrever aqui é o ponto inteiro: as duas listas
+    não podem divergir, porque não há duas — há uma, escrita num sítio, e este
+    script lê-a.
+    """
+    p = os.path.join(ROOT, "CMakeLists.txt")
+    if not os.path.exists(p):
+        return []
+    with open(p, encoding="utf-8") as f:
+        texto = f.read()
+    m = re.search(r"set\(IA_EDEN_SOURCES\n(.*?)\n\)", texto, re.S)
+    if not m:
+        return []
+    return [ln.strip() for ln in m.group(1).split("\n")
+            if ln.strip().endswith(".cpp")]
 
 
 def raizes_de_include():
     return [ROOT, os.path.join(ROOT, "include"), os.path.join(ROOT, "vendor", "third_party")]
 
 
-def alcancaveis():
-    """As fontes que realmente compilam, e tudo o que elas alcançam."""
+def incluir_de(fich, visitados, raizes):
+    """Segue os includes de `fich`, em profundidade."""
+    if fich in visitados or not os.path.exists(fich):
+        return
+    visitados.add(fich)
+    try:
+        with open(fich, encoding="utf-8", errors="replace") as f:
+            linhas = f.readlines()
+    except OSError:
+        return
+    for linha in linhas:
+        m = INC_RE.match(linha)
+        if not m:
+            continue
+        alvo = m.group(1)
+        if alvo.startswith("vendor/eden/"):
+            incluir_de(os.path.join(ROOT, alvo), visitados, raizes)
+        elif alvo.startswith(".."):
+            seguir = os.path.normpath(os.path.join(os.path.dirname(fich), alvo))
+            incluir_de(seguir, visitados, raizes)
+        else:
+            for r in raizes:
+                cand = os.path.join(r, alvo)
+                if os.path.exists(cand):
+                    incluir_de(cand, visitados, raizes)
+                    break
+
+
+def alcancaveis(extra=()):
     raizes = raizes_de_include()
     visitados = set()
 
-    # As fontes do nosso motor que tocam no Eden.
-    for rel in ("src/eden_bridge.cpp",
-                "vendor/eden/core/hle/kernel/k_kernel_core_bridge.h",
-                "vendor/eden/core/hle/kernel/k_process_bridge.h",
-                "vendor/eden/core/system_ref.h"):
+    # 1) Tudo o que o build compila de fora do vendor: as nossas fontes, que
+    #    incluem as cabeçalhos da ponte.
+    for rel in ("src/eden_bridge.cpp", "src/eden_log.cpp",
+                "src/eden_synchronization_object.cpp",
+                "include/ia/eden_bridge.hpp", "include/ia/svc_dispatcher.hpp",
+                "include/ia/ipc_min.hpp") + tuple(extra):
         p = os.path.join(ROOT, rel)
         if os.path.exists(p):
             incluir_de(p, visitados, raizes)
 
-    for p in sorted(os.listdir(os.path.join(VENDOR, "core/hle/kernel"))):
-        if p.endswith(".cpp"):
-            incluir_de(os.path.join(VENDOR, "core/hle/kernel", p), visitados, raizes)
-    for sub in ("core/hle/service", "core/hle/service/sm"):
-        d = os.path.join(VENDOR, sub)
-        if os.path.isdir(d):
-            for p in sorted(os.listdir(d)):
-                if p.endswith(".cpp"):
-                    incluir_de(os.path.join(d, p), visitados, raizes)
+    # 2) A lista do build, lida do CMakeLists.
+    for rel in lista_do_build():
+        incluir_de(os.path.join(ROOT, rel), visitados, raizes)
+
+    # 3) As quatro peças da ponte, mesmo que nenhuma fonte as inclua ainda.
+    for rel in ("vendor/eden/core/system_ref.h",
+                "vendor/eden/core/memory_bridge.h",
+                "vendor/eden/core/hle/kernel/k_kernel_core_bridge.h",
+                "vendor/eden/core/hle/kernel/k_process_bridge.h"):
+        incluir_de(os.path.join(ROOT, rel), visitados, raizes)
     return visitados
 
 
-def main():
-    alc = alcancaveis()
-    todos = set()
+def todos():
+    out = set()
     for dirpath, _, files in os.walk(VENDOR):
         for p in files:
             if p.endswith((".h", ".cpp")):
-                todos.add(os.path.join(dirpath, p))
+                out.add(os.path.join(dirpath, p))
+    return out
 
-    orfaos = sorted(todos - alc)
+
+def main():
+    extra = []
+    if "--raiz" in sys.argv:
+        i = sys.argv.index("--raiz")
+        extra = tuple(sys.argv[i + 1:])
+    alc = alcancaveis(extra)
+    orfaos = sorted(todos() - alc)
     rel = lambda p: os.path.relpath(p, ROOT)
 
     if "--podar" in sys.argv:
         for p in orfaos:
             os.remove(p)
-        # directorios vazios, de baixo para cima
         for dirpath, _, _ in sorted(os.walk(VENDOR), reverse=True):
             if not os.listdir(dirpath) and dirpath != VENDOR:
                 os.rmdir(dirpath)
-        print("Podados: %d ficheiros" % len(orfaos))
+        print("Podados: %d ficheiros, de %d alcancados" % (len(orfaos), len(alc)))
         for p in orfaos:
             print("  - %s" % rel(p))
         return 0
 
+    print("Raizes: %d .cpp da lista do build + as nossas fontes" % len(lista_do_build()))
     print("Alcancados: %d" % len(alc))
     print("Orfaos:     %d\n" % len(orfaos))
     linhas = 0

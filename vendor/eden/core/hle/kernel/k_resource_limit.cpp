@@ -6,7 +6,7 @@
 
 #include "vendor/eden/common/assert.h"
 #include "vendor/eden/common/overflow.h"
-#include "vendor/eden/core/core.h"
+#include "vendor/eden/core/system_ref.h"  // PONTE: substitui core/core.h
 #include "vendor/eden/core/core_timing.h"
 #include "vendor/eden/core/hle/kernel/k_hardware_timer.h"
 #include "vendor/eden/core/hle/kernel/k_resource_limit.h"

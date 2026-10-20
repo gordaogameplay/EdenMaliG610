@@ -12,7 +12,7 @@
 
 #include "vendor/eden/core/hle/kernel/k_auto_object.h"
 #include "vendor/eden/core/hle/kernel/k_event.h"
-#include "vendor/eden/core/hle/kernel/k_memory_block.h"
+#include "vendor/eden/core/hle/kernel/k_page_table_bridge.h"  // PONTE: os enums de memoria
 #include "vendor/eden/core/hle/kernel/k_process_bridge.h"  // PONTE: ver README
 #include "vendor/eden/core/hle/kernel/k_process_bridge.h"  // PONTE: ver README
 #include "vendor/eden/core/hle/kernel/slab_helpers.h"

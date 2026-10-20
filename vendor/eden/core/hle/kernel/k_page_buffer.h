@@ -6,7 +6,7 @@
 #include <array>
 
 #include "vendor/eden/common/common_types.h"
-#include "vendor/eden/core/hle/kernel/memory_types.h"
+#include "vendor/eden/core/hle/kernel/k_process_bridge.h"  // PONTE: PageBits e PageSize estao na ponte
 #include "vendor/eden/core/hle/kernel/slab_helpers.h"
 
 namespace Kernel {

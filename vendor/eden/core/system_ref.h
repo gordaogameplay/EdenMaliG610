@@ -79,7 +79,7 @@ public:
 
     // Declarado aqui, definido em `src/eden_bridge.cpp`.
     //
-    // O membro `servidor_` é um `unique_ptr<Service::ServerManager>` e o tipo
+    // Os membros `servidores_` são `unique_ptr<Service::ServerManager>` e o tipo
     // só está declarado à frente — que é o que permite a este cabeçalho não
     // puxar `server_manager.h`. O preço é que o destructor implícito gerado
     // aqui precisa de um `sizeof` de um tipo incompleto.
@@ -145,7 +145,7 @@ public:
     // **Declarado aqui, definido em `src/eden_bridge.cpp`.** A primeira versão
     // tinha o corpo aqui e não compilava em três ficheiros.
     //
-    // O corpo é `servidor_ = std::move(server_manager)`, e essa atribuição
+    // O corpo guarda `server_manager` em `servidores_`, e essa operação
     // chama `default_delete<ServerManager>::operator()`, que faz
     // `sizeof(ServerManager)`. **O corpo de uma função inline é verificado
     // mesmo que ninguém a chame** — a verificação não espera por um uso. E
@@ -158,6 +158,11 @@ public:
     //     **um `unique_ptr` de tipo incompleto obriga a que tudo o que o
     //     toca seja declarado, não definido.**
     void RunServer(std::unique_ptr<Service::ServerManager>&& server_manager);
+
+    // Consome o evento de porto/sessão pendente sem bloquear numa thread
+    // host. Definido em `src/eden_bridge.cpp`, onde ServerManager está
+    // completo.
+    Result ProcessPendingSynchronously();
 
     // ── os dois que o `service.cpp` usa no caminho do "não implementado" ──
 
@@ -218,13 +223,15 @@ public:
     // morresse, o `KPort` da porta "sm:" ficava pendurado e o primeiro
     // `ConnectToNamedPort` do jogo devolveria lixo. Por isso o membro chama-se
     // `servidor_` e não `descartar`.
-    const Service::ServerManager* servidor() const noexcept { return servidor_.get(); }
+    const std::vector<std::unique_ptr<Service::ServerManager>>& servidores() const noexcept {
+        return servidores_;
+    }
 
 private:
     Kernel::KernelCore* kernel_ = nullptr;
     Reporter* reporter_ = nullptr;
     Service::SM::ServiceManager* sm_ = nullptr;
-    std::unique_ptr<Service::ServerManager> servidor_;
+    std::vector<std::unique_ptr<Service::ServerManager>> servidores_;
 };
 
 } // namespace Core

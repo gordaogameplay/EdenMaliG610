@@ -122,6 +122,12 @@ struct EngineHooks {
     std::uint64_t   guest_tls = 0;
     std::uint64_t   host_tls  = 0;
 
+    // O x1 do guest no entry point: o handle da thread principal.
+    //
+    // Ver `ia_call_guest.S`. Zero é o valor que o motor usava, e zero é
+    // **o valor de um mutex livre** — o que fazia o SDK da Nintendo abortar.
+    std::uint64_t   guest_x1 = 0;
+
     // 0 = sem limite. Ao exceder, o handler sai pela rotina de recuperação.
     std::uint64_t   trap_limit   = 0;
 
@@ -161,6 +167,9 @@ public:
     // quando não há guest — e é o que evita que a libc do host fique com um
     // `fs` a apontar para memória que não existe.
     void set_guest_tls(std::uint64_t base) noexcept { hooks_.guest_tls = base; }
+
+    // O x1 do guest no entry point. Ver `EngineHooks::guest_x1`.
+    void set_guest_x1(std::uint64_t v) noexcept { hooks_.guest_x1 = v; }
 
     // Instala os handlers. Uma vez. Sem isto um BRK mata o processo.
     bool install_handlers(std::string& error);
@@ -244,6 +253,9 @@ private:
     EngineHooks     hooks_;
     std::uint64_t   platform_reg_ = 0;
 
+    // O x1 do guest no entry point. Ver `EngineHooks::guest_x1`.
+    std::uint64_t   guest_x1_ = 0;
+
 
 };
 
@@ -261,6 +273,7 @@ private:
 // `[[noreturn]]` documenta a intenção e evita que o optimizador assuma um
 // regresso que nunca vem.
 extern "C" [[noreturn]] void ia_call_guest(void (*code)(), std::uint64_t sp,
-                                            std::uint64_t platform_reg);
+                                            std::uint64_t platform_reg,
+                                            std::uint64_t guest_x1);
 
 } // namespace ia

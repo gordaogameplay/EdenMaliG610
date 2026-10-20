@@ -84,10 +84,19 @@ public:
     // e o `ServiceManager` já existem — o que resolve o ciclo sem
     // `virtual` e sem Chronologia de membros.
 
+    // O handle da thread principal, na tabela de handles do Eden.
+    //
+    // É o que o Eden passa no x1 do entry point (`k_process.cpp:1006-1010`) e
+    // é o que o SDK da Nintendo lê para preencher
+    // `nn::os::detail::g_OsBootParamter`. Sem ele, o SDK recebe zero, e zero é
+    // o valor de um mutex livre — por isso o `SdkMutexType::TryLock` achava que
+    // o mutex já era seu.
+    std::uint32_t main_thread_handle() const noexcept { return main_thread_handle_; }
+
     // O endereço de TLS. Vai para o `KThread` para que
     // `KThread::GetTlsAddress` responda, que é o que a camada de IPC usa
     // para saber onde está o `MessageBuffer` do guest.
-    void set_tls(std::uint64_t endereco);
+    void set_tls(std::uint64_t endereco) noexcept;
     std::uint64_t tls() const noexcept { return tls_; }
 
 private:
@@ -95,6 +104,7 @@ private:
     std::uint64_t pid_;
     std::uint64_t tid_;
     std::uint64_t tls_ = 0;
+    std::uint32_t main_thread_handle_ = 0;
 
     // Ver a nota do ciclo: `unique_ptr`, e não membro por valor.
     std::unique_ptr<Kernel::KernelCore> kernel_;

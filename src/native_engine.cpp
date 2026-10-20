@@ -353,6 +353,7 @@ RunResult NativeEngine::run(void (*code)(), std::uint64_t sp) {
 // não há programa — e nesse caso o `TPIDR_EL0` não é tocado.
 g_hooks.guest_tls = hooks_.guest_tls;
 g_hooks.host_tls  = read_thread_pointer();
+guest_x1_         = hooks_.guest_x1;
 
 const int jumped = sigsetjmp(g_run_jmp, 1);
 
@@ -394,7 +395,7 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
         if (g_hooks.guest_tls != 0)
             write_thread_pointer(g_hooks.guest_tls);
 
-        ia_call_guest(code, sp, platform_reg_);
+        ia_call_guest(code, sp, platform_reg_, guest_x1_);
         g_have_run_jmp = false;
         // inalcançável em operação normal: se o guest tivesse regressado,
         // a stack estaria corrompida e isto nem sequer seria seguro escrever.

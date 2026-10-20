@@ -48,6 +48,16 @@ public:
     Result ManageDeferral(Kernel::KEvent** out_event);
 
     Result LoopProcess();
+    // Atende sincronicamente um evento pendente, no mesmo fluxo da thread do
+    // guest. `LoopProcessImpl` espera num MultiWait e exige uma thread host;
+    // este método permite ao executor nativo chamar `OnPortEvent` e
+    // `OnSessionEvent` directamente depois de `SendSyncRequest` enfileirar o
+    // pedido. Devolve `ResultNotFound` quando nada está pendente.
+    Result ProcessPendingSynchronously();
+    // O manager é possuído sem thread de loop pelo executor nativo. O
+    // destructor não pode esperar em m_stopped quando não existe loop para o
+    // sinalizar.
+    void EnableSynchronousMode() noexcept { m_synchronous_mode = true; }
     void StartAdditionalHostThreads(const char* name, size_t num_threads);
 
     static void RunServer(std::unique_ptr<ServerManager>&& server);
@@ -92,6 +102,7 @@ private:
     Common::Event m_stopped{};
     std::vector<std::jthread> m_threads{};
     std::stop_source m_stop_source{};
+    bool m_synchronous_mode{};
 };
 
 } // namespace Service

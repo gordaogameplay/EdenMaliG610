@@ -106,9 +106,15 @@ set(IA_EDEN_SOURCES
   vendor/eden/core/hle/kernel/k_readable_event.cpp
   vendor/eden/core/hle/kernel/k_resource_limit.cpp
   vendor/eden/core/hle/kernel/k_server_port.cpp
+  vendor/eden/core/hle/kernel/k_server_session.cpp
   vendor/eden/core/hle/kernel/k_session.cpp
   vendor/eden/core/hle/kernel/k_session_request.cpp
+  vendor/eden/core/hle/kernel/k_spin_lock.cpp
   vendor/eden/core/hle/service/hle_ipc.cpp
+  vendor/eden/core/hle/service/lm/lm.cpp
+  vendor/eden/core/hle/service/os/multi_wait.cpp
+  vendor/eden/core/hle/service/os/multi_wait_holder.cpp
+  vendor/eden/core/hle/service/os/mutex.cpp
   vendor/eden/core/hle/service/server_manager.cpp
   vendor/eden/core/hle/service/service.cpp
   vendor/eden/core/hle/service/sm/sm.cpp
@@ -133,6 +139,8 @@ set(IA_EDEN_SOURCES
 target_sources(ia_core PRIVATE
   src/eden_bridge.cpp
   src/eden_log.cpp
+  src/eden_settings.cpp
+  src/eden_synchronization_object.cpp
   ${IA_EDEN_SOURCES}
 )
 

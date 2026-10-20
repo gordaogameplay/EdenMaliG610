@@ -337,6 +337,14 @@ bool GuestProgram::init_main_thread_tls(std::string& error) {
     if (!mem_.write(tv, &t, sizeof(t), error))
         return false;
 
+    // O handle da thread, em TLS+0x110, é escrito **depois**, por quem
+    // conhece o handle verdadeiro: `SvcDispatcher::set_eden_tls`.
+    //
+    // Ver a nota longa em `SvcDispatcher::set_eden_tls` — o handle tem de ser
+    // o da tabela de handles do Eden, e esse só existe depois de o sistema ser
+    // montado. Escrever aqui um número diferente seria dar ao loader um handle
+    // que não existe na tabela.
+
     // A região de TLS entregue ao guest tem de estar a zeros à partida. Não
     // é pprint: é o contrato — se houvesse lixo, o SDK ia ler um `magic`
     // errado e recusar a thread em vez de inicializar.
@@ -397,6 +405,21 @@ bool GuestProgram::patch_all(std::string& error) {
         }
 
         m.patched = pr.saw_any_svc || pr.hints_nop > 0;
+
+        // Acumula o relatório de todos os módulos. Um módulo sem SVC (o `main`
+        // do jogo tem zero) não apaga o que o outro viu: o relatório é do
+        // **programa**, não do ficheiro.
+        patch_report_.words_scanned += pr.words_scanned;
+        patch_report_.svc_patched += pr.svc_patched;
+        patch_report_.hints_nop += pr.hints_nop;
+        patch_report_.mrs_seen += pr.mrs_seen;
+        patch_report_.tpidrro_to_tpidr += pr.tpidrro_to_tpidr;
+        patch_report_.msr_seen += pr.msr_seen;
+        patch_report_.exclusives_seen += pr.exclusives_seen;
+        if (!patch_report_.saw_any_svc && pr.saw_any_svc) {
+            patch_report_.saw_any_svc = true;
+            patch_report_.first_svc = pr.first_svc;
+        }
     }
 
     error.clear();

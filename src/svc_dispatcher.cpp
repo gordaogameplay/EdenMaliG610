@@ -4,6 +4,8 @@
 #include "ia/eden_bridge.hpp"
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 
@@ -100,6 +102,7 @@ std::string to_string(Svc s) {
     case Svc::SendSyncRequest:         return "SendSyncRequest";
     case Svc::GetProcessId:            return "GetProcessId";
     case Svc::GetThreadId:             return "GetThreadId";
+    case Svc::SignalProcessWideKey: return "SignalProcessWideKey";
     case Svc::Break:                   return "Break";
     case Svc::OutputDebugString:       return "OutputDebugString";
     case Svc::GetInfo:                 return "GetInfo";
@@ -238,6 +241,7 @@ void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
     case Svc::SendSyncRequestLight: r = svc_send_sync_request_light(ctx); break;
     case Svc::GetThreadPriority:    r = svc_get_thread_priority(ctx); break;
     case Svc::SetThreadPriority:    r = svc_set_thread_priority(ctx); break;
+    case Svc::SignalProcessWideKey: r = svc_signal_process_wide_key(ctx); break;
     default:                        r = svc_unsupported(ctx);    break;
     }
 
@@ -336,6 +340,29 @@ Result SvcDispatcher::svc_get_thread_id(SvcContext& ctx) {
 
 SvcDispatcher::SvcDispatcher(tel::Telemetry& tel) : tel_(tel) {}
 SvcDispatcher::~SvcDispatcher() = default;
+
+void SvcDispatcher::set_eden_tls(std::uint64_t endereco) noexcept {
+    // No-op sem Eden ligado, e sem erro: os testes que não montam um programa
+    // não têm TLS para dar.
+    if (!eden_)
+        return;
+
+    eden_->set_tls(endereco);
+
+    // O handle da thread principal, em TLS+0x110. Ver a nota no cabecalho.
+    const std::uint32_t handle = eden_->main_thread_handle();
+    if (handle != 0 && mem_ != nullptr) {
+        std::string err;
+        if (!mem_->write(endereco + 0x110, &handle, sizeof(handle), err))
+            last_ipc_ = "set_eden_tls: nao escrevi o handle em TLS+0x110: " + err;
+    }
+}
+
+std::uint32_t SvcDispatcher::main_thread_handle() const noexcept {
+    // Definido aqui, e nao no cabecalho, porque `EdenSystem` so esta completo
+    // neste ficheiro. O mesmo movimento que o `~SvcDispatcher`.
+    return eden_ ? eden_->main_thread_handle() : 0;
+}
 
 bool SvcDispatcher::attach_eden(std::uint64_t pid, std::uint64_t tid) {
     if (mem_ == nullptr) {
@@ -699,8 +726,10 @@ Result SvcDispatcher::svc_get_info(SvcContext& ctx) {
     case 6:  value = mem_total_;            break;  // TotalMemorySize
     case 7:  value = mem_used_;             break;  // UsedMemorySize
     case 11: value = random_u64();          break;  // RandomEntropy
-    case 12: value = heap_base_;            break;  // AslrRegionAddress
-    case 13: value = heap_size_;            break;  // AslrRegionSize
+    // A região ASLR: a região do CÓDIGO, não o heap. Ver a nota em
+    // `set_aslr_region`. O Eden é a fonte (`svc_info.cpp:76-82`).
+    case 12: value = aslr_base_;            break;  // AslrRegionAddress
+    case 13: value = aslr_size_;            break;  // AslrRegionSize
     case 14: value = stack_base_;           break;  // StackRegionAddress
     case 15: value = stack_size_;           break;  // StackRegionSize
     case 16: value = system_resource_size_; break;  // SystemResourceSizeTotal
@@ -725,6 +754,27 @@ Result SvcDispatcher::svc_get_info(SvcContext& ctx) {
         return Result::Unsupported;
     }
     (void)subtype;
+
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[svc] GetInfo type=%u handle=0x%llx subtype=%u -> 0x%llx\n",
+                     type, static_cast<unsigned long long>(ctx.x[2]), subtype,
+                     static_cast<unsigned long long>(value));
+        if (type == 16 && ctx.gpr[30] >= 0x80000040ull) {
+            // Diagnóstico temporário do assert que segue GetInfo(16): guardar
+            // a janela de instruções em volta do call-site, não deduzir a
+            // asserção pelo valor do NPDM.
+            std::uint32_t code[32]{};
+            const std::uint64_t start = ctx.gpr[30] - 0x40;
+            if (read_guest(start, code, sizeof(code))) {
+                std::fprintf(stderr, "[svc-code] GetInfo(16) caller=0x%llx:",
+                             static_cast<unsigned long long>(ctx.gpr[30]));
+                for (auto word : code)
+                    std::fprintf(stderr, " %08x", word);
+                std::fprintf(stderr, "\n");
+            }
+        }
+    }
 
     // O valor vai em x1. `ctx.ret` fica para o Result, que o motor escreve
     // em x0 — são coisas diferentes, e é por aqui que esta SVC custa mais
@@ -761,6 +811,32 @@ Result SvcDispatcher::svc_get_thread_priority(SvcContext& ctx) {
 // nao houver threads a schedular.
 Result SvcDispatcher::svc_set_thread_priority(SvcContext& ctx) {
     last_priority_ = static_cast<std::int32_t>(ctx.x[2]);
+    return Result::Success;
+}
+
+Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
+    const std::uint64_t cv_key = ctx.x[0] & ~std::uint64_t{3};
+    const auto count = static_cast<std::int32_t>(ctx.x[1]);
+
+    // Semântica medida no Eden, `svc/svc_condition_variable.cpp:50-57`:
+    // `SignalProcessWideKey` chama `KProcess::SignalConditionVariable` com a
+    // chave alinhada a `sizeof(u32)` e o número de threads a acordar.
+    //
+    // Este motor não tem fila de espera de condition variables: tem uma
+    // thread guest, o `WaitProcessWideKeyAtomic` ainda não é implementado, e
+    // nenhuma thread pode estar à espera. Sinalizar zero waiters é um no-op.
+    //
+    // O SVC do Eden é `void`; o wrapper não escreve um resultado de volta em
+    // x0. Preservamos x0, em vez de inventar um ResultSuccess que a ABI não
+    // devolve. Se surgir o primeiro waiter, `WaitProcessWideKeyAtomic` tem de
+    // ser implementado antes de este no-op deixar de ser correcto.
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[svc] SignalProcessWideKey key=0x%llx count=%d (sem waiters; no-op)\n",
+                     static_cast<unsigned long long>(cv_key), count);
+    }
+    ctx.ret = ctx.x[0];
+    ctx.has_ret = true;
     return Result::Success;
 }
 

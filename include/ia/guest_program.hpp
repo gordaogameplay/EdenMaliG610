@@ -42,6 +42,7 @@
 #include "ia/guest_memory.hpp"
 #include "ia/nso_arguments.hpp"
 #include "ia/nso_loader.hpp"
+#include "ia/patcher.hpp"
 #include "ia/svc_dispatcher.hpp"
 #include "ia/telemetry.hpp"
 
@@ -141,6 +142,15 @@ public:
     // Diagnóstico para o `doctor`.
     std::string summary() const;
 
+    // O relatório do patcher, acumulado de todos os módulos.
+    //
+    // Existe para responder a uma pergunta que o relatório por módulo não
+    // responde: **quantos `MSR TPIDR_EL0` há no programa**. O `MRS` é
+    // reescrito (um bit) e o `MSR` não é, e a diferença entre os dois decide
+    // se o registo `TPIDR_EL0` do host pode servir de TLS do guest — que é a
+    // questão que o abort do `SdkMutexType::TryLock` levantou.
+    const PatchReport& patch_report() const noexcept { return patch_report_; }
+
 private:
     bool load_one(const std::string& path, GuestModule::Kind kind,
                   std::string& error);
@@ -155,6 +165,10 @@ private:
     GuestMemory   mem_;
     tel::Telemetry* tel_ = nullptr;
     std::uint64_t stack_top_ = 0;
+
+    // O relatório do patcher, somado de todos os módulos. Ver
+    // `patch_report()`.
+    PatchReport patch_report_{};
 
     // Onde cada módulo vai, e onde o heap começa. Calculado em plan_layout()
     // e guardado para que o diagnóstico e a cópia usem os mesmos números.

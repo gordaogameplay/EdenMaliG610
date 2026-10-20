@@ -44,7 +44,8 @@
 
 #include "ia/guest_memory.hpp"
 #include "vendor/eden/common/common_types.h"   // Vaddr, Handle
-#include "vendor/eden/core/memory_bridge.h"   // `Core::Memory::Memory`, a nossa
+#include "vendor/eden/core/memory_bridge.h"          // `Core::Memory::Memory`, a nossa
+#include "vendor/eden/core/hle/kernel/k_page_table_bridge.h"  // a pagina unica
 #include "vendor/eden/core/hle/kernel/k_kernel_core_bridge.h"
 #include "vendor/eden/core/hle/kernel/k_synchronization_object.h"
 
@@ -52,6 +53,18 @@ namespace Kernel {
 
 class KProcess;
 class KThread;
+
+// Copiado de `core/hle/kernel/memory_types.h:13-14` do Eden.
+//
+// `k_server_session.cpp:719` usa `PageSize` para calcular o tamanho maximo de
+// uma copia rapida, e o Eden nao o declara em nenhum dos headers que
+// vendorizámos -- vem de `memory_types.h`, que nao foi vendorizado.
+//
+// Os valores sao do Eden, nao nossos: `PageBits = 12` da a pagina de 4 KiB que
+// o Switch usa. Um valor diferente aqui seria uma invencao que so apareceria
+// como um calculo de tamanho errado, muito longe da causa.
+constexpr std::size_t PageBits{12};
+constexpr std::size_t PageSize{1 << PageBits};
 
 // Declarada aqui porque `KThread::BeginWait` a recebe como parametro, e a
 // classe vem **depois** no ficheiro. Um ponteiro para um tipo incompleto e'
@@ -167,12 +180,25 @@ public:
 
     Memory& GetMemory() { return memory_; }
 
+    // A page table do processo. No Eden e' uma tabela de verdade
+    // (`k_process.h:524`); aqui e' a ponte de pagina unica, e a razao e' uma
+    // so: **o endereco do guest e' o endereco do host**. Ver
+    // `k_page_table_bridge.h`.
+    //
+    // Fica DEPOIS de `memory_` na declaracao, e por isso e' inicializada
+    // depois dela -- a lista de membros e' a ordem de construcao, e a page
+    // table precisa da memoria para existir.
+    KProcessPageTable& GetPageTable() { return page_table_; }
+
 private:
     KHandleTable& handles_;
     KResourceLimit& limits_;
     u64 pid_;
     u32 pointer_buffer_size_ = 0x8000;
     Memory memory_;
+    // A memoria, e nao a tabela de handles: e' a `Memory` que o `GuestMemory`
+    // nosso envolve, e e' ela que a page table devolve pelo `GetMemory()`.
+    KProcessPageTable page_table_{memory_};
 };
 
 // ── a thread ───────────────────────────────────────────────────────────────
@@ -468,6 +494,19 @@ private:
     static inline KProcess* g_processo = nullptr;
     static inline KThread* g_thread = nullptr;
 };
+
+// `GetInteger` extrai o valor de um `TypedAddress` (`common/typed_address.h`).
+//
+// **A nossa `KThread::GetTlsAddress` devolve um `std::uint64_t`, não um
+// endereço tipado** — a ponte usa `std::uint64_t` para não depender do pacote
+// externo de onde vem `Vaddr` (ver a nota no topo deste ficheiro). Por isso
+// esta sobrecarga existe, e é a identidade.
+//
+// Duas sobrecargas e não uma genérica: uma genérica aceitaria `uint64_t` e
+// `TypedAddress` com o mesmo corpo, e o corpo de uma tem de ser diferente do
+// corpo da outra — `TypedAddress` precisa de `GetValue()`.
+inline std::uint64_t GetInteger(std::uint64_t address) { return address; }
+inline std::uint64_t GetInteger(Common::ProcessAddress address) { return address.GetValue(); }
 
 inline KProcess* GetCurrentProcessPointer(KernelCore&) { return Bridge::processo(); }
 inline KProcess& GetCurrentProcess(KernelCore&) { return *Bridge::processo(); }

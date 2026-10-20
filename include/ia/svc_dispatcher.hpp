@@ -276,6 +276,44 @@ public:
     bool attach_eden(std::uint64_t pid, std::uint64_t tid);
     bool eden_attached() const noexcept { return eden_ != nullptr; }
 
+    // O handle da thread principal, no espaço de handles do Eden.
+    //
+    // Vai para o x1 do entry point do guest, que é onde o Eden o põe
+    // (`k_process.cpp:1006-1010`) e onde o SDK da Nintendo o lê.
+    std::uint32_t main_thread_handle() const noexcept;
+
+    // A base da TLS do guest, para o `KThread`.
+    //
+    // `KThread::GetTlsAddress` é o que o `KClientSession::SendSyncRequest`
+    // usa para encontrar a `MessageBuffer` — é por isso que este valor tem de
+    // chegar ao `EdenSystem` e não só ao `NativeEngine`.
+    //
+    // Vem depois de `attach_eden` porque a TLS só está montada depois de o
+    // programa estar carregado.
+    // (definido no .cpp: `EdenSystem` so esta completo la)")
+    //
+    // **E escreve aqui o handle da thread principal, em TLS+0x110.** É o Eden,
+    // medido (`k_process.cpp:1014`):
+    //
+    //     this->GetMemory().Write32(GetInteger(main_thread->GetTlsAddress()) + 0x110,
+    //                                thread_handle);
+    //
+    // E é o elo que faltava na cadeia toda:
+    //
+    //   1. o kernel escreve o handle em TLS+0x110
+    //   2. o rtld lê-o e passa-o no x1 do entry do `main`
+    //   3. o crt0 do SDK copia-o para `nn::os::detail::g_OsBootParamter`
+    //   4. o `SdkMutexType::TryLock` compara o dono do mutex com esse valor
+    //
+    // Se o passo 1 der zero, o passo 4 compara zero com zero — o valor de um
+    // mutex **livre** — e o SDK aborta a dizer que o mutex já é seu. Foi
+    // exactamente o que aconteceu, e o sintoma (`this == NULL`) não aponta
+    // para nada disto.
+    //
+    // **O mesmo handle que vai no x1** — o Eden usa uma variável para os dois,
+    // e é o que o loader espera.
+    void set_eden_tls(std::uint64_t endereco) noexcept;
+
     // Onde começa o heap que SetHeapSize devolve.
     //
     // Vem do layout do programa (`ia::layout::kHeapBase`). Definir aqui
@@ -296,6 +334,34 @@ public:
         alias_base_ = base;
         alias_size_ = size;
     }
+
+    // A região ASLR: onde o código do processo está mapeado.
+    //
+    // **Não é o heap, e não é a região de alias.** No Eden
+    // (`svc_info.cpp:76-82`):
+    //
+    //     case InfoType::AslrRegionAddress:
+    //         *result = GetInteger(process->GetPageTable().GetAliasCodeRegionStart());
+    //     case InfoType::AslrRegionSize:
+    //         *result = process->GetPageTable().GetAliasCodeRegionSize();
+    //
+    // E uma versão anterior deste motor devolvia o **heap** em 12 e 13 — o
+    // que se vê no commentário de `case 16`, que fala de um `PersonalWordSize`
+    // que não existe em lado nenhum. A conta estava errada e o resultado
+    // também.
+    //
+    // A consequência medida: o SDK da Nintendo usa esta região para instalar
+    // o seu heap e o seu estado. Com o heap devolvido no sítio da região ASLR,
+    // o `nn::os::detail::g_OsBootParamter` do SDK ficava a zeros, e o
+    // `SdkMutexType::TryLock` comparava o dono do mutex (0, livre) com esse
+    // zero — concluía que o mutex já era seu, e abortava com `this == NULL`.
+    void set_aslr_region(std::uint64_t base, std::uint64_t size) noexcept {
+        aslr_base_ = base;
+        aslr_size_ = size;
+    }
+    std::uint64_t aslr_base() const noexcept { return aslr_base_; }
+    std::uint64_t aslr_size() const noexcept { return aslr_size_; }
+
 
     // O que `GetInfo` responde a "TotalMemorySize" e "UsedMemorySize".
     void set_memory_totals(std::uint64_t total, std::uint64_t used) noexcept {
@@ -408,6 +474,7 @@ public:
 private:
     // Cada grupo devolve Result; o resultado é escrito em ctx.ret.
     Result svc_set_heap_size(SvcContext&);
+    Result svc_signal_process_wide_key(SvcContext&);
     Result svc_exit_process(SvcContext&);
     Result svc_close_handle(SvcContext&);
     Result svc_control_memory(SvcContext&);
@@ -505,6 +572,9 @@ private:
     std::uint64_t    system_resource_size_ = 0;
     std::uint64_t    alias_base_   = 0;
     std::uint64_t    alias_size_   = 0;
+
+    std::uint64_t    aslr_base_    = 0;
+    std::uint64_t    aslr_size_    = 0;
     std::uint64_t    stack_base_   = 0;
     std::uint64_t    stack_size_   = 0;
     std::uint32_t    main_priority_ = 0;

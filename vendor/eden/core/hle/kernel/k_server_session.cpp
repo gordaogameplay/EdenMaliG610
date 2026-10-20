@@ -27,7 +27,7 @@
 #include "vendor/eden/core/hle/kernel/message_buffer.h"
 #include "vendor/eden/core/hle/service/hle_ipc.h"
 #include "vendor/eden/core/hle/service/ipc_helpers.h"
-#include "vendor/eden/core/memory.h"
+#include "vendor/eden/core/memory_bridge.h"  // PONTE: substitui core/memory.h
 
 namespace Kernel {
 
@@ -560,7 +560,11 @@ Result ReceiveMessage(KernelCore& kernel, bool& recv_list_broken, uint64_t dst_m
     //
     // Isto nao e' perda de funcao. Um "user buffer" do guest neste motor e'
     // um endereco dentro da mesma reserva, e traduzi-lo seria a identidade.
-    // (void)dst_process; (void)src_process;  // mantem o par usado
+    // Os dois nomes **ficam**: é uma `page table` a sério (a da ponte), e as
+    // linhas seguintes usam-nos como no Eden. O que muda é a natureza do
+    // objecto, não o nome nem o número de linhas.
+    auto& dst_page_table = dst_process.GetPageTable();
+    auto& src_page_table = src_process.GetPageTable();
 
     // NOTE: Session is used only for debugging, and so may go unused.
     (void)session;
@@ -892,20 +896,20 @@ Result SendMessage(KernelCore& kernel, uint64_t src_message_buffer, size_t src_b
 
     if (dst_message_buffer) {
         // NOTE: Nintendo does not check the result of this GetPhysicalAddress call.
-        dst_msg_ptr = dst_page_table.GetMemory().GetPointer<u32>(dst_message_buffer);
+        dst_msg_ptr = GetCurrentMemory(kernel).GetPointer<u32>(dst_message_buffer);
         dst_user = true;
     } else {
-        dst_msg_ptr = dst_page_table.GetMemory().GetPointer<u32>(dst_thread.GetTlsAddress());
+        dst_msg_ptr = GetCurrentMemory(kernel).GetPointer<u32>(dst_thread.GetTlsAddress());
         dst_buffer_size = MessageBufferSize;
         dst_message_buffer = GetInteger(dst_thread.GetTlsAddress());
         dst_user = false;
     }
 
     if (src_message_buffer) {
-        src_msg_ptr = src_page_table.GetMemory().GetPointer<u32>(src_message_buffer);
+        src_msg_ptr = GetCurrentMemory(kernel).GetPointer<u32>(src_message_buffer);
         src_user = true;
     } else {
-        src_msg_ptr = src_page_table.GetMemory().GetPointer<u32>(src_thread.GetTlsAddress());
+        src_msg_ptr = GetCurrentMemory(kernel).GetPointer<u32>(src_thread.GetTlsAddress());
         src_buffer_size = MessageBufferSize;
         src_message_buffer = GetInteger(src_thread.GetTlsAddress());
         src_user = false;

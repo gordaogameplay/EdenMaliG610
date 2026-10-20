@@ -5,7 +5,7 @@
 
 #include "vendor/eden/common/alignment.h"
 #include "vendor/eden/common/bit_field.h"
-#include "vendor/eden/core/hle/kernel/k_thread.h"
+#include "vendor/eden/core/hle/kernel/k_process_bridge.h"  // PONTE: substitui k_thread.h
 
 namespace Kernel {
 
