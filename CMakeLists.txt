@@ -114,6 +114,15 @@ add_executable(ia_translate_test tests/test_translate.cpp)
 target_link_libraries(ia_translate_test PRIVATE ia_core)
 add_test(NAME translate COMMAND ia_translate_test)
 
+# Executa o SPIR-V na Mali-G610 de verdade e le o pixel de volta.
+# Depende do ia_translate_test ter gerado /tmp/ia_min.frag.
+find_library(VULKAN_LIB vulkan)
+if(VULKAN_LIB)
+  add_executable(ia_gpu_exec tests/test_gpu_exec.cpp)
+  target_link_libraries(ia_gpu_exec PRIVATE ia_core ${VULKAN_LIB})
+  add_test(NAME gpu_exec COMMAND ia_gpu_exec)
+endif()
+
 # Teste de input: prova que a pilha SDL2 + evdev + mapeamento funciona.
 # Nao e' um teste do motor, e' um teste do INPUT.
 add_executable(ia_input tests/probe_input.cpp)

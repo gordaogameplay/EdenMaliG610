@@ -35,23 +35,35 @@ std::string f32_literal(std::uint32_t bits) {
 
 std::string u32_literal(std::uint32_t v) { return std::to_string(v) + "u"; }
 
-// O banco de constantes vira um array de uniforms indexado por binding.
-// O SPIR-V gerado pelo glslang mapeia isto para um UBO.
+// O passo de um array de `uint` dentro de um UBO, em bytes.
+//
+// NÃO é 4. É 16.
+//
+// A primeira versão dividia o offset por 4 e achava que sim. Compilou,
+// validou, executou na Mali-G610 — e devolveu 0.000000 em vez de 1.500000.
+// O que falhou foi o seguinte, medido no SPIR-V gerado:
+//
+//     OpDecorate %_arr_uint_uint_256 ArrayStride 16
+//
+// O `std140` (que é o único layout de UBO que o Vulkan permite, se não for
+// scalar block layout) ALINHA CADA ELEMENTO de um array de escalares num
+// vec4. Um `uint[256]` ocupa 4096 bytes, não 1024, com três quartos de
+// memoria a ser enchimento.
+//
+// E o pior: o erro não dava nenhum sinal. Zero é um número válido, a GLSL
+// compilava, e o único sintoma era um pixel preto. Isto é a razão de este
+// projecto medir o `ArrayStride` no binário em vez de o supor — ver o
+// teste `gpu_exec`.
+//
+// Se a declaração do banco mudar, este número tem de mudar com ela. É por
+// isso que a função existe em vez de ser um literal espalhado pelo ficheiro.
+std::uint32_t cbuf_stride_bytes() noexcept { return 16; }
+
 std::string cbuf_ref(const ir::Value& v) {
     return "u_c[" + std::to_string(v.binding) + "][" +
-           std::to_string(v.offset / 4) + "]";
+           std::to_string(v.offset / cbuf_stride_bytes()) + "]";
 }
 
-// O operando, convertido para o tipo que a INSTRUÇÃO espera.
-//
-// Isto não é cosmético. Em Maxwell um registo não tem tipo: R2 pode ser
-// escrito por um `MOV` inteiro e lido por um `FMUL` como float. O GLSL
-// não tem nada disso — `float + uint` é erro de compilação — e o glslang
-// recusa com "wrong operand types".
-//
-// A primeira versão emitia `R4 + R2` e o GLSL não compilava. Compilar era o
-// teste; se não houvesse teste, isto chegava ao host como um shader que não
-// se consegue compilar, e a culpa parecia do PanVK.
 const char* glsl_type(ir::Type t) {
     switch (t) {
     case ir::Type::F32: return "float";
@@ -64,8 +76,45 @@ const char* glsl_type(ir::Type t) {
 
 std::string operand(const ir::Value& v);
 
-std::string operand_as(const ir::Value& v, ir::Type t) {
-    return std::string(glsl_type(t)) + "(" + operand(v) + ")";
+// O operando convertido para o tipo que a INSTRUÇÃO espera.
+//
+// E aqui está uma distinção que separa um shader que funciona de um shader
+// que devolve lixo.
+//
+// Em Maxwell um registo não tem tipo: `MOV R2, c[0][0x10]` escreve um PADRÃO
+// DE BITS, e um `FMUL R4, R2, R3` a seguir interpreta esse registo como
+// float — reinterpreta os 32 bits, não converte o número. O GLSL tem as duas
+// coisas separadas:
+//
+//     float(x)           -> conversão NUMÉRICA: o inteiro 1065353216 vira
+//                           o float 1065353216.0
+//     uintBitsToFloat(x) -> reinterpretação de bits: vira 1.0
+//
+// A primeira versão usava `float()`. Compilava, o `spirv-val` validava,
+// executava na Mali-G610, e devolvia 1126040644330979328.000000 em vez de
+// 1.500000 — que é 1065353216.0 * 1056964608.0 + 1065353216.0, exactamente
+// os dois padrões de bits (0x3F800000 e 0x3F000000) tratados como números.
+//
+// Vale a pena o que a medição revelou: o banco de constantes estava
+// PERFEITO. Os valores que chegavam ao shader eram 0x3F800000 e 0x3F000000 —
+// os dois certos, à mão e ao bit. O tradutor não tinha um problema de
+// dados; tinha um problema de INTERPRETAÇÃO. E nenhum teste do tipo "os
+// valores que chegam são os que se escreveram" o apanharia, porque os
+// valores eram os certos.
+std::string converter(const ir::Value& v, ir::Type alvo) {
+    const std::string base = operand(v);
+    if (v.type == alvo)
+        return base;
+
+    // 32 bits reinterpretados. É o caso normal: um registo escrito por um MOV
+    // de uma constante é um padrão de bits, não um número.
+    if (v.type == ir::Type::U32 && alvo == ir::Type::F32)
+        return "uintBitsToFloat(" + base + ")";
+    if (v.type == ir::Type::F32 && alvo == ir::Type::U32)
+        return "floatBitsToUint(" + base + ")";
+
+    // Só para o que sobrar. Uma conversão numérica a sério.
+    return std::string(glsl_type(alvo)) + "(" + base + ")";
 }
 
 std::string operand(const ir::Value& v) {
@@ -152,26 +201,25 @@ std::string to_glsl(const ir::Program& p) {
         switch (i.op) {
         case ir::Op::Mov: {
             const ir::Type dt = (i.dst < 16) ? reg_type[i.dst] : i.type;
-            o << "    " << reg_name(i.dst) << " = "
-              << glsl_type(dt) << "(" << operand_as(i.a, dt) << ");\n";
+            o << "    " << reg_name(i.dst) << " = " << converter(i.a, dt) << ";\n";
             break;
         }
         case ir::Op::FAdd: {
             const ir::Type dt = (i.dst < 16) ? reg_type[i.dst] : i.type;
-            o << "    " << reg_name(i.dst) << " = " << glsl_type(dt) << "("
-              << operand_as(i.a, dt) << " + " << operand_as(i.b, dt) << ");\n";
+            o << "    " << reg_name(i.dst) << " = "
+              << converter(i.a, dt) << " + " << converter(i.b, dt) << ";\n";
             break;
         }
         case ir::Op::FMul: {
             const ir::Type dt = (i.dst < 16) ? reg_type[i.dst] : i.type;
-            o << "    " << reg_name(i.dst) << " = " << glsl_type(dt) << "("
-              << operand_as(i.a, dt) << " * " << operand_as(i.b, dt) << ");\n";
+            o << "    " << reg_name(i.dst) << " = "
+              << converter(i.a, dt) << " * " << converter(i.b, dt) << ";\n";
             break;
         }
         case ir::Op::IAdd: {
             const ir::Type dt = (i.dst < 16) ? reg_type[i.dst] : i.type;
-            o << "    " << reg_name(i.dst) << " = " << glsl_type(dt) << "("
-              << operand_as(i.a, dt) << " + " << operand_as(i.b, dt) << ");\n";
+            o << "    " << reg_name(i.dst) << " = "
+              << converter(i.a, dt) << " + " << converter(i.b, dt) << ";\n";
             break;
         }
         case ir::Op::StoreColor:
@@ -208,3 +256,10 @@ std::string to_glsl(const ir::Program& p) {
 }
 
 } // namespace ia::gpu
+
+// A parte de fora do anonimo, para o teste poder usar o mesmo número que o
+// backend usou. Um teste que recalcula a regra por conta própria está a
+// testar a sua própria cópia da regra, e não a regra.
+std::uint32_t glsl_cbuf_stride_bytes() noexcept {
+    return ::ia::gpu::cbuf_stride_bytes();
+}

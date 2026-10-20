@@ -616,3 +616,134 @@ Fica para quando se confirmar em `integer_scaled_add.cpp`.
 as constantes, um render pass e um readback de um pixel — e comparar o valor
 com o que o shader deveria produzir. É o que fecha o ciclo, e é medível:
 `R4 = 1.0f * 0.5f + 1.0f = 1.5`, e o pixel tem de dar 1.5.
+
+
+---
+
+# Frente 2 — marco 2: a cadeia executada na Mali-G610
+
+```
+Maxwell SASS -> IR -> GLSL -> SPIR-V -> PanVK -> Mali-G610 -> pixel lido
+   [feito]      [feito] [feito]  [feito]   [feito]   [feito]      [feito]
+```
+
+**O pixel lido de volta é 1.500000. O previsto é 1.500000.**
+
+O shader é `R4 = 1.0f * 0.5f + 1.0f`, com `c[0][0x10] = 1.0f` e
+`c[0][0x14] = 0.5f` no banco de constantes.
+
+Device: **Mali-G610**, PanVK (Mesa 25.2.8), Vulkan 1.4.318, sem surface e
+sem Wayland — render para uma imagem de 64x64 offscreen e readback.
+
+Suite: **6 testes, todos a passar.**
+
+## Os quatro bugs que faltavam, e como foram apanhados
+
+### 1. `std140` achata arrays de escalares a vec4
+
+O backend dividia o offset da constante por 4. O SPIR-V medido diz:
+
+```
+OpDecorate %_arr_uint_uint_256 ArrayStride 16
+```
+
+O passo é **16**, não 4. O shader lia `u_c[0][16]` = byte 256; o teste
+escrevia em byte 64. Um `uint[256]` em std140 ocupa 4096 bytes, não 1024,
+com três quartos de enchimento.
+
+Agora o passo vive numa função (`cbuf_stride_bytes()`) que o backend e o
+teste partilham, e o teste **confirma-o contra o binário** com `grep -q` em
+`ArrayStride 16`. Se o layout mudar, falha com um número.
+
+### 2. Dependências de subpass — e a lição do controlo
+
+Sem `VkSubpassDependency` explícita, a escrita no attachment de cor não é
+visível para o `vkCmdCopyImageToBuffer`. O sintoma medido: **cada desenho lia
+o resultado do ANTERIOR**. O primeiro lia 0, o segundo lia o valor do
+primeiro. Nenhum erro, nenhuma mensagem do validador.
+
+E o que quase custou: o diagnóstico automático que escrevi dizia "as
+constantes chegaram vazias". Estava certo **e** era mentira — 0 também é o
+que se lê de um buffer que nunca foi preenchido.
+
+Daí a saída: **dois shaders de controlo**, escritos à mão.
+
+| shader | o que toca | o que tem de dar |
+|---|---|---|
+| controlo | nada, escreve `3.0` | 3.0 |
+| controlo do banco | só lê `c[0][0x10]` | 1.0 |
+| do tradutor | a cadeia toda | 1.5 |
+
+Sem o controlo, a conclusão teria sido "o tradutor está errado", e o tradutor
+estava inocente.
+
+### 3. A barreira estava invertida
+
+`srcSubpass`/`dstSubpass` trocados. A dependência descrevia a entrada no
+subpass em vez da saída. Com a troca, o controlo passou a dar 3.0.
+
+### 4. `float(uint)` não é o que o guest faz
+
+Este é o importante, e só apareceu quando o pipeline deixou de estar atrasado
+uma frame.
+
+Em Maxwell, `MOV R2, c[0][0x10]` escreve um **padrão de bits**, e um
+`FMUL R4, R2, R3` a seguir **reinterpreta** esses 32 bits como float. O GLSL
+separa as duas coisas:
+
+```glsl
+float(R2)           // conversão NUMÉRICA: 1065353216 -> 1065353216.0
+uintBitsToFloat(R2)  // reinterpretação:      1065353216 -> 1.0
+```
+
+O backend usava `float()`. Compilava, validava, executava, e devolvia
+**1126040644330979328.000000** em vez de 1.5 — que é
+`1065353216.0 * 1056964608.0 + 1065353216.0`, exactamente os dois padrões de
+bits (`0x3F800000` e `0x3F000000`) tratados como números.
+
+O que a medição revela: **o banco de constantes estava perfeito.** Os valores
+que chegavam ao shader eram os dois certos, à mão e ao bit. O tradutor não
+tinha um problema de dados; tinha um problema de *interpretação*.
+
+Nenhum teste do tipo "os valores que chegam são os que se escreveram"
+apanharia isto, porque os valores eram os certos. O teste que apanha é o que
+pergunta "a conta deu o resultado que a conta dá".
+
+O frontend passou a guardar o tipo com que cada registo foi escrito pela
+última vez (`reg_tipo[16]`), para o backend poder distinguir padrão de bits de
+número — sem isso não há forma de saber que `R2` é bits e não um inteiro.
+
+## O GLSL que passa
+
+```glsl
+void main() {
+    uint R2 = uint(0);  uint R3 = uint(0);  float R4 = float(0);
+    R2 = u_c[0][4];                              // MOV R2, c[0][0x10]
+    R3 = u_c[0][5];                              // MOV R3, c[0][0x14]
+    R4 = uintBitsToFloat(R2) * uintBitsToFloat(R3);   // FMUL R4, R2, R3
+    R4 = R4 + uintBitsToFloat(R2);               // FADD R4, R4, R2
+    o_color = vec4(R4);
+}
+```
+
+## O que isto NÃO é
+
+- **Não é um shader de jogo.** É um shader de teste, sem texturas, sem
+  controlo de fluxo, sem predicados, sem `ST.E.CON` (cuja codificação ainda
+  não está confirmada), e que escreve um literal de 1.5 num pixel.
+- **Não é o NVN.** Não há memória de guest, não há canais, não há barrieras,
+  não há-transferências de memória. É um render pass num buffer Vulkan.
+- **Não é o backend de produção.** É um caminho de teste directo.
+
+O que É: a cadeia de tradução está correcta e medida no destino. Tudo o que
+falhar a partir de agora vai ser por falta de cobertura da SASS, não por
+conversão errada. É uma base muito diferente de um tradutor que "parece
+funcionar".
+
+## O passo seguinte
+
+Trazer a **SASS real** de um shader do jogo e ver o que cai fora do
+subconjunto. Já sabemos que o `IMAD.MOV.U32` é o idioma de carregar
+constantes e que o seu destino não está em [20:28). Confirmá-lo em
+`integer_scaled_add.cpp`, e depois medir o subconjunto contra os shaders de
+um `.nsp` de verdade.

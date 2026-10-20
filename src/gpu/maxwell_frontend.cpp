@@ -108,6 +108,22 @@ ir::Program translate(const maxwell::Program& prog) {
     ir::Program out;
     out.stage = prog.stage;
 
+    // O tipo com que cada registo foi ESCRITO pela última vez.
+    //
+    // Maxwell não tem registos tipados, e é precisamente por isso que isto
+    // é necessário: `MOV R2, c[0][0x10]` escreve um padrão de bits, e um
+    // `FMUL R4, R2, R3` a seguir tem de saber que those bits são um float e
+    // não um inteiro. Se o frontend marcar o operando como float sem mais,
+    // o backend emite `R4 = R2 * R3` e o GLSL, aoSeeing R2 declarado `uint`,
+    // recusa a compilação — ou, pior, converte o número em vez de o
+    // reinterpretar, e o resultado é lixo que parece um valor.
+    //
+    // Começa em U32 porque é o tipo com que um registo não inicializado se
+    // comporta: um padrão de bits, que é exactamente o que o hardware tem.
+    ir::Type reg_tipo[16];
+    for (int i = 0; i < 16; ++i)
+        reg_tipo[i] = ir::Type::U32;
+
     for (Insn insn : prog.code) {
         const maxwell::Op op = maxwell::decode(insn);
         ir::Instr n;
@@ -122,7 +138,7 @@ ir::Program translate(const maxwell::Program& prog) {
             // `MOV (cbuf)` tem a sua propria entrada na tabela, por isso
             // aqui ja sabemos de onde vem. Nao ha bit para consultar.
             n.a    = (op == maxwell::Op::MOV_cbuf) ? v_cbuf(insn, ir::Type::U32)
-                                                   : v_reg(reg_d(insn), ir::Type::U32);
+                                                   : v_reg(reg_d(insn), reg_tipo[reg_d(insn)]);
             break;
         }
         case maxwell::Op::MOV_imm: {
@@ -145,11 +161,11 @@ ir::Program translate(const maxwell::Program& prog) {
             n.op   = ir::Op::FAdd;
             n.dst  = reg_d(insn);
             n.type = ir::Type::F32;
-            n.a    = v_reg(reg_a(insn), ir::Type::F32);
+            n.a    = v_reg(reg_a(insn), reg_tipo[reg_a(insn)]);
             n.b    = (op == maxwell::Op::FADD_cbuf)  ? v_cbuf(insn, ir::Type::F32)
                     : (op == maxwell::Op::FADD_imm) ? v_imm32(static_cast<std::uint32_t>(imm20(insn)),
                                                             ir::Type::F32)
-                                                    : v_reg(reg_b(insn), ir::Type::F32);
+                                                    : v_reg(reg_b(insn), reg_tipo[reg_b(insn)]);
             break;
         }
         case maxwell::Op::FMUL_reg:
@@ -158,11 +174,11 @@ ir::Program translate(const maxwell::Program& prog) {
             n.op   = ir::Op::FMul;
             n.dst  = reg_d(insn);
             n.type = ir::Type::F32;
-            n.a    = v_reg(reg_a(insn), ir::Type::F32);
+            n.a    = v_reg(reg_a(insn), reg_tipo[reg_a(insn)]);
             n.b    = (op == maxwell::Op::FMUL_cbuf)  ? v_cbuf(insn, ir::Type::F32)
                     : (op == maxwell::Op::FMUL_imm) ? v_imm32(static_cast<std::uint32_t>(imm20(insn)),
                                                             ir::Type::F32)
-                                                    : v_reg(reg_b(insn), ir::Type::F32);
+                                                    : v_reg(reg_b(insn), reg_tipo[reg_b(insn)]);
             break;
         }
         case maxwell::Op::IADD3_reg:
@@ -171,11 +187,11 @@ ir::Program translate(const maxwell::Program& prog) {
             n.op   = ir::Op::IAdd;
             n.dst  = reg_d(insn);
             n.type = ir::Type::U32;
-            n.a    = v_reg(reg_a(insn), ir::Type::U32);
+            n.a    = v_reg(reg_a(insn), reg_tipo[reg_a(insn)]);
             n.b    = (op == maxwell::Op::IADD3_cbuf)  ? v_cbuf(insn, ir::Type::U32)
                     : (op == maxwell::Op::IADD3_imm) ? v_imm32(static_cast<std::uint32_t>(imm20(insn)),
                                                             ir::Type::U32)
-                                                    : v_reg(reg_b(insn), ir::Type::U32);
+                                                    : v_reg(reg_b(insn), reg_tipo[reg_b(insn)]);
             break;
         }
         // `IMAD_reg` NÃO entra no subconjunto, apesar de ser a forma canónica
@@ -213,6 +229,10 @@ ir::Program translate(const maxwell::Program& prog) {
             ++out.unsupported;
             break;
         }
+
+        // A instrução passa a ser a dona do tipo do destino.
+        if (n.op != ir::Op::Exit && n.dst < 16)
+            reg_tipo[n.dst] = n.type;
 
         out.code.push_back(n);
     }

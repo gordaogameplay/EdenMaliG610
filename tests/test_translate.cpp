@@ -25,6 +25,11 @@ ir::Program translate(const maxwell::Program& prog);
 std::string    to_glsl(const ir::Program& p);
 } // namespace ia::gpu
 
+// Definido no backend, e aqui só declarado. Vive no namespace global porque
+// é uma verdade sobre o GLSL emitido, não sobre o IR — e os dois testes que
+// a usam precisam de a ver sem `ia::gpu::` à frente.
+std::uint32_t glsl_cbuf_stride_bytes();
+
 namespace {
 
 int g_pass = 0;
@@ -117,8 +122,28 @@ int main() {
     check(!glsl.empty(), "o GLSL nao esta vazio");
     check(glsl.find("#version 310 es") != std::string::npos,
           "declara a versao de GLSL");
-    check(glsl.find("R4 = float(float(R4) + float(R2))") != std::string::npos,
-          "a soma FADD chegou ao GLSL com os operandos certos");
+    check(glsl.find("R4 = R4 + uintBitsToFloat(R2)") != std::string::npos,
+          "a soma FADD chegou ao GLSL, e R2 virou bits, nao numero");
+
+    // O indice do banco de constantes. Byte 0x40 com passo 16 da' indice 4,
+    // NAO 16 — o std140 achata arrays de escalares a vec4. O teste le o passo
+    // de uma funcao que o backend tambem usa, para que os dois nao possam
+    // divergir sem ninguém dar por isso.
+    std::printf("\n       passo do array de constantes: %u bytes\n",
+                glsl_cbuf_stride_bytes());
+    check(glsl.find("u_c[0][4]") != std::string::npos,
+          "byte 0x40 virou indice 4 (o passo do std140, 16, foi aplicado)");
+    check(glsl.find("u_c[0][16]") == std::string::npos,
+          "o indice NAO e' 16 — dividi o offset por 4 em vez de 16");
+
+    // O ponto que custou uma execucao inteira na G610. `float(uint)` e' uma
+    // conversao NUMERICA; o guest reinterpreta os bits. O teste verifica que
+    // o GLSL pede a reinterpretabao, porque se o backend voltar a usar
+    // `float(...)` isto falha aqui e nao na imagem.
+    check(glsl.find("uintBitsToFloat(R2)") != std::string::npos,
+          "R2 (padrao de bits) entra no FMUL com uintBitsToFloat");
+    check(glsl.find("float(float(R2)") == std::string::npos,
+          "o backend NAO usa float(float(R2)) — essa e' a conversao numerica");
 
     std::printf("\n----- GLSL gerado -----\n%s--------------------\n", glsl.c_str());
 
