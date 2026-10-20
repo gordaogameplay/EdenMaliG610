@@ -2241,3 +2241,84 @@ evento que o `am` nao sinaliza. Medido: 74 `SignalProcessWideKey` e 53
 E o assert, que agora e' **do jogo** e nao um artefacto do motor: o jogo
 verifica um byte do seu objecto (`ldrb w8, [x21, #8]; cbz w8, ...`) e
 aborta se ele nao for zero.
+
+---
+
+## O `am` esta completo — e o bloqueio restante e' o sistema de ficheiros
+
+**A regra do Eden para a mudanca de foco** estava a faltar, e o sintoma
+era o mais enganador de todos: o guest **nao abortava**, ficava a espera.
+
+Medido antes: **3936 `WaitSynchronization` seguidos**, ate ao limite de
+traps. O `WaitSynchronization` devolvia `ResultTimedOut` (o motor nao
+dorme) e o guest repetia — porque o evento do sistema do `am` **nunca era
+sinalizado**.
+
+Tres correccoes, todas da regra do Eden:
+
+1. **`m_focus_state_changed_notification_enabled` comeca a `true`**
+   (`lifecycle_manager.h:159`) — o nosso comecava a `false`;
+2. o **`PopMessage` so' consome o `m_has_focus_state_changed` se o notify
+   estiver ligado** (`:47-63`) — o nosso consumia-o logo no primeiro
+   `ReceiveMessage`, e o `SetFocusHandlingMode` (que vem **depois**) ja nao
+   encontrava nada para sinalizar;
+3. o **`SetFocusHandlingMode` le os tres bools** (`notify`, `background`,
+   `suspend`) — o Eden, `self_controller.cpp:187`. Os bools sao
+   **empacotados** (um byte cada), e o `Pop<u8>` avanca uma palavra
+   inteira: foi preciso um `PopBools`.
+
+**E um bug nosso, medido:** o `WaitSynchronization` lia o **timeout de x0** —
+que e' o ponteiro de saida. A ordem do Eden (`svc.cpp:1420`) e': x0 = ponteiro
+de saida, x1 = array de handles, x2 = numero, **x3 = timeout**. O trace
+mostrava "timeout=2222980920 ns", que era o ponteiro.
+
+**Depois disto:** o `WaitSynchronization` passou a **1**, e o
+`ReceiveMessage` devolve a `FocusStateChanged`. A sequencia de comandos do
+`am` e' agora a do Eden, toda.
+
+## O abort que resta e' do jogo, e e' um ficheiro em falta
+
+O guest aborta num assert **seu** — a mensagem e'
+*"SuperStripe instance is null"*, mas o `x3` (o endereco que o SDK
+reporta) aponta para o fim de outra string:
+
+    pane_L_btlspot_button_00_T_button_l_00.bin
+
+O codigo do jogo (desassemblado, `0x80005d70`):
+
+    80005d88: ldr x8, [x23]          ; o singleton actual
+    80005d8c: str x0, [x23]          ; guarda o novo
+    80005d90: cbz x8, 0x80005dcc     ; se ja existia, nao destroi
+    ...
+    80005dc8: ldr x0, [x23]
+    80005dcc: add x8, x0, #0x48
+    80005dd0: cmp x0, #0x0
+    80005dd4: csel x0, xzr, x8, eq
+    80005dd8: bl 0x805cf9c0          ; <-- aborta
+
+**O singleton e' nulo** (o `csel` escolhe 0), e a funcao aborta. O
+`x21` (o objecto cujo byte e' lido) e' o **`SuperStripe`** do jogo.
+
+**E o ficheiro:** o jogo precisa de
+`pane_L_btlspot_button_00_T_button_l_00.bin` — um **ficheiro de dados**.
+O nosso motor **nao tem sistema de ficheiros**: nao ha `fs`, nao ha `fss`, e
+nao ha o **`bcat`** (o *delivery cache*), que e' o que da os ficheiros ao
+jogo (`nn::bcat`, 25 simbolos no `.dynstr` do jogo).
+
+**O `bcat` do Eden:** `core/hle/service/bcat/` — 1098 linhas, com um
+`backend` que le do `FileSys` (o emulador de ficheiros). **Para um motor
+nativo, o backend tem de servir os ficheiros que o jogo tem** — e, numa
+copia do jogo, o *delivery cache* esta **vazio**. Logo, um `bcat` que
+responda com um directorio vazio pode ser suficiente.
+
+**O caminho ate a imagem, por ordem:**
+
+| Passo | O que e' | Tamanho (Eden) |
+|---|---|---|
+| 1 | o `bcat` (delivery cache) | 1098 linhas |
+| 2 | o `fs`/`fss` (sistema de ficheiros) | ? |
+| 3 | o `nv::` (NVN) — a apresentacao | 3034 linhas |
+| 4 | o gralloc e a apresentacao | 173 + ? |
+| 5 | `bsd`/`ns`/`pm`/`time`/`hid`, conforme o jogo pedir | ? |
+
+**O passo 1 e' o proximo.**
