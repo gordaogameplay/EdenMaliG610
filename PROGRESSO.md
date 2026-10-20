@@ -2092,3 +2092,74 @@ servicos que **nao existem**: `aoc:u` e `pctl:*`.
 O proximo passo e' vendorizar o `aoc:u` do Eden
 (`core/hle/service/aoc/`, 374 linhas) e registar o `pctl` pelo
 `RegisterNamedService`.
+
+---
+
+## A limpeza da telemetria: uma regressao queIntroduziu
+
+Ao limpar a telemetria de debug injectada no `vendor/`, o script de
+remocao levou **linhas a mais**: o `return strong_ptr->HandleSyncRequest(...)`
+do `hle_ipc.cpp` e o `if (info == nullptr ...) return ReportUnimplementedFunction(...)`
+do `service.cpp` desapareceram com o log que os rodeava.
+
+**Como se viu:** o `am` deixou de responder (30 pedidos de IPC caíram para
+9), e a suite continuava a passar — porque nenhum dos testes exercita o `am`
+por dominio.
+
+**A verificacao que apanhou:** comparar **todo** o `vendor/` com a versao
+anterior, e nao so' os ficheiros que se mexeram. O `git diff` face ao commit
+anterior tem de mostrar **apenas** as diferencas intencionais.
+
+Este e' o custo de um `str.replace` com um bloco grande: o bloco removido
+leva com ele o que estava **a volta**. A regra que sai daqui: **quando se
+limpa instrumentacao, compara-se o resultado com a base, linha a linha.**
+
+## A ferramenta de separacao, e um bug dela
+
+O `/tmp/separar.py` separava a historia em commits por assunto, e foi
+promovido a `tools/separar.py`.
+
+Tinha um bug: uma remocao que **nao** e' seguida de uma adicao (a remocao
+de um bloco de linhas) **nao saia** do ficheiro. A regra interna era "a
+remocao sai se a proxima linha nova foi escolhida" — e um bloco de remocoes
+sem adicao nenhuma nao tem "proxima linha nova".
+
+A correccao e' o modo `faixas`: `{"0": {"h": [[1, 999]]}}` marca as posicoes
+do corpo do hunk que entram, e as remocoes dentro da faixa saem.
+
+**Como se viu:** a arvore final da separacao diferia da original, e a
+ferramenta **verifica isso** — a soma das fatias tem de dar o commit
+original. Sem essa verificacao, a separacao publicava uma historia que
+nunca existiu.
+
+## A publicacao
+
+O projecto foi publicado em **https://github.com/gordaogameplay/EdenMaliG610**
+(publico, GPL-3.0-or-later), com a historia separada por assunto:
+
+```
+cfaad82  o `.gitattributes`: normalizacao de fim de linha
+e3a0bca  o `PROGRESSO.md`: as medicoes de hoje
+94adc95  a telemetria: o dump do modulo, a assercao do SDK e o endereco do fault
+325ec00  o `am`: a mensagem de foco e o tamanho da resposta
+1eddd28  o heap do guest: a ABI do `SetHeapSize` e o `GetInfo(21)`
+262c219  o `pctl` do Eden, vendorizado: o parental control
+3d3372e  o README: o que e' isto, o que e' do Eden e o que e' nosso
+bb65f12  a licenca GPL-3.0 e os cabecalhos SPDX nos ficheiros nossos
+```
+
+**Os 8 commits foram compilados no Pi, um a um** — e todos compilaram.
+
+O `README` diz o que o projecto e', o que e' **nativo** e o que e'
+**traduzido**, **o que foi tomado do Eden e o que foi escrito aqui**, e que
+o projecto e' escrito com assistencia de IA e revisto por uma pessoa.
+
+## Onde estamos
+
+O guest chega ao `am`, abre o proxy da aplicacao e as sub-interfaces, e
+fica a espera dos servicos que **nao existem**: `aoc:u` e `pctl:*`.
+
+O `aoc:u` (`IAddOnContentManager`, 374 linhas no Eden) e' o proximo: o Eden
+implementa-o com o `ContentProvider` e o `PatchManager` — o emulador de
+ficheiros. Num motor nativo nao ha DLC, e a lista e' vazia; o que o guest
+precisa e' que o **servico exista** e responda.
