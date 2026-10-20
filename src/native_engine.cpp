@@ -442,8 +442,9 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
         r.last_trap = TrapKind::GuestFault;
         char msg[160];
         std::snprintf(msg, sizeof(msg),
-                      "fault de memoria do guest em 0x%llx (sp=0x%llx)",
+                      "fault de memoria do guest em 0x%llx (endereco 0x%llx, sp=0x%llx)",
                       (unsigned long long)g_hooks.fault_pc,
+                      (unsigned long long)g_hooks.fault_addr,
                       (unsigned long long)g_hooks.fault_sp);
         r.error = msg;
     }

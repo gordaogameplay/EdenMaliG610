@@ -295,14 +295,22 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
     // E uma string a readable que vale mais do que vinte palpites sobre o
     // formato da resposta IPC.
     if (number == 0x26 && g_mem != nullptr) {
-        for (int arg = 1; arg <= 3; ++arg) {
+        for (int arg = 0; arg <= 7; ++arg) {
             const std::uint64_t p = ctx.gpr[arg];
-            if (p < 0x80000000ull || p >= 0x98000000ull)
+            if (p < 0x80000000ull || p >= 0x98000000ull) {
+                if (std::getenv("IA_IPC_TRACE") != nullptr) {
+                    std::printf("[msg] x%d = 0x%llx (fora da gama do guest)\n",
+                                arg, (unsigned long long)p);
+                }
                 continue;
+            }
             char buf[256];
             std::string e;
-            if (!g_mem->read(p, buf, sizeof buf - 1, e))
+            if (!g_mem->read(p, buf, sizeof buf - 1, e)) {
+                std::printf("[msg] x%d = 0x%llx: a leitura falhou (%s)\n", arg,
+                            (unsigned long long)p, e.c_str());
                 continue;
+            }
             buf[sizeof buf - 1] = 0;
             // So interessa se for mesmo texto.
             int legiveis = 0;
@@ -311,10 +319,10 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
                     ++legiveis;
                 else
                     break;
+            std::printf("[msg] x%d = 0x%llx -> \"%s\" (%d legiveis)\n", arg,
+                        (unsigned long long)p, buf, legiveis);
             if (legiveis < 4)
                 continue;
-            std::printf("[msg] x%d = 0x%llx -> \"%s\"\n", arg,
-                        (unsigned long long)p, buf);
         }
         std::printf("[msg] w2 = %u\n",
                     (unsigned)(ctx.gpr[2] & 0xFFFFFFFFu));
@@ -441,6 +449,46 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
                                 (b % 16 == 15) ? "\n          " : " ");
                 std::printf("\n");
             }
+        }
+    }
+
+    // A assercao do SDK: `OnAssertionFailure(type, file, line, msg, ...)`.
+    //
+    // A mensagem esta no x5 (o quinto argumento), e o ficheiro no x2/x3.
+    // E' a unica forma de saber **o que** falhou: o SDK aborta por uma
+    // assercao, e a assercao tem o ficheiro e a linha.
+    if (number == 0x26 && g_mem != nullptr) {
+        // Todos os registos: a assercao do SDK passa (type, file, line,
+        // msg, ...) e nao sabemos qual o que interessa.
+        // A string da assercao: o SDK passa um ponteiro para uma
+        // string **do proprio SDK** (o `.rodata` dele), que nao esta no
+        // espaco do guest. Por isso o `g_mem->read` nao a ve — e a
+        // unica forma e' o dump do modulo.
+        std::printf("[brk] registos:");
+        for (int arg = 0; arg <= 7; ++arg) {
+            std::printf(" x%d=0x%llx", arg,
+                        (unsigned long long)ctx.gpr[arg]);
+        }
+        std::printf("  pc=0x%llx\n", (unsigned long long)ctx.pc);
+        for (int arg = 1; arg <= 6; ++arg) {
+            const std::uint64_t p = ctx.gpr[arg];
+            if (p == 0 || p >= 0x98000000ull)
+                continue;
+            char buf[512];
+            std::string e;
+            if (!g_mem->read(p, buf, sizeof buf - 1, e))
+                continue;
+            buf[sizeof buf - 1] = 0;
+            int legiveis = 0;
+            for (const char* q = buf; *q; ++q)
+                if (*q >= 0x20 && *q < 0x7F)
+                    ++legiveis;
+                else
+                    break;
+            if (legiveis < 4)
+                continue;
+            std::printf("[ass] x%d = 0x%llx -> \"%s\"\n", arg,
+                        (unsigned long long)p, buf);
         }
     }
 
@@ -858,7 +906,8 @@ int main(int argc, char** argv) {
     // a tabela de simbolos dinamicos sem um debugger.
     if (const char* dump_modulo = std::getenv("IA_DUMP_MODULE")) {
         for (const auto& module : prog.modules()) {
-            if (dump_modulo[0] != 0 && std::strcmp(dump_modulo, module.name()) != 0)
+            if (dump_modulo[0] != 0 && std::strcmp(dump_modulo, module.name()) != 0 &&
+                std::strcmp(dump_modulo, "todos") != 0)
                 continue;
             const auto& img = module.nso.image;
             char caminho[128];

@@ -898,8 +898,12 @@ Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
     // ser implementado antes de este no-op deixar de ser correcto.
     if (std::getenv("IA_IPC_TRACE") != nullptr) {
         std::fprintf(stderr,
-                     "[svc] SignalProcessWideKey key=0x%llx count=%d (sem waiters; no-op)\n",
-                     static_cast<unsigned long long>(cv_key), count);
+                     "[svc] SignalProcessWideKey key=0x%llx count=%d x2=0x%llx "
+                     "x3=0x%llx x4=0x%llx (sem waiters; no-op)\n",
+                     static_cast<unsigned long long>(cv_key), count,
+                     static_cast<unsigned long long>(ctx.x[2]),
+                     static_cast<unsigned long long>(ctx.x[3]),
+                     static_cast<unsigned long long>(ctx.x[4]));
     }
     ctx.ret = ctx.x[0];
     ctx.has_ret = true;
