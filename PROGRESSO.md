@@ -1979,3 +1979,116 @@ pela ponte nao pode coexistir com ela. O Eden compila o
 `k_process.cpp` e o `k_thread.cpp` **reais**; nos usamos a ponte
 `k_process_bridge.h`, e por isso os originais nao podem coexistir
 com ela.
+
+---
+
+## A sessao `0x481f7`: o `am` fala por `object_id`
+
+A sessao `0x481f7` nao respondia, e era a razao de o guest abortar.
+
+**Medido.** O `AddMoveObject` do Eden (com o `PushIpcInterface` do
+`ipc_helpers.h:114-131`) devolve a sessao nova, e o handle que o
+guest ve e' o da **4.a** interface devolvida pelo `appletOE`. Nao e'
+um servico nosso.
+
+E o mecanismo e' o **dominio** do Eden: o `am` e' chamado por
+`object_id`, nao por comando de servico. Medido:
+
+    [ipc] HandleDomainSyncRequest: comando 0, object_id 5, handlers 10
+    [service] HandleSyncRequest: servico "ICommonStateGetter" comando 0
+
+Cada `object_id` responde com o **nome** do servico a que pertence.
+Isto ja funcionava.
+
+## A resposta de 0 palavras: `aoc:u`
+
+A resposta de 0 palavras nao era do `am`. Era do **`sm:`**, a
+receber `GetService("aoc:u")`:
+
+    [eden:W] Service::SM: GetService: nome lido = "aoc:u"
+    [eden:W] Service::SM: Server is not registered! service=aoc:u
+    [eden:I] Service::SM: Waiting for service aoc:u to become available
+    [ipc] resposta (0 palavras):
+
+O `sm:` **deixa o pedido pendente** (`ctx.SetIsDeferred()`,
+`sm.cpp:206`) ate o servico aparecer. Como o `aoc:u` nao existe
+neste motor, o pedido fica pendente para sempre — e o guest
+aborta.
+
+**Os servicos que o guest pede e que este motor nao tem:**
+
+| Servico | Onde |
+|---|---|
+| `aoc:u` | `sm:` — o `IAddOnContentManager` do Eden |
+| `pctl`, `pctl:s`, `pctl:a`, `pctl:r` | `sm:` — o parental control |
+
+**Medido, os servicos registados no `sm:`** (contador no
+`RegisterService`): `lm`, `apm`, `apm:am`, `apm:p`, `apm:sys`,
+`appletOE`. **Seis.** O `pctl` vendorizado nao aparecia: o
+`pctl.cpp` do Eden regista-se por `LoopProcess`, e nao pelo
+`RegisterNamedService` — e o `pctl` que adaptamos precisa de uma
+registo explicito.
+
+## A ABI do `SetHeapSize`: o guest e' a fonte da verdade
+
+A implementacao tratava `x0` como o **tamanho** e `x1` como o
+**endereco de saida**, com a justificacao de que "a fonte da verdade
+para a ABI do guest e' o guest". **Medido no SDK, e o guest diz o
+contrario.**
+
+O modulo `sdk` desassemblado (`IA_DUMP_MODULE=sdk`):
+
+    0x82d799ec — a wrapper do SVC 1:
+        str  x0, [sp, #-16]!   ; guarda o ponteiro de saida
+        brk  #0x1
+        ldr  x2, [sp]
+        str  x1, [x2]          ; escreve x1 no endereco x0
+
+    0x82d29ee0 — nn::os::detail::MemoryHeapManagerImplByHorizon::SetHeapSize:
+        mov  x0, x1            ; x0 do SVC = 1.o argumento
+        mov  x1, x2            ; x1 do SVC = 2.o argumento
+        bl   0x82d799ec
+
+Ou seja: **x0 e' o ponteiro de saida, x1 e' o tamanho, e o endereco
+base volta em x1.** E o Eden concorda (`svc.cpp:1250-1255`):
+
+    static void SvcWrap_SetHeapSize64(Core::System& system, std::span<uint64_t, 8> args) {
+        uint64_t size = Convert<uint64_t>(GetArg64(args, 1));
+        uint64_t out_address{};
+        Result ret = SetHeapSize64(system, std::addressof(out_address), size);
+        SetArg64(args, 0, Convert<uint64_t>(ret));
+        SetArg64(args, 1, Convert<uint64_t>(out_address));
+    }
+
+**O sintoma da versao errada tambem bate certo.** Com `x0` tratado
+como o tamanho, o SDK lia `x1` (0x7e00000 — o tamanho) como se fosse
+o endereco base, e escrevia la. Era o fault em 0x82d25ca0, com a
+escrita a **0x7e00010**.
+
+E o teste `test_core.cpp` **validava a ABI errada** — e passava. Um
+teste que valida uma ABI inventada da confianca a uma coisa falsa.
+
+**Correcção:** `x0` = ponteiro, `x1` = tamanho, o base escrito no
+ponteiro **e** devolvido em `x1`. O motor ja copia `x1`-`x5` de
+volta (`native_engine.cpp:604-605`), por isso nao foi preciso mexer
+no motor.
+
+## O `SetHeapSize` ja nem e' chamado
+
+Com o `GetInfo(21)` a devolver o **tamanho** (e nao o fim da
+reserva), o SDK **deixa de pedir** o heap: o `SetHeapSize` nao
+aparece no trace. Antes pedia 2,4 GB, e o assert de crescimento de
+vector do SDK (`!safe_add(&new_capacity, new_size, (new_size / 2))`)
+transbordava.
+
+E' por isso que a medicao antiga da ABI **nao provava nada**: o
+caminho nunca foi exercitado depois da correccao do `GetInfo`.
+
+## Onde estamos
+
+O guest chega ao `am`, pede as sub-interfaces, e fica a espera dos
+servicos que **nao existem**: `aoc:u` e `pctl:*`.
+
+O proximo passo e' vendorizar o `aoc:u` do Eden
+(`core/hle/service/aoc/`, 374 linhas) e registar o `pctl` pelo
+`RegisterNamedService`.
