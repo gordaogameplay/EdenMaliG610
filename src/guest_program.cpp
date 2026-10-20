@@ -76,10 +76,25 @@ bool GuestProgram::load(const std::string& exefs_dir, std::string& error) {
     // ordem de arranque. O rtld mapeia a memória e resolve os imports do main
     // a partir da sdk — sem ele e sem ela, o main não arranca.
     struct Wanted { const char* file; GuestModule::Kind kind; };
+    //
+    // A ordem é a do Eden (`deconstructed_rom_directory.cpp:191-193`):
+    // rtld, main, subsdk0..subsdk9, sdk. O `rtld` vai para o fim do
+    // espaço (ver `plan_layout`), mas a ordem RELATIVA do main, dos
+    // sub-SDKs e da sdk é a mesma.
     static constexpr Wanted kOrder[] = {
-        {"rtld", GuestModule::kRtld},
-        {"main", GuestModule::kMain},
-        {"sdk",  GuestModule::kSdk},
+        {"rtld",    GuestModule::kRtld},
+        {"main",    GuestModule::kMain},
+        {"subsdk0", GuestModule::kSubsdk0},
+        {"subsdk1", GuestModule::kSubsdk1},
+        {"subsdk2", GuestModule::kSubsdk2},
+        {"subsdk3", GuestModule::kSubsdk3},
+        {"subsdk4", GuestModule::kSubsdk4},
+        {"subsdk5", GuestModule::kSubsdk5},
+        {"subsdk6", GuestModule::kSubsdk6},
+        {"subsdk7", GuestModule::kSubsdk7},
+        {"subsdk8", GuestModule::kSubsdk8},
+        {"subsdk9", GuestModule::kSubsdk9},
+        {"sdk",     GuestModule::kSdk},
     };
 
     for (const auto& w : kOrder) {
@@ -125,8 +140,6 @@ bool GuestProgram::plan_layout(std::uint64_t heap_reserve, std::string& error) {
     heap_size_  = std::max<std::uint64_t>(heap_reserve, layout::kHeapSize);
     heap_base_  = layout::kHeapBase;
     stack_size_ = layout::kStackSize;
-    stack_base_ = layout::kStackBase;
-    stack_top_  = layout::kStackTop();
 
     // Os módulos são carregados SEQUENCIALMENTE, cada um no fim do anterior.
     //
@@ -226,12 +239,30 @@ bool GuestProgram::plan_layout(std::uint64_t heap_reserve, std::string& error) {
     }
     code_end_ = cursor;
 
+    // A stack vem DEPOIS do codigo, e o SDK e' avisado do endereco (SVC 0x29,
+    // tipo 14). No Switch a regiao da stack e' sorteada pelo kernel, e nao
+    // esta num sitio fixo: o que o guest sabe e' o endereco que o kernel lhe
+    // deu. Portanto move-la e' legitimo — o que nao e' legitimo e'_move-la
+    // sem avisar o guest.
+    //
+    // A base e' o fim do codigo, sem buraco pelo meio: o rtld varre o
+    // espaco do processo a procura de modulos e desiste quando cai num
+    // endereco livre. Um buraco entre o codigo e a stack seria esse endereco.
+    //
+    // Com os sub-SDKs (`subsdk0`, `subsdk1`) o codigo cresce para alem dos
+    // 64 MiB que separavam o codigo da stack fixa em 0x8400'0000 — e a
+    // sobreposicao era detectada (`layout do guest sobreposto`), o que
+    // impedia o jogo de arrancar. A stack e' o unico sitio que pode
+    // mudar: o resto do layout tem enderecos que o linkador fixou.
+    stack_base_ = layout::page_align_up(code_end_);
+    stack_top_  = stack_base_ + stack_size_;
+
     // Verificação de sobreposição.
     struct Span { std::uint64_t lo, hi; const char* what; };
     const Span spans[] = {
         {layout::kAliasBase, layout::kAliasBase + layout::kAliasSize, "alias"},
         {layout::kCodeBase,  code_end_,                              "code"},
-        {layout::kStackBase, layout::kStackTop(),                    "stack"},
+        {stack_base_,         stack_top_,                            "stack"},
         {layout::kTlsBase,   layout::kTlsBase + layout::kTlsSize,     "tls"},
         {heap_base_,         heap_base_ + heap_size_,                "heap"},
     };

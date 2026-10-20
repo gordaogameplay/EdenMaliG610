@@ -63,12 +63,32 @@ struct GuestModule {
     // O .text está escrito (o patcher já passou) e pronto a executar.
     bool patched = false;
 
+    // Os nomes dos módulos, na ordem do Eden.
+    //
+    // A lista é a do Eden (`core/loader/deconstructed_rom_directory.cpp:191`):
+    //
+    //     static const std::array static_modules = {"rtld", "main",
+    //         "subsdk0", "subsdk1", ..., "subsdk9", "sdk"};
+    //
+    // O ExeFS de um jogo traz `subsdk0` e `subsdk1` (e às vezes mais), e
+    // o carregador de módulos do SDK (`nn::ld`) procura-os no espaço do
+    // processo. Sem eles carregados, a procura não acha o que quer e o SDK
+    // lança uma excepção que ninguém apanha.
     const char* name() const {
-        static const char* kNames[3] = {"rtld", "main", "sdk"};
+        static const char* kNames[] = {
+            "rtld", "main", "subsdk0", "subsdk1", "subsdk2", "subsdk3",
+            "subsdk4", "subsdk5", "subsdk6", "subsdk7", "subsdk8", "subsdk9",
+            "sdk"};
         return kNames[static_cast<int>(kind)];
     }
 
-    enum Kind : std::uint8_t { kRtld = 0, kMain = 1, kSdk = 2 };
+    enum Kind : std::uint8_t {
+        kRtld = 0, kMain = 1,
+        kSubsdk0 = 2, kSubsdk1 = 3, kSubsdk2 = 4, kSubsdk3 = 5,
+        kSubsdk4 = 6, kSubsdk5 = 7, kSubsdk6 = 8, kSubsdk7 = 9,
+        kSubsdk8 = 10, kSubsdk9 = 11,
+        kSdk = 12,
+    };
     Kind kind = kMain;
 };
 
@@ -123,6 +143,7 @@ public:
 
     // Endereço da pilha do guest (topo), pronto a passar a `run()`.
     std::uint64_t stack_top() const noexcept { return stack_top_; }
+    std::uint64_t stack_base() const noexcept { return stack_base_; }
 
     const std::vector<GuestModule>& modules() const noexcept { return modules_; }
     GuestMemory& memory() noexcept { return mem_; }
