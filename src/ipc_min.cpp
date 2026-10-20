@@ -739,7 +739,26 @@ Result SvcDispatcher::svc_send_sync_request(SvcContext& ctx) {
 // **A espera tem de consultar o estado.** E' o que o Eden faz, e e'
 // uma linha de codigo.
 Result SvcDispatcher::svc_wait_synchronization(SvcContext& ctx) {
-    const std::uint64_t timeout_ns = ctx.x[0];
+    // **A ordem dos argumentos** — a do Eden (`svc.cpp:1420`,
+    // `SvcWrap_WaitSynchronization64`):
+    //
+    //     uint64_t handles     = GetArg64(args, 1);
+    //     int32_t  num_handles = GetArg32(args, 2);
+    //     uint64_t timeout_ns  = GetArg64(args, 3);
+    //     Result   ret = WaitSynchronization64(system, &out_index, handles, num_handles, timeout_ns);
+    //     SetArg64(args, 0, ret);
+    //     SetArg64(args, 1, out_index);
+    //
+    // Ou seja: **x0 e' o ponteiro de saida** (que o guest passa e de que o
+    // proprio SDK escreve o indice — o wrapper do SDK, `0x82b7cb0c`: `str
+    // w1, [x2]`), **x1 e' o array de handles**, **x2 e' o numero**, e
+    // **x3 e' o timeout**.
+    //
+    // **O timeout estava a ser lido de x0** — ou seja, do ponteiro de
+    // saida. Medido: o trace mostrava \"timeout=2222980920 ns\", que e' o
+    // ponteiro (0x847fff38), e nao um prazo. O SDK espera com o timeout
+    // **infinito** (`mov x3, #-1`).
+    const std::uint64_t timeout_ns = ctx.x[3];
     const std::uint64_t handles_ptr = ctx.x[1];
     const std::uint32_t num_handles = static_cast<std::uint32_t>(ctx.x[2]);
 
