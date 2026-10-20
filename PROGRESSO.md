@@ -2665,3 +2665,66 @@ O que falta, por ordem:
 3. o `TPIDR_EL0` do host por thread;
 4. **medir onde a thread dá fault** — que é a informação que falta, e que o
    dump do `entry point` (no `boot_trace`) já permite comparar.
+
+---
+
+# Sessão 2026-10-20 (quinta parte) — o passo 1, em detalhe, e uma referência
+
+## As quatro coisas por thread (e porque sao quatro)
+
+Uma thread de guest precisa de:
+
+| | o que acontece se nao for por thread |
+|---|---|
+| o `TPIDR_EL0` do **guest** | o guest le o TLS do *host* e escreve por cima da `libc` — **OOM**, medido |
+| o `TPIDR_EL0` do **host** | a `libc` de cada thread tem o seu; o handler troca o TLS do host pelo do guest *durante* a trap |
+| o ponto de regresso (`sigsetjmp`) | um `siglongjmp` para o buffer de outra thread é comportamento indefinido — `exit 70`, medido |
+| os **registos** | o Eden deixa-os a zero (`KThread::InitializeContext`): sem isso, o entry point lê `x7`/`x19` do host e salta para um endereço do host — medido |
+
+E o `sigsetjmp` tem de estar numa **frame que sobreviva** ao código do
+guest: um `siglongjmp` para o `sigjmp_buf` de uma frame já regressada é
+comportamento indefinido.
+
+**O que está escrito** (e não está publicado, porque não passou nos
+testes): o motor tem o estado por thread, a rotina `g610_run_guest` (em
+ensamblador, porque o `sp` do guest tem de ser o `sp` da CPU) e o
+`CreateThread` arranca a thread. **O que não está resolvido:** com isso, o
+processo morre de OOM **mesmo sem a thread a correr** — e o crash acontece
+no **primeiro `SendSyncRequest`** (`sm: Initialize`), que não tem nada a
+ver com threads. Ou seja: há uma regressão no caminho principal que ainda
+não está isolada.
+
+**A lição:** a mudança do motor que "não muda nada" (o estado por thread)
+mudou. A próxima tentativa tem de ser **por partes**: primeiro o motor com
+o estado por thread e **sem** o arranque da thread (e ver se o
+`sm: Initialize` continua a funcionar), e só depois o arranque.
+
+## A referência que faltava: o Eden está a correr o mesmo jogo
+
+No Pi há um **Eden completo a correr este mesmo jogo**:
+
+    /home/emuos/eden/build/bin/eden -f \
+        /home/emuos/user/sdmc/atmosphere/contents/01008DB008C2C000
+
+Isto é a **fonte da verdade do projecto** a correr ao lado: o mesmo jogo, o
+mesmo ExeFS, e o emulador de referência. Serve para:
+
+- confirmar o que o Eden faz nos mesmos pontos onde o nosso motor diverge
+  (o `CreateThread`, a região da stack, o `QueryMemory`);
+- ter um trace de comparação das respostas IPC.
+
+É o melhor sítio para passam a próxima sessão: não para adivinhar o
+comportamento do SDK, mas para o **ver**.
+
+## O estado do motor
+
+| | estado |
+|---|---|
+| arranque | 61,9 ms / 218 SVCs |
+| SVCs com erro | 0 |
+| respostas IPC com erro | 0 |
+| testes | 6/6 |
+| commits | `df33889` (o `PROGRESSO.md` da sessão) |
+
+O passo 1 fica escrito e **medido**, mas não publicado: só entra no
+histórico quando passar nos testes.
