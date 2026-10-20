@@ -47,6 +47,7 @@
 // ler a partir da segunda ocorrencia em diante.
 #include "vendor/eden/common/common_types.h"
 #include "vendor/eden/core/reporter.h"  // `Core::Reporter`, o do Eden
+#include "vendor/eden/core/hle/service/apm/apm_controller.h"  // o controller do `apm`
 
 namespace Kernel {
 class KernelCore;
@@ -54,6 +55,9 @@ class KernelCore;
 
 namespace Service {
 class ServerManager;
+namespace APM {
+class Controller;
+} // namespace APM
 namespace SM {
 class ServiceManager;
 } // namespace SM
@@ -199,6 +203,16 @@ public:
     // peças é o `EdenSystem`, e entrega-as ao `ligar()` no fim do construtor.
     Reporter& GetReporter() { return *reporter_; }
 
+    // O controller do `apm` (a performance do sistema).
+    //
+    // É o padrão que todos os serviços do Eden seguem: o serviço é fino e
+    // delega o estado a um controller que o `Core::System` possui. O Eden
+    // tem um controller por serviço; aqui também, e o do `apm` é nosso.
+    //
+    // Ver `apm_controller.h` para o que o controller do Eden tem que este
+    // não tem (e porque).
+    Service::APM::Controller& GetAPMController();
+
     // Liga as duas pontas depois de ambas existirem.
     //
     // Separado do construtor porque não pode estar nele: o `KernelCore`
@@ -228,6 +242,13 @@ public:
     }
 
 private:
+    // O controller do `apm`. Ver `GetAPMController`.
+    //
+    // Vive aqui, e não no `EdenSystem`, porque o accessor e' do `Core::System`
+    // e o Eden tambem o tem no `Core::System` — e o `EdenSystem` e' o nosso
+    // `Core::System`.
+    Service::APM::Controller apm_controller_;
+
     Kernel::KernelCore* kernel_ = nullptr;
     Reporter* reporter_ = nullptr;
     Service::SM::ServiceManager* sm_ = nullptr;

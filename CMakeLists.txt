@@ -110,6 +110,9 @@ set(IA_EDEN_SOURCES
   vendor/eden/core/hle/kernel/k_session.cpp
   vendor/eden/core/hle/kernel/k_session_request.cpp
   vendor/eden/core/hle/kernel/k_spin_lock.cpp
+  vendor/eden/core/hle/service/apm/apm.cpp
+  vendor/eden/core/hle/service/apm/apm_controller.cpp
+  vendor/eden/core/hle/service/apm/apm_interface.cpp
   vendor/eden/core/hle/service/hle_ipc.cpp
   vendor/eden/core/hle/service/lm/lm.cpp
   vendor/eden/core/hle/service/os/multi_wait.cpp

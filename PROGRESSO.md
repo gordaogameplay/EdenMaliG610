@@ -1346,3 +1346,174 @@ Suite: **6 testes, todos a passar**. GPU: 1.500000 na G610.
 
 Telemetria nova: `IA_FIND=<magic>` procura um magic na imagem
 descomprimida, e imprime os 64 bytes a seguir.
+
+---
+
+# A parede do `SdkMutexType::TryLock` — e o que estava por trás
+
+## O sintoma
+
+O guest abortava em `nn::os::SdkMutexType::TryLock`, com a expressão
+`this == NULL` na mensagem do assert. O sintoma não aponta para nada: um
+assert sobre "this == NULL" num `TryLock` de um mutex é absurdo.
+
+E o abort era o **único** sintoma. O IPC já funcionava (`sm:` a sério,
+`lm:` a sério), o TLS estava montado, o rtld correria.
+
+## A medição que abriu a porta
+
+O `TryLock` do SDK, desassemblado:
+
+```
+82d2a900: mrs  x8, tpidr_el0          ; x8 = TPIDR_EL0
+82d2a904: ldr  w9, [x0]               ; w9 = o dono do mutex
+82d2a908: ldr  x8, [x8, #504]         ; x8 = *(x8 + 0x1F8) = tv->tls_tp
+82d2a90c: and  w9, w9, #0xbfffffff    ; limpa o bit 29
+82d2a910: ldr  w8, [x8, #432]         ; w8 = *(tls_tp + 0x1B0)
+82d2a914: cmp  w9, w8
+82d2a918: cset w0, eq                 ; devolve "o dono sou eu?"
+```
+
+E o `TryLock` aborta quando a resposta é "sim". Ou seja: aborta quando
+**dono do mutex == o meu identificador**.
+
+Medido: o dono era **0** (mutex livre) e o meu identificador também **0**.
+Zero == zero, portanto "já é meu", portanto assert.
+
+**O zero não é um valor neutro aqui: é exactamente o valor de um mutex
+livre.** Era esse o bug — não o mutex, o identificador.
+
+## Onde o identificador vem
+
+O SDK inicializa a thread assim (medido, 0x82d28e80):
+
+```
+ldr  x8, [x21]            ; x8 = g_OsBootParamter[0]
+str  w8, [x19, #432]      ; tv->tls_tp[0x1B0] = esse valor
+bl   0x82d79b8c           ; svcGetThreadId(&local, handle)
+str  x8, [x19, #440]      ; tv->tls_tp[0x1B8] = o ID (u64)
+```
+
+E `g_OsBootParamter[0]` é o **handle da thread principal**, escrito pelo
+crt0 do SDK:
+
+```
+82d2a35c: adrp x8, 0x8360d000
+82d2a360: ldr  x8, [x8, #1632]   ; x8 = g_OsBootParamter
+82d2a364: str  x0, [x8]          ; g_OsBootParamter[0] = x0  <<<<
+```
+
+O `x0` vem do **rtld**, que por sua vez o recebe no `x1` do entry point:
+
+```
+80000008: cmp  x0, #0x0        ; o entry do rtld
+8000000c: b.ne 0x800000c4
+80000010: mov  w19, w1         ; <<<< o handle da thread, no x1
+...
+80000088: mov  w0, w19         ; e passa-o ao SDK
+```
+
+**A cadeia inteira, e onde ela se partia:**
+
+| # | passo | quem faz | estado antes |
+|---|-------|----------|---------------|
+| 1 | handle em TLS+0x110 | kernel | **não existia** |
+| 2 | handle no x1 do entry | kernel | **não existia** |
+| 3 | rtld lê o x1, monta o bloco | rtld (Nintendo) |ok|
+| 4 | crt0 copia para `g_OsBootParamter` | SDK | ok |
+| 5 | `TryLock` compara dono com esse valor | SDK | abortava |
+
+## O que o Eden faz, e nós não
+
+`k_process.cpp:1006-1015`, medido:
+
+```cpp
+} else {                                  // entrada NSO, sem ABI homebrew
+    main_thread->GetContext().r[0] = 0;
+    main_thread->GetContext().r[1] = thread_handle;   // <-- o x1
+}
+this->GetMemory().Write32(GetInteger(main_thread->GetTlsAddress()) + 0x110,
+                          thread_handle);                // <-- o TLS
+```
+
+**O mesmo handle nos dois sítios.** Não dois parecidos: o Eden usa uma
+variável só, e é o que o loader espera.
+
+O nosso motor não fazia nem um nem outro. Agora faz os dois, com o handle
+que a tabela de handles do Eden devolve, registado pela thread principal.
+
+## Três armadilhas no caminho
+
+**1. O `x1` do guest não pode viajar num registo.** A primeira versão punha
+o handle em `x16` (`mov x16, x3`) e o loop de limpeza de registos do
+trampoline apagava-o a seguir. O x1 chegava ao rtld a zero — exactamente o
+sintoma original, com a correcção aplicada. O handle viaja agora pela
+stack, numa palavra que fica **acima** do sp do guest, e o sp do guest não
+muda (reserva de 48 e `add sp` de 32, contra 32 e 16).
+
+**2. A ordem das chamadas importa.** `set_guest_x1` antes de `attach_eden`
+devolve zero — o handle ainda não existe. A ordem correcta é
+`attach_eden` → `set_eden_tls` → `set_guest_x1`.
+
+**3. `GetInfo(12)` e `GetInfo(13)` não são o heap.** São a região **ASLR**
+(`svc_info.cpp:76-82`, `GetAliasCodeRegionStart/Size`) — a região do
+**código**. Devolvíamos o heap. O SDK usa essa região para se instalar, e
+com o heap no sítio errado o `g_OsBootParamter` ficava a zeros.
+
+## O que mudou no comportamento
+
+Antes: abort em `SdkMutexType::TryLock`.
+
+Agora: o SDK **inicializa**. `sm:Initialize`, `lm:OpenLogger`, e depois
+pede o `apm` — que o motor serviu, e depois o `appletOE`, que é o
+serviço do `am`.
+
+## `apm`: o primeiro serviço do Eden, e o padrão
+
+O `apm` são 5 ficheiros do Eden e **280 linhas**. A única dependência
+específica do Eden era o `APMController`, que por sua vez queria um
+`Core::Timing::CoreTiming&` — **que nunca usava** (o Eden diz isso nos
+TODOs do fim do ficheiro) e um `Settings::IsDockedMode()`.
+
+O controller foi reescrito por nós (`tools/overrides/`), sem o `CoreTiming`
+e com o modo de performance fixo em `Normal` (este motor corre um jogo, e
+o jogo não está docked).
+
+**O padrão de um serviço do Eden**, que vai repetir-se:
+
+- o serviço é fino (o `apm.cpp` do Eden tem 29 linhas);
+- o estado vive num *controller*, que o `Core::System` possui;
+- a interface CMIF (os IDs dos comandos e as estruturas) é a parte que
+  **tem de ser exacta** e vem do Eden tal e qual;
+- o `Core::System` do Eden **não** é adoptado: tem ~40 acessores a
+  subsistemas reais (GPU, áudio, HID, temporização) e adoptá-lo seria
+  adoptar o emulador.
+
+Por isso o `Core::System` nosso (`vendor/eden/core/system_ref.h`) ganhou um
+accessor por serviço, e os controllers vivem nele.
+
+## AOverride: porque é preciso
+
+A árvore `vendor/` é uma cópia do Eden, e uma cópia volta a ser a cópia do
+Eden sempre que se sincroniza. As nossas substituições precisam de
+sobreviver a isso, por isso vivem em `tools/overrides/` — **fora** do
+vendor — e `tools/aplicar_overrides.py` copia-as para o sítio. É o único
+ponto do projecto onde se decide que um ficheiro do Eden é substituído por
+um nosso, e porquê.
+
+## O `ankerl` e o `<cstring>`
+
+O `unordered_dense.h` do Eden, em modo STD_MODULE, usa a biblioteca padrão
+directamente e precisa que ela esteja incluida. O Eden compila-o com
+`stl.h` ao lado; nós não tínhamos o `stl.h`. Vendorizá-lo resolveu, de uma
+vez, todos os serviços — a falha aparecia no `ankerl`, a milhares de
+quilómetros do problema.
+
+## Estado
+
+Suite: **6 testes, todos a passar**. `ia_translate` 24 verificações,
+`ia_gpu_exec` 20 (pixel 1.500000 na G610), `ia_maxwell` 13.
+
+O guest inicializa o SDK e vai buscar os serviços. O próximo na fila é o
+`appletOE` — que é o `am` do Eden, e o `am` é grande (8946 linhas) e
+arrasta o núcleo de HID e o sistema de janelas.

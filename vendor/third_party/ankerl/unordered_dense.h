@@ -92,6 +92,15 @@
 
 #    if !ANKERL_UNORDERED_DENSE_STD_MODULE
 #        include "stl.h"
+#    else
+// Em modo STD_MODULE o cabecalho usa a biblioteca padrao directamente, e
+// precisa que ela esteja incluida. O `stl.h` do mesmo projecto e' o que traz
+// `<cstring>`, `<stdexcept>` e o resto.
+//
+// Sem isto, qualquer servico que inclua este cabecalho antes de qualquer
+// outro falha com "memcpy is not a member of std" — e a falha aparece no
+// `ankerl`, a miles de quilometros do problema.
+#        include "stl.h"
 #    endif
 
 #    if __has_cpp_attribute(likely) && __has_cpp_attribute(unlikely) && ANKERL_UNORDERED_DENSE_CPP_VERSION >= 202002L

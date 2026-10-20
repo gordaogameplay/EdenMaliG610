@@ -39,6 +39,8 @@
 #include "vendor/eden/core/hle/kernel/k_resource_limit.h"
 #include "vendor/eden/core/hle/kernel/k_session.h"
 #include "vendor/eden/core/hle/kernel/svc_results.h"
+#include "vendor/eden/core/hle/service/apm/apm.h"
+#include "vendor/eden/core/hle/service/apm/apm_controller.h"
 #include "vendor/eden/core/hle/service/lm/lm.h"
 #include "vendor/eden/core/hle/service/server_manager.h"
 #include "vendor/eden/core/hle/service/sm/sm.h"
@@ -235,6 +237,12 @@ const ::Kernel::KernelCore& ::Core::System::Kernel() const { return *kernel_; }
 ::Service::SM::ServiceManager& ::Core::System::ServiceManager() { return *sm_; }
 const ::Service::SM::ServiceManager& ::Core::System::ServiceManager() const {
     return *sm_;
+}
+
+// O controller do `apm` vive no `Core::System`, como no Eden. Ver o
+// `apm_controller.h` ao lado.
+::Service::APM::Controller& ::Core::System::GetAPMController() {
+    return apm_controller_;
 }
 
 void ::Core::System::RunServer(
@@ -523,6 +531,10 @@ EdenSystem::EdenSystem(GuestMemory& memoria, std::uint64_t pid, std::uint64_t ti
     // (`core/hle/service/lm/lm.cpp:360-364`); o Core::System guarda esse
     // segundo manager para o dispatch síncrono.
     Service::LM::LoopProcess(*this);
+
+    // O `apm` (a performance do sistema). O SDK pergunta por ele no arranque,
+    // e o `sm:` fica a espera ate que exista.
+    Service::APM::LoopProcess(*this);
 
     // A verificacao que esteve aqui -- `KObjectName::Find("sm:")` -- **partiu
     // o jogo**.
