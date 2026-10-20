@@ -140,6 +140,8 @@ bool GuestProgram::plan_layout(std::uint64_t heap_reserve, std::string& error) {
     heap_size_  = std::max<std::uint64_t>(heap_reserve, layout::kHeapSize);
     heap_base_  = layout::kHeapBase;
     stack_size_ = layout::kStackSize;
+    stack_base_ = layout::kStackBase;
+    stack_top_  = layout::kStackTop();
 
     // Os módulos são carregados SEQUENCIALMENTE, cada um no fim do anterior.
     //
@@ -239,23 +241,6 @@ bool GuestProgram::plan_layout(std::uint64_t heap_reserve, std::string& error) {
     }
     code_end_ = cursor;
 
-    // A stack vem DEPOIS do codigo, e o SDK e' avisado do endereco (SVC 0x29,
-    // tipo 14). No Switch a regiao da stack e' sorteada pelo kernel, e nao
-    // esta num sitio fixo: o que o guest sabe e' o endereco que o kernel lhe
-    // deu. Portanto move-la e' legitimo — o que nao e' legitimo e'_move-la
-    // sem avisar o guest.
-    //
-    // A base e' o fim do codigo, sem buraco pelo meio: o rtld varre o
-    // espaco do processo a procura de modulos e desiste quando cai num
-    // endereco livre. Um buraco entre o codigo e a stack seria esse endereco.
-    //
-    // Com os sub-SDKs (`subsdk0`, `subsdk1`) o codigo cresce para alem dos
-    // 64 MiB que separavam o codigo da stack fixa em 0x8400'0000 — e a
-    // sobreposicao era detectada (`layout do guest sobreposto`), o que
-    // impedia o jogo de arrancar. A stack e' o unico sitio que pode
-    // mudar: o resto do layout tem enderecos que o linkador fixou.
-    stack_base_ = layout::page_align_up(code_end_);
-    stack_top_  = stack_base_ + stack_size_;
 
     // Verificação de sobreposição.
     struct Span { std::uint64_t lo, hi; const char* what; };
@@ -344,7 +329,10 @@ bool GuestProgram::map_into(std::uint64_t heap_reserve, std::string& error) {
     // Uma reserva única que cobre tudo: o `owns()` passa a ser uma comparação
     // só, e um módulo nunca fica a meio de uma reserva.
     const std::uint64_t lo = layout::kAliasBase;
-    const std::uint64_t hi = heap_base_ + heap_size_;
+    // A reserva tem de cobrir o heap E a regiao da stack (que fica depois
+    // dele). O `MAP_NORESERVE` faz o resto: 43 GiB de espaco virtual sao
+    // gratis, as paginas so' existem quando o guest as toca.
+    const std::uint64_t hi = std::max(heap_base_ + heap_size_, stack_top_);
     (void)code_end_;
     const std::uint64_t span = page_align_up(hi - lo);
 
@@ -565,8 +553,22 @@ std::vector<GuestRegion> GuestProgram::memory_regions() const {
     // DELA, e o SDK aloca dali — se devolvêssemos 0, o `AddressSpaceAllocator`
     // ficava com uma região nula e desreferenciava-a. Foi o que aconteceu
     // antes de isto existir: `svc Break(x0=0)`.
-    out.push_back({layout::kAliasBase, layout::kAliasSize, G::kNormal,
-                   G::kReadWrite});
+    // A regiao de alias e' **LIVRE**.
+    //
+    // No Switch a regiao de alias e' o sitio onde o SDK aloca: o
+    // `nn::os::detail::AddressSpaceAllocator::AllocateSpace` procura um
+    // bloco **Free** para alocar, e so' o Eden devolve os blocos livres com
+    // o tamanho certo (`k_memory_block_manager.h:129`, `FindBlock`: a
+    // arvore de blocos contem blocos `Free`).
+    //
+    // Descreve-la como `Normal` (mapeada) tirava ao SDK todo o espaco
+    // livre: ele percorria o espaco do processo a perguntar `svcQueryMemory`
+    // e recebia sempre um bloco mapeado, sem nenhum tamanho livre onde
+    // alocar. Medido: o SDK chegou a fazer **527** interrogacoes
+    // `svcQueryMemory` a procurar espaco (as que caem fora do mapeado
+    // devolviam `size=0`) e depois lancou uma excecao sem quem a apanhe.
+    out.push_back({layout::kAliasBase, layout::kAliasSize, G::kFree,
+                   G::kNone});
 
     // Cada módulo em três regiões, à medida dos segmentos. Os gaps entre
     // segmentos (medidos: 3328 bytes no `main`) ficam absorbidos na região
@@ -625,15 +627,48 @@ std::vector<GuestRegion> GuestProgram::memory_regions() const {
         out.push_back({data_lo, module_end - data_lo, G::kNormal, G::kReadWrite});
     }
 
-    // Tudo o resto até ao fim da reserva: pilha, heap, e a cauda de cada
-    // módulo alinhada para o início da página seguinte. É uma região RW e
-    // contígua, e é o que garante que a varredura não para no meio.
-    const std::uint64_t reserve_end = mem_.size() != 0
-                                          ? mem_.base() + mem_.size()
-                                          : code_end_;
-    if (code_end_ < reserve_end)
-        out.push_back({code_end_, reserve_end - code_end_, G::kNormal,
-                       G::kReadWrite});
+    // A região da stack: 2 GiB, como no Eden
+    // (`k_address_space_info.cpp:56`). E **só a stack da thread principal
+    // é mapeada** — o resto da região é `Free`, porque no Eden é de lá que o
+    // SDK aloca as stacks das threads.
+    //
+    // Isto não é um detalhe: o `nn::os::detail::AddressSpaceAllocator::
+    // AllocateSpace` do SDK escolhe um endereço aleatório dentro da região
+    // da stack, pergunta o `svcQueryMemory` e **exige um bloco com estado
+    // `Free`** (medido no `sdk`, offset 0x32c13c-0x32c140: o estado vem do
+    // `MemoryInfo` que o SVC devolve). Medido: com a região inteira
+    // marcada como `Stack`, o SDK gazava 512 endereços e falhava — e
+    // lançava uma excepção que ninguém apanhou.
+    //
+    // O tamanho da stack da thread principal vem do NPDM
+    // (`main_thread_stack_size`, offset 0x1C): **1 MiB**, medido. E fica no
+    // TOPO da região, que é onde o kernel a põe (e onde o `sp` inicial do
+    // guest aponta).
+    {
+        const std::uint64_t tamanho =
+            modules_.empty() ? 0 : modules_.front().nso.stack_size;
+        const std::uint64_t regiao = stack_top_ - stack_base_;
+        if (tamanho > 0 && tamanho < regiao)
+            out.push_back({stack_base_, regiao - tamanho, G::kFree, G::kNone});
+        if (tamanho > 0)
+            out.push_back({stack_top_ - tamanho, tamanho, G::kStack,
+                           G::kReadWrite});
+        else if (regiao > 0)
+            out.push_back({stack_base_, regiao, G::kStack, G::kReadWrite});
+    }
+
+    // O TLS da thread principal. Estado `ThreadLocal` (`svc_types.h:33`).
+    {
+        const std::uint64_t tls_fim = layout::kReentBase + 0x1000;
+        if (tls_fim > layout::kTlsBase)
+            out.push_back({layout::kTlsBase, tls_fim - layout::kTlsBase,
+                           G::kThreadLocal, G::kReadWrite});
+    }
+
+    // O heap. `SetHeapSize` devolve a base daqui, e o SDK aloca a partir
+    // dela.
+    if (heap_size_ != 0)
+        out.push_back({heap_base_, heap_size_, G::kNormal, G::kReadWrite});
 
     std::sort(out.begin(), out.end(),
               [](const GuestRegion& a, const GuestRegion& b) { return a.base < b.base; });

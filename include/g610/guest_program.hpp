@@ -214,9 +214,9 @@ private:
 // não ter SVC estão em `GuestProgram::load`.
 //
 //   code   0x8000_0000   rtld + main     (o code_address do Switch, 39-bit)
-//   stack  0x8400_0000   8 MiB
+//   stack  0x2900_00000  2 GiB, a regiao da stack do Switch (ver `kStackSize`)
 //   sdk    0x8500_0000   a biblioteca de serviços
-//   heap   0x9000_0000   128 MiB, pedido pelo rtld via SetHeapSize
+//   heap   0x9000_0000   8 GiB, pedido pelo rtld via SetHeapSize
 namespace layout {
 
 // Os módulos são empilhados sequencialmente a partir daqui, como o Eden faz
@@ -245,8 +245,25 @@ inline constexpr std::uint64_t kAliasBase = 0x0000'0000'6000'0000ull;
 // primeira versão, com 256 MiB.
 inline constexpr std::uint64_t kAliasSize = 0x2000'0000ull;  // 512 MiB
 
-inline constexpr std::uint64_t kStackBase = 0x0000'0000'8400'0000ull;
-inline constexpr std::uint64_t kStackSize = 0x0080'0000ull;   // 8 MiB
+// A regiao da stack: **2 GiB**, como no Eden.
+//
+// A fonte e' `core/hle/kernel/k_address_space_info.cpp:56`:
+//
+//     { .bit_width = 39, .size = 2_GiB, .type = KAddressSpaceInfo::Type::Stack },
+//
+// E o tamanho e' load-bearing: o
+// `nn::os::detail::AddressSpaceAllocator::AllocateSpace` do SDK escolhe um
+// endereco **aleatorio** dentro da regiao da stack (medido no `sdk`, offset
+// 0x32c118-0x32c130) e exige que o bloco que o `svcQueryMemory` devolve seja
+// maior do que o total que precisa (offset 0x32c148-0x32c154). Com 8 MiB de
+// regiao e um total de ~8 MiB, o total nunca cabia - o SDK gazava 512
+// enderecos e falhava, lanando uma excecao que ninguem apanhe.
+//
+// No Eden a regiao da stack e' sorteada pelo kernel; aqui e' fixa, mas o
+// modelo e' o mesmo: a thread principal corre no topo (o `sp` inicial) e o
+// SDK aloca as stacks das threads pelo fundo.
+inline constexpr std::uint64_t kStackBase = 0x0000'0000'2900'0000'0ull;
+inline constexpr std::uint64_t kStackSize = 0x8000'0000ull;   // 2 GiB
 
 inline constexpr std::uint64_t kSdkBase   = 0x0000'0000'8500'0000ull;
 inline constexpr std::uint64_t kSdkSize   = 0x0400'0000ull;   // 64 MiB
