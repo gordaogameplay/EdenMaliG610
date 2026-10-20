@@ -735,6 +735,24 @@ Result SvcDispatcher::svc_wait_synchronization(SvcContext& ctx) {
     // O Eden devolve `ResultTimedOut` quando o prazo expira sem nada
     // acontecer, e o SDK sabe o que isso significa. E' essa a resposta
     // honesta, e o guest sabe o que fazer com ela.
+    // `ResultTimedOut`, e nao sucesso.
+    //
+    // **A espera nao pode dizer que passou se ninguem sinalizou nada.** A
+    // primeira versao devolvia sucesso, e o SDK — que faz
+    // `ReceiveMessage` + `WaitSynchronization` em ciclo — voltava a pedir
+    // imediatamente: 1311 pedidos em poucos segundos, e o motor a 100% de
+    // CPU a fazer nada.
+    //
+    // O Eden devolve `ResultTimedOut` quando o prazo expira sem nada
+    // acontecer, e o SDK sabe o que isso significa. E' essa a resposta
+    // honesta, e o guest sabe o que fazer com ela.
+    //
+    // **A espera que o SDK faz no fim e' maior do que esta.** A fila de
+    // mensagens do SDK (`nn::os::ReceiveMessageQueue`) espera por um
+    // *multi-wait de dominio* — `nn::os::InitializeMultiWaitHolder` — e nao
+    // por um evento. Esse multi-wait e' a machine de dominios do IPC
+    // controller, que este motor ainda nao tem. E' a parede de espera, e
+    // esta escrita em `PROGRESSO.md`.
     ctx.ret     = static_cast<std::uint64_t>(Result::TimedOut);
     ctx.has_ret = true;
     ctx.x[1]    = 0;   // o indice do handle sinalizado

@@ -57,6 +57,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "vendor/eden/common/logging.h"
 #include "vendor/eden/core/system_ref.h"  // o `Core::System` nosso
@@ -104,6 +105,78 @@ constexpr Result kResultNoMessages{ErrorModule::AM, 3};
 // `ResultSuccess` e `ResultUnknown` sao globais (estao em
 // `core/hle/result.h`, fora de qualquer namespace) — o Eden usa-os assim
 // nos seus servicos, e o mesmo vale aqui.
+
+// ─────────────────────────────────────────────────────────────────────────────
+// O estado do applet
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// O `am` do Eden tem um `Applet` com um `LifecycleManager`, e o
+// `WindowSystem` empurra para a fila do applet as mensagens de mudança de
+// estado. A fila e' o que o `ReceiveMessage` vai buscar.
+//
+// **O que o SDK espera, medido:** o SDK ficou preso a pedir `ReceiveMessage`
+// sem parar. E a mensagem que falta e' a de entrada no primeiro plano —
+// `AppletMessage::ChangeIntoForeground` (= 1), do enum do Eden
+// (`am_types.h:125-147`).
+//
+// No Switch, um applet e' lançado, o `am` mete-o em primeiro plano e
+// entrega-lhe essa mensagem. O SDK inicializa, e so depois de a receber e'
+// que continua.
+//
+// Aqui nao ha `Applet`, nem `LifecycleManager`, nem `WindowSystem`. Mas a
+// mensagem e' uma **primeira vez**: o applet e' criado, e vai para o
+// primeiro plano. Por isso a fila tem uma mensagem, e so uma.
+//
+// A fila vive no `AppletOE` — o objecto do serviço — e e' partilhada por
+// referencia com o proxy e com as sub-interfaces. **Nao pode viver na
+// sub-interface**: cada `PushIpcInterface` cria um objecto novo, e a
+// mensagem seria entregue uma vez por sub-interface.
+struct EstadoDoApplet {
+    // As mensagens, por ordem. `AppletMessage`, do Eden (`am_types.h`).
+    std::vector<u32> mensagens;
+
+    // A mensagem que o `am` entrega quando o applet e' lanado:
+    // `ChangeIntoForeground` = 1.
+    static constexpr u32 kChangeIntoForeground = 1;
+
+    // O evento do sistema: o que o `GetEventHandle` devolve, e o que e'
+    // sinalizado quando o estado muda.
+    //
+    // **A ligacao entre a mensagem e o evento e' do Eden**, e e' o que
+    // faz o SDK arrancar (`lifecycle_manager.cpp:31-34`):
+    //
+    //     void LifecycleManager::PushUnorderedMessage(Kernel::KernelCore& kernel,
+    //                                                AppletMessage message) {
+    //         m_unordered_messages.push_back(message);
+    //         this->SignalSystemEventIfNeeded(kernel);
+    //     }
+    //
+    // A mensagem diz **o que** mudou; o evento diz **que** mudou. O SDK
+    // espera por um e le o outro.
+    Kernel::KEvent* evento = nullptr;
+
+    // O handle do evento. Vem do `KHandleTable::Add` — o `KEvent` nao tem
+    // `GetHandle()`, porque o handle vive na tabela, e nao no objecto.
+    std::uint32_t handle_evento = 0;
+
+    bool tem_mensagem() const { return !mensagens.empty(); }
+
+    // Tira a proxima. Devolve `None` (= 0) quando nao ha nenhuma.
+    u32 proxima() {
+        if (mensagens.empty())
+            return 0;
+        const u32 m = mensagens.front();
+        mensagens.erase(mensagens.begin());
+        return m;
+    }
+
+    // Empurra uma mensagem e sinaliza o evento do sistema.
+    void empurrar(Kernel::KernelCore& kernel, u32 mensagem) {
+        mensagens.push_back(mensagem);
+        if (evento != nullptr)
+            evento->Signal(kernel);
+    }
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // O evento
@@ -159,8 +232,8 @@ std::uint32_t handle_de_evento(Core::System& system) {
 /// O `ICommonStateGetter` — o estado comum do applet.
 class CommonStateGetter final : public Service::ServiceFramework<CommonStateGetter> {
 public:
-    explicit CommonStateGetter(Core::System& system)
-        : ServiceFramework{system, "ICommonStateGetter"} {
+    CommonStateGetter(Core::System& system, std::shared_ptr<EstadoDoApplet> estado)
+        : ServiceFramework{system, "ICommonStateGetter"}, estado_{std::move(estado)} {
         static const FunctionInfo functions[] = {
             {0, &CommonStateGetter::GetEventHandle, "GetEventHandle"},
             {1, &CommonStateGetter::ReceiveMessage, "ReceiveMessage"},
@@ -196,10 +269,27 @@ private:
     void GetEventHandle(HLERequestContext& ctx) {
         ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
-        rb.Push(handle_de_evento(system));
+        rb.Push(estado_ ? handle_do_evento_do_sistema() : 0u);
+    }
+
+    // O handle do evento do sistema. O evento e' **o mesmo** que o
+    // `handle_de_evento` devolveu — e por isso que o `empurrar` o possa
+    // sinalizar.
+    std::uint32_t handle_do_evento_do_sistema() const {
+        return estado_ ? estado_->handle_evento : 0u;
     }
 
     void ReceiveMessage(HLERequestContext& ctx) {
+        // A mensagem, se a houver. `AppletMessage`, que e' um u32.
+        if (estado_ && estado_->tem_mensagem()) {
+            const u32 mensagem = estado_->proxima();
+            LOG_DEBUG(Service_AM, "ReceiveMessage: entrega {}", mensagem);
+            ResponseBuilder rb{ctx, 2};
+            rb.Push(ResultSuccess);
+            rb.Push(mensagem);
+            return;
+        }
+
         // `ResultNoMessages`, como o Eden (`common_state_getter.cpp:99-104`).
         // E' um Result **valido**, e o SDK sabe o que significa.
         ResponseBuilder rb{ctx, 2};
@@ -320,6 +410,9 @@ private:
         rb.Push(ResultSuccess);
         rb.Push(handle_de_evento(system));
     }
+
+private:
+    std::shared_ptr<EstadoDoApplet> estado_;
 };
 
 /// O `ISelfController` — o que o jogo pode fazer consigo próprio.
@@ -981,8 +1074,8 @@ private:
 /// O `IApplicationProxy` — o que dá as sub-interfaces.
 class ApplicationProxy final : public Service::ServiceFramework<ApplicationProxy> {
 public:
-    explicit ApplicationProxy(Core::System& system)
-        : ServiceFramework{system, "IApplicationProxy"} {
+    ApplicationProxy(Core::System& system, std::shared_ptr<EstadoDoApplet> estado)
+        : ServiceFramework{system, "IApplicationProxy"}, estado_{std::move(estado)} {
         static const FunctionInfo functions[] = {
             {0, &ApplicationProxy::GetCommonStateGetter, "GetCommonStateGetter"},
             {1, &ApplicationProxy::GetSelfController, "GetSelfController"},
@@ -1004,48 +1097,75 @@ private:
     //
     // `rb{ctx, 2, 0, 1}`: dois palavras de corpo (o Result e um
     // reservado), e **um** objecto a mover (a sessao do interface).
+    // Devolve uma sub-interface.
+    //
+    // A fabrica vem de fora porque **so o `CommonStateGetter` precisa do
+    // estado**: e' o unico que tem a fila de mensagens. Os outros nao tem
+    // estado nenhum, e um `make_shared<T>(system, estado_)` a todos seria
+    // uma assinatura que nenhum deles tem.
     template <typename T>
-    void Devolve(HLERequestContext& ctx, const char* nome) {
+    void Devolve(HLERequestContext& ctx, const char* nome,
+                 std::shared_ptr<T> (*fabrica)(Core::System&, std::shared_ptr<EstadoDoApplet>)) {
         LOG_DEBUG(Service_AM, "{}: devolvido", nome);
         ResponseBuilder rb{ctx, 2, 0, 1};
         rb.Push(ResultSuccess);
-        rb.PushIpcInterface<T>(ctx, std::make_shared<T>(system));
+        rb.PushIpcInterface<T>(ctx, fabrica(system, estado_));
     }
 
+    std::shared_ptr<EstadoDoApplet> estado_;
+
     void GetCommonStateGetter(HLERequestContext& ctx) {
-        Devolve<CommonStateGetter>(ctx, "GetCommonStateGetter");
+        Devolve<CommonStateGetter>(ctx, "GetCommonStateGetter", [](Core::System& sys, std::shared_ptr<EstadoDoApplet> est) {
+            return std::make_shared<CommonStateGetter>(sys, est);
+        });
     }
 
     void GetSelfController(HLERequestContext& ctx) {
-        Devolve<SelfController>(ctx, "GetSelfController");
+        Devolve<SelfController>(ctx, "GetSelfController", [](Core::System& sys, std::shared_ptr<EstadoDoApplet>) {
+            return std::make_shared<SelfController>(sys);
+        });
     }
 
     void GetWindowController(HLERequestContext& ctx) {
-        Devolve<WindowController>(ctx, "GetWindowController");
+        Devolve<WindowController>(ctx, "GetWindowController", [](Core::System& sys, std::shared_ptr<EstadoDoApplet>) {
+            return std::make_shared<WindowController>(sys);
+        });
     }
 
     void GetAudioController(HLERequestContext& ctx) {
-        Devolve<AudioController>(ctx, "GetAudioController");
+        Devolve<AudioController>(ctx, "GetAudioController", [](Core::System& sys, std::shared_ptr<EstadoDoApplet>) {
+            return std::make_shared<AudioController>(sys);
+        });
     }
 
     void GetDisplayController(HLERequestContext& ctx) {
-        Devolve<DisplayController>(ctx, "GetDisplayController");
+        Devolve<DisplayController>(ctx, "GetDisplayController", [](Core::System& sys, std::shared_ptr<EstadoDoApplet>) {
+            return std::make_shared<DisplayController>(sys);
+        });
     }
 
     void GetProcessWindingController(HLERequestContext& ctx) {
-        Devolve<ProcessWindingController>(ctx, "GetProcessWindingController");
+        Devolve<ProcessWindingController>(ctx, "GetProcessWindingController", [](Core::System& sys, std::shared_ptr<EstadoDoApplet>) {
+            return std::make_shared<ProcessWindingController>(sys);
+        });
     }
 
     void GetLibraryAppletCreator(HLERequestContext& ctx) {
-        Devolve<LibraryAppletCreator>(ctx, "GetLibraryAppletCreator");
+        Devolve<LibraryAppletCreator>(ctx, "GetLibraryAppletCreator", [](Core::System& sys, std::shared_ptr<EstadoDoApplet>) {
+            return std::make_shared<LibraryAppletCreator>(sys);
+        });
     }
 
     void GetApplicationFunctions(HLERequestContext& ctx) {
-        Devolve<ApplicationFunctions>(ctx, "GetApplicationFunctions");
+        Devolve<ApplicationFunctions>(ctx, "GetApplicationFunctions", [](Core::System& sys, std::shared_ptr<EstadoDoApplet>) {
+            return std::make_shared<ApplicationFunctions>(sys);
+        });
     }
 
     void GetDebugFunctions(HLERequestContext& ctx) {
-        Devolve<DebugFunctions>(ctx, "GetDebugFunctions");
+        Devolve<DebugFunctions>(ctx, "GetDebugFunctions", [](Core::System& sys, std::shared_ptr<EstadoDoApplet>) {
+            return std::make_shared<DebugFunctions>(sys);
+        });
     }
 };
 
@@ -1054,6 +1174,35 @@ class AppletOE final : public Service::ServiceFramework<AppletOE> {
 public:
     explicit AppletOE(Core::System& system) : ServiceFramework{system, "appletOE"} {
         LOG_DEBUG(Service_AM, "appletOE: registado");
+
+        // O applet e' criado, e vai para o primeiro plano — que e' o que o
+        // `am` do Eden faz quando lanca um applet
+        // (`window_system.cpp`, `AppletMessage::ChangeIntoForeground`).
+        //
+        // **Sem esta mensagem o SDK nao arranca.** Medido: o guest ficou a
+        // pedir `ReceiveMessage` sem parar, e a unica mensagem que o
+        // `am` entrega no arranque e' esta.
+        estado_ = std::make_shared<EstadoDoApplet>();
+
+        // O evento do sistema. E' o que o `GetEventHandle` devolve, e e'
+        // sinalizado quando a mensagem e' empurrada.
+        {
+            auto& kernel = system.Kernel();
+            auto& processo = Kernel::GetCurrentProcess(kernel);
+            auto* evento = new Kernel::KEvent(kernel);
+            evento->Initialize(kernel, &processo);
+            Kernel::Handle handle{};
+            if (R_SUCCEEDED(processo.GetHandleTable().Add(kernel, &handle, evento))) {
+                estado_->evento = evento;
+                estado_->handle_evento = static_cast<std::uint32_t>(handle);
+            } else {
+                LOG_WARNING(Service_AM, "appletOE: o handle do evento do sistema nao reservou");
+            }
+        }
+
+        // A mensagem de entrada no primeiro plano, e o evento que a
+        // acompanha. Ver `EstadoDoApplet::empurrar`.
+        estado_->empurrar(system.Kernel(), EstadoDoApplet::kChangeIntoForeground);
         static const FunctionInfo functions[] = {
             {0, &AppletOE::OpenApplicationProxy, "OpenApplicationProxy"},
         };
@@ -1076,8 +1225,12 @@ private:
 
         ResponseBuilder rb{ctx, 2, 0, 1};
         rb.Push(ResultSuccess);
-        rb.PushIpcInterface<ApplicationProxy>(ctx, std::make_shared<ApplicationProxy>(system));
+        rb.PushIpcInterface<ApplicationProxy>(ctx, std::make_shared<ApplicationProxy>(system, estado_));
     }
+
+    // O estado do applet: a fila de mensagens. Vive aqui porque o objecto
+    // do servico e' o unico que sobrevive a todas as sub-interfaces.
+    std::shared_ptr<EstadoDoApplet> estado_;
 };
 
 } // namespace

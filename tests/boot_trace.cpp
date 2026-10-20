@@ -824,6 +824,31 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ── o modulo `main`, em binario ─────────────────────────────────────────
+    //
+    // `IA_DUMP_MAIN` escreve o `.text` do modulo `main` em
+    // `/tmp/ia_main.text`. E' o **proprio jogo**, e a unica forma de ver o
+    // que ele chama sem um debugger.
+    if (const char* dump_main = std::getenv("IA_DUMP_MAIN")) {
+        for (const auto& module : prog.modules()) {
+            if (std::strcmp(module.name(), "main") != 0)
+                continue;
+            const auto& img = module.nso.image;
+            const std::size_t ini = module.nso.seg_offset[0];
+            const std::size_t tam = static_cast<std::size_t>(module.nso.segments[0].size);
+            if (tam == 0 || ini + tam > img.size())
+                continue;
+            std::FILE* f = std::fopen("/tmp/ia_main.text", "wb");
+            if (f == nullptr)
+                continue;
+            std::fwrite(img.data() + ini, 1, tam, f);
+            std::fclose(f);
+            std::printf("[dump] main: %zu bytes em /tmp/ia_main.text (base 0x%llx)\n", tam,
+                        static_cast<unsigned long long>(module.vaddr_base +
+                                                     module.nso.segments[0].vaddr));
+        }
+    }
+
     // ── despejar a imagem completa de um modulo ────────────────────────────
     //
     // `IA_DUMP_MODULE=sdk` escreve a imagem inteira do modulo (cabeçalho

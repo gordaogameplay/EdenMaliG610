@@ -1722,3 +1722,120 @@ seja consultável, e o `ReceiveMessage` precisa de uma fila.
 
 Suite: **6 testes, todos a passar**. `ia_translate` 24 verificações,
 `ia_gpu_exec` 20 (pixel 1.500000 na G610), `ia_maxwell` 13.
+a fila de mensagens do am, e o multi-wait de dominio que falta
+
+O SDK ja recebe a mensagem de entrada no primeiro plano, e ja nao esta em
+loop. O que falta e' a parede de espera: a fila de mensagens do SDK espera
+por um multi-wait de dominio, e nao por um evento.
+
+## A mensagem de entrada no primeiro plano
+
+O SDK ficou preso a pedir `ReceiveMessage` sem parar. A mensagem que
+faltava e' a de entrada no primeiro plano — `AppletMessage::ChangeIntoForeground`
+(= 1), do enum do Eden (`am_types.h:125-147`).
+
+No Switch, um applet e' lanado, o `am` mete-o em primeiro plano e
+entrega-lhe essa mensagem. O SDK inicializa, e so depois de a receber e'
+que continua.
+
+Aqui nao ha `Applet`, nem `LifecycleManager`, nem `WindowSystem`. Mas a
+mensagem e' uma **primeira vez**: o applet e' criado, e vai para o primeiro
+plano. Por isso a fila tem uma mensagem, e so uma.
+
+A fila vive no `AppletOE` — o objecto do servico — e e' partilhada por
+referencia com o proxy e com as sub-interfaces. **Nao pode viver na
+sub-interface**: cada `PushIpcInterface` cria um objecto novo, e a
+mensagem seria entregue uma vez por sub-interface.
+
+## O evento do sistema, ligado a mensagem
+
+O Eden (`lifecycle_manager.cpp:31-34`):
+
+    void LifecycleManager::PushUnorderedMessage(Kernel::KernelCore& kernel,
+                                                AppletMessage message) {
+        m_unordered_messages.push_back(message);
+        this->SignalSystemEventIfNeeded(kernel);
+    }
+
+A mensagem diz **o que** mudou; o evento diz **que** mudou. O SDK
+espera por um e le o outro. Por isso o `GetEventHandle` devolve **o mesmo**
+evento que o `empurrar` sinaliza — e nao um evento novo a cada chamada.
+
+O handle do evento vem do `KHandleTable::Add`: o `KEvent` nao tem
+`GetHandle()`, porque o handle vive na tabela, e nao no objecto.
+
+## A parede de espera: o multi-wait de dominio
+
+O que o SDK espera no fim **nao e' um evento**. A fila de mensagens do SDK
+— `nn::os::ReceiveMessageQueue` (0x82d21340) — espera por um
+**multi-wait de dominio**:
+
+    nn::os::InitializeMultiWaitHolder(MultiWaitHolderType*, MessageQueueType*,
+                                      MessageQueueWaitType)   0x82d217c0
+    nnosInitializeMultiWaitHolderForMessageQueue               0x82d24590
+
+E o `IpcController` aparece na traça, com dois comandos:
+
+    IpcController: comando 0 (ConvertCurrentObjectToDomain)
+    IpcController: comando 3 (QueryPointerBufferSize)
+
+**Isto e' a parede de espera**, e e' a mesma que ja estava escrita no
+`PROGRESSO.md`: o `Wait` do Eden usa `KScopedSchedulerLockAndSleep`, que
+e' o escalonador, e dorme a thread. Nao existe nada disso num motor de
+execucao nativa.
+
+O que falta, em concreto:
+
+1. **os objectos de dominio** — o `IpcController` (`ConvertCurrentObjectToDomain`
+   transforma um objecto normal num objecto de dominio, com o seu proprio
+   ciclo de vida);
+2. **o `MultiWait`** como objecto de dominio — o Eden tem
+   `core/hle/service/os/multi_wait.cpp` e `multi_wait_holder.cpp` (ja
+   vendorizados), e o `MultiWaitHolder` do SDK e' o mesmo mecanismo com
+   outro nome;
+3. **uma espera que bloqueie** — hoje o `WaitSynchronization` devolve
+   `ResultTimedOut` porque nao ha como dormir a thread do guest sem
+   escalonador.
+
+**A peca 3 e' a difficult.** As pecas 1 e 2 sao o Eden a fazer o que o
+Eden faz.
+
+## O `WaitSynchronization` que devolve `ResultTimedOut`
+
+A primeira versao devolvia sucesso — a espera dizia que tinha passado sem
+ninguem ter sinalizado nada. O SDK, que faz `ReceiveMessage` +
+`WaitSynchronization` em ciclo, voltava a pedir imediatamente: 1311
+pedidos em poucos segundos, e o motor a 100% de CPU a fazer nada.
+
+O Eden devolve `ResultTimedOut` quando o prazo expira sem nada
+acontecer, e o SDK sabe o que isso significa. E' essa a resposta honesta.
+
+## A receita das sub-interfaces
+
+O `Devolve<T>` do proxy passou a receber uma **fabrica**, e nao a
+construir o objecto ele proprio: so o `CommonStateGetter` precisa do
+estado (a fila de mensagens), e um `make_shared<T>(system, estado)` a
+todos seria uma assinatura que nenhum dos outros tem.
+
+## O que o log por comando mostrou
+
+    1311  ICommonStateGetter: comando 1 (ReceiveMessage)
+       3  sm:: comando 1 (GetService)
+       1  sm:: comando 0 (Initialize)
+       1  lm: comando 0 (OpenLogger)
+       1  IWindowController: comando 1 (GetAppletResourceUserId)
+       1  ISelfController: comando 91 (GetAccumulatedSuspendedTickChangedEvent)
+       1  IpcController: comando 3 (QueryPointerBufferSize)
+       1  IpcController: comando 0 (ConvertCurrentObjectToDomain)
+       1  ICommonStateGetter: comando 0 (GetEventHandle)
+
+E o `IpcController` no meio dos comandos do `am` e' a pista: e' a
+machine de dominios do IPC, e e' o que a fila de mensagens espera.
+
+## Onde estamos
+
+O SDK inicializa, pede o `apm` e o `appletOE`, recebe as nove
+sub-interfaces, recebe a mensagem de entrada no primeiro plano, e espera
+pelo multi-wait de dominio.
+
+Suite: 6 testes. ia_translate 24, ia_gpu_exec 20 (pixel 1.500000), ia_maxwell 13.
