@@ -233,7 +233,23 @@ void on_svc(std::uint32_t number, ia::SvcContext& ctx, std::uint64_t pc,
             }
         }
     }
-   (void)user;
+   // Endereços de retorno do guest na stack, para seguir de onde veio o
+    // abort. Um `Break(x0=0)` diz QUE valor estava a zero; a stack diz
+    // QUEM o tinha.
+    if (number == 0x26 && sp != 0 && g_mem != nullptr) {
+        std::uint64_t slots[96];
+        std::string e;
+        if (g_mem->read(sp, slots, sizeof slots, e)) {
+            std::printf("[stk] retorno a partir de Break:\\n");
+            for (int i = 0; i < 96; ++i) {
+                const std::uint64_t v = slots[i];
+                if (v >= 0x80000000ull && v < 0x98000000ull)
+                    std::printf("      sp+%4d  0x%016llx\\n", i * 8,
+                                (unsigned long long)v);
+            }
+        }
+    }
+    (void)user;
     // Confirma que o observer corre DENTRO do handler. Sem isto, e sem o
     // relatório (que só imprime quando o guest sai), um SVC despachado sem
     // guest parado não deixa rasto nenhum.
@@ -280,11 +296,14 @@ void on_svc(std::uint32_t number, ia::SvcContext& ctx, std::uint64_t pc,
     // gpr[] e não x[]: x[] tem 6 entradas e x[18] seria memória a mais.
     char b[320];
     const int k = std::snprintf(b, sizeof b,
-        "[svc #%u] 0x%02x %-18s x0=0x%llx x1=0x%llx x2=0x%llx x18=0x%llx x30=0x%llx\n",
+        "[svc #%u] 0x%02x %-18s x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx "
+        "x4=0x%llx x5=0x%llx x18=0x%llx x30=0x%llx\n",
         g_svcs, number, c.name.c_str(),
         (unsigned long long)ctx.x[0], (unsigned long long)ctx.x[1],
-        (unsigned long long)ctx.x[2], (unsigned long long)ctx.gpr[18],
-        (unsigned long long)ctx.gpr[30]);
+        (unsigned long long)ctx.x[2],
+        (unsigned long long)ctx.gpr[3], (unsigned long long)ctx.gpr[4],
+        (unsigned long long)ctx.gpr[5],
+        (unsigned long long)ctx.gpr[18], (unsigned long long)ctx.gpr[30]);
     ssize_t w = ::write(2, b, (size_t)k);
     (void)w;
 }

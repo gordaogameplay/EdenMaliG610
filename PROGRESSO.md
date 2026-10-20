@@ -99,21 +99,79 @@ serviço em `magic + 0x10`**. Uma versão anterior lia o `cmd_id` de 0x28 e
 achava que o primeiro pedido era `Initialize`; era `GetService`, e o
 `Initialize` nunca chegou a ser pedido.
 
-### Quatro tentativas, sem o guest avançar
+### Experimento em matriz: a resposta NÃO é a causa
 
-| # | O que mudei | Resultado |
-|---|---|---|
-| 1 | resposta com magic `SFCI`, `type = 6` | `Break(x0=0)` |
-| 2 | limite de escrita à MessageBuffer (0x100) | `Break(x0=0)` — **fixou uma regressão real** |
-| 3 | magic `SFCO`, `type = 0`, `data_size = 8`, payload em 0x18 | segundo pedido! mas `Break(x0=0)` |
-| 4 | procura da assinatura em vez de offset fixo | `Break(x0=0)` |
-| 5 | responder sucesso ao nome vazio | `Break(x0=0)` — revertido |
+Em vez de escolher mais um palpite, testaram-se **todas as combinações** de
+geometria da resposta. `IA_IPC_VARIANT` é uma bitmask:
 
-A tentativa 5 é a mais informativa: **a resposta não é o problema.** Com
-sucesso e com erro o guest falha igual. Logo o que falta é a leitura da
-resposta pelo guest estar a apanhar outra coisa, ou o pedido não ser o que
-parece.
+| bit | o que muda |
+|---|---|
+| 0 | handle no descritor de handles (+ `enable_handle_descriptor`) em vez de inline |
+| 1 | repetir o `type` do pedido em vez de `type = 0` |
+| 2 | pôr o payload 0x10 mais acima |
+| 3 | **não responder** — o controlo |
 
+Resultado das 16 variantes:
+
+```
+v=0..15   sync=1   svc=32   break=2
+```
+
+**Todas as dezasseis dão exactamente o mesmo.** Incluindo as quatro em que
+**não escrevemos nada no buffer**. Se o conteúdo da resposta fosse a causa,
+uma delas teria de ser diferente.
+
+Conclusão, e é uma conclus��ão Negative que vale muito: **o guest não depende
+do que escrevemos no buffer de IPC.** O problema está antes da resposta, ou
+noutro sítio.
+
+### O que se aprendeu pelo caminho
+
+**O `Break(x0)` é um abort deliberado**, não um crash:
+
+```
+0x82b7b1d8  mov  x1, x0            ; x1 = o endereço culpado
+0x82b7b1dc  orr  w2, wzr, #0x4
+0x82b7b1e0  mov  w0, wzr
+0x82b7b1e4  bl   0x82d79ba4        ; svc Break
+0x82b7b1e8  b    .                 ; e fica preso
+```
+
+E o wrapper do `SendSyncRequest` confirma que o Result é lido:
+
+```
+0x82d57c44  and  w9, w0, #0x3fffff
+0x82d57c50  cmp  w9, #0xf601
+0x82d57c5c  csel x8, x9, x8, eq    ; traduz Result inválido -> codigo interno
+0x82d57c60  cmp  w0, #0x0
+0x82d57c64  csel x0, xzr, x8, eq   ; 0 se sucesso
+```
+
+Logo, o SDK le o nosso Result=0 e continua. O abort vem **depois**.
+
+**O TLS funciona a sério.** O guest reescreveu o nosso `tls_tp`:
+
+```
+antes (nosso):  tls_tp = 0x88100010
+depois (dele):  tls_tp = 0x836a0bc0
+```
+
+O SDK montou o seu próprio bloco de TLS estático, dentro do espaço do guest.
+Isto é o que a convenção do `ThreadLocalRegion` predict — e é a primeira vez
+que vemos o guest a **escrever** lá em vez de o ler.
+
+### Onde o abort vem de dentro
+
+Na stack, no momento do `Break`:
+
+```
+sp+  0  0x847ffdd0        (x29 do helper)
+sp+  8  0x82b79cc0        <- regresso a partir do helper do Break
+sp+448  0x88000010        <- o NOSSO ThreadLocalRegion + 0x10
+```
+
+A instrumentação de stack foi acrescentada ao tracer por causa disto: um
+`Break(x0=0)` diz **que** valor era zero; a stack diz **quem** o tinha.
 ### O que NÃO está resolvido
 
 O `Break(x0=0)` continua, e a tentativa 5 diz que **não é a resposta**. As

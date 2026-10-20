@@ -402,6 +402,13 @@ private:
     // Devolve false se não foi um pedido SMART válido.
     bool ipc_dispatch(std::uint64_t buffer, std::size_t size);
 
+    // A geometria da resposta, lida de `IA_IPC_VARIANT`.
+    //
+    // Existe porque três palpites seguidos falharam e deduzir mais um ia ser
+    // adivinhar. Testam-se todas as combinações e vê-se qual deixa o guest
+    // avançar — que é uma forma de medir em vez de supor.
+    static int ipc_variant();
+
     Result svc_send_sync_request(SvcContext& ctx);
     Result svc_send_sync_request_light(SvcContext& ctx);
 

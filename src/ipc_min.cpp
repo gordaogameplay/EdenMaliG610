@@ -55,6 +55,8 @@
 
 #include "ia/svc_dispatcher.hpp"
 
+#include <cstdlib>
+
 namespace ia {
 namespace {
 
@@ -238,6 +240,24 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
     // O corpo tem de ser limpo. O Eden faz `memset(cmdbuf, 0, ...)` antes de
     // escrever, e sem isso sobram bytes do pedido — que é como um guest
     // descobre que a resposta é feita de remendos.
+    // ── geometria da resposta: experimento, não dedução ──────────────────
+    //
+    // Chegou-se aqui por dedução e três palpites falharam. Em vez de escolher
+    // mais um, testam-se TODOS. A variante vem de `IA_IPC_VARIANT` (bitmask)
+    // e o valor usado entra em `last_ipc_`, para que um resultado sem
+    // contexto nao seja interpretavel.
+    //
+    //   bit 0  handle no descritor de handles (+ enable_handle_descriptor)
+    //   bit 1  repetir o `type` do pedido em vez de 0
+    //   bit 2  pôr o payload 0x10 mais acima
+    //   bit 3  NAO responder (deixar o buffer como o guest o deixou) — o
+    //         controlo, para saber se o guest repara na diferenca
+    const int variante = ipc_variant();
+    const bool v_handles   = (variante & 0x1) != 0;
+    const bool v_tipo      = (variante & 0x2) != 0;
+    const bool v_payload   = (variante & 0x4) != 0;
+    const bool v_silencio  = (variante & 0x8) != 0;
+
     // A resposta usa a MESMA geometria do pedido.
     //
     // O `ResponseBuilder` do Eden reconstrói o payload a partir do zero, mas
@@ -245,7 +265,7 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
     // e ele procura-a onde a deixou estar. Ecoar o offset do pedido é o que
     // garante isso, sem ter de reproduzir a aritmética dos descritores duas
     // vezes.
-    const std::size_t pay_r = payload;
+    const std::size_t pay_r = v_payload ? (payload + 0x10) : payload;
 
     std::size_t lim_r = pay_r + kReplyDataSize + 4;
     if (lim_r > limite)
@@ -261,13 +281,27 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
     // `CommandHeader header{}`. E `data_size` passa a ser
     // `normal_params + sizeof(DataPayloadHeader)/4 + 4` — os 4 u32 são os
     // 16 bytes de padding obrigatório que o comentário menciona.
-    put32(kOffCommandHeader, 0);
-    put32(kOffCommandHeader + 4, kReplyDataSize);
+    // `enable_handle_descriptor` (bit 31 de raw_high) diz ao guest que ha
+    // handles a seguir. Se o handle vai no descritor, este bit TEM de estar a
+    // 1 — senao o guest nem va la buscar.
+    const std::uint32_t hdr_type = v_tipo ? kCmdRequestWithContext : 0u;
+    const std::uint32_t hdr_high  = kReplyDataSize | (v_handles ? 0x80000000u : 0u);
+    put32(kOffCommandHeader, hdr_type);
+    put32(kOffCommandHeader + 4, hdr_high);
 
     for (int i = 0; i < 4; ++i)
         m[pay_r + i] = static_cast<std::uint8_t>(kMagicResponse[i]);
     put32(pay_r + 4, 0);                       // o Result
-    put32(pay_r + 8, 0);                       // sem handles
+
+    if (v_handles) {
+        // O handle vai no descritor: logo a seguir ao `CommandHeader`, como o
+        // `ResponseBuilder` faz (`ctx.handles_offset = index` logo depois de
+        // escrever o `HandleDescriptorHeader`).
+        put32(kOffCommandHeader + 8, 0);       // HandleDescriptorHeader
+        put32(kOffCommandHeader + 12, 0);      // o handle movido
+    } else {
+        put32(pay_r + 8, 0);                   // sem handles
+    }
 
     std::string nome;
 
@@ -305,7 +339,10 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
 
         const std::uint32_t h = connect_named_port(nome);
         put32(pay_r + 4, 0);
-        put32(pay_r + 8, h);
+        if (v_handles)
+            put32(kOffCommandHeader + 12, h);
+        else
+            put32(pay_r + 8, h);
         break;
     }
 
@@ -324,12 +361,33 @@ bool SvcDispatcher::ipc_dispatch(std::uint64_t buffer, std::size_t size) {
         break;
     }
 
+    last_ipc_ += "  [variante " + std::to_string(variante) +
+                (v_handles ? ": handle no descritor" : ": handle inline") +
+                (v_tipo ? ", type ecoado" : ", type=0") +
+                (v_payload ? ", payload+0x10" : ", payload ecoado") +
+                (v_silencio ? ", SEM RESPOSTA" : "") + "]";
+
+    if (v_silencio) {
+        // Controlo: nao escreve nada. Se o guest tambem falhar com isto, o
+        // problema nao e o conteudo da resposta.
+        return true;
+    }
+
     std::string err;
     if (!write_guest(buffer, m, lim_r)) {
         last_ipc_ += "  [ESCRITA FALHOU]";
         return false;
     }
     return true;
+}
+
+
+
+int SvcDispatcher::ipc_variant() {
+    const char* v = std::getenv("IA_IPC_VARIANT");
+    if (v == nullptr)
+        return 0;
+    return static_cast<int>(std::strtol(v, nullptr, 0));
 }
 
 Result SvcDispatcher::svc_send_sync_request(SvcContext& ctx) {
