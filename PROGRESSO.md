@@ -3352,6 +3352,32 @@ compositor — tem de responder a estas transacções (dar um buffer ao
 jogo, receber o buffer desenhado) e apresentá-lo. É a **fila de
 buffers** do Android, em versão mínima.
 
+### O push buffer **real** — medido
+
+O guest submeteu (`SubmitGPFIFO: address=0xE2D62290 entradas=3
+flags=0x104 kickoff=1`) e os cabeçalhos, lidos crus, são:
+
+```
+00 20 11 b9  00 76 22 80  74 42 11 b9
+00 06 00 80  78 42 11 b9  00 2a 00 80
+00 00 00 00  00 00 00 00
+```
+
+Isto é `0xB9112000`, `0x80227600`, `0xB9114274`, `0x80000600`,
+`0xB9114278`, `0x80002A00` — **três palavras, todas endereços** (dois
+dados do guest, um de código).
+
+**O layout NÃO é o `{tipo, endereço, tamanho}` que se supunha** (o
+`Tegra::CommandListHeader` do Eden). Ler com essa forma dá
+`tipo=3104907264` e `tamanho=3104916084` — o que é o sintoma de uma
+leitura dessincronizada, e de um descodificador que precisa do *dump*
+real para ser corrigido. É exactamente o que as notas do
+`maxwell_translator.hpp` pedem: *"é preciso validar a tabela contra um
+dump capturado"*.
+
+**O dump existe agora** (acima). Falta descodificá-lo contra a
+referência do *host1x*/*Tegra*.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native

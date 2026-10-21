@@ -61,6 +61,7 @@
 #include "vendor/eden/core/hle/service/service.h"
 
 #include "g610/gpu/maxwell_translator.hpp"
+#include "g610/services/nvmap_registry.hpp"
 #include "g610/telemetry.hpp"
 
 namespace g610::services {
@@ -1005,6 +1006,11 @@ private:
         it->second.alocado = true;
         va_.proximo_pequeno += tamanho;
 
+        // O registo **partilhado**: o compositor precisa de chegar ao
+        // endereco do buffer quando o jogo o entrega pelo binder
+        // (`SetPreallocatedBuffer` traz o handle do `nvmap`).
+        RegistoNvmap::Instancia().Registar(params.handle, it->second.endereco, tamanho);
+
         LOG_DEBUG(Service_NVDRV, "nvmap: IocAlloc handle={} tamanho=0x{:X} -> 0x{:X}",
                   params.handle, it->second.tamanho, it->second.endereco);
 
@@ -1076,6 +1082,7 @@ private:
                       params.handle, params.address, params.size);
             it->second.alocado = false;
             nvmap_.erase(it);
+            RegistoNvmap::Instancia().Remover(params.handle);
         }
 
         EscreverSaida(ctx, params);
@@ -1391,11 +1398,37 @@ private:
                   cabecalhos_no_endereco ? 1 : 0);
 
         // Os cabeçalhos.
+        const std::size_t bytes_cabec =
+            static_cast<std::size_t>(params.num_entries) * sizeof(CommandListHeader);
+        std::vector<std::uint8_t> bruto_cabec(bytes_cabec, 0);
+        if (bytes_cabec > 0 &&
+            !LerDoGuest(params.address, bruto_cabec.data(), bruto_cabec.size())) {
+            LOG_WARNING(Service_NVDRV, "SubmitGPFIFO: não li os cabeçalhos em 0x{:X}",
+                        params.address);
+        }
+
+        // Os cabeçalhos **crus**, em hexadecimal: é o que permite
+        // descodificar o formato real (que **não** é o
+        // {tipo, endereço, tamanho} que se supunha).
+        {
+            char linha[320];
+            std::size_t n = 0;
+            n += static_cast<std::size_t>(
+                std::snprintf(linha + n, sizeof(linha) - n, "[gpfifo] cabecalhos crus:"));
+            for (std::size_t i = 0; i < bruto_cabec.size() && i < 64 && n + 4 < sizeof(linha);
+                 ++i)
+                n += static_cast<std::size_t>(
+                    std::snprintf(linha + n, sizeof(linha) - n, " %02x", bruto_cabec[i]));
+            if (n + 2 < sizeof(linha))
+                n += static_cast<std::size_t>(std::snprintf(linha + n, sizeof(linha) - n, "\n"));
+            const ssize_t w = ::write(2, linha, n);
+            (void)w;
+        }
+
         std::vector<CommandListHeader> cabecalhos;
         if (params.num_entries > 0) {
             if (cabecalhos_no_endereco) {
-                const std::size_t bytes =
-                    static_cast<std::size_t>(params.num_entries) * sizeof(CommandListHeader);
+                const std::size_t bytes = bytes_cabec;
                 std::vector<std::uint8_t> bruto(bytes, 0);
                 if (!LerDoGuest(params.address, bruto.data(), bruto.size())) {
                     LOG_WARNING(Service_NVDRV, "SubmitGPFIFO: não li os cabeçalhos");
@@ -1427,10 +1460,33 @@ private:
         //
         // **O VA da GPU é o espaço do guest** (ver a nota do `VmDaGpu`),
         // por isso ler os comandos é ler a memória do guest.
+        //
+        // **Os tamanhos são limitados.** Um cabeçalho com um `size`
+        // absurdo (o guest corrompido, ou um push buffer que ainda não é
+        // o que pensamos) faria alocar gigabytes — e a memória do guest
+        // é um `mmap` plano: ler fora dela é um fault. O limite é o
+        // mesmo que o `drain_pushbuffer` da casa usa (4 MiB).
+        constexpr std::uint64_t kLimitePorEntrada = 4u * 1024u * 1024u;
+        constexpr std::uint64_t kLimiteTotal = 16u * 1024u * 1024u;
+
         std::vector<std::uint8_t> pushbuffer;
         for (const auto& cab : cabecalhos) {
+            LOG_DEBUG(Service_NVDRV,
+                      "SubmitGPFIFO: entrada tipo={} endereco=0x{:X} tamanho={}", cab.type,
+                      cab.address, cab.size);
             if (cab.size == 0)
                 continue;
+            if (cab.size > kLimitePorEntrada ||
+                pushbuffer.size() + cab.size > kLimiteTotal) {
+                LOG_WARNING(Service_NVDRV,
+                           "SubmitGPFIFO: entrada com tamanho {} acima do limite — "
+                           "o push buffer não é o que esperamos",
+                           cab.size);
+                ResponseBuilder rb{ctx, 3};
+                rb.Push(ResultSuccess);
+                rb.PushEnum(NvResult::InvalidSize);
+                return;
+            }
             const std::size_t inicio = pushbuffer.size();
             pushbuffer.resize(inicio + cab.size, 0);
             if (!LerDoGuest(cab.address, pushbuffer.data() + inicio, cab.size)) {
@@ -1441,6 +1497,24 @@ private:
                 rb.PushEnum(NvResult::InvalidAddress);
                 return;
             }
+        }
+
+        // O push buffer **cru**, em hexadecimal: é o que permite
+        // descodificar o formato real (que **não** é o
+        // {tipo, endereço, tamanho} que se supunha).
+        {
+            char linha[320];
+            std::size_t n = 0;
+            n += static_cast<std::size_t>(
+                std::snprintf(linha + n, sizeof(linha) - n, "[pushbuffer]"));
+            for (std::size_t i = 0; i < pushbuffer.size() && i < 64 && n + 4 < sizeof(linha);
+                 ++i)
+                n += static_cast<std::size_t>(
+                    std::snprintf(linha + n, sizeof(linha) - n, " %02x", pushbuffer[i]));
+            if (n + 2 < sizeof(linha))
+                n += static_cast<std::size_t>(std::snprintf(linha + n, sizeof(linha) - n, "\n"));
+            const ssize_t w = ::write(2, linha, n);
+            (void)w;
         }
 
         // E a tradução — que é o **tradutor** da casa.
@@ -1471,6 +1545,59 @@ private:
         }
         // As bandeiras saem a zero (o Eden faz o mesmo).
         params.flags = 0;
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x47/0x14 e 0x47/0x15: `SetClientData` e `GetClientData` — os
+    // dados do cliente que o canal guarda.
+    //
+    // **O grupo `'G'` também é do canal.** O Eden (`nvhost_gpu.cpp`,
+    // `Ioctl1`) tem três grupos no `nvhost_gpu`: 0x00, `'H'` e `'G'` — e
+    // o `'G'` do canal (`SetClientData`/`GetClientData`) **não** é o `'G'`
+    // do `nvhost-ctrl-gpu`. É por isso que o despacho é por device: o
+    // mesmo grupo, comandos diferentes.
+    void SetClientData(HLERequestContext& ctx) {
+        IoctlClientData params{};
+        LerEntrada(ctx, params);
+
+        LOG_DEBUG(Service_NVDRV, "canal: SetClientData: 0x{:X}", params.data);
+        if (auto* canal = CanalDoFd())
+            canal->dados_cliente = params.data;
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    void GetClientData(HLERequestContext& ctx) {
+        IoctlClientData params{};
+        LerEntrada(ctx, params);
+
+        if (auto* canal = CanalDoFd())
+            params.data = canal->dados_cliente;
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x48/0x1d: `ChannelSetTimeslice` — a fatia de tempo do canal.
+    //
+    // O Eden (`nvhost_gpu.cpp`, `ChannelSetTimeslice`): o valor tem de
+    // estar entre 1000 e 5000; o resto é `BadParameter`.
+    void ChannelSetTimeslice(HLERequestContext& ctx) {
+        IoctlSetTimeslice params{};
+        LerEntrada(ctx, params);
+
+        LOG_DEBUG(Service_NVDRV, "canal: ChannelSetTimeslice: {}", params.timeslice);
+        if (params.timeslice < 1000 || params.timeslice > 5000) {
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::BadParameter);
+            return;
+        }
+        if (auto* canal = CanalDoFd())
+            canal->fatia_de_tempo = params.timeslice;
 
         EscreverSaida(ctx, params);
         RespostaOk(ctx);

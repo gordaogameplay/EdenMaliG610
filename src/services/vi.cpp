@@ -60,6 +60,8 @@
 #include "vendor/eden/core/hle/service/server_manager.h"
 #include "vendor/eden/core/hle/service/service.h"
 
+#include "g610/services/binder.hpp"
+
 namespace g610::services {
 
 namespace {
@@ -349,14 +351,9 @@ private:
             (void)w;
         }
 
-        // A resposta: um parcel em branco — o cabeçalho, sem dados.
-        std::vector<std::uint8_t> reply(sizeof(ParcelHeader), 0);
-        ParcelHeader cab{};
-        cab.data_size = 0;
-        cab.data_offset = sizeof(ParcelHeader);
-        cab.objects_size = 0;
-        cab.objects_offset = sizeof(ParcelHeader);
-        std::memcpy(reply.data(), &cab, sizeof(cab));
+        // A resposta: a do **compositor** (`src/services/binder.cpp`), que
+        // e' quem atende o protocolo do `IGraphicBufferProducer`.
+        const std::vector<std::uint8_t> reply = TransactionarParcel(transacao, entrada);
 
         const std::size_t tamanho = ctx.GetWriteBufferSize(0);
         if (tamanho > 0) {
