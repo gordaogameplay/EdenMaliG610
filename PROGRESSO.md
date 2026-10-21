@@ -3718,6 +3718,36 @@ descobrir o que o SDK carrega de um ponteiro nulo — é a mesma técnica
 que o dump da stack no `wait` usou, e que já disse onde o jogo
 estava bloqueado.
 
+### O fault novo — o código, em bytes
+
+O relatório de traps agora despeja os **bytes do código no PC do
+fault** (o VA do guest é plano ✓):
+
+```
+[fault] cod em 0x83b0bb64:
+  e0 0f 1f f8   LDR X0, [SP, #0x1F8]
+  60 04 20 d4   BRK #0x100          ← o SVC do SDK
+  c0 03 5f d6   RET
+  ...
+  e0 0f 1f f8   LDR X0, [SP, #0x1F8]
+  60 04 20 d4   BRK #0x100
+  e2 03 40 f9   LDR X2, [X0]        ← carrega de x0 — e x0 é NULO
+  41 00 00 b9   LDR W1, [X0]
+```
+
+**É o wrapper de SVC do SDK**: o `BRK #0x100` é a chamada ao
+serviço ✓, e o ponteiro para o bloco de argumentos é lido da stack
+(`[sp+0x1f8]`) ✓. O fault é num `LDR` desse ponteiro **nulo** ✗.
+
+E o último serviço servido antes do fault foi o
+`nvdrv` **comando 8 (`SetAruid`)** ✓ (`pid=1` ✓) — a resposta saiu
+✓ e o guest faults logo a seguir, ao voltar do SVC.
+
+Ou seja: **o SVC foi servido, e o wrapper do SDK recebe um ponteiro
+de argumentos nulo** — o que aponta para o *stack slot* do guest ter
+sido estragado (ou para o wrapper estar a ser chamado com um
+argumento que nunca foiposto).
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native

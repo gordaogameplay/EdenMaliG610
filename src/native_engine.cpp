@@ -736,6 +736,27 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
                       (unsigned long long)g_hooks.fault_addr,
                       (unsigned long long)g_hooks.fault_sp);
         r.error = msg;
+
+        // **Os bytes do código no PC do fault.** O VA do guest é plano
+        // (a reserva é um `mmap` de gama fixa — o endereço do guest é
+        // o endereço do host), por isso se lêem direto. É o que diz o
+        // que a instrução está a fazer — sem símbolos, os bytes são a
+        // única pista.
+        {
+            const auto* codigo = reinterpret_cast<const std::uint8_t*>(g_hooks.fault_pc);
+            char linha[256];
+            std::size_t n = 0;
+            n += static_cast<std::size_t>(
+                std::snprintf(linha + n, sizeof(linha) - n, "[fault] cod em 0x%llx:",
+                               (unsigned long long)g_hooks.fault_pc));
+            for (std::size_t i = 0; i < 48 && n + 4 < sizeof(linha); ++i)
+                n += static_cast<std::size_t>(
+                    std::snprintf(linha + n, sizeof(linha) - n, " %02x", codigo[i]));
+            if (n + 2 < sizeof(linha))
+                n += static_cast<std::size_t>(std::snprintf(linha + n, sizeof(linha) - n, "\n"));
+            const ssize_t w = ::write(2, linha, n);
+            (void)w;
+        }
     }
 
     r.exited    = svc_.exited();
