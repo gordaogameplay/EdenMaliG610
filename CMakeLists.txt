@@ -174,7 +174,26 @@ target_include_directories(spirv_reflect PUBLIC vendor/third_party/SPIRV-Reflect
 # implementa-a (o `ValhallBackend` ✓ do desenho). O `renderer_vulkan` do
 # upstream traz shaders gerados ✗ (glslang ✗) e o PanVK ✗ — e nao e'
 # preciso para o motor ✓.
-target_sources(g610_core PRIVATE ${IA_FONTES_VIDEO_CORE})
+#
+# **E sem o resto do `video_core`** ✗ — medido (`/tmp/build.log` ✗): os
+# `.cpp` do upstream do `video_core` ✗ herdam o **kernel real** ✗
+# (`core/hle/kernel/kernel.h` ✗), que a casa **nao tem** ✗ — a casa tem o
+# `KernelCore` minimo ✗ (a ponte ✗, `k_kernel_core_bridge.h` ✗) porque o
+# `kernel.cpp` do Eden precisa de `Core::Timing` ✗ e da `CpuManager` ✗ — a
+# infra de emulacao ✗, que nao e' o que esta casa e' ✗.
+#
+# O que o upstream pede e' `KernelCore` completo ✗ — `GetMemoryManager` ✗,
+# `GetCurrentProcess` ✗, o `KDynamicPageManager` ✗ — e a casa nao o tem ✗.
+#
+# **Os CABECALHOS ficam** ✓ — e' o que a `RasterizerInterface` do upstream
+# e' ✗ (`video_core/rasterizer_interface.h` ✗), que o `RasterizerG610` da
+# casa implementa ✓ ✓.
+#
+# **O upstream e' a REFERENCIA, nao a implementacao** ✗: a leitura do push
+# buffer ✗ e' a da casa ✗ (`src/gpu/pushbuffer.cpp` ✗ — 24 verificacoes
+# ✓) e o tradutor dos comandos Maxwell ✗ tambem ✗
+# (`src/gpu/maxwell_translator.cpp` ✗) ✗. O `dma_pusher.cpp` do upstream ✗
+# serve para conferir a semantica ✗, nao para ser linkado ✗.
 target_include_directories(g610_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/vendor/eden/src
   ${CMAKE_CURRENT_SOURCE_DIR}/vendor/third_party/Vulkan-Headers/include
