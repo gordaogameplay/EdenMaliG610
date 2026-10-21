@@ -2097,10 +2097,24 @@ Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
                 // ArbitrateLock, e é por isso que o velho predicado
                 // "saiu da fila" da espera é o `desperta` (a thread troca
                 // de fila sem acordar).
+                //
+                // **MAS o jogo nunca destrava** (medido: `grep -c
+                // ArbitrateUnlock` = 0 no log inteiro) — e o *waiter*
+                // ficava à espera de um destrave que não vinha. O
+                // deadlock fechava-se: ninguém acorda o waiter e ninguém
+                // destrava a mutex.
+                //
+                // Por isso o signal **acorda na mesma** (a cv é ao
+                // nível) e deixa o waiter na fila da mutex — o dono
+                // continua a ter a mutex, e o waiter vai buscá-la quando
+                // puder (o SDK re-avalia o predicado e volta a travar).
                 const std::uint32_t novo = prev | kArbWaitMask;
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 if (write_guest(w.addr, &novo, sizeof novo)) {
                     g_arbiter.fila[w.addr].push_back({w.tag, w.token});
+                    g_arbiter.desperta[w.token] = ArbitrationBoard::DespertaSucesso;
+                    ++acordados;
+                    wakers.push_back(w.token);
                 } else {
                     g_arbiter.desperta[w.token] =
                         ArbitrationBoard::DespertaInvalido;

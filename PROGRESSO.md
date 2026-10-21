@@ -3665,6 +3665,40 @@ mutex** quando a mutex estava ocupada por outro, e o
   `IA_WAIT_MS` desliga) — o guest re-avalia o seu predicado, como uma
   cv bem usada faz.
 
+### O deadlock abriu — medido
+
+Com o signal da cv a **acordar o waiter mesmo com a mutex ocupada**
+(o Eden só o acorda quando o dono destrava — e o jogo **nunca**
+destrava: `grep -c ArbitrateUnlock` = 0 no log inteiro), o jogo sai
+do impasse:
+
+```
+4758  [svc] SignalProcessWideKey key=0x10a2c7b0c count=1 acordados=1   ← acorda!
+4831  parou por: fault de memoria do guest em 0x83b0bb44 (endereco 0x0, sp=0x30fffe950)
+```
+
+O *waiter* é **acordado** ✓ — e o jogo passa a correr até um
+**fault diferente**: um acesso a `0x0` dentro do wrapper de futex do
+SDK (`0x83b0bb44`). Ou seja: o impasse está resolvido, e o que
+segue é um problema novo (e é um bom problema: o jogo está a
+executar código a sério).
+
+**O que fica por decidir**: o Eden só acorda o *waiter* quando o
+dono destrava, e essa é a regra certa — mas o jogo, no nosso motor,
+nunca destrava. As duas leituras possíveis:
+
+1. o SDK do guest, no caminho do destrave, não chama o SVC porque a
+   **palavra da mutex não tem o bit "há quem espere"** (`0x40000000`,
+   `svc_common.h:19`) — e o bit é posto em `UpdateLockAtomic`
+   (`k_condition_variable.cpp:198-215`), que a casa não faz no
+   caminho do *lock* rápido;
+2. o jogo destrava por um caminho que a casa não vê.
+
+O caminho 1 é o mais provável, e é onde está a correcção a fazer: o
+`write` da máscara na palavra da mutex, no `ArbitrateLock` e no
+`SignalImpl`, tem de ser **incondicional** (como no Eden), e não
+depender da contagem de *waiters* que a casa faz.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native
