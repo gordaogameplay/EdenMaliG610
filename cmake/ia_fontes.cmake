@@ -572,32 +572,6 @@ set(IA_FONTES_VIDEO_CORE
   vendor/eden/src/video_core/renderer_base.cpp
   vendor/eden/src/video_core/renderer_null/null_rasterizer.cpp
   vendor/eden/src/video_core/renderer_null/renderer_null.cpp
-  vendor/eden/src/video_core/renderer_opengl/present/filters.cpp
-  vendor/eden/src/video_core/renderer_opengl/present/fsr.cpp
-  vendor/eden/src/video_core/renderer_opengl/present/fxaa.cpp
-  vendor/eden/src/video_core/renderer_opengl/present/layer.cpp
-  vendor/eden/src/video_core/renderer_opengl/present/smaa.cpp
-  vendor/eden/src/video_core/renderer_opengl/present/window_adapt_pass.cpp
-  vendor/eden/src/video_core/renderer_opengl/blit_image.cpp
-  vendor/eden/src/video_core/renderer_opengl/gl_blit_screen.cpp
-  vendor/eden/src/video_core/renderer_opengl/gl_buffer_cache_base.cpp
-  vendor/eden/src/video_core/renderer_opengl/gl_buffer_cache.cpp
-  vendor/eden/src/video_core/renderer_opengl/gl_compute_pipeline.cpp
-  vendor/eden/src/video_core/renderer_opengl/gl_device.cpp
-  vendor/eden/src/video_core/renderer_opengl/gl_fence_manager.cpp
-  vendor/eden/src/video_core/renderer_opengl/gl_graphics_pipeline.cpp
-  vendor/eden/src/video_core/renderer_opengl/gl_rasterizer.cpp
-  vendor/eden/src/video_core/renderer_opengl/gl_resource_manager.cpp
-  vendor/eden/src/video_core/renderer_opengl/gl_shader_cache.cpp
-  vendor/eden/src/video_core/renderer_opengl/gl_shader_manager.cpp
-  vendor/eden/src/video_core/renderer_opengl/gl_shader_util.cpp
-  vendor/eden/src/video_core/renderer_opengl/gl_state_tracker.cpp
-  vendor/eden/src/video_core/renderer_opengl/gl_staging_buffer_pool.cpp
-  vendor/eden/src/video_core/renderer_opengl/gl_texture_cache.cpp
-  vendor/eden/src/video_core/renderer_opengl/gl_texture_cache_base.cpp
-  vendor/eden/src/video_core/renderer_opengl/gl_query_cache.cpp
-  vendor/eden/src/video_core/renderer_opengl/renderer_opengl.cpp
-  vendor/eden/src/video_core/renderer_opengl/util_shaders.cpp
   vendor/eden/src/video_core/renderer_vulkan/present/filters.cpp
   vendor/eden/src/video_core/renderer_vulkan/present/fsr.cpp
   vendor/eden/src/video_core/renderer_vulkan/present/fxaa.cpp

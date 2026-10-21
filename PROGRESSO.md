@@ -3923,6 +3923,41 @@ do upstream fica de fora ✗ — e com ele o PanVK ✗ e o VMA ✗ — e o
 `shader_recompiler` ✗ pode ser ligado depois ✓ (é o que troca o
 *placeholder* do `ShaderCache` ✓).
 
+### Onde está a integração do motor (passo 1)
+
+Feito ✓:
+- o `video_core` e o `shader_recompiler` do upstream vendorizados ✓;
+- o `core/` e o `common/` **completos** ✓ (o que estava podado ✗);
+- as dependências de compilação vendorizadas ✓ (Vulkan-Headers ✓, VMA ✓,
+  SPIRV-Headers/Tools/Reflect ✓) — o PanVK é só runtime ✓;
+- as listas de fontes extraídas dos `CMakeLists.txt` do upstream ✓
+  (`tools/extrair_fontes_upstream.py` → `cmake/ia_fontes.cmake` ✓),
+  porque o upstream é a fonte da verdade ✓;
+- o `video_core` entra no **mesmo alvo** do `core/` ✓ (`g610_core` ✓ —
+  separados dariam um círculo ao linker ✓);
+- **os índices numéricos dos registos do Maxwell3D** ✓ — extraídos
+  *compilando* o cabeçalho do upstream ✓ (a macro
+  `MAXWELL3D_REG_INDEX` ✓ é a fonte da verdade ✓). Por exemplo:
+  `draw.begin` = 1414 ✓, `draw.end` = 1413 ✓,
+  `index_buffer.count` = 1528 ✓, `vertex_buffer.count` = 862 ✓,
+  `vertex_array_instance_first` = 1157 ✓, `clear_surface` = 1652 ✓.
+
+O primeiro bloqueio da compilação ✓: os **shaders do host** ✗ — o
+upstream gera-os (`video_core/host_shaders/CMakeLists.txt` ✗, com
+glslang ✗). O renderer OpenGL já ficou de fora ✓ (a casa é Vulkan ✓);
+o `renderer_vulkan` precisa dos mesmos shaders gerados ✗.
+
+**Duas saídas** ✓:
+1. trazer o `glslang` ✗ e gerar os shaders ✓ (o caminho do upstream ✓);
+2. compilar **só o motor** ✓ (sem renderer ✗) e implementar a
+   `RasterizerInterface` ✓ na casa ✓ — o motor Maxwell fala com o
+   renderer só por essa interface ✓✓ (40 métodos ✓, mecânicos ✓), e o
+   `ValhallBackend` ✓ que o desenho da casa já nomeia ✓ é exactamente
+   essa implementação ✓.
+
+A 2ª é a que dá o backend **da casa** ✓ (e não o do Eden ✗) — e é
+também a que evita o glslang ✗.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native

@@ -61,6 +61,10 @@ def extrair(caminho: str, prefixo: str, indice: set[str], faltantes: list[str]) 
             continue
         if not t.endswith((".cpp", ".c", ".cc")):
             continue
+        # O renderer OpenGL e' peso morto para a casa (que e' Vulkan) e
+        # traz shaders gerados que nao temos como gerar. Fica de fora.
+        if t.startswith("renderer_opengl/"):
+            continue
         if f"{prefixo}/{t}" in indice:
             fontes.append(f"{prefixo}/{t}")
         elif t in indice:
