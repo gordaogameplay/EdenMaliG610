@@ -69,6 +69,7 @@ add_library(g610_core STATIC
   src/gpu/maxwell_frontend.cpp
   src/gpu/glsl_backend.cpp
   src/gpu/maxwell_translator.cpp
+  src/gpu/pushbuffer.cpp
   src/patcher.cpp
   src/native_engine.cpp
   src/g610_call_guest.S

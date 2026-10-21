@@ -2218,6 +2218,26 @@ void g610::SvcDispatcher::RegistarTrabalhoGpu() {
     g_gpu_trabalho_pronto.store(true, std::memory_order_release);
 }
 
+void g610::SvcDispatcher::AcordarFutexNoEndereco(std::uint64_t endereco) {
+    if (endereco == 0)
+        return;
+    std::unique_lock<std::mutex> lock(g_arbiter.gate);
+    const auto cv = g_arbiter.cv_fila.find(endereco);
+    if (cv == g_arbiter.cv_fila.end() || cv->second.empty())
+        return;
+    const ArbitrationBoard::CvWaiter w = cv->second.front();
+    cv->second.erase(cv->second.begin());
+    if (cv->second.empty())
+        g_arbiter.cv_fila.erase(cv);
+    // A palavra do mutex passa a zero (liberta) e o waiter acorda
+    // **dono** — o Eden, `SignalImpl` (`k_condition_variable.cpp:209-220`).
+    const std::uint32_t zero = 0;
+    (void)g_dispatcher_atual->write_guest(w.addr, &zero, sizeof zero);
+    g_arbiter.desperta[w.token] = ArbitrationBoard::DespertaSucesso;
+    lock.unlock();
+    g_arbiter.wake.notify_all();
+}
+
 void g610::SvcDispatcher::DespertarCvWaitersDoGuest() {
     if (g_dispatcher_atual == nullptr)
         return;

@@ -61,6 +61,7 @@
 #include "vendor/eden/core/hle/service/service.h"
 
 #include "g610/gpu/maxwell_translator.hpp"
+#include "g610/gpu/pushbuffer.hpp"
 #include "g610/services/binder.hpp"
 #include "g610/svc_dispatcher.hpp"
 #include "g610/services/nvmap_registry.hpp"
@@ -1577,6 +1578,83 @@ private:
             }
         }
 
+        // ── O fluxo de métodos ──────────────────────────────────────────
+        //
+        // O push buffer **não** é uma lista de {tipo, endereço, tamanho}:
+        // é um fluxo de métodos (o upstream: `dma_pusher.cpp`,
+        // `ProcessCommands`). Cada método começa por um `CommandHeader`
+        // e é seguido pelos argumentos.
+        //
+        // Os métodos do **canal** (o *puller* do upstream) são os que o
+        // driver executa por conta própria: o bind dos subcanais, os
+        // semáforos e a **fence**. E a fence é o que diz ao jogo "o
+        // trabalho acabou" — sem ela, o jogo fica à espera para sempre
+        // (foi o que se mediu).
+        {
+            gpu::PushBufferReader leitor;
+            // O estado do canal (o `Puller::Regs` do upstream).
+            std::uint64_t sem_endereco = 0;
+            std::uint32_t sem_sequencia = 0;
+            std::uint32_t fence_acao = 0;
+
+            const std::size_t metodos = leitor.for_each(
+                pushbuffer, [&](const gpu::MethodCall& m) {
+                    switch (m.method) {
+                    case gpu::canal::SemaphoreAddressHigh:
+                        sem_endereco = (sem_endereco & 0xFFFFFFFFull) |
+                                       (static_cast<std::uint64_t>(m.argument) << 32);
+                        break;
+                    case gpu::canal::SemaphoreAddressLow:
+                        sem_endereco = (sem_endereco & 0xFFFFFFFF00000000ull) | m.argument;
+                        break;
+                    case gpu::canal::SemaphoreSequence:
+                        sem_sequencia = m.argument;
+                        break;
+                    case gpu::canal::SemaphoreTrigger: {
+                        const std::uint32_t op = m.argument & 0xFu;
+                        if (op == gpu::sem_op::WriteLong && sem_endereco != 0) {
+                            // **O payload do semáforo.** O upstream
+                            // escreve o valor na memória do guest e
+                            // sinaliza o syncpoint — o guest vê o valor
+                            // e prossegue.
+                            const std::uint32_t payload = sem_sequencia;
+                            if (EscreverNoGuest(sem_endereco, &payload, sizeof payload)) {
+                                SvcDispatcher::AcordarFutexNoEndereco(sem_endereco);
+                                LOG_DEBUG(Service_NVDRV,
+                                          "SubmitGPFIFO: payload do semáforo escrito em "
+                                          "0x{:X} ({} )",
+                                          sem_endereco, payload);
+                            }
+                        }
+                        break;
+                    }
+                    case gpu::canal::FenceValue:
+                        // O valor da fence do canal.
+                        break;
+                    case gpu::canal::FenceAction: {
+                        fence_acao = m.argument;
+                        const std::uint32_t op = fence_acao & 0x1u;
+                        const std::uint32_t syncpoint = (fence_acao >> 8) & 0xFFFFFFu;
+                        if (op == gpu::fence_op::Increment) {
+                            // **A fence foi incrementada** (o upstream:
+                            // `rasterizer->SignalSyncPoint(id)`).
+                            LOG_DEBUG(Service_NVDRV,
+                                      "SubmitGPFIFO: fence incrementada (syncpoint {})",
+                                      syncpoint);
+                            SvcDispatcher::RegistarTrabalhoGpu();
+                        }
+                        break;
+                    }
+                    default:
+                        break;
+                    }
+                });
+
+            LOG_DEBUG(Service_NVDRV,
+                      "SubmitGPFIFO: {} métodos no push buffer ({} descartados)", metodos,
+                      leitor.descartados());
+        }
+
         // O push buffer **cru**, em hexadecimal: é o que permite
         // descodificar o formato real (que **não** é o
         // {tipo, endereço, tamanho} que se supunha).
@@ -1733,6 +1811,18 @@ private:
     bool LerDoGuest(std::uint64_t endereco, void* destino, std::size_t tamanho) {
         auto& memoria = Kernel::GetCurrentMemory(system.Kernel());
         return memoria.ReadBlock(static_cast<Common::ProcessAddress>(endereco), destino, tamanho);
+    }
+
+    // O espelho de `LerDoGuest`: escrever na memoria do guest.
+    //
+    // E' o que o driver faz com o **payload do semaforo** (o upstream:
+    // `puller.cpp`, `ProcessSemaphoreTriggerMethod` — o
+    // `rasterizer->Query(..., Payload, ...)` escreve o valor na memoria
+    // do guest). E' por ai que o jogo sabe que o trabalho da GPU
+    // acabou.
+    bool EscreverNoGuest(std::uint64_t endereco, const void* origem, std::size_t tamanho) {
+        auto& memoria = Kernel::GetCurrentMemory(system.Kernel());
+        return memoria.WriteBlock(static_cast<Common::ProcessAddress>(endereco), origem, tamanho);
     }
 
     // O ioctl comum aos três comandos.

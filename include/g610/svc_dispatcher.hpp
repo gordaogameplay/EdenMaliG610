@@ -334,6 +334,17 @@ public:
     // por ele prossegue logo.
     static void RegistarTrabalhoGpu();
 
+    // Acorda quem estiver à espera **numa chave de processo** (um
+    // endereço) — é o que o driver faz quando escreve num semáforo do
+    // guest: escreve o valor e acorda quem estava a olhar para ele.
+    //
+    // No Eden, o sinal do semáforo é `rasterizer->Query(...Payload...)`
+    // (`puller.cpp:ProcessSemaphoreTriggerMethod`): o valor é escrito
+    // na memória do guest e o syncpoint é sinalizado. O guest espera
+    // pelo semáforo com um futex sobre esse endereço — por isso o
+    // sinal tem de ser o do endereço.
+    static void AcordarFutexNoEndereco(std::uint64_t endereco);
+
     // Liga o espaço de endereçamento do guest.
     //
     // Sem isto, os SVC que recebem um endereço do guest (MapMemory,

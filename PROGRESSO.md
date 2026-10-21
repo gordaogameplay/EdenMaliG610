@@ -3811,6 +3811,57 @@ não ✗) — e corrigir a resposta ✗. Com isso, o pedido do
 `GetEventHandle` entra bem ✓, o `applet:oe` responde ✓, e o jogo
 deixa de bater no assert ✗.
 
+### O emulador Maxwell do Eden — o mapa (fonte: upstream)
+
+O Eden **não** tem uma "tabela de traduções": tem o **motor Maxwell**
+a executar os comandos do push buffer. O mapa (todos os ficheiros
+confirmados no upstream):
+
+| ficheiro | o que é |
+|---|---|
+| `src/video_core/dma_pusher.h` | o `CommandHeader` (o `u64` de 8 bytes da lista) e o `CommandHeader` do método: método (13 bits), subcanal (3), `arg_count` (13), modo (3) |
+| `src/video_core/dma_pusher.cpp` | `ProcessCommands` — **o walker**: a máquina de estados que consome os métodos e os seus argumentos |
+| `src/video_core/engines/puller.h/.cpp` | os métodos do **canal**: o bind dos subcanais, os semáforos e a **fence** (as posições dos registos estão nas `ASSERT_REG_POSITION` ✓) |
+| `src/video_core/engines/maxwell_3d.h/.cpp` | o motor 3D: `CallMethod` → `ProcessMethodCall`; o ID do método é o **índice do registo** no `Regs` (`MAXWELL3D_REG_INDEX` ✓) |
+| `src/video_core/engines/draw_manager.cpp` | os comandos de desenho |
+| `src/video_core/renderer_vulkan/maxwell_to_vk.cpp` | a tradução do **estado** Maxwell para Vulkan (samplers, formatos, blend/depth) |
+
+Os IDs dos métodos do canal (do upstream, `puller.h` ✓):
+`semaphore_address` 0x04/0x05, `semaphore_sequence` 0x06,
+`semaphore_trigger` 0x07, `semaphore_acquire` 0x1A, `semaphore_release`
+0x1B, `fence_value` 0x1C, **`fence_action` 0x1D** ✓ — e a `fence_action`
+é `{op: bit 0, syncpoint_id: bits 8..31}` ✓.
+
+### O que foi implementado com esta fonte
+
+- **`src/gpu/pushbuffer.cpp` + `include/g610/gpu/pushbuffer.hpp`** — o
+  leitor do fluxo de métodos ✓: uma porta directa de
+  `DmaPusher::ProcessCommands` ✓, com a mesma máquina de estados
+  (Increasing / NonIncreasing / Inline / IncreaseOnce ✓) e as mesmas
+  regras de incremento do método ✓.
+- **`nvdrv`** — o push buffer é lido com o formato certo ✓ e os
+  métodos do **canal** são executados ✓:
+  - o **payload do semáforo** (0x07 com `WriteLong` ✓) é escrito na
+    memória do guest ✓ e quem espera por esse endereço é acordado ✓ —
+    é assim que o driver diz ao jogo "o trabalho acabou" ✓ (o
+    upstream: `rasterizer->Query(..., Payload, ...)` ✓);
+  - a **fence** (0x1D com `Increment` ✓) é tratada ✓.
+
+O que **não** está: a tabela de IDs do motor 3D (o `Regs` do
+`maxwell_3d.h` ✗ — os índices saem de `offsetof` ✗, e o `video_core`
+não está vendorizado ✗ nem no Pi ✗), o estado, e o backend.
+
+### O caminho que resta (mecânico, com o upstream)
+
+1. **Vendorizar o `video_core` do Eden** ✓ (o upstream tem-no inteiro
+   ✓ — `src/video_core/**` ✗) e juntar-lhe o `renderer_vulkan` ✓. É o
+   que dá o motor Maxwell e a tradução Maxwell→Vulkan **do próprio
+   Eden** ✓ — sem reescrever nada ✓. Depende do `core/` ✓ (que já
+   está vendorizado ✓) e do `common/` ✓.
+2. Ligar o `nvdrv` ao `DmaPusher` do upstream ✓: o `SubmitGPFIFO`
+   entrega a lista de `CommandListHeader` ✓ e o motor executa ✓.
+3. O *presenter* (Wayland/SDL ✓) mostra o frame ✓.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native
