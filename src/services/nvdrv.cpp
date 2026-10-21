@@ -46,6 +46,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -53,6 +54,7 @@
 #include <string>
 #include <vector>
 
+#include "g610/gpu/syncpoint.hpp"
 #include "vendor/eden/common/logging.h"
 #include "vendor/eden/core/system_ref.h"  // o `Core::System` nosso
 #include "vendor/eden/core/hle/kernel/k_event.h"
@@ -271,7 +273,12 @@ struct Canal {
     // `AllocGPFIFOEx` e que o guest usa para sincronizar. O valor
     // **incrementa** a cada submissão — é o que diz ao guest "isto já
     // chegou à GPU".
-    std::int32_t fence_id = 0;
+    //
+    // **O `fence_id` é um syncpoint** ✗ — o mesmo objecto que o
+    // `EventWait` do `/dev/nvhost-ctrl` espera ✗. É alocado na primeira
+    // `AllocGPFIFOEx` do canal ✗ (o upstream aloca-o na criação do canal
+    // ✗ — `nvhost_gpu.cpp`, `channel_syncpoint` ✗).
+    std::int32_t fence_id = -1;
     std::uint32_t fence_valor = 0;
     // Os contextos de objectos, por classe (o Eden tem 6: 2D, 3D,
     // compute, kepler, DMA, gpfifo).
@@ -491,6 +498,40 @@ static_assert(sizeof(IoctlFreeSpace) == 16, "tamanho errado");
 // `static_assert` do tamanho — que é o que o Eden exige.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// `IoctlZbcQueryTable`: a tabela de cores do ZCull.
+// O Eden (`nvhost_ctrl_gpu.h`): 52 bytes — quatro cores para a
+// "data surface", quatro para a L2, e a profundidade, a contagem de
+// referencias, o formato e o tipo.
+struct IoctlZbcQueryTable {
+    std::uint32_t color_ds[4];
+    std::uint32_t color_l2[4];
+    std::uint32_t depth;
+    std::uint32_t ref_cnt;
+    std::uint32_t format;
+    std::uint32_t type;
+    std::uint32_t index_size;
+};
+static_assert(sizeof(IoctlZbcQueryTable) == 52, "tamanho errado");
+
+// O numero de tipos de tabela que o Eden suporta — `color` (0) e
+// `colorFormat` (1) — mais um, para o `type` poder ser 2 —.
+inline constexpr std::uint32_t kTiposZbc = 1;
+
+// `IoctlActiveSlotMask`: a mascara dos slots activos.
+// O Eden (`nvhost_ctrl_gpu.h`): 8 bytes — o slot (sempre 0x07) e a mascara.
+struct IoctlActiveSlotMask {
+    std::uint32_t slot;
+    std::uint32_t mask;
+};
+static_assert(sizeof(IoctlActiveSlotMask) == 8, "tamanho errado");
+
+// `IoctlGpuTime`: o tempo global da GPU, em nanossegundos.
+// O Eden (`nvhost_ctrl_gpu.h`): 8 bytes.
+struct IoctlGpuTime {
+    std::uint64_t gpu_time;
+};
+static_assert(sizeof(IoctlGpuTime) == 8, "tamanho errado");
+
 // `IoctlZcullGetCtxSize`: o tamanho do contexto de ZCull.
 struct IoctlZcullGetCtxSize {
     std::uint32_t size;
@@ -707,17 +748,70 @@ private:
 
     // 4: o evento de um dispositivo. O Eden devolve um **handle de
     // cópia** (o `KReadableEvent`) e o `NvResult`.
+    //
+    // **O `fd` diz de que device e' o evento** ✗ — o upstream
+    // (`nvdrv.cpp:211-229` ✗) procura o device pelo fd ✗ e chama o
+    // `QueryEvent` dele ✗ (`nvhost_ctrl.cpp:297` ✗), que traduz o
+    // `event_id` no slot ✗ e devolve o `KEvent` ✗.
+    //
+    // **A casa so' tinha um evento global** ✗ — o `evento_` ✗ — que
+    // servia para o `nvhost-ctrl-gpu` ✗ mas nao para o `nvhost-ctrl` ✗
+    // (que tem 64 eventos ✗, um por slot ✗) ✗.
     void QueryEvent(HLERequestContext& ctx) {
         RequestParser rp{ctx};
         const DeviceFD fd = rp.Pop<DeviceFD>();
         const std::uint32_t evento = rp.Pop<std::uint32_t>();
-        (void)fd;
 
         if (!initialized_) {
             LOG_WARNING(Service_NVDRV, "QueryEvent: NvServices ainda não foi inicializado");
             ResponseBuilder rb{ctx, 3};
             rb.Push(ResultSuccess);
             rb.PushEnum(NvResult::NotInitialized);
+            return;
+        }
+
+        // O device do evento ✗.
+        const auto tipo_it = tipos_.find(fd);
+        const TipoDeDevice tipo =
+            tipo_it == tipos_.end() ? TipoDeDevice::Desconhecido : tipo_it->second;
+
+        if (tipo == TipoDeDevice::Controle) {
+            // **O `/dev/nvhost-ctrl`** ✗ — o evento e' o do slot ✗.
+            //
+            // O `event_id` do upstream (`nvhost_ctrl.cpp:297-320` ✗) e' um
+            // `SyncpointEventValue` ✗: um union com o slot nos bits
+            // baixos ✗ e o syncpoint nos altos ✗ ✗.
+            const std::uint32_t slot = evento & 0xFFu;
+            if (slot >= g610::gpu::kMaxNvEvents) {
+                ResponseBuilder rb{ctx, 3};
+                rb.Push(ResultSuccess);
+                rb.PushEnum(NvResult::BadParameter);
+                return;
+            }
+            auto& nv = eventos_nv_[slot];
+            if (!nv.registado || nv.kevent == nullptr) {
+                LOG_WARNING(Service_NVDRV, "QueryEvent: o evento NV {} não está registado", slot);
+                ResponseBuilder rb{ctx, 3};
+                rb.Push(ResultSuccess);
+                rb.PushEnum(NvResult::BadParameter);
+                return;
+            }
+            if (nv.fd != fd) {
+                // O evento e' de outro device ✗ — o upstream
+                // (`nvdrv.cpp:214-222` ✗) falha o mesmo ✗.
+                LOG_WARNING(Service_NVDRV,
+                           "QueryEvent: o evento NV {} pertence ao device {}, não ao {}",
+                           slot, nv.fd, fd);
+                ResponseBuilder rb{ctx, 3};
+                rb.Push(ResultSuccess);
+                rb.PushEnum(NvResult::BadParameter);
+                return;
+            }
+
+            ResponseBuilder rb{ctx, 3, 1};
+            rb.Push(ResultSuccess);
+            rb.PushCopyObjects(ctx, &nv.kevent->GetReadableEvent());
+            rb.PushEnum(NvResult::Success);
             return;
         }
 
@@ -783,6 +877,114 @@ private:
         RespostaOk(ctx);
     }
 
+    // 0x47/0x14: `GetActiveSlotMask` — a máscara dos slots activos.
+    //
+    // O Eden (`nvhost_ctrl_gpu.cpp`, `GetActiveSlotMask`): devolve
+    // `slot = 0x07` e `mask = 0x01` — sempre ✗.
+    //
+    // **Medido**: o guest pede este ioctl ✗ (`fd=1 grupo=0x47 cmd=0x14` ✗)
+    // e a casa respondia `NotImplemented` ✗ — o que é um erro para
+    // o guest ✗.
+    void GetActiveSlotMask(HLERequestContext& ctx) {
+        IoctlActiveSlotMask params{};
+        LerEntrada(ctx, params);
+
+        LOG_DEBUG(Service_NVDRV, "GetActiveSlotMask: pedido");
+
+        params.slot = 0x07;
+        params.mask = 0x01;
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x47/0x1c: `GetGpuTime` — o tempo global da GPU, em nanossegundos.
+    //
+    // O Eden (`nvhost_ctrl_gpu.cpp`, `GetGpuTime`): o `CoreTiming` global.
+    //
+    // **A casa nao tem `CoreTiming`** — o `System` da casa e' o
+    // `system_ref.h` ✗, que nao o expoe ✗. O que o guest quer e' um tempo
+    // que **avance** ✗ — o Eden usa-o para medir o tempo de GPU ✗ — e o
+    // relogio monotonico do host serve ✗ ✗. O valor absoluto nao
+    // interessa ✗ (o Eden comeca do zero ✗) ✗.
+    void GetGpuTime(HLERequestContext& ctx) {
+        IoctlGpuTime params{};
+        LerEntrada(ctx, params);
+
+        LOG_DEBUG(Service_NVDRV, "GetGpuTime: pedido");
+
+        params.gpu_time = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x47/0x03: `ZBCSetTable` — o guest escreve a tabela de cores do
+    // ZCull.
+    //
+    // O Eden (`nvhost_ctrl_gpu.cpp`, `ZBCSetTable`): valida o tipo e
+    // escreve as cores. **A casa não precisa de guardar a tabela** — o
+    // ZCull da casa não a consulta ✗ — mas tem de **aceitar** o
+    // comando ✗, porque um `NotImplemented` é um erro para o guest ✗.
+    void ZBCSetTable(HLERequestContext& ctx) {
+        IoctlZbcQueryTable params{};
+        LerEntrada(ctx, params);
+
+        LOG_DEBUG(Service_NVDRV, "ZBCSetTable: type={} index_size={}", params.type,
+                  params.index_size);
+
+        // O Eden: um tipo acima do suportado é `BadParameter` ✗.
+        if (params.type > kTiposZbc) {
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::BadParameter);
+            return;
+        }
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x47/0x04: `ZBCQueryTable` — o guest pergunta a tabela de cores.
+    //
+    // O Eden (`nvhost_ctrl_gpu.cpp`, `ZBCQueryTable`): devolve as cores da
+    // tabela pedida — e a struct é de tamanho fixo ✗, com as cores
+    // dentro ✗.
+    void ZBCQueryTable(HLERequestContext& ctx) {
+        IoctlZbcQueryTable params{};
+        LerEntrada(ctx, params);
+
+        LOG_DEBUG(Service_NVDRV, "ZBCQueryTable: type={} index_size={}", params.type,
+                  params.index_size);
+
+        if (params.type > kTiposZbc) {
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::BadParameter);
+            return;
+        }
+
+        // As cores da tabela — as do Eden ✗ (`nvhost_ctrl_gpu.cpp` ✗).
+        static constexpr std::uint32_t kCoresZbc[3][4] = {
+            {0x00000000, 0x00000000, 0x00000000, 0x00000000},
+            {0xFF000000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFF00},
+            {0xFF000000, 0xFF00FF00, 0xFF0000FF, 0xFFFFFF00},
+        };
+
+        const std::uint32_t indice = params.type < 3 ? params.type : 0;
+        for (std::size_t k = 0; k < 4; ++k) {
+            params.color_ds[k] = kCoresZbc[indice][k];
+            params.color_l2[k] = kCoresZbc[indice][k];
+        }
+        params.index_size = 16;
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
     // O `ZCullGetCtxSize` (grupo `'G'`, comando 0x01) — o tamanho do
     // contexto de ZCull. O Eden: `params.size = 0x1`.
     void ZCullGetCtxSize(HLERequestContext& ctx) {
@@ -839,10 +1041,30 @@ private:
         // valores por omissão (`nvhost_as_gpu.cpp`, `AllocAsEx`: "If
         // this is unspecified then default values should be used").
         //
-        // **Aqui o espaço por omissão é o da casa** — a região de alias
-        // da reserva — e não o do Eden ([32 MiB, 8 GiB)), porque o VA
-        // tem de ser memória do **guest** (ver a nota da `VmDaGpu`).
+        // **Se o guest escolheu** ✗, o Eden usa o **dele** ✗
+        // (`nvhost_as_gpu.cpp:127-131` ✗):
         //
+        //     if (params.va_range_start) {
+        //         vm.va_range_start = params.va_range_start;
+        //         vm.va_range_split = params.va_range_split;
+        //         vm.va_range_end = params.va_range_end;
+        //     }
+        //
+        // **A casa ignorava-o** ✗ e usava a sua regiao ✗ — o que
+        // fazia o `MapBufferEx` devolver VAs **fora** da regiao que o
+        // guest reservou ✗ ✗ ✗.
+        //
+        // A regiao por omissão da casa ✗ é a da reserva do guest ✗ (a nota
+        // da `VmDaGpu` ✗) — de 0x98000000 ✗ a 0x290000000 ✗ — porque o VA
+        // da GPU tem de ser memória do **guest** ✗ ✗.
+        if (params.va_range_start != 0) {
+            va_.base = params.va_range_start;
+            va_.split = params.va_range_split;
+            va_.fim = params.va_range_end;
+            va_.proximo_pequeno = va_.base;
+            va_.proximo_grande = va_.split;
+        }
+
         // O tamanho de página grande, esse é o do guest (0x10000) — e o
         // Eden só o aceita se for uma potência de dois dentro das
         // suportadas (`SUPPORTED_BIG_PAGE_SIZES` = 0x30000).
@@ -1237,11 +1459,24 @@ private:
             return;
         }
 
+        // **O tamanho** ✗ — o upstream (`nvhost_as_gpu.cpp:369` ✗):
+        //
+        //     u64 size{params.mapping_size ? params.mapping_size : handle->orig_size};
+        //
+        // **O tamanho zero significa "o handle inteiro"** ✗ — e a casa
+        // usava o zero ✗, o que mapeava **nada** ✗ ✗.
+        //
+        // **Medido**: o guest pede `MapBufferEx` com `mapping_size = 0` ✗
+        // (`fd=2 grupo=0x41 cmd=0x06 tamanho=40` ✗, `va=0x0 -> ... tamanho=0x0`
+        // ✗) ✗ — e a casa registava `tamanho=0x0` ✗.
+        const std::uint64_t tamanho =
+            params.mapping_size != 0 ? params.mapping_size : it->second.tamanho;
+
         const std::uint64_t endereco = it->second.endereco + params.buffer_offset;
         LOG_DEBUG(Service_NVDRV,
                   "MapBufferEx: handle={} va=0x{:X} -> 0x{:X} tamanho=0x{:X} flags=0x{:X}",
-                  params.handle, static_cast<std::uint64_t>(params.offset), endereco,
-                  params.mapping_size, params.flags);
+                  params.handle, static_cast<std::uint64_t>(params.offset), endereco, tamanho,
+                  params.flags);
 
         // O VA devolvido: o do guest, se pediu um fixo; o da memória, se
         // não (a identidade).
@@ -1445,11 +1680,18 @@ private:
     void AllocGPFIFOEx(HLERequestContext& ctx) {
         IoctlAllocGpfifoEx params{};
         LerEntrada(ctx, params);
-
         LOG_DEBUG(Service_NVDRV, "canal: AllocGPFIFOEx: entradas={} jobs={} flags=0x{:X}",
                   params.num_entries, params.num_jobs, params.flags);
 
         if (auto* canal = CanalDoFd()) {
+            // **O syncpoint do canal** ✗ — alocado na primeira vez ✗ (o
+            // upstream aloca-o na criação do canal ✗ — `nvhost_gpu.cpp` ✗,
+            // `channel_syncpoint` ✗). E' o id que o guest espera no
+            // `EventWait` ✗.
+            if (canal->fence_id < 0) {
+                canal->fence_id = static_cast<std::int32_t>(syncpoints_.Alocar());
+                LOG_DEBUG(Service_NVDRV, "canal: syncpoint {} alocado", canal->fence_id);
+            }
             params.fence_id = canal->fence_id;
             params.fence_value = canal->fence_valor;
         }
@@ -1708,8 +1950,15 @@ private:
             std::uint32_t sem_sequencia = 0;
             std::uint32_t fence_acao = 0;
 
+            // A contagem por metodo: e' a unica forma de dizer o que esta
+            // dentro do push buffer sem adivinhar. Os metodos do canal
+            // (semaphore, fence) tem id < 0x40; os do motor 3D tem id
+            // >= 0x40 (upstream, dma_pusher.cpp:204).
+            std::map<std::uint32_t, std::uint32_t> metodos_vistos;
+
             const std::size_t metodos = leitor.for_each(
                 pushbuffer, [&](const gpu::MethodCall& m) {
+                    ++metodos_vistos[m.method];
                     switch (m.method) {
                     case gpu::canal::SemaphoreAddressHigh:
                         sem_endereco = (sem_endereco & 0xFFFFFFFFull) |
@@ -1764,6 +2013,21 @@ private:
             LOG_DEBUG(Service_NVDRV,
                       "SubmitGPFIFO: {} métodos no push buffer ({} descartados)", metodos,
                       leitor.descartados());
+
+            // Os ids de metodo que apareceram, e quantas vezes. Os do canal
+            // (id < 0x40) sao os que o puller executa; os do motor (>= 0x40)
+            // sao os que o 3D executa.
+            {
+                std::string linha;
+                char tmp[64];
+                for (const auto& [id, n] : metodos_vistos) {
+                    std::snprintf(tmp, sizeof tmp, "%s%u:%u", linha.empty() ? "" : " ", id, n);
+                    linha += tmp;
+                    if (linha.size() > 900)
+                        break;
+                }
+                LOG_DEBUG(Service_NVDRV, "SubmitGPFIFO: ids de método: {}", linha);
+            }
         }
 
         // O push buffer **cru**, em hexadecimal: é o que permite
@@ -1807,6 +2071,21 @@ private:
 
         // A fence: o `id` é o syncpoint do canal e o `valor` incrementa
         // (a regra do Eden, `SubmitGPFIFOImpl`).
+        //
+        // **O upstream** (`nvhost_gpu.cpp:367-372` ✗):
+        //
+        //     params.fence.id = channel_syncpoint;
+        //     u32 increment{(flags.fence_increment.Value() != 0 ? 2 : 0) +
+        //                   (flags.increment_value.Value() != 0 ? params.fence.value : 0)};
+        //     params.fence.value =
+        //         syncpoint_manager.IncrementSyncpointMaxExt(channel_syncpoint, increment);
+        //
+        // **O incremento pode ser zero** ✗ — e nesse caso o syncpoint **nao
+        // sobe** ✗ ✗. A casa **incrementava sempre** ✗ ✗ — o que faz o
+        // guest ver um valor de fence que o Eden nunca devolveria ✗ ✗.
+        //
+        // E o `fence.value` de saída é o valor **depois** do incremento ✗ —
+        // o novo valor do syncpoint ✗ ✗.
         constexpr std::uint32_t kFenceWait = 1u << 0;
         constexpr std::uint32_t kFenceIncrement = 1u << 1;
         constexpr std::uint32_t kIncrementValue = 1u << 8;
@@ -1816,8 +2095,35 @@ private:
                 incremento += 2;
             if ((params.flags & kIncrementValue) != 0)
                 incremento += params.fence_value;
-            canal->fence_valor += incremento != 0 ? incremento : 1;
             canal->submissoes += 1;
+
+            // **O syncpoint avanca** ✗ — e e' isto que cumpre a espera do
+            // guest ✗ ✗.
+            //
+            // O upstream (`nvhost_gpu.cpp`, `SubmitGPFIFOImpl` ✗) faz
+            // `syncpoint_manager.IncrementSyncpointMaxExt(channel_syncpoint,
+            // increment)` ✗ — o syncpoint sobe **quando a submissao e'
+            // aceite** ✗ ✗. O `EventWait` do `/dev/nvhost-ctrl` ve o
+            // valor novo ✗ e o guest prossegue ✗ ✗.
+            //
+            // **Aqui nao ha thread de GPU** ✗ — o trabalho e' "executado"
+            // agora ✗ — por isso o syncpoint sobe aqui ✗ ✗. O guest ve
+            // exactamente o mesmo ✗.
+            if (canal->fence_id >= 0) {
+                const std::uint32_t id = static_cast<std::uint32_t>(canal->fence_id);
+                // **O incremento zero deixa o syncpoint quieto** ✗ ✗ — e o
+                // "MaxExt" ✗ do upstream significa que o valor nunca
+                // **desce** ✗ ✗.
+                if (incremento != 0) {
+                    syncpoints_.Incrementar(id, incremento);
+                }
+                canal->fence_valor = syncpoints_.Valor(id);
+                LOG_DEBUG(Service_NVDRV,
+                          "canal: syncpoint {} Advanced para {} ({} submissões)",
+                          canal->fence_id, canal->fence_valor, canal->submissoes);
+            }
+
+            // A fence de saída ✗ — o par (syncpoint ✗, valor **actual** ✗).
             params.fence_id = canal->fence_id;
             params.fence_value = canal->fence_valor;
         }
@@ -1906,6 +2212,335 @@ private:
         (void)w;
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // O `/dev/nvhost-ctrl` — o device da espera pela fence.
+    //
+    // **E' o device onde o guest espera que a GPU acabe** ✗. O
+    // `SubmitGPFIFO` devolve o par (syncpoint, valor) ✗ e o guest vem aqui
+    // (`IocCtrlEventWait` ✗) esperar que aquele syncpoint chegue a esse
+    // valor ✗.
+    //
+    // A tabela e' a do upstream (`nvhost_ctrl.cpp:41-57`) ✗ — o **grupo
+    // 0x00** ✗, que e' diferente do `'G'` do `/dev/nvhost-ctrl-gpu` ✗ e
+    // do `0x00` do `/dev/nvhost-gpu` ✗ (o `GetWaitbase` ✗) ✗.
+    //
+    // ─────────────────────────────────────────────────────────────────────
+
+    // 0x00/0x1f: `IocCtrlEventRegister` — o guest regista um evento NV ✗.
+    //
+    // O upstream (`nvhost_ctrl.cpp`) cria um `KEvent` do kernel ✗ e
+    // guarda-o ✗; o guest depois espera nele ✗ com o `WaitSynchronization`
+    // ✗.
+    void CtrlEventRegister(HLERequestContext& ctx) {
+        std::uint32_t event_id = 0;
+        LerEntrada(ctx, event_id);
+
+        LOG_DEBUG(Service_NVDRV, "CtrlEventRegister: event_id={}", event_id);
+
+        if (event_id >= g610::gpu::kMaxNvEvents) {
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::BadParameter);
+            return;
+        }
+
+        // Se ja' estava registado ✗, o upstream liberta-o primeiro ✗
+        // (`FreeEvent` ✗) — e se estiver em uso ✗, isso e' um erro ✗.
+        auto& evento = eventos_nv_[event_id];
+        if (evento.registado) {
+            if (evento.em_uso) {
+                ResponseBuilder rb{ctx, 3};
+                rb.Push(ResultSuccess);
+                rb.PushEnum(NvResult::Busy);
+                return;
+            }
+            LibertarEventoNv(event_id);
+        }
+
+        // O `KEvent` — como o do `nvdrv` (o `QueryEvent` ✗).
+        auto& kernel = system.Kernel();
+        auto& processo = Kernel::GetCurrentProcess(kernel);
+        evento.kevent = new Kernel::KEvent(kernel);
+        evento.kevent->Initialize(kernel, &processo);
+        evento.registado = true;
+        evento.em_uso = false;
+        evento.fd = fd_em_curso_;
+
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.PushEnum(NvResult::Success);
+    }
+
+    // 0x00/0x20: `IocCtrlEventUnregister` — o guest liberta um evento ✗.
+    void CtrlEventUnregister(HLERequestContext& ctx) {
+        std::uint32_t event_id = 0;
+        LerEntrada(ctx, event_id);
+        event_id &= 0xFFu;
+
+        LOG_DEBUG(Service_NVDRV, "CtrlEventUnregister: event_id={}", event_id);
+
+        if (event_id >= g610::gpu::kMaxNvEvents) {
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::BadParameter);
+            return;
+        }
+
+        auto& evento = eventos_nv_[event_id];
+        if (!evento.registado) {
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::Success);
+            return;
+        }
+        if (evento.em_uso) {
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::Busy);
+            return;
+        }
+
+        LibertarEventoNv(event_id);
+
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.PushEnum(NvResult::Success);
+    }
+
+    // 0x00/0x21: `IocCtrlEventUnregisterBatch` — liberta varios ✗.
+    void CtrlEventUnregisterBatch(HLERequestContext& ctx) {
+        std::uint64_t mascara = 0;
+        LerEntrada(ctx, mascara);
+
+        LOG_DEBUG(Service_NVDRV, "CtrlEventUnregisterBatch: mascara=0x{:X}", mascara);
+
+        NvResult resultado = NvResult::Success;
+        while (mascara != 0) {
+            const std::uint32_t event_id =
+                static_cast<std::uint32_t>(__builtin_ctzll(mascara));
+            mascara &= ~(1ULL << event_id);
+
+            auto& evento = eventos_nv_[event_id];
+            if (!evento.registado)
+                continue;
+            if (evento.em_uso) {
+                resultado = NvResult::Busy;
+                continue;
+            }
+            LibertarEventoNv(event_id);
+        }
+
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.PushEnum(resultado);
+    }
+
+    // 0x00/0x1c: `IocCtrlClearEventWait` — o guest larga a espera ✗.
+    void CtrlClearEventWait(HLERequestContext& ctx) {
+        std::uint32_t event_id = 0;
+        LerEntrada(ctx, event_id);
+
+        LOG_DEBUG(Service_NVDRV, "CtrlClearEventWait: event_id=0x{:X}", event_id);
+
+        const std::uint32_t slot = event_id & 0xFFu;
+        if (slot < g610::gpu::kMaxNvEvents) {
+            auto& evento = eventos_nv_[slot];
+            if (evento.em_uso) {
+                // O upstream (`IocCtrlClearEventWait`) cancela a accao
+                // registada e limpa o evento ✗.
+                syncpoints_.Remover(evento.syncpoint, evento.valor);
+                evento.em_uso = false;
+                evento.syncpoint = 0;
+                evento.valor = 0;
+            }
+        }
+
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.PushEnum(NvResult::Success);
+    }
+
+    // 0x00/0x1d e 0x00/0x1e: `IocCtrlEventWait` — a espera ✗.
+    //
+    // **A alocacao** ✗ (0x1d ✗) cria o evento e devolve o par
+    // (syncpoint, slot) ✗; **a espera** ✗ (0x1e ✗) regista a accao no
+    // syncpoint ✗.
+    //
+    // A semantica do upstream (`nvhost_ctrl.cpp` ✗):
+    //
+    //   - se o valor pedido **ja** foi alcancado ✗, devolve sucesso ✗ e
+    //     o valor actual ✗;
+    //   - se nao ✗, regista a accao ✗ e devolve `Timeout` ✗ — que
+    //     significa "ainda nao, mas ja' estou a ver" ✗ ✗.
+    void CtrlEventWait(HLERequestContext& ctx, bool alocacao) {
+        struct IocCtrlEventWaitParams {
+            std::int32_t fence_id;
+            std::uint32_t fence_value;
+            std::uint32_t timeout;
+            std::uint32_t value;
+        };
+        static_assert(sizeof(IocCtrlEventWaitParams) == 16, "tamanho errado");
+
+        IocCtrlEventWaitParams params{};
+        LerEntrada(ctx, params);
+
+        LOG_DEBUG(Service_NVDRV,
+                  "CtrlEventWait: syncpt_id={} threshold={} timeout={} alocacao={}",
+                  params.fence_id, params.fence_value, params.timeout, alocacao ? 1 : 0);
+
+        // O upstream: `fence_id` fora do intervalo e' `BadParameter` ✗.
+        if (params.fence_id < 0 ||
+            static_cast<std::uint32_t>(params.fence_id) >= g610::gpu::kMaxSyncpoints) {
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::BadParameter);
+            return;
+        }
+        const std::uint32_t fence_id = static_cast<std::uint32_t>(params.fence_id);
+
+        // **Valor zero** ✗: o guest so' quer saber o valor actual ✗ (o
+        // upstream devolve o minimo do syncpoint ✗).
+        if (params.fence_value == 0) {
+            params.value = syncpoints_.Valor(fence_id);
+            EscreverSaida(ctx, params);
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::Success);
+            return;
+        }
+
+        // **Ja' cumprido** ✗ — o upstream devolve o valor actual ✗.
+        if (syncpoints_.EstaSinalizado(fence_id, params.fence_value)) {
+            params.value = syncpoints_.Valor(fence_id);
+            EscreverSaida(ctx, params);
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::Success);
+            return;
+        }
+
+        // O slot do evento ✗.
+        std::uint32_t slot = params.value & 0xFFu;
+        if (alocacao) {
+            slot = EventoNvLivre(fence_id);
+            if (slot >= g610::gpu::kMaxNvEvents) {
+                ResponseBuilder rb{ctx, 3};
+                rb.Push(ResultSuccess);
+                rb.PushEnum(NvResult::BadParameter);
+                return;
+            }
+        } else if (slot >= g610::gpu::kMaxNvEvents) {
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::BadParameter);
+            return;
+        }
+
+        auto& evento = eventos_nv_[slot];
+        if (!evento.registado) {
+            // O upstream: um evento nao registado e' `BadParameter` ✗.
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::BadParameter);
+            return;
+        }
+        if (evento.em_uso) {
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::BadParameter);
+            return;
+        }
+
+        // A accao ✗: sinalizar o `KEvent` quando o syncpoint chegar ao
+        // valor ✗.
+        Kernel::KEvent* kevent = evento.kevent;
+        const std::uint32_t valor = params.fence_value;
+        const bool registado = syncpoints_.Registar(
+            fence_id, valor, [this, kevent, slot]() { SinalizarEventoNv(slot, kevent); });
+
+        if (!registado) {
+            // Chegou entretanto ✗ — sinaliza ja' ✗.
+            SinalizarEventoNv(slot, kevent);
+            params.value = syncpoints_.Valor(fence_id);
+            EscreverSaida(ctx, params);
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::Success);
+            return;
+        }
+
+        evento.syncpoint = fence_id;
+        evento.valor = valor;
+        evento.em_uso = true;
+
+        // O valor de saida ✗: o syncpoint e o slot ✗.
+        //
+        // O upstream (`nvhost_ctrl.cpp` ✗) na alocacao devolve o
+        // syncpoint e o bit de "alocado" ✗; na espera devolve o syncpoint
+        // e o slot ✗.
+        params.value = fence_id;
+        if (alocacao) {
+            params.value |= (slot & 0xFu);
+            params.value |= (1u << 12);  // o bit de "evento alocado" ✗
+        } else {
+            params.value |= slot;
+        }
+        EscreverSaida(ctx, params);
+
+        // `Timeout` ✗ — o upstream usa-o para dizer "ainda nao, mas ja'
+        // estou a ver" ✗. **Nao e' um erro** ✗ — e' o que o guest
+        // espera ✗.
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.PushEnum(NvResult::Timeout);
+    }
+
+    // O slot de evento livre ✗ — o `FindFreeNvEvent` do upstream ✗.
+    std::uint32_t EventoNvLivre(std::uint32_t syncpoint) {
+        std::uint32_t slot_livre = g610::gpu::kMaxNvEvents;
+        std::uint32_t melhor = g610::gpu::kMaxNvEvents;
+        for (std::uint32_t i = 0; i < g610::gpu::kMaxNvEvents; ++i) {
+            auto& evento = eventos_nv_[i];
+            if (!evento.registado) {
+                if (slot_livre == g610::gpu::kMaxNvEvents)
+                    slot_livre = i;
+                continue;
+            }
+            if (evento.em_uso)
+                continue;
+            // O do mesmo syncpoint e' o melhor ✗ (o upstream ✗).
+            if (evento.syncpoint == syncpoint)
+                melhor = i;
+        }
+        return melhor != g610::gpu::kMaxNvEvents ? melhor : slot_livre;
+    }
+
+    // Sinaliza o `KEvent` de um evento NV ✗.
+    void SinalizarEventoNv(std::uint32_t slot, Kernel::KEvent* kevent) {
+        if (!kevent)
+            return;
+        auto& kernel = system.Kernel();
+        kevent->Signal(kernel);
+        auto& evento = eventos_nv_[slot];
+        evento.em_uso = false;
+        LOG_DEBUG(Service_NVDRV, "CtrlEventWait: evento {} sinalizado", slot);
+    }
+
+    // Liberta um evento NV ✗ — o `FreeNvEvent` do upstream ✗.
+    void LibertarEventoNv(std::uint32_t event_id) {
+        auto& evento = eventos_nv_[event_id];
+        if (evento.kevent) {
+            auto& kernel = system.Kernel();
+            evento.kevent->Finalize(kernel);
+            delete evento.kevent;
+            evento.kevent = nullptr;
+        }
+        evento.registado = false;
+        evento.em_uso = false;
+        evento.syncpoint = 0;
+        evento.valor = 0;
+    }
+
     // O canal do device de um ioctl (o `fd` do comando).
     Canal* CanalDoFd() {
         const DeviceFD fd = fd_em_curso_;
@@ -1985,6 +2620,36 @@ private:
         // `nvhost_ctrl_gpu.cpp`, `nvhost_as_gpu.cpp`, `nvhost_gpu.cpp`,
         // `nvmap.cpp`.
         switch (tipo) {
+        case TipoDeDevice::Controle:
+            // O `/dev/nvhost-ctrl` — o device da **espera pela fence** ✗.
+            //
+            // O **grupo 0x00** ✗ (o upstream, `nvhost_ctrl.cpp:41-57` ✗) —
+            // que e' diferente do `'G'` do `/dev/nvhost-ctrl-gpu` ✗ ✗.
+            if (comando.group() == 0x00) {
+                switch (comando.cmd()) {
+                case 0x1c:
+                    CtrlClearEventWait(ctx);
+                    return;
+                case 0x1d:
+                    CtrlEventWait(ctx, true);
+                    return;
+                case 0x1e:
+                    CtrlEventWait(ctx, false);
+                    return;
+                case 0x1f:
+                    CtrlEventRegister(ctx);
+                    return;
+                case 0x20:
+                    CtrlEventUnregister(ctx);
+                    return;
+                case 0x21:
+                    CtrlEventUnregisterBatch(ctx);
+                    return;
+                default:
+                    break;
+                }
+            }
+            break;
         case TipoDeDevice::ControleGpu:
             if (comando.group() == 'G') {
                 switch (comando.cmd()) {
@@ -1994,11 +2659,23 @@ private:
                 case 0x2:
                     ZCullGetInfo(ctx);
                     return;
+                case 0x3:
+                    ZBCSetTable(ctx);
+                    return;
+                case 0x4:
+                    ZBCQueryTable(ctx);
+                    return;
                 case 0x5:
                     GetCharacteristics1(ctx);
                     return;
                 case 0x6:
                     GetTPCMasks1(ctx);
+                    return;
+                case 0x14:
+                    GetActiveSlotMask(ctx);
+                    return;
+                case 0x1c:
+                    GetGpuTime(ctx);
                     return;
                 default:
                     break;
@@ -2229,6 +2906,40 @@ private:
     // cada `/dev/nvhost-gpu`.
     std::map<DeviceFD, TipoDeDevice> tipos_;
     std::map<DeviceFD, Canal> canais_;
+
+    // ── O `/dev/nvhost-ctrl` e os syncpoints ───────────────────────────
+    //
+    // **Os syncpoints** ✗ — o objecto que o guest espera ✗. A semantica e'
+    // a do upstream (`video_core/host1x/syncpoint_manager.h`) ✗: cada
+    // syncpoint tem um valor monotonico ✗ e um conjunto de accoes que
+    // disparam quando o valor chega ao esperado ✗.
+    //
+    // **A diferenca** ✗: o upstream avanca o syncpoint numa thread de GPU
+    // ✗; aqui avanca **no `SubmitGPFIFO`** ✗ — que e' quando o trabalho
+    // e' "executado" ✗. O guest ve o mesmo ✗.
+    g610::gpu::SyncpointManager syncpoints_;
+
+    // **Os eventos NV** ✗ — o `nvhost_ctrl` tem 64 ✗ (o upstream:
+    // `MaxNvEvents = 64` ✗). Cada um e' um `KEvent` do kernel ✗ que o
+    // guest pode esperar ✗ (`WaitSynchronization` ✗).
+    //
+    // O `KEvent` e' criado pelo `IocCtrlEventRegister` ✗ (0x1f ✗) e
+    // destruido no `Unregister` ✗ (0x20 ✗) ou no `UnregisterBatch` ✗
+    // (0x21 ✗) — como no upstream ✗.
+    struct EventoNv {
+        Kernel::KEvent* kevent = nullptr;
+        // O syncpoint que este evento espera ✗ e o valor ✗.
+        std::uint32_t syncpoint = 0;
+        std::uint32_t valor = 0;
+        // O device a que pertence ✗ — o `QueryEvent` do upstream
+        // (`nvdrv.cpp:211-229` ✗) procura o device pelo fd ✗ ✗.
+        DeviceFD fd = -1;
+        // Registado ✗ (o guest pediu-o ✗) e a ser usado ✗.
+        bool registado = false;
+        bool em_uso = false;
+    };
+    std::map<std::uint32_t, EventoNv> eventos_nv_;
+
     // O device do ioctl em curso (o `fd` do comando) — o canal que o
     // ioctl diz respeito.
     DeviceFD fd_em_curso_ = -1;

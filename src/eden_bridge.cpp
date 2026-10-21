@@ -819,8 +819,8 @@ bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_ha
     if (std::getenv("IA_IPC_TRACE") != nullptr) {
         std::fprintf(stderr, "[ipc] SendSyncRequest handle=0x%x typed=%p\n",
                      session_handle, static_cast<const void*>(sessao.GetPointerUnsafe()));
-    }
 
+    }
     // A referência ao pai: o pai tem de sobreviver ao pedido. Sem este
     // `KScopedAutoObject` a sessão pode ser destruída a meio e o pedido
     // escreve para memória morta.

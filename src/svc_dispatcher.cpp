@@ -1584,11 +1584,6 @@ struct ArbitrationBoard {
 
 ArbitrationBoard g_arbiter;
 
-// O trabalho da GPU está pronto (a fence foi cumprida). O próximo
-// espera do guest prossegue — é a semântica da fence: o valor devolvido
-// já é o do syncpoint incrementado.
-std::atomic<bool> g_gpu_trabalho_pronto{false};
-
 // Os sinais **pendentes**: um `signal` que chegou antes do `wait`.
 //
 // **Medido**: o jogo perde um sinal assim — o `signal` do *main* chega
@@ -2220,12 +2215,27 @@ Result SvcDispatcher::svc_unsupported(SvcContext&) {
 // e o `SignalProcessWideKey` do próprio jogo não ajuda, porque o que o
 // jogo está a esperar é o driver.
 //
+// **O mecanismo actual** ✗: o `KEvent` do evento NV ✗ — o mesmo
+// objecto que o upstream sinaliza ✗ (`nvhost_ctrl.cpp` ✗,
+// `event.kevent->Signal()` ✗) ✗. O `WaitSynchronization` do guest
+// consulta-o e prossegue ✗ ✗.
+//
+// A flag `g_gpu_trabalho_pronto` que existia aqui ✗ era **estado
+// morto** ✗: era escrita ✗ e nunca lida ✗ ✗. O sinal agora vem do
+// syncpoint ✗ (`g610/gpu/syncpoint.hpp` ✗) ✗ — que dispara a accao
+// registada pelo `EventWait` ✗ ✗.
+//
 // O mecanismo é o do Eden (`SignalImpl`,
 // `k_condition_variable.cpp:209-220`): a palavra do mutex passa a zero
 // (liberta) e o *waiter* acorda **já dono** — por isso é preciso
 // escrever na memória do guest, e não só tocar no token.
 void g610::SvcDispatcher::RegistarTrabalhoGpu() {
-    g_gpu_trabalho_pronto.store(true, std::memory_order_release);
+    // **Sem sinal proprio** ✗ — o sinal e' o do `KEvent` ✗ ✗.
+    //
+    // Esta funcao fica porque o `nvdrv` a chama no `FenceAction` ✗ (o
+    // metodo de canal que incrementa a fence ✗) ✗. Mas ja' nao ha flag
+    // para ler ✗ ✗: o `KEvent` ja' foi sinalizado ✗ ✗, e o
+    // `WaitSynchronization` do guest ve-o ✗ ✗.
 }
 
 void g610::SvcDispatcher::AcordarFutexNoEndereco(std::uint64_t endereco) {
