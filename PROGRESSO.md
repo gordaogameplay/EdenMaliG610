@@ -3862,6 +3862,23 @@ não está vendorizado ✗ nem no Pi ✗), o estado, e o backend.
    entrega a lista de `CommandListHeader` ✓ e o motor executa ✓.
 3. O *presenter* (Wayland/SDL ✓) mostra o frame ✓.
 
+### O `video_core` do Eden — vendorizado
+
+O motor Maxwell 3D e a tradução Maxwell→Vulkan do **próprio Eden**
+foram trazidos para `vendor/eden/src/` ✓ (624 ficheiros, 5,8 MiB ✓):
+
+    vendor/eden/src/video_core/**          — o motor Maxwell, o puller,
+                                             o dma_pusher, o renderer_vulkan
+    vendor/eden/src/shader_recompiler/**   — a conversão NVIDIA GLSL → SPIR-V
+
+A ferramenta é `tools/vendorizar_video_core.py` ✓ (tem `--fetch` ✓) —
+e o que ela traz substitui o `ShaderCache::compile` da casa, que hoje
+é um *placeholder* ✓ (copia o blob para dentro de um vector `spirv` ✗).
+
+O que falta para compilar isto dentro da casa: as dependências do
+`renderer_vulkan` (o **PanVK** ✗ — o driver Vulkan-sobre-Vulkan que o
+Eden usa ✗) e as flags de compilação ✗. É mecânico, mas não é trivial.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native
