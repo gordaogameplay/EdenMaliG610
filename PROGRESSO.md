@@ -3774,6 +3774,43 @@ na fila da cv e a *consulta* no signal (quantos *waiters* há em cada
 fila, e com que chave) — para ver onde a inscrição do worker A se
 perde. É uma linha de instrumentação e fecha o caso.
 
+### O próximo passo, exacto: o pedido sem o cabeçalho de domínio
+
+O log dá o par:
+
+```
+624   HSR appletOE: comando 0 tipo=6 tem_domain=1   → OpenApplicationProxy ✓
+11874 HSR appletOE: comando 0 tipo=0 tem_domain=0   → o MESMO comando, como comando
+```
+
+E logo a seguir, **dois asserts do Eden**:
+```
+hle_ipc.cpp: assert data_payload_header->magic == MakeMagic('S','F','C','I')
+service.cpp: assert command_type=0
+```
+
+Ou seja: o pedido do jogo **chegou sem o cabeçalho de domínio**
+(`tem_domain=0` ✗), mas a sessão *é* de domínio ✓ (a primeira
+chamada, a de controlo, foi `tipo=6 tem_domain=1` ✓). O Eden lê o
+cabeçalho de domínio onde não está ✗ → todos os deslocamentos
+erram ✗ → o `magic` do payload não é "SFCI" ✗ → assert ✗, e o
+comando é lido do sítio errado ✗.
+
+**De onde vem**: o Eden devolve as sub-interfaces com
+`PushIpcInterface` (`ipc_helpers.h:114-131`) — e, quando a sessão é
+de domínio, o objecto vai por `ctx.AddDomainObject(...)` ✗ (e o
+gestor de sessões fica com a *interface* como handler ✓). A casa
+respondeu ao `OpenApplicationProxy` de forma que o guest **não sabe
+que está numa sessão de domínio** ✗ — e manda o pedido sem o
+cabeçalho ✗.
+
+**O que fazer**: comparar a resposta da casa ao `OpenApplicationProxy`
+(control, tipo 6 ✓) com a do Eden (`applet_oe.cpp`) — em especial
+o handle devolvido e a forma como a sessão é criada (de domínio ✓ ou
+não ✗) — e corrigir a resposta ✗. Com isso, o pedido do
+`GetEventHandle` entra bem ✓, o `applet:oe` responde ✓, e o jogo
+deixa de bater no assert ✗.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native
