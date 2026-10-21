@@ -78,7 +78,21 @@ target_include_directories(g610_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}                # `vendor/eden/core/...`
   ${CMAKE_CURRENT_SOURCE_DIR}/vendor/third_party
+  ${CMAKE_CURRENT_SOURCE_DIR}/vendor/eden/src # `video_core/...`, `core/...` do upstream
+  ${CMAKE_CURRENT_SOURCE_DIR}/vendor/third_party/Vulkan-Headers/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/vendor/third_party/VulkanMemoryAllocator/include
 )
+
+# --- o motor Maxwell do Eden (video_core) ----------------------------------
+# O `video_core` do upstream e' o motor Maxwell 3D (que executa os comandos
+# do push buffer) e o `renderer_vulkan` (que os traduz para Vulkan). Entra no
+# MESMO alvo do `core/`, como o resto do Eden vendorizado: sao as duas metades
+# do mesmo motor e separadas dariam ao linker um circulo.
+#
+# As fontes vem do `CMakeLists.txt` do upstream — extraidas por
+# `tools/extrair_fontes_upstream.py` (a fonte da verdade e' o upstream).
+include(cmake/ia_fontes.cmake)
+target_sources(g610_core PRIVATE ${IA_FONTES_VIDEO_CORE})
 target_compile_definitions(g610_core PUBLIC ANKERL_UNORDERED_DENSE_STD_MODULE=1)
 target_link_libraries(g610_core PUBLIC Vulkan::Vulkan SDL2::SDL2 fmt::fmt pthread)
 

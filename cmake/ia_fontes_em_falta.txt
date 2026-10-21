@@ -1,0 +1,1 @@
+set_source_files_properties(host1x/ffmpeg/ffmpeg.cpp
