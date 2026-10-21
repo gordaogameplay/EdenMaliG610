@@ -25,6 +25,7 @@
 
 #include <csignal>
 #include <cstdint>
+#include <csetjmp>
 #include <string>
 
 #include "g610/guest_context.hpp"
@@ -41,13 +42,75 @@ extern "C" void g610_run_guest(std::uint64_t entry, std::uint64_t arg,
 namespace g610 {
 
 // O que o guest fez na última trap. Registado para o relatório e para
-// distinguir uma paragem por serviço de uma por fault.
+// distinguir uma paragem por serviço de uma por fault. Definido aqui, antes
+// de `GuestThreadState`, porque o estado de thread tem um campo deste tipo
+// (o passo 1 deixava-o abaixo, e o struct filho ficava a referenciar um tipo
+// ainda por declarar).
 enum class TrapKind : std::uint8_t {
     None = 0,
     SvcCall,
     GuestFault,
     Breakpoint,
     Yield,
+};
+
+// O estado de UMA thread que executa codigo de guest.
+//
+// Tudo o que o handler de sinais escreve e' por thread: uma thread de guest
+// que faultou nao pode reescrever o relatorio da principal, e o regresso ao
+// host tem de ser para a frame DA thread que faultou.
+//
+// **Nao e' um `__thread`.** A razao e' especifica deste motor, e foi
+// medida: enquanto o guest corre, o `TPIDR_EL0` vale o TLS do GUEST (o motor
+// troca-o), e um `__thread` do host lido nesse intervalo daria o valor de um
+// bloco errado. E `thread_local` (C++) em PIC passa por `__tls_get_addr`,
+// que aloca - e alocar dentro de um handler de sinais e' caminho para o OOM
+// (medido: o processo morria no primeiro `SendSyncRequest`).
+//
+// Como o handler encontra a sua thread? Pelo `TPIDR_EL0` de entrada: enquanto
+// o guest corre, o registo vale a base do TLS do guest DESSA thread. Logo, o
+// valor do registo identifica a thread - e le-se com um `mrs`, sem libc.
+struct GuestThreadState {
+    // O TLS do guest desta thread (o valor instalado em TPIDR_EL0 enquanto o
+    // guest corre) e o TLS da libc desta thread. Sao trocados a volta de cada
+    // trap: o handler e' codigo do host e precisa da libc, e o guest precisa
+    // do TLS DELE.
+    std::uint64_t guest_tls = 0;
+    std::uint64_t host_tls  = 0;
+
+    // Contadores.
+    std::uint64_t svc_calls   = 0;
+    std::uint64_t traps       = 0;
+    std::uint64_t faults      = 0;
+    std::uint64_t host_faults = 0;
+    std::uint64_t svc_time_ns = 0;
+    TrapKind      last        = TrapKind::None;
+
+    // O ultimo fault DESTA thread.
+    bool          limit_hit        = false;
+    bool          faulted          = false;
+    bool          guest_returned   = false;
+    bool          illegal_insn     = false;
+    std::uint64_t fault_pc         = 0;
+    std::uint64_t fault_sp         = 0;
+    std::uint64_t fault_addr       = 0;
+
+    // O `x18` DESTA thread — o "platform register" (stack canary).
+    //
+    // O Eden gera um valor POR THREAD: `ctx.r[18] = Random64(0) | 1` em cada
+    // `ResetThreadContext64` (`k_thread.cpp:58`, Eden no Pi). A canary é
+    // guardada pela frame que a viu no prólogo, logo só tem de ser
+    // consistente DENTRO da thread — e threads diferentes terem canaries
+    // diferentes é o que o Eden produz. O handler repõe o `x18` desta
+    // estrutura depois de cada SVC.
+    std::uint64_t platform_reg     = 0;
+
+    // O ponto de regresso ao host desta thread, e a stack onde a recuperacao
+    // de faults corre. A stack e' propria porque a do guest pode estar
+    // corrompida - e o regresso tem de ser para a frame desta thread.
+    sigjmp_buf    jmp{};
+    bool          have_jmp = false;
+    alignas(16) std::uint8_t recovery_stack[64 * 1024];
 };
 
 // Resumo de uma execução do guest.
@@ -72,8 +135,13 @@ struct RunResult {
 
 // Ponteiros instalados pelo handler de sinais. São file-scope (e não
 // thread-local) porque um handler tem de os encontrar sem saber que thread o
-// levantou; aFlags de contexto do jogo single-thread tornam isto seguro, e
-// quando houver threads de guest isto passa a ser um array por thread.
+// levantou.
+//
+// Com threads de guest, o arranjo é: **a thread principal conta aqui** (é a
+// que corre em `run()`); cada thread criada pelo jogo conta no SEU
+// `GuestThreadState` (tabela `g_thread_slots` em `native_engine.cpp`). Este
+// struct passa a levar sobretudo CONFIGURAÇÃO — despacho, observador,
+// plataforma, limite de traps, recuperação — e os TLS da principal.
 struct EngineHooks {
     SvcDispatcher* svc      = nullptr;
     tel::Telemetry* tel     = nullptr;
@@ -254,7 +322,14 @@ private:
 
     // O corpo do handler, sem a troca de TLS. Ver `signal_trampoline` para
     // porque é que a troca está à volta e não dentro.
-    static void handle_guest_signal(int sig, siginfo_t* info, void* raw);
+    //
+    // `st` diz de quem é a trap: `nullptr` = trap da thread principal (conta
+    // nos contadores de `EngineHooks`, como sempre) ou do próprio host. Nas
+    // threads de guest registadas, os contadores e o fault vão para o SEU
+    // `GuestThreadState` — uma thread a faultar nunca sobrescreve o
+    // relatório da outra.
+    static void handle_guest_signal(int sig, siginfo_t* info, void* raw,
+                                    GuestThreadState* st);
 
     // Copia os hooks para a cópia que o handler de sinais lê. Qualquer
     // alteração depois de `install_handlers` tem de passar por aqui: o handler

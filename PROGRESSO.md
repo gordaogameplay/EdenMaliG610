@@ -2786,3 +2786,84 @@ vez de 218 ✗, porque a thread morreu mais cedo ✗).
 |---|---|
 | `main` | **estável**: 62,0 ms, 218 SVCs, 0 SVCs com erro, 6/6 testes |
 | `wip/passo-1-thread` | o passo 1 + a thread a correr; falta a medida fina |
+
+# 2026-10-21 — wip/passo-2-thread: a thread de guest deixou de roubar o TLS da principal
+
+## O bug do passo 1, agora explicado com medida
+
+No passo 1, as três variáveis `__thread` (`g_thread_de_guest`,
+`g_guest_tls`, `g_host_tls`) eram escritas e lidas *só no contexto da
+thread certa* (`run_guest_thread`). O que não tinha resposta era o
+**handler**: que thread levantou a trap? O trampolim respondia
+`g_hooks.guest_tls`/`g_hooks.host_tls` — os valores da **principal**,
+publicados no `run()`.
+
+Medição do `wip/passo-1-thread`(log `/tmp/boot_wip.log`, Pi): a trap de
+uma thread de guest instalava o TLS da principal; o `str x0,[x1,#0x1f8]`
+do SDK (que grava o ponteiro de TLS no próprio bloco, medido ate ao
+sdk+0x32F840) escreveu o `tls_tp` **da principal**; a thread de guest
+ficava com o estado partilhado e o relatório de fault lia o estado
+global — "pc=0x…, addr=0x0" (lixo de outra thread) e **zero** `[thrd]
+trap` no log.
+
+## O desenho do passo 2 (tabela, não `__thread`)
+
+`mrs x, tpidr_el0` no handler de entrada; o **valor do registo
+identifica a thread** (o kernel preserva o `TPIDR_EL0` no caminho do
+sinal — medido no passo 0, quatro vias, PROGRESSO.md). Tabela fixa de
+32 slots (`g_thread_slots`), registo com `compare_exchange` — sem lock,
+sem alocação dentro do handler. Cada slot é um `GuestThreadState`: os
+TLS da thread (guest e libc), contadores, fault (pc/addr/sp reais), o
+`sigjmp_buf` da frame **dela** e uma stack de recuperação **dela** (um
+`siglongjmp` para o `jmp_buf` de outra thread é UB, e o `sp` de
+recuperação segue a mesma regra).
+
+O `run()` regista a principal no `g_hooks` **como sempre** (os testes
+e a v0.1.0 não mudam); as threads criadas via `CreateThread` contam no
+SEU slot, e o relatório do `run()` soma os dois: principal + slots.
+
+O `x18` é **por thread**: o Eden gera `Random64(0) | 1` em cada
+`ResetThreadContext64` (`k_thread.cpp:58`). O handler repõe o `x18`
+desta thread depois de cada SVC (do `GuestThreadState.platform_reg`,
+não do `g_hooks.platform_reg` da principal).
+
+## Medido no Pi (`/tmp/boot_p2.log`, exit=134)
+
+| métrica | passo 1 | passo 2 |
+|---|---|---|
+| `[thrd] trap` no log | **0** | **195** |
+| `addr do fault` | `0x0` (lixo global) | pc/sp/regs reais por trap |
+| SVCs despachados no total | 189 (a thread morria cedo) | **522+** (as 3 threads seguem depois do fim da principal) |
+| abort da thread principal | idem | **idem da v0.1.0**: 61,0 ms/205-218 SVCs, `_Unwind_RaiseException()`, brk #0x26 em `pc=0x83b0bba4` |
+| fim do processo | SIGSEGV do próprio motor | novo: `double free or corruption (out)` (glibc) |
+
+As 195 traps de guest têm PCs reais do `sdk`
+(`0x83b0bb2c`, `…bb3c`, `…bb44`, `…bb64` — perto do brk de 0x83b0bba4
+que a v0.1.0 tinha) com sp de stack de guest real
+(`0x2b2a204c0`, dentro da região [0x2900_0000, +2 GiB)) e
+`x19` com o contexto do guest — as traps são de **código do guest a
+correr de verdade**, não do motor.
+
+## O que a parede nova é
+
+O processo morre depois do fim da execução da principal, com as 3
+threads de guest ainda a despachar `Svc#26` (QueryMemory) — o registro
+`[svc #513]…[#522]` alterna a stack da principal (`x4=0x30fff…`) com
+stacks de threads (`x4=0x2b2a20…`) na **mesma fila de despacho**: o
+`SvcDispatcher` é **global e partilhado** (`g_hooks.svc->dispatch`),
+com estado interno não protegido — `handles_` (std::map),
+`new KObject` em `svc_create_thread`, e o IPC (o Eden usa o buffer de
+mensagem da thread principal, `Bridge::thread()`,
+`k_server_session.cpp:379`). **Suspeita** (não é afirmação): a heap
+corrompe-se numa destas corridas.
+
+Fica registado: o `g610_boot` (host) morre por `double free or
+corruption (out)` — **a parede nova não é uma SIGSEGV**, o `main`
+continua estável na v0.1.0.
+
+## Estado
+
+| | |
+|---|---|
+| `main` | **estável** (tag v0.1.0, `8c27236`): 6/6 testes |
+| `wip/passo-2-thread` | a thread de guest com estado e TLS próprios; **6/6 testes no Pi**; 195 traps reais de guest; a seguir: serializar o despacho (passo 3) |

@@ -5,6 +5,7 @@
 #include "g610/native_engine.hpp"
 #include "g610/guest_program.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <csetjmp>
@@ -15,44 +16,120 @@
 #include <ucontext.h>
 
 // ---------------------------------------------------------------------------
-// O estado das threads de GUEST
+// O estado das threads de guest: uma TABELA fixa, nao um `__thread`
 // ---------------------------------------------------------------------------
 //
-// `__thread` com o modelo **initial-exec** explicito. As tres razoes, todas
-// medidas:
+// O passo 1 tentou resolver isto com tres variaveis `__thread` (initial-exec,
+// medidas razao por razao no PROGRESSO.md): `g_thread_de_guest`,
+// `g_guest_tls`, `g_host_tls`. As variaveis em si estavam certas — eram
+// escritas E lidas no contexto da thread certa (`run_guest_thread`). O que
+// nao tinha alguma resposta e' o caso do HANDLER: levantou-se um sei la'
+// que trap numa thread de guest — **que thread e'?** O trampolim do passo 1
+// respondia "os valores `g_hooks.guest_tls`/`g_hooks.host_tls`" — que sao os
+// da principal, publicados no `run()`. Medido (`wip/passo-1-thread`):
+// a trap de uma thread de guest INSTALAVA o TLS da principal, o guest dessa
+// thread corria com o TLS dela, e o `str x0,[x1,#0x1f8]` do SDK — que grava
+// o ponteiro de TLS no proprio bloco — escreveu o `tls_tp` DA PRINCIPAL.
 //
-//   - `thread_local` em modo PIC passa por `__tls_get_addr`, que **pode
-//     alocar** — e alocar dentro de um handler de sinais e' um caminho para
-//     o OOM (o processo morria no primeiro `SendSyncRequest`);
-//   - `__thread` sem modelo forcado usa *local-exec*, cujo offset e'
-//     resolvido no link — e o binario e' PIE, logo o offset esta' errado e o
-//     valor lido e' lixo (o motor acha que esta' numa thread de guest, poe o
-//     TLS da `libc` a zero, e morre);
-//   - o modelo *initial-exec* da um acesso directo (`%fs:offset`), sem
-//     alocacao e sem lock — e portanto seguro dentro de um handler.
+// Nem da para resolver com `__thread` no handler: o registo que a libc usa
+// (`fs`) e o registo que o guest usa (`TPIDR_EL0`) sao O MESMO registo
+// fisico. Enquanto o guest corre, o motor programa-o com o TLS do guest, e
+// uma leitura de `__thread` dentro do handler nessa janela devolve o bloco
+// do guest — nao o do host. (E `thread_local` do C++ em PIC passa por
+// `__tls_get_addr`, que pode alocar — dentro de um handler, OOM medido:
+// o processo morria no primeiro `SendSyncRequest`.)
 //
-// Sao globais e nao por thread porque o Eden tambem tem um "current thread"
-// global (`GetCurrentThreadPointer`); nos temos uma thread de guest, e a
-// corrida entre a principal e a de guest limita-se a estes tres valores.
-__thread __attribute__((tls_model("initial-exec"))) volatile bool g_thread_de_guest = false;
-__thread __attribute__((tls_model("initial-exec"))) std::uint64_t g_guest_tls = 0;
-__thread __attribute__((tls_model("initial-exec"))) std::uint64_t g_host_tls = 0;
-
-
-// O ponto de regresso das threads de guest. E' um buffer **partilhado**: um
-// `siglongjmp` para o `sigjmp_buf` de outra thread e' comportamento
-// indefinido, e o buffer tem de ser o da frame que armou o `sigsetjmp`.
-sigjmp_buf g_thread_jmp;
-volatile bool g_thread_have_jmp = false;
+// A marca que resolve isto e' a que o propio Eden usa no NCE: **o
+// `TPIDR_EL0` de entrada do handler IDENTIFICA a thread.** O kernel
+// preserva o registo no caminho do sinal — enquanto o guest corre, o
+// registo vale o TLS DESSA thread (medido em quatro vias no passo 0:
+// ver PROGRESSO.md). Entao o handler le o registo — `mrs`, uma instrucao,
+// sem libc — e procura na tabela:
+//
+//     TPIDR_EL0 = TLS do guest DESSA thread  →  GuestThreadState
+//
+// A procura tem de correr sem lock e sem alocacao — dentro do handler nem
+// uma coisa nem outra sao seguras. Por isso: 32 slots fixos, estado
+// estatico, e o unico acesso sincronizado e' o `in_use` por slot, trocado
+// com `compare_exchange`. O registo de um slot acontece ANTES de o guest
+// dessa thread correr (na criacao da thread); o des-registo, depois do
+// ultimo trap dela — nunca no meio do handler.
 
 namespace g610 {
 
 namespace {
 
 // Os hooks são file-scope porque um handler de sinais não sabe que thread o
-// levantou. Um motor single-thread torna isto seguro; com threads de guest
-// isto passa a ser um array indexado pelo tid retrieved em tpidr_el0.
+// levantou. Contêm a CONFIGURAÇÃO (despacho, observador, limite, recuperação,
+// TLS da principal) e os contadores da thread principal; as threads de guest
+// criadas via `CreateThread` contam NO SEU `GuestThreadState`.
 EngineHooks g_hooks{};
+
+// A TABELA de estado por thread. Tamanho fixo por duas razoes: (a) o handler
+// nao pode alocar (OOM medido: `thread_local` → `__tls_get_addr`); (b) a
+// procura dentro do handler tem de ser uma varredura linear de memória
+// estática — sem mapa, sem lock, async-signal-safe.
+//
+// 32 é folga grossa para o que o jogo faz hoje: o arranque criou 3 threads
+// (medido no `wip/passo-1-thread`).
+constexpr int kMaxGuestThreads = 32;
+
+struct GuestThreadSlot {
+    std::atomic_bool in_use{false};
+    GuestThreadState st{};
+};
+
+GuestThreadSlot g_thread_slots[kMaxGuestThreads];
+
+// Toma um slot para uma thread nova. Async-signal-safe por construção:
+// um test-and-set atómico, nenhuma alocação, nenhum lock.
+GuestThreadState* register_guest_thread_state(std::uint64_t guest_tls) {
+    for (auto& slot : g_thread_slots) {
+        bool expect = false;
+        if (!slot.in_use.compare_exchange_strong(expect, true,
+                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_acquire))
+            continue;
+        // Repõe o payload inteiro: um slot reusado de uma execução anterior
+        // não pode trazer contadores nem fault de outra vida.
+        slot.st = GuestThreadState{};
+        slot.st.guest_tls = guest_tls;
+        return &slot.st;
+    }
+    return nullptr;
+}
+
+// Devolve o slot. Chama-se no fim da vida da thread — nunca com traps
+// pendentes desta: nenhum trap novo desta thread pode chegar depois do
+// des-registo (o guest dela já parou).
+void unregister_guest_thread_state(GuestThreadState* st) {
+    if (st == nullptr)
+        return;
+    for (auto& slot : g_thread_slots) {
+        if (&slot.st == st) {
+            slot.in_use.store(false, std::memory_order_release);
+            return;
+        }
+    }
+}
+
+// A THREAD cuja trap é, pelo valor de `TPIDR_EL0` no momento do trap.
+//
+// Chamada no princípio do handler. Busca falha não é erro: ou é a trap da
+// thread principal (que conta em `g_hooks`, como sempre fez), ou é um fault
+// do host — ambos seguem o caminho antigo, sem a troca de TLS por estado.
+GuestThreadState* find_guest_thread_state(std::uint64_t tp) {
+    if (tp == 0)
+        return nullptr;
+    for (auto& slot : g_thread_slots) {
+        // `acquire`: ver o payload completo posto pelo registo; o
+        // `compare_exchange` do registo tem `release` nessa troca.
+        if (slot.in_use.load(std::memory_order_acquire) &&
+            slot.st.guest_tls == tp)
+            return &slot.st;
+    }
+    return nullptr;
+}
 
 // ---------------------------------------------------------------------------
 // TPIDR_EL0: o TLS da thread, lido e escrito pelo guest
@@ -105,7 +182,8 @@ inline void write_thread_pointer(std::uint64_t v) {
 // `0xd53bd068` dava `0xd53bd040`, que não batia certo com o alvo e a
 // emulação nunca disparava. A máscara foi escrita a olho, não medida; foi o
 // Bits a olhar para os bytes que a apanhou.
-inline bool emulate_tls_read(ucontext_t* uc, std::uint64_t pc) {
+inline bool emulate_tls_read(ucontext_t* uc, std::uint64_t pc,
+                             GuestThreadState* st) {
     if (pc < 4)
         return false;
 
@@ -144,7 +222,10 @@ inline bool emulate_tls_read(ucontext_t* uc, std::uint64_t pc) {
         if (reg >= 32 || uc->uc_mcontext.regs[reg] != 0)
             continue;
 
-        uc->uc_mcontext.regs[reg] = g_hooks.guest_tls;
+        // O TLS emulado é o DA THREAD que faultou (o seu slot da tabela),
+        // nunca o da principal — o passo 1 usava `g_hooks.guest_tls`.
+        uc->uc_mcontext.regs[reg] =
+            st != nullptr ? st->guest_tls : g_hooks.guest_tls;
         uc->uc_mcontext.pc = at + 4;
         return true;
     }
@@ -184,17 +265,69 @@ volatile std::uint64_t g_fault_sp = 0;
 // Rotinas de saída do guest.
 //
 // Tanto um fault de memória como um ExitProcess precisam de regressar ao host
-// sem o guest voltar a executar. Ambas usam siglongjmp para `g_run_jmp`, o
-// ponto de regresso posto por `run()` antes de chamar o guest.
+// sem o guest voltar a executar. Ambos usam siglongjmp para o ponto de
+// regresso DE QUEM faultou:
 //
-// NOTA: `g_run_jmp` e não `g_fault_jmp` — há um único ponto de regresso, e
-// é o `run()` que o põe. Ter dois obrigaria a sincronizar os dois.
+//   - thread de guest registada  →  `sigjmp_buf` DO SEU `GuestThreadState`;
+//   - thread principal / guest sintético  →  `g_run_jmp`, posto por `run()`.
+//
+// Como se sabe de quem é a saída? O `TPIDR_EL0`: o trampolim repõe o TLS do
+// guest DESSA thread antes do sigreturn, e é esse o valor que o registo tem
+// aqui dentro — a busca é a mesma do handler.
 [[noreturn]] void exit_recovery() {
+    GuestThreadState* st = find_guest_thread_state(read_thread_pointer());
+    if (st != nullptr) {
+        if (st->have_jmp)
+            siglongjmp(st->jmp, 1);
+        // Thread registada mas sem ponto de regresso: continuar a executar
+        // com o `sp` de recuperação é lixo garantido — parar conscientemente.
+        _exit(71);
+    }
     if (g_have_run_jmp)
         siglongjmp(g_run_jmp, 1);
     // Sem ponto de regresso: sair é melhor do que executar lixo.
     _exit(70);
 }
+
+// A mesma vista de campos DE ESTADO, sobre duas estruturas.
+//
+// O corpo do handler escreve contadores e fault em UMA via só — que é o
+// estado de quem fez a trap. `GuestThreadState` e `EngineHooks` têm de
+// propósito os mesmos nomes nestes campos; a vista evita duplicar o corpo do
+// handler (uma cópia esquecida era exactamente o bug do passo 1, que lia o
+// estado da thread errada).
+struct TrapState {
+    std::uint64_t* svc_calls;
+    std::uint64_t* traps;
+    std::uint64_t* faults;
+    std::uint64_t* host_faults;
+    std::uint64_t* svc_time_ns;
+    std::uint64_t* fault_pc;
+    std::uint64_t* fault_sp;
+    std::uint64_t* fault_addr;
+    std::uint64_t* platform_reg;
+    TrapKind*      last;
+    bool*          limit_hit;
+    bool*          faulted;
+    bool*          guest_returned;
+    bool*          illegal_insn;
+
+    explicit TrapState(EngineHooks& h)
+        : svc_calls(&h.svc_calls), traps(&h.traps), faults(&h.faults),
+          host_faults(&h.host_faults), svc_time_ns(&h.svc_time_ns),
+          fault_pc(&h.fault_pc), fault_sp(&h.fault_sp),
+          fault_addr(&h.fault_addr), platform_reg(&h.platform_reg),
+          last(&h.last), limit_hit(&h.limit_hit), faulted(&h.faulted),
+          guest_returned(&h.guest_returned), illegal_insn(&h.illegal_insn) {}
+
+    explicit TrapState(GuestThreadState& s)
+        : svc_calls(&s.svc_calls), traps(&s.traps), faults(&s.faults),
+          host_faults(&s.host_faults), svc_time_ns(&s.svc_time_ns),
+          fault_pc(&s.fault_pc), fault_sp(&s.fault_sp),
+          fault_addr(&s.fault_addr), platform_reg(&s.platform_reg),
+          last(&s.last), limit_hit(&s.limit_hit), faulted(&s.faulted),
+          guest_returned(&s.guest_returned), illegal_insn(&s.illegal_insn) {}
+};
 
 } // namespace
 
@@ -245,6 +378,12 @@ void NativeEngine::publish_hooks() {
 // `g_hooks`. Repô-los só na instância e depois publicar não os limpava, e o
 // segundo `run()` reportava os contadores do primeiro — que é o número que
 // esconde bugs.
+//
+// Isto repõe SÓ o estado da thread principal. As threads de guest contam no
+// SEU slot da tabela (`g_thread_slots`), e o slot é reposto no registo da
+// thread — `register_guest_thread_state` põe um payload a zero — não aqui,
+// porque uma thread ainda a correr durante um segundo arranque não pode ter
+// os contadores da PRINCIPAL a interferir com os dela.
 void NativeEngine::reset_counters() {
     g_hooks.svc_calls   = 0;
     g_hooks.traps       = 0;
@@ -489,6 +628,21 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
     r.fault_pc   = hooks_.fault_pc;
     r.fault_addr = hooks_.fault_addr;
     r.svc_time_ns = hooks_.svc_time_ns;
+
+    // O relatório soma os contadores DAS THREADS DE GUEST: cada uma conta no
+    // SEU slot; o que está acima é só o que a principal contou. Leitura por
+    // varrimento sem lock — os números de uma thread ainda a viver são os que
+    // ela já reportou (os slots vivos continuam a conta; é um apontador de
+    // progresso, não uma contabilidade exacta).
+    for (const auto& slot : g_thread_slots) {
+        if (!slot.in_use.load(std::memory_order_acquire))
+            continue;
+        r.svc_calls   += slot.st.svc_calls;
+        r.traps       += slot.st.traps;
+        r.faults      += slot.st.faults;
+        r.host_faults += slot.st.host_faults;
+        r.svc_time_ns += slot.st.svc_time_ns;
+    }
     return r;
 }
 
@@ -563,84 +717,167 @@ extern "C" __attribute__((naked)) void g610_run_guest(std::uint64_t entry,
 
 int NativeEngine::run_guest_thread(std::uint64_t entry, std::uint64_t arg,
                                    std::uint64_t sp, std::uint64_t tls) {
+    // O estado DESTA thread, num slot da tabela — nunca `__thread` (ver o
+    // bloco de comentário acima de `g_hooks` para as medições que obrigam a
+    // isso). O slot é registrado antes do guest desta thread correr, e
+    // libertado nos dois fins abaixo, depois do último trap dela.
+    GuestThreadState* st = register_guest_thread_state(tls);
+    if (st == nullptr) {
+        // A tabela esgotou: esta thread fica sem correr. Partilhar o estado
+        // de outra thread (o comportamento do passo 1) era o bug medido —
+        // melhor uma thread a menos do que duas a escrever no mesmo relatório.
+        std::fprintf(stderr,
+                     "[thrd] sem slot de estado para o TLS 0x%llx — a thread nao corre\n",
+                     (unsigned long long)tls);
+        return 2;
+    }
+    st->host_tls = read_thread_pointer();
+    st->guest_tls = tls;
+
+    // O `x18` é POR THREAD: o Eden põe `Random64(0) | 1` no contexto de cada
+    // uma (`ResetThreadContext64`, `k_thread.cpp:58`). A canary é preservada
+    // pela frame que a guardou no prólogo, logo o valor só precisa de ser
+    // consistente dentro desta thread — e diferente entre threads é o que o
+    // Eden produz. Isto corre FORA do handler: `/dev/urandom` aqui é seguro.
+    {
+        std::uint64_t seed = 0;
+        std::FILE* f = std::fopen("/dev/urandom", "rb");
+        if (f != nullptr) {
+            if (std::fread(&seed, 1, sizeof(seed), f) != sizeof(seed))
+                seed = tls ^ entry;
+            std::fclose(f);
+        } else {
+            seed = tls ^ entry;
+        }
+        st->platform_reg = seed | 1u;
+    }
+
     // O `sigsetjmp` tem de estar numa frame que **sobreviva** ao codigo do
     // guest: um `siglongjmp` para o `sigjmp_buf` de uma frame ja regressada
-    // e' comportamento indefinido.
-    g_thread_de_guest = true;
-    g_guest_tls       = tls;
-    g_host_tls        = read_thread_pointer();
-
-    if (sigsetjmp(g_thread_jmp, 1) != 0) {
-        // Um fault trouxe-nos para aqui. A thread acaba — e o lugar do fault
-        // e' a informacao mais valuable que temos.
-        g_thread_have_jmp = false;
-        write_thread_pointer(g_host_tls);
+    // e' comportamento indefinido. O buffer é o DESSA thread — um buffer
+    // global partilhado (o `g_thread_jmp` do passo 1) era exactamente o que
+    // o `exit_recovery` não podia escolher: a busca por `TPIDR_EL0` decide
+    // para que frame regressar.
+    if (sigsetjmp(st->jmp, 1) != 0) {
+        // Um fault, ExitProcess ou o limite de traps trouxe-nos para aqui —
+        // nesta thread, porque foi NELA que o guest parou. O lugar do fault
+        // é a informação mais valiosa que temos, e agora é o DELE: o passo 1
+        // lia os campos GLOBAIS (da principal), e por isso imprimia
+        // "pc=0xa... (addr 0x0)" — lixo de outra thread.
+        st->have_jmp = false;
+        write_thread_pointer(st->host_tls);
         std::fprintf(stderr,
-                     "[thrd] a thread de guest faultou: pc=0x%llx addr=0x%llx sp=0x%llx\n",
-                     (unsigned long long)g_hooks.fault_pc,
-                     (unsigned long long)g_hooks.fault_addr,
-                     (unsigned long long)g_hooks.fault_sp);
+                     "[thrd] a thread de guest parou: pc=0x%llx addr=0x%llx "
+                     "sp=0x%llx (traps=%llu faults=%llu)\n",
+                     (unsigned long long)st->fault_pc,
+                     (unsigned long long)st->fault_addr,
+                     (unsigned long long)st->fault_sp,
+                     (unsigned long long)st->traps,
+                     (unsigned long long)st->faults);
+        unregister_guest_thread_state(st);
         return 1;
     }
-    g_thread_have_jmp = true;
+    st->have_jmp = true;
 
     // **O TLS do guest tem de estar instalado ANTES de o guest correr.** O
     // handler de sinais troca o TLS do host pelo do guest *durante* as traps
     // — mas o guest le o `TPIDR_EL0` a toda a hora, e fora de uma trap o
     // registo e' o da `libc` do host.
-    write_thread_pointer(g_guest_tls);
+    write_thread_pointer(st->guest_tls);
 
-    g610_run_guest(entry, arg, sp, g_hooks.platform_reg);
+    g610_run_guest(entry, arg, sp, st->platform_reg);
 
-    write_thread_pointer(g_host_tls);
-    g_thread_have_jmp = false;
-    g_thread_de_guest = false;
+    write_thread_pointer(st->host_tls);
+    st->have_jmp = false;
+    unregister_guest_thread_state(st);
     return 0;
 }
 
 void NativeEngine::signal_trampoline(int sig, siginfo_t* info, void* raw) {
-    // Duas trocas, e o motivo é o mesmo nos dois sentidos: quem executa
-    // decide de quem é o registo.
+    // QUE thread faultou? O próprio `TPIDR_EL0` de entrada responde: o kernel
+    // preserva-o do momento do trap, e enquanto o guest corre o registo vale
+    // o TLS DESSA thread (quatro vias de medição no passo 0). Encontrar o
+    // slot ANTES de qualquera troca — o registo ainda está por repor.
     //
-    //   - o handler é código do HOST (printf, telemetria, despacho de SVC) e
-    //     precisa do TLS da libc.
-    //   - o `sigreturn` que se segue põe o guest a correr, e o guest espera o
-    //     SEU TLS em `TPIDR_EL0`.
-    //
-    // Se a troca do fim faltar, o guest retoma com o TLS da libc e lê o
-    // ThreadLocalRegion no sítio errado — um fault que não parece um fault.
+    // Foi aqui que o passo 1 falhou: trocava o TLS por `g_hooks.guest_tls` /
+    // `g_hooks.host_tls` — os valores da thread PRINCIPAL, postos no `run()`.
+    // A trap de uma thread de guest instalava o TLS da principal, e o `str
+    // x0,[x1,#0x1f8]` do SDK escreveu o `tls_tp` DA PRINCIPAL (medido no
+    // `wip/passo-1-thread`).
+    GuestThreadState* st = find_guest_thread_state(read_thread_pointer());
+
+    if (st != nullptr) {
+        // Duas trocas, DESSA thread, e pelo mesmo motivo nos dois sentidos:
+        //
+        //   - o handler é código do HOST (telemetria, despacho, e o
+        //     `fprintf` dos contadores) e precisa da libc DELA;
+        //   - o `sigreturn` que se segue retoma o GUEST DELA, que espera o
+        //     SEU TLS em `TPIDR_EL0`.
+        //
+        // Sem a segunda troca, o guest retoma com a libc e lê o próprio
+        // ThreadLocalRegion no sítio errado — um fault que não parece fault.
+        write_thread_pointer(st->host_tls);
+        handle_guest_signal(sig, info, raw, st);
+        if (st->guest_tls != 0)
+            write_thread_pointer(st->guest_tls);
+        return;
+    }
+
     if (g_hooks.guest_tls == 0) {
         // Sem programa carregado não há bloco de TLS de guest — e instalar
         // um endereço não mapeado rebenta a libc dentro do handler. Os testes
         // unitários correm um guest sintético sem programa, e ficavam a
         // bloquear por causa disto.
-        handle_guest_signal(sig, info, raw);
+        handle_guest_signal(sig, info, raw, nullptr);
         return;
     }
+
+    // A thread principal: os `g_hooks.guest_tls` / `g_hooks.host_tls` são os
+    // DELA — postos no `run()` — e o caminho é o mesmo de sempre.
     write_thread_pointer(g_hooks.host_tls);
-    handle_guest_signal(sig, info, raw);
+    handle_guest_signal(sig, info, raw, nullptr);
     write_thread_pointer(g_hooks.guest_tls);
 }
 
-void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw) {
+void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
+                                       GuestThreadState* st) {
     if (!g_hooks.armed)
         return; // nunca devia acontecer: handlers não instalados
 
     auto* uc = static_cast<ucontext_t*>(raw);
     const auto pc = static_cast<std::uint64_t>(uc->uc_mcontext.pc);
-    ++g_hooks.traps;
+
+    // O estado que isto ACTUALIZA é o de quem faultou: uma thread de guest
+    // registada escreve no SEU slot — nunca sobrescreve o relatório de outra
+    // thread nem o da principal. A principal e os guests sintéticos
+    // continuam (bem) em `g_hooks`. Era aqui, no passo 1, que uma thread
+    // faultada fazia a principal perder o próprio relatório.
+    TrapState ts = st != nullptr ? TrapState(*st) : TrapState(g_hooks);
+
+    // O topo da stack de recuperação DE QUEM FAULTOU: a das threads de guest
+    // é a delas; a da principal é a global. Um `siglongjmp` para o
+    // `sigjmp_buf` de outra thread é comportamento indefinido — e o `sp`
+    // segue a mesma regra do buffer.
+    const std::uint64_t rec_sp =
+        st != nullptr
+            ? reinterpret_cast<std::uint64_t>(st->recovery_stack +
+                                              sizeof(st->recovery_stack))
+            : g_hooks.recovery_sp;
+
+    ++*ts.traps;
 
     if (g_hooks.trapper != nullptr)
         g_hooks.trapper(sig, pc, static_cast<std::uint64_t>(uc->uc_mcontext.sp),
                         g_hooks.trapper_user);
 
-    // Limite de traps. Um guest em ciclo não pode ficar a queimar CPU para
-    // sempre: sai-se pela rotina de recuperação, que preserva o `sp` do host
-    // e deixa o relatório explicar o que aconteceu.
-    if (g_hooks.trap_limit != 0 && g_hooks.traps >= g_hooks.trap_limit) {
-        g_hooks.limit_hit = true;
-        g_hooks.last = TrapKind::Breakpoint;
-        uc->uc_mcontext.sp = g_hooks.recovery_sp;
+    // Limite de traps. POR THREAD: cada uma tem a sua contagem, e um guest
+    // em ciclo numa delas não pode ficar a queimar CPU para sempre — sai-se
+    // pela rotina de recuperação DELA, que preserva o `sp` do host e deixa o
+    // relatório explicar o que aconteceu.
+    if (g_hooks.trap_limit != 0 && *ts.traps >= g_hooks.trap_limit) {
+        *ts.limit_hit = true;
+        *ts.last = TrapKind::Breakpoint;
+        uc->uc_mcontext.sp = rec_sp;
         uc->uc_mcontext.pc = g_hooks.recovery_pc;
         return;
     }
@@ -668,8 +905,8 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw) {
         if ((insn & 0xFFE00000u) != 0xD4200000u) {
             // Não é um BRK: é outra trap (depuracao do host, ou um BRK de
             // instrumentação nosso). Contabiliza e devolve.
-            g_hooks.last = TrapKind::Breakpoint;
-            ++g_hooks.host_faults;
+            *ts.last = TrapKind::Breakpoint;
+            ++*ts.host_faults;
             return;
         }
 
@@ -678,9 +915,9 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw) {
         if (number == kBrkForceStop) {
             // Paragem pedida pelo tracer (um spin de código que não levanta
             // traps). Sai pelo mesmo caminho dos restantes.
-            g_hooks.last = TrapKind::Breakpoint;
-            g_hooks.limit_hit = true;
-            uc->uc_mcontext.sp = g_hooks.recovery_sp;
+            *ts.last = TrapKind::Breakpoint;
+            *ts.limit_hit = true;
+            uc->uc_mcontext.sp = rec_sp;
             uc->uc_mcontext.pc = g_hooks.recovery_pc;
             return;
         }
@@ -690,16 +927,16 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw) {
             // faults para que o `siglongjmp` restaure o `sp` do host: sem
             // isto, o epílogo de `run()` verificaria o canário do stack
             // protector sobre a stack do guest.
-            g_hooks.last = TrapKind::Breakpoint;
-            g_hooks.guest_returned = true;
-            uc->uc_mcontext.sp = g_hooks.recovery_sp;
+            *ts.last = TrapKind::Breakpoint;
+            *ts.guest_returned = true;
+            uc->uc_mcontext.sp = rec_sp;
             uc->uc_mcontext.pc = g_hooks.recovery_pc;
             return;
         }
 
         // Numa thread de guest, cada trap e' uma pista: e' o unico registo
         // do que o guest esta' a fazer la dentro.
-        if (g_thread_de_guest) {
+        if (st != nullptr) {
             std::fprintf(stderr,
                          "[thrd] trap #%u pc=0x%llx sp=0x%llx x0=0x%llx x1=0x%llx "
                          "x2=0x%llx x3=0x%llx x7=0x%llx x19=0x%llx x28=0x%llx\n",
@@ -733,9 +970,9 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw) {
 
         const auto t0 = g_hooks.tel->time_now();
         g_hooks.svc->dispatch(number, c);
-        g_hooks.svc_time_ns +=
+        *ts.svc_time_ns +=
             static_cast<std::uint64_t>(g_hooks.tel->time_now() - t0);
-        ++g_hooks.svc_calls;
+        ++*ts.svc_calls;
 
         // A ORDA IMPORTA: x0 é o registo de RETORNO na ABI do Switch.
         //
@@ -756,19 +993,21 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw) {
         uc->uc_mcontext.regs[0] = c.ret;
 
         // Repõe x18. O `ret` do guest clobbera o platform register, e o
-        // próximo SVC que verificar a canary encontraria um valor diferente do
-        // que foi posto no arranque.
-        if (g_hooks.platform_reg != 0)
-            uc->uc_mcontext.regs[18] = g_hooks.platform_reg;
+        // próximo SVC que verificar a canary encontraria um valor diferente
+        // do que foi posto no arranque — que é o DESTA thread: cada thread
+        // de guest tem a sua (o Eden gera um por thread em
+        // `ResetThreadContext64`).
+        if (*ts.platform_reg != 0)
+            uc->uc_mcontext.regs[18] = *ts.platform_reg;
 
-        g_hooks.last = TrapKind::SvcCall;
+        *ts.last = TrapKind::SvcCall;
 
         // ExitProcess: o guest pediu para terminar. Escrever pc+4 e regressar
         // NÃO chega — o guest continuaria a executar depois do ExitProcess.
-        // A saída faz-se como a dos faults: saltar para uma rotina com stack
-        // própria, que regressa ao host por siglongjmp.
+        // A saída faz-se como a dos faults: saltar para uma rotina com a
+        // stack DE QUEM PEDIU, que regressa ao host por siglongjmp.
         if (g_hooks.svc->exited()) {
-            uc->uc_mcontext.sp = g_hooks.recovery_sp;
+            uc->uc_mcontext.sp = rec_sp;
             uc->uc_mcontext.pc = g_hooks.recovery_pc;
             return;
         }
@@ -796,7 +1035,9 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw) {
         //
         //resta a emular a LEITURA, que é uma instrução e não um caminho de
         //execução. Continua a ser nativo: o CPU não sabe que isto aconteceu.
-        if (g_hooks.guest_tls != 0 && emulate_tls_read(uc, pc))
+        const std::uint64_t tls_de_quem = st != nullptr ? st->guest_tls
+                                                        : g_hooks.guest_tls;
+        if (tls_de_quem != 0 && emulate_tls_read(uc, pc, st))
             return;   // retoma o guest no PC seguinte
 
         if (::getenv("IA_TRACE")) {
@@ -818,19 +1059,19 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw) {
             ssize_t w = ::write(2, b, (size_t)n); (void)w;
         }
 
-        ++g_hooks.faults;
-        g_hooks.last = TrapKind::GuestFault;
+        ++*ts.faults;
+        *ts.last = TrapKind::GuestFault;
         g_hooks.tel->note_page_fault();
 
         // Um fault de memória não pode continuar: deixar o sigreturn
         // re-executar a mesma instrução entraria em ciclo até o processo ser
         // morto, engolindo o stack trace — o pior diagnóstico possível.
-        g_hooks.fault_pc = pc;
-        g_hooks.fault_sp = static_cast<std::uint64_t>(uc->uc_mcontext.sp);
-        g_hooks.fault_addr = reinterpret_cast<std::uint64_t>(info->si_addr);
-        g_hooks.faulted  = true;
+        *ts.fault_pc = pc;
+        *ts.fault_sp = static_cast<std::uint64_t>(uc->uc_mcontext.sp);
+        *ts.fault_addr = reinterpret_cast<std::uint64_t>(info->si_addr);
+        *ts.faulted  = true;
 
-        uc->uc_mcontext.sp = g_hooks.recovery_sp;
+        uc->uc_mcontext.sp = rec_sp;
         uc->uc_mcontext.pc = g_hooks.recovery_pc;
         return;
     }
@@ -840,9 +1081,9 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw) {
         // levanta traps) e o tracer quer que o programa volte ao host para
         // imprimir o relatório. Sem isto, um spin silencioso truncava a
         // saída e perdia-se o único rasto do que aconteceu.
-        g_hooks.limit_hit = true;
-        g_hooks.last = TrapKind::Breakpoint;
-        uc->uc_mcontext.sp = g_hooks.recovery_sp;
+        *ts.limit_hit = true;
+        *ts.last = TrapKind::Breakpoint;
+        uc->uc_mcontext.sp = rec_sp;
         uc->uc_mcontext.pc = g_hooks.recovery_pc;
         return;
     }
@@ -851,13 +1092,13 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw) {
         // Uma instrucao que o CPU nao reconhece. Num guest isto significa uma
         // descodificacao errada ou um patch mal formado — e nao uma saida.
         // Registado a parte para o relatorio dizer qual dos dois.
-        ++g_hooks.faults;
-        ++g_hooks.host_faults;
-        g_hooks.last = TrapKind::Breakpoint;
-        g_hooks.illegal_insn = true;
-        g_hooks.fault_pc = pc;
-        g_hooks.fault_sp = static_cast<std::uint64_t>(uc->uc_mcontext.sp);
-        uc->uc_mcontext.sp = g_hooks.recovery_sp;
+        ++*ts.faults;
+        ++*ts.host_faults;
+        *ts.last = TrapKind::Breakpoint;
+        *ts.illegal_insn = true;
+        *ts.fault_pc = pc;
+        *ts.fault_sp = static_cast<std::uint64_t>(uc->uc_mcontext.sp);
+        uc->uc_mcontext.sp = rec_sp;
         uc->uc_mcontext.pc = g_hooks.recovery_pc;
         return;
     }
