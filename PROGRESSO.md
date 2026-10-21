@@ -3997,6 +3997,44 @@ registar: se a parte de Vulkan ficar feita ✓, talvez se possa eliminar a
 dependência do OpenGL 4.3 ✗ e deixar disponível também o OpenGL do
 Switch ✓ (alguns jogos são só OpenGL ✓).
 
+### A aritmética do pedido não conta o cabeçalho de domínio
+
+O `applet:oe` é um **gestor de domínio** ✓ — no Switch ✓ e no Eden ✓. O
+guest manda o cabeçalho de domínio ✓ (8 bytes ✗ = 2 palavras ✗) e o
+Eden lê-o **se a sessão for um domínio** ✓ (`hle_ipc.cpp:199-215` ✓):
+
+```cpp
+if (GetManager()->IsDomain() && ((command_header->type == Request ||
+                                 RequestWithContext) || !incoming)) {
+    if (incoming || domain_message_header) {
+        domain_message_header = rp.PopRaw<IPC::DomainMessageHeader>();
+    }
+}
+```
+
+**A aritmética da casa** (`src/ipc_min.cpp:310-327` ✓) conta o
+`CommandHeader` ✓, o `HandleDescriptorHeader` ✓, o pid ✓, os
+descritores X/A/B/W ✓ e o `DataPayloadHeader` ✓ — **mas não o
+cabeçalho de domínio** ✗. E a sessão do `applet:oe` **não é um
+domínio** ✗ (a casa regista-o como serviço normal ✗) ✗.
+
+Resultado: o payload é lido **deslocado** ✗ → o `magic` não é "SFCI"
+✗ → `assert data_payload_header->magic` ✗, e o `command_type` lido
+✗ → `assert command_type=0` ✗. **É este o assert que faltava** ✓.
+
+**A correcção são duas coisas** ✓:
+
+1. **A sessão do `applet:oe` tem de ser um domínio** ✓ — no Eden isso
+   faz-se com `SessionRequestManager::ConvertToDomain()` ✓ (o
+   `ConvertToDomainOnRequestEnd()` ✓ é o que o guest dispara ✓, e
+   mede-se no log ✓: "ConvertCurrentObjectToDomain: a sessao passa a
+   dominio" ✓). A casa precisa de o fazer no mesmo sítio ✓ — o
+   `Controller::ConvertCurrentObjectToDomain` ✗ (o override da casa ✓)
+   converte a sessão **do `sm:`** ✗ ✗ — e o guest precisa da do
+   **`applet:oe`** ✗ ✗.
+2. **A aritmética tem de contar as 2 palavras** ✗ do cabeçalho de
+   domínio ✗ quando a sessão é um domínio ✓ — como o Eden ✗.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native

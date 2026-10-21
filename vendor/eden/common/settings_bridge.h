@@ -37,9 +37,37 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
+// Os *enums* do upstream (o `AstcRecompression` e o `NvdecEmulation`) —
+// estão no `common/settings_enums.h` ✓, que é vendorizado ✓.
+#include "common/settings_enums.h"
+
 namespace Settings {
+
+// Um valor de configuracao que serve **os dois usos**.
+//
+// A casa lia-os como `bool` (`if (Settings::values.use_auto_stub)` ✓) e o
+// upstream lia-os como `Setting<T>::GetValue()` ✓. Com a conversao
+// implicita e o `GetValue()` ✓, os dois compilam contra o **mesmo**
+// objecto ✓ — que e' o que importa ✗ (dois `Values` diferentes no
+// mesmo binario = campos lidos a deslocamentos errados ✗).
+template <typename T>
+class Valor {
+public:
+    Valor() = default;
+    // NOLINTNEXTLINE(google-explicit-constructor) — a conversao
+    // implicita e' o que faz o `if (Settings::values.use_auto_stub)`
+    // do codigo da casa compilar sem mudar uma linha.
+    Valor(T valor) : valor_(std::move(valor)) {}
+
+    [[nodiscard]] const T& GetValue() const noexcept { return valor_; }
+    operator const T&() const noexcept { return valor_; }
+
+private:
+    T valor_{};
+};
 
 struct Values {
     // Ver a nota do ficheiro: `false` é a escolha, não a omissão.
@@ -58,8 +86,8 @@ struct Values {
     // todos os comandos: um comando desconhecido la' e' um bug do Eden. A
     //qui e' o nosso bug, e a resposta honesta e' um Result de erro, e nao
     // o silencio.
-    bool use_auto_stub = true;
-    bool use_debug_asserts = false;
+    Valor<bool> use_auto_stub{true};
+    Valor<bool> use_debug_asserts{false};
 
     // Os DLC desativados, por id de programa. **Vazio** — este motor não
     // tem DLC (não há `NCA` com conteúdo).
@@ -79,6 +107,27 @@ struct Values {
     // jogo. Medido (`boot_p6j.log`): o fault foi um `std::find` sobre um
     // mapa lixo, dentro do `CountAddOnContent`.
     std::map<std::uint64_t, std::vector<std::string>> disabled_addons;
+
+    // ── Os campos que o motor Maxwell do upstream lê ─────────────────────
+    //
+    // **Medido**: `grep -rhoE "Settings::values\.[a-z_0-9]+"` sobre os
+    // ficheiros do `video_core` que a casa compila — e mais o campo que
+    // o cabeçalho da interface do renderizador usa. São estes e nenhum
+    // mais (o `Settings` do Eden tem centenas; a casa só precisa destes).
+    //
+    // Os valores por omissão são os do Eden ✓, menos o `astc_recompression`
+    // (o Eden pe-de-ao-`Bc1`; a casa não recomprime ASTC ✗ — não há
+    // descodificador de ASTC no host ✗).
+    Valor<AstcRecompression> astc_recompression{AstcRecompression::Uncompressed};
+    Valor<bool> use_reactive_flushing{false};
+    Valor<NvdecEmulation> nvdec_emulation{NvdecEmulation::Gpu};
+    Valor<bool> sync_memory_operations{false};
+    Valor<bool> disable_macro_hle{false};
+    Valor<bool> dump_macros{false};
+    Valor<bool> disable_macro_jit{false};
+    Valor<bool> use_fast_gpu_time{false};
+    Valor<std::uint32_t> fast_gpu_time{0};
+    Valor<bool> skip_cpu_inner_invalidation{false};
 };
 
 // A definição global. O Eden põe isto numa função para não haver uma ordem de

@@ -16,7 +16,7 @@
 // deslocamento que é o meio de outro objecto. O que lá está é lixo, e o
 // `std::find` sobre um vector lixo mata o motor.
 //
-// Medido (`boot_p6j.log`): o fault foi um `std::find` dentro do
+// Medido (`boot_p6j.log`): o fault foi um `std::find` dentro da
 // `CountAddOnContent`, com o `aoc` a escrever num endereço de host
 // (`0xaaaacd87d140`).
 //
@@ -25,13 +25,27 @@
 // Este ficheiro **é** a ponte. Passa a haver um só `Settings::Values` no
 // binário, e o `aoc` passa a ver o mesmo objecto que o resto.
 //
-// O `settings.h` do Eden tem 928 linhas de configuração que **nenhum**
-// ficheiro que compilamos lê — medido: só `use_auto_stub`,
-// `use_debug_asserts` e `disabled_addons` são lidos, e estão todos na ponte.
+// ## Os campos que o motor Maxwell precisa
+//
+// Com o `video_core` do upstream a compilar na casa, os campos que ele lê
+// já não são três — são **dez** (medido: `grep -rhoE
+// "Settings::values\.[a-z_0-9]+"` sobre os ficheiros que a casa
+// compila do `video_core`):
+//
+//     astc_recompression, use_reactive_flushing, nvdec_emulation,
+//     sync_memory_operations, disable_macro_hle, dump_macros,
+//     disable_macro_jit, use_fast_gpu_time, fast_gpu_time
+//
+// e mais um, no cabeçalho da interface do renderizador:
+// `skip_cpu_inner_invalidation`.
+//
+// E o upstream **lê-os como `Setting<T>::GetValue()`** ✗, enquanto a
+// casa os lia como `bool` ✗ — por isso o `Valor<T>` de baixo serve os
+// dois usos ✓ (conversão implícita ✓ e `GetValue()` ✓).
 //
 // SPDX-FileCopyrightText: 2026 Eden Emulator Project
 // SPDX-FileCopyrightText: 2021 yuzu Emulator Project
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
 
