@@ -56,6 +56,8 @@ add_library(g610_core STATIC
   src/input.cpp
   src/svc_dispatcher.cpp
   src/services/applet_oe.cpp
+  src/services/fsp_srv.cpp
+  src/services/nvdrv.cpp
   src/services/time_u.cpp
   src/ipc_min.cpp
   src/guest_placement.cpp
