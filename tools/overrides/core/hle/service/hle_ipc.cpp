@@ -222,6 +222,56 @@ void HLERequestContext::ParseCommandBuffer(u32_le* src_cmdbuf, bool incoming) {
             return;
         }
 
+        // ── O DIAGNÓSTICO DA CASA ─────────────────────────────────────────
+        //
+        // A assinatura não bate: o payload foi lido no sítio errado. A única
+        // causa que o Eden contempla é um **cabeçalho de domínio** (16 bytes)
+        // que o guest mandou e que nós não lemos — porque a sessão não é um
+        // domínio, e o `ParseCommandBuffer` só o lê nesse caso
+        // (`hle_ipc.cpp:199-212`).
+        //
+        // Este dump **mede** em vez de supor: mostra as palavras à volta do
+        // ponto onde o payload foi lido, e o que estaria lá se o cabeçalho
+        // de domínio tivesse sido lido.
+        //
+        // A contagem, em palavras de 32 bits:
+        //
+        //     data_payload_offset = onde o corpo começa (depois do
+        //                          DataPayloadHeader, que são 2 palavras)
+        //
+        //     [data_payload_offset - 6]  DomainMessageHeader (4 palavras)
+        //     [data_payload_offset - 2]  DataPayloadHeader    (2 palavras)
+        //     [data_payload_offset]      o command id (u64 = 2 palavras)
+        //
+        // Se em `-6` o `command` for 1 (SendMessage) ou 2
+        // (CloseVirtualHandle), o guest mandou um pedido de domínio ✓ — e a
+        // correcção é a sessão ser um domínio, não a aritmética.
+        if (incoming && data_payload_header->magic != Common::MakeMagic('S', 'F', 'C', 'I')) {
+            const u32 base = data_payload_offset >= 8 ? data_payload_offset - 8 : 0;
+            std::printf("[ipc-dom] payload SEM 'SFCI': data_payload_offset=%u "
+                        "(assinatura lida em %u)\n",
+                        data_payload_offset, data_payload_offset - 2);
+            if (data_payload_offset >= 6) {
+                const u32 d0 = static_cast<u32>(src_cmdbuf[data_payload_offset - 6]);
+                const u32 d1 = static_cast<u32>(src_cmdbuf[data_payload_offset - 5]);
+                std::printf("[ipc-dom] se fosse DomainMessageHeader: command=%u "
+                            "input_object_count=%u size=%u object_id=%u\n",
+                            d0 & 0xFFu, (d0 >> 8) & 0xFFu, (d0 >> 16) & 0xFFFFu, d1);
+            }
+            std::printf("[ipc-dom] palavras:\n");
+            for (u32 i = base; i < data_payload_offset + 4; ++i) {
+                const char* marca = "";
+                if (i == data_payload_offset - 6)
+                    marca = "  <- candidato a DomainMessageHeader";
+                else if (i == data_payload_offset - 2)
+                    marca = "  <- DataPayloadHeader (onde lemos a assinatura)";
+                else if (i == data_payload_offset)
+                    marca = "  <- command id (u64)";
+                std::printf("[ipc-dom]   [%2u] 0x%08x%s\n", i, static_cast<u32>(src_cmdbuf[i]), marca);
+            }
+            std::fflush(stdout);
+        }
+
         if (incoming) {
             ASSERT(data_payload_header->magic == Common::MakeMagic('S', 'F', 'C', 'I'));
         } else {
