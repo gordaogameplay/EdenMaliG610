@@ -2971,8 +2971,32 @@ desenho. A transferência com fila (estacionar/entregar/acordar) valida
 no boot real no Pi, que é o critério: as threads deixarem de queimar
 traps `#26`.
 
+## Medição no Pi (a prova do passo 4)
+
+- **Testes**: 114 checks todos ok no `g610_tests`; `ctest` 6/6.
+- **Boots `IA_NOOB=1` ×3** (`/tmp/boot_p4_r{1,2,3}.log`): **traps de guest
+  11 / 11 / 12** — o ciclo de 8004 traps `#26` **morreu**. Determinístico
+  entre execuções, exit igual (139) nos 3.
+- **Confirmação por desmontagem**: `pc=0x83b0bb2c` é o stub do SDK,
+  offset `0x37eb2c` do `text.bin` do módulo `sdk` (base `0x8378d000`) =
+  **`svc #0x1a` real no binário** (o patcher reescreve para `brk #26`) —
+  o guest chama `svcArbitrateLock(dono=0x8000, addr=0x843ea4d0,
+  tag=0x10001/0x18002/0x81ff…)` — os tags são os handles das threads,
+  como previsto.
+- **A thread principal não progrediu com este passo** (honestidade):
+  223 SVCs, mesma parede de IPC de antes — `SendSyncRequest: o handle
+  66046 não é sessão` (58 calls). O passo 4 foi sobre a fila de mutex
+  das threads de guest; a parede do IPC é o passo seguinte.
+- **Correcção honesta**: o "limite de traps (4000)" do relatório é o
+  force-stop do amostrador do tracer no fim da janela
+  (`boot_trace.cpp:140`), não um tecto natural: o guest parou À MÃO no fim
+  da amostragem. E a linha "última tr" cortada nos logs era o stdout
+  em buffer perdido no SIGSEGV do exit — com `stdbuf -o0` o relatório sai
+  inteiro (4/4 boots: exit 139 DEPOIS de `[boot] fim`, mesma regressão
+  pré-existente do passo 3, agora confirmada em 4).
+
 ## Estado
 
 | | |
 |---|---|
-| `wip/passo-4-thread` | arbiter à Eden + dono exportável; pendente Pi: compilar, 6/6+ testes, e medir os boots (traps #26 devem desabar de 8004) |
+| `wip/passo-4-thread` | arbiter à Eden medido no Pi: 6/6 testes, 11 traps de guest por boot (era 8004); a parede seguinte é o IPC da principal |

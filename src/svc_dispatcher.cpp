@@ -1292,15 +1292,10 @@ Result SvcDispatcher::svc_arbitrate_lock(SvcContext& ctx) {
     if (addr == 0 || (addr & 3) != 0)
         return Result::InvalidAddress;
 
-    // O token EM CURSO desta thread é o que se larga ao estacionar e a
-    // identidade de despertar. thread_local: nenhum outro despacho o toca.
-    const std::uint64_t token = dispatch_owner_itself();
-    if (token == 0) {
-        // Estacionar sem despacho em curso não é possível nesta estrutura —
-        // o lock é chamado de dentro da trap. Se algum dia chegar 0, é um
-        // bug a registar, não semântica a burlar.
-        return Result::Invalid;
-    }
+    // O token EM CURSO desta thread (o que se larga ao estacionar e a
+    // identidade de despertar). Declarado a nível da função porque o
+    // pós-wait ainda o usa. thread_local: nenhum outro despacho o toca.
+    std::uint64_t token = 0;
 
     // Estacionar com a corrida fechada. A LEITURA da palavra entra no
     // mesmo gate que o registo: se o dono largar ENTRE a leitura e o
@@ -1322,8 +1317,24 @@ Result SvcDispatcher::svc_arbitrate_lock(SvcContext& ctx) {
         // nesse caso, e é esse estado que este SVC consome. Os outros
         // valores (0 = livre, tag puro, dono de outra thread) voltam
         // Success imediato — inclusive ACABAR de largar (0 lido aqui).
+        //
+        // O fast-path NÃO depende do despacho: é a volta que o Eden faz
+        // sem tocar em fila nem thread — por isso o teste de unidade (fora
+        // de trap) passa aqui.
         if (word != (handle | kArbWaitMask))
             return Result::Success;
+
+        // O token EM CURSO desta thread é o que se larga ao estacionar e a
+        // identidade de despertar. LER SÓ AQUI — não fica antes da
+        // leitura, senão bloqueava o fast-path inteiro (o teste de unidade
+        // é fora de despacho).
+        token = dispatch_owner_itself();
+        if (token == 0) {
+            // Estacionar sem despacho em curso não é possível nesta
+            // estrutura — o lock é chamado de dentro da trap. Se algum dia
+            // chegar 0, é um bug a registar, não semântica a burlar.
+            return Result::Invalid;
+        }
 
         g_arbiter.fila[addr].push_back({tag, token});
         dispatch_owner_vacate();

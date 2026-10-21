@@ -33,9 +33,9 @@ void check(bool ok, const std::string& what) {
     ++g_checks;
     if (!ok) {
         ++g_failures;
-        std::printf("  FALHOU: %s\n", what);
+        std::printf("  FALHOU: %s\n", what.c_str());
     } else {
-        std::printf("  ok: %s\n", what);
+        std::printf("  ok: %s\n", what.c_str());
     }
 }
 
