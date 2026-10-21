@@ -45,6 +45,7 @@
 #include "vendor/eden/core/hle/service/apm/apm_controller.h"
 #include "vendor/eden/core/hle/service/aoc/addon_content_manager.h"
 #include "g610/services/applet_oe.hpp"
+#include "g610/services/time_u.hpp"
 #include "vendor/eden/core/hle/service/lm/lm.h"
 #include "vendor/eden/core/hle/service/pctl/pctl.h"
 #include "vendor/eden/core/hle/service/server_manager.h"
@@ -579,6 +580,14 @@ EdenSystem::EdenSystem(GuestMemory& memoria, std::uint64_t pid, std::uint64_t ti
     // motor de execucao nativa nao tem DLC, e a lista vazia e' a
     // resposta honesta. O que o guest precisa e' que o servico **exista**.
     Service::AOC::LoopProcess(*this);
+
+    // O `time:u` — o tempo do sistema. Medido: o SDK pede-o ao `sm:` no
+    // arranque (`nn::time::Initialize`) e, sem ele, o `sm:` **defere**
+    // o pedido e o `m_current_request` do `KServerSession` fica preso
+    // para sempre — o guest estaciona no `SendSyncRequest` e morre no
+    // `SetTerminateResult` (o cap do passo 6). Ver
+    // `src/services/time_u.cpp`.
+    g610::services::registar_time_u(*this);
 
     // A verificacao que esteve aqui -- `KObjectName::Find("sm:")` -- **partiu
     // o jogo**.
