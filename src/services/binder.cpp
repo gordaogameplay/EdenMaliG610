@@ -644,6 +644,13 @@ std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
         }
         // O handle é o do `nvmap` — e é por ele que se chega ao
         // endereço.
+        if (std::getenv("IA_IPC_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[binder] SetPreallocatedBuffer: slot=%d buffer_id=%u handle=%u "
+                         "width=%u height=%u format=%u\n",
+                         slot, buffer.BufferId(), buffer.Handle(), buffer.Width(),
+                         buffer.Height(), buffer.Format());
+        }
         RegistoNvmap::Regiao regiao{};
         if (!RegistoNvmap::Instancia().Procurar(buffer.BufferId(), regiao)) {
             LOG_WARNING(Service_NVDRV,
