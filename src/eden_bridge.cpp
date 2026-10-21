@@ -790,7 +790,8 @@ bool eden_connect_to_named_port(Kernel::KernelCore& kernel, GuestMemory& memoria
 // `message` e `buffer_size` são **0** nesta variante: é o kernel que vai buscar
 // o `MessageBuffer` ao TLS da thread. É por isso que x1 e x2 são ignorados —
 // o SDK passa-os, e o Eden também não os olha.
-bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_handle) {
+bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_handle,
+                            std::uint64_t endereco) {
     auto& tabela = Kernel::GetCurrentProcess(kernel).GetHandleTable();
 
     Kernel::KScopedAutoObject<Kernel::KClientSession> sessao =
@@ -832,7 +833,25 @@ bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_ha
         return false;
     }
 
-    if (R_FAILED(sessao->SendSyncRequest(kernel, 0, 0))) {
+    // ── O ENDEREÇO DO PEDIDO ─────────────────────────────────────────────
+    //
+    // `SendSyncRequest(handle, endereco, tamanho)` — o guest passa o
+    // endereço **do seu buffer de pedido** ✗ e o kernel escreve a resposta
+    // no buffer de resposta do TLS ✗.
+    //
+    // **Medido** (`/tmp/boot_dom.log` ✗): o guest manda
+    // `x1=0x88004000` ✗ e a casa passava `0` ✗ — e o upstream, quando o
+    // endereço é zero ✗, vai buscar o pedido ao **TLS** da thread ✗
+    // (`k_server_session.cpp:1162` ✗) em vez de o ler de onde o guest o
+    // escreveu ✗. O que lá estava era a **resposta** anterior ✗ — o magic
+    // "SFCO" ✗ em vez de "SFCI" ✗ — e o `ParseCommandBuffer` do upstream
+    // queixava-se ✗ (`assert data_payload_header->magic` ✗).
+    //
+    // O tamanho ✗: o `x2` do guest ✗ **não** é um tamanho ✗ (no pedido
+    // medido ✗, `x2 = 0x481f7` ✗ — o mesmo valor do handle ✗ ✗). O
+    // caminho HLE ✗ do upstream lê o buffer pelo `COMMAND_BUFFER_LENGTH` ✗
+    // fixo ✗ e não usa o tamanho ✗ — por isso vai `0` ✗ ✓.
+    if (R_FAILED(sessao->SendSyncRequest(kernel, endereco, 0))) {
         if (std::getenv("IA_IPC_TRACE") != nullptr)
             std::fprintf(stderr,
                          "[ipc] SendSyncRequest handle=0x%x FILA falhou (KClientSession::SendSyncRequest != Success)\n",

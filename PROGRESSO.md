@@ -4035,6 +4035,46 @@ Resultado: o payload é lido **deslocado** ✗ → o `magic` não é "SFCI"
 2. **A aritmética tem de contar as 2 palavras** ✗ do cabeçalho de
    domínio ✗ quando a sessão é um domínio ✓ — como o Eden ✗.
 
+### O assert do payload — resolvido (era o endereço, não o domínio)
+
+O `assert data_payload_header->magic` **nao** era o cabeçalho de dominio ✗.
+Medido com um dump no `ParseCommandBuffer` (`/tmp/boot_dom.log` ✗):
+
+    [ipc-dom] payload SEM 'SFCI': data_payload_offset=6
+    [ipc-dom]   [ 4] 0x4f434653  <- DataPayloadHeader
+
+`0x4f434653` e' **"SFCO"** ✗ — o magic de **RESPOSTA** ✗, nao de pedido ✗.
+O guest nao mandou um cabecalho de dominio ✗: mandou um pedido ✗ e a casa
+leu-o de um sitio onde estava a **resposta anterior** ✗.
+
+**A causa** ✗: `eden_send_sync_request` ✗ chamava
+`sessao->SendSyncRequest(kernel, 0, 0)` ✗ — endereco **zero** ✗ — e o
+upstream, nesse caso ✗, vai buscar o pedido ao **TLS** da thread ✗
+(`k_server_session.cpp:1162` ✗) em vez de o ler de onde o guest o
+escreveu ✗. O guest passa o endereco do seu buffer em **x1** ✗ (medido:
+`x1=0x88004000` ✗) ✗.
+
+**A correccao** ✗: passar `ctx.x[1]` ✗ (o endereco ✗). O `x2` ✗ **nao** e'
+um tamanho ✗ (no pedido medido ✗, `x2 = 0x481f7` ✗ = o handle ✗ ✗) ✗ — e
+o caminho HLE do upstream ✗ le o buffer pelo `COMMAND_BUFFER_LENGTH` ✗ fixo
+✗ e nao usa o tamanho ✗ ✓.
+
+**Medido depois da correccao** ✗: o assert **desapareceu** ✗ (0 ocorrencias
+✗ de `ipc-dom` ✗) e o jogo passa a fazer IPC a serio ✗ (o pump ✗ mostra
+sessoes a serem servidas ✗) ✗.
+
+### Onde o jogo está agora
+
+O guest chega ao **`Break` SVC (#0x26)** ✗ — o caminho de crash do proprio
+SDK ✗ — e a ultima linha do motor ✗ e' a mais informativa ✗:
+
+    [eden:D] Service::NVDRV: [canal] a regiao de 328204288 bytes esta toda a ZEROS
+
+Ou seja ✗: o guest **alocou a regiao do canal da GPU** ✗ (328 MB ✗) e
+**nao escreveu o push buffer** ✗ ✗. O proximo passo nao e' o IPC ✗ — e' o
+**canal do NVDRV** ✗ ✗: onde o guest escreve os comandos ✗, e de onde a
+casa os tem de ler ✗.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native

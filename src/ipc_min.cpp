@@ -645,7 +645,10 @@ Result SvcDispatcher::svc_send_sync_request(SvcContext& ctx) {
     if (eden_) {
         const std::uint32_t handle = static_cast<std::uint32_t>(ctx.x[0]);
         ++sync_request_calls_;
-        if (eden_send_sync_request(eden_->Kernel(), handle)) {
+        // O endereco do buffer do pedido ✗ — e' o x1 ✗ (ver
+        // `eden_bridge.cpp` ✗: sem isto ✗, o upstream ia ler o pedido do
+        // TLS ✗ e encontrava a resposta anterior ✗).
+        if (eden_send_sync_request(eden_->Kernel(), handle, ctx.x[1])) {
             ctx.ret     = 0;
             ctx.has_ret = true;
             return Result::Success;

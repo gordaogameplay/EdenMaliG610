@@ -148,6 +148,7 @@ bool eden_connect_to_named_port(Kernel::KernelCore& kernel, GuestMemory& memoria
 // O `SendSyncRequest` **ignora x1 e x2**: é o que o Eden faz, e é o que o
 // guest espera. O kernel usa o `MessageBuffer` do TLS da thread, que o
 // `KClientSession::SendSyncRequest` vai buscar sozinho.
-bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_handle);
+bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_handle,
+                            std::uint64_t endereco);
 
 } // namespace g610
