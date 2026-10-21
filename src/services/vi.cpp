@@ -46,6 +46,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdint>
+#include <cstring>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -80,6 +82,15 @@ struct EstadoDoDisplay {
     // para o display interno.
     std::int64_t largura = 1280;
     std::int64_t altura = 720;
+    // O **binder** que o jogo recebe: um identificador por camada. É
+    // por ele que o jogo passa os seus buffers ao compositor.
+    std::uint64_t proximo_binder = 1;
+    // A **janela** de cada camada: o buffer onde o jogo desenha.
+    struct Janela {
+        std::uint64_t endereco = 0;
+        std::uint64_t tamanho = 0;
+    };
+    std::map<std::uint64_t, Janela> janelas;
 };
 
 // O estado é partilhado pelos três displays (eles falam do **mesmo**
@@ -201,6 +212,67 @@ protected:
     Core::System& system_;
     Kernel::KEvent* evento_ = nullptr;
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// O *parcel* — o formato do Eden (`nvnflinger/parcel.h`).
+//
+// O Eden serializa um `NativeWindow` num "parcel" Android:
+//
+//   - o **cabeçalho** (`ParcelHeader`, 16 bytes): o tamanho e o offset dos
+//     dados, e o tamanho e o offset dos objectos;
+//   - os **dados**: o `NativeWindow` (40 bytes);
+//   - os **objectos**: um `u32` a zero (o `WriteInterface` do Eden
+//     escreve `0U` no buffer de objectos).
+//
+// A NativeWindow (`vi_types.h`, 0x28 bytes):
+//
+//   u32 magic = 2;  u32 process_id = 1;  u64 id;  (2 palavras de padding)
+//   u8 dispdrv[8] = "dispdrv\0";          (2 palavras de padding)
+//
+// **O `id` é o binder** — é por ele que o jogo passa os seus buffers ao
+// compositor.
+// ─────────────────────────────────────────────────────────────────────────────
+struct NativeWindow {
+    std::uint32_t magic = 2;
+    std::uint32_t process_id = 1;
+    std::uint64_t id = 0;
+    std::uint32_t padding0 = 0;
+    std::uint32_t padding1 = 0;
+    char dispdrv[8] = {'d', 'i', 's', 'p', 'd', 'r', 'v', '\0'};
+    std::uint32_t padding2 = 0;
+    std::uint32_t padding3 = 0;
+};
+static_assert(sizeof(NativeWindow) == 0x28, "tamanho errado");
+
+// O cabeçalho do parcel (o Eden: `ParcelHeader`).
+struct ParcelHeader {
+    std::uint32_t data_size;
+    std::uint32_t data_offset;
+    std::uint32_t objects_size;
+    std::uint32_t objects_offset;
+};
+static_assert(sizeof(ParcelHeader) == 16, "tamanho errado");
+
+// Serializa uma `NativeWindow` num parcel — a forma do Eden
+// (`OutputParcel::WriteInterface` + `Serialize`).
+std::vector<std::uint8_t> SerializarNativeWindow(const NativeWindow& janela) {
+    std::vector<std::uint8_t> dados(sizeof(NativeWindow), 0);
+    std::memcpy(dados.data(), &janela, sizeof(janela));
+
+    const std::uint32_t object_size = 4;  // o `u32` a zero do `WriteInterface`
+    std::vector<std::uint8_t> objectos(object_size, 0);
+
+    std::vector<std::uint8_t> parcel(sizeof(ParcelHeader) + dados.size() + objectos.size(), 0);
+    ParcelHeader cabecalho{};
+    cabecalho.data_size = static_cast<std::uint32_t>(dados.size());
+    cabecalho.data_offset = sizeof(ParcelHeader);
+    cabecalho.objects_size = static_cast<std::uint32_t>(objectos.size());
+    cabecalho.objects_offset = cabecalho.data_offset + cabecalho.data_size;
+    std::memcpy(parcel.data(), &cabecalho, sizeof(cabecalho));
+    std::memcpy(parcel.data() + cabecalho.data_offset, dados.data(), dados.size());
+    std::memcpy(parcel.data() + cabecalho.objects_offset, objectos.data(), objectos.size());
+    return parcel;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // O *binder* (o "relay service") — o serviço de que o display devolve o
@@ -455,7 +527,7 @@ public:
             {1020, nullptr, "CloseDisplay"},
             {1101, &ViDisplayApplication::SetDisplayEnabled, "SetDisplayEnabled"},
             {1102, &ViDisplayApplication::GetDisplayResolution, "GetDisplayResolution"},
-            {2020, nullptr, "OpenLayer"},
+            {2020, &ViDisplayApplication::OpenLayer, "OpenLayer"},
             {2021, nullptr, "CloseLayer"},
             {2030, nullptr, "CreateStrayLayer"},
             {2031, nullptr, "DestroyStrayLayer"},
@@ -471,6 +543,76 @@ public:
     }
 
 private:
+    // 2020: abrir uma camada — e devolver a **native window**, que é o
+    // buffer onde o jogo desenha.
+    //
+    // O Eden (`application_display_service.cpp`, `OpenLayer`): abre o
+    // display, abre a camada (e fica com o **binder** do produtor), e
+    // devolve um *parcel* com a `NativeWindow` dentro.
+    //
+    // O parcel é o que o jogo sabe ler: o cabeçalho, a `NativeWindow` e o
+    // objecto a zero — byte a byte, como o Eden.
+    void OpenLayer(HLERequestContext& ctx) {
+        RequestParser rp{ctx};
+        (void)rp.PopRaw<std::uint64_t>();  // o layer_id
+        (void)rp.PopRaw<std::uint32_t>();  // o aruid
+
+        // A janela: um buffer **real** na memória do guest, do tamanho do
+        // display. O guest desenha lá dentro; o compositor da casa
+        // apresenta-o.
+        //
+        // Onde? No espaço de VA da GPU (o mesmo que o `nvdrv` dá ao
+        // jogo) — é memória do guest, e por isso o host lê-la
+        // directamente.
+        const std::uint64_t tamanho = static_cast<std::uint64_t>(Estado().largura) *
+                                      static_cast<std::uint64_t>(Estado().altura) * 4u;
+        std::uint64_t endereco = 0;
+        if (!AlocarJanela(tamanho, endereco)) {
+            LOG_WARNING(Service_VI, "IDisplayApplication: OpenLayer: sem espaço para a janela");
+        }
+
+        const std::uint64_t binder = Estado().proximo_binder++;
+        NativeWindow janela{};
+        janela.id = binder;
+        const std::vector<std::uint8_t> parcel = SerializarNativeWindow(janela);
+
+        LOG_DEBUG(Service_VI, "IDisplayApplication: OpenLayer: binder={} janela=0x{:X} bytes={}",
+                  binder, endereco, tamanho);
+
+        // A resposta: o tamanho do parcel (`Out<u64>`) e o parcel no
+        // buffer de saída (`OutBuffer`).
+        const std::size_t saida = ctx.GetWriteBufferSize(0);
+        if (saida > 0) {
+            const std::size_t n = std::min(saida, parcel.size());
+            ctx.WriteBuffer(parcel.data(), n, 0);
+        }
+
+        ResponseBuilder rb{ctx, 4};
+        rb.Push(ResultSuccess);
+        rb.Push<std::uint64_t>(parcel.size());
+    }
+
+    // Aloca o buffer de uma janela no espaço de VA da GPU.
+    //
+    // **O VA da GPU é gerido pelo `nvdrv`** (que é quem o dá ao jogo);
+    // aqui alocamos da mesma reserva, e o `nvdrv` é quem sabe onde estão
+    // as regiões. A alocação é feita aqui porque é a display que pede a
+    // janela — e o `nvdrv` e' quem tem a reserva.
+    //
+    // Devolve `true` se alocar.
+    static bool AlocarJanela(std::uint64_t tamanho, std::uint64_t& endereco) {
+        // A reserva do VA da GPU: a mesma que o `nvdrv` usa (a região
+        // de alias, 0x60000000..0x80000000, é do *alias*; o VA da GPU
+        // começa em 0x98000000, depois do heap do guest).
+        static std::uint64_t proximo = 0x98000000ull;
+        constexpr std::uint64_t kFim = 0xC0000000ull;
+        if (proximo + tamanho > kFim)
+            return false;
+        endereco = proximo;
+        proximo += (tamanho + 0xFFF) & ~0xFFFull;
+        return true;
+    }
+
     // 100: o *relay service* (o driver do *binder*).
     void GetRelayService(HLERequestContext& ctx) {
         LOG_DEBUG(Service_VI, "IDisplayApplication: GetRelayService");
