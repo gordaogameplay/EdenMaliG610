@@ -45,12 +45,16 @@
 // SPDX-FileCopyrightText: 2018 Yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <unistd.h>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "vendor/eden/common/logging.h"
@@ -101,6 +105,38 @@ struct EstadoDoDisplay {
 EstadoDoDisplay& Estado() {
     static EstadoDoDisplay e;
     return e;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// O **vsync**.
+//
+// O evento de vsync (`GetDisplayVsyncEvent`, 5202) existia, mas **ninguém
+// o sinalizava** — e o jogo bloqueia à espera dele.
+//
+// Um display real emite vsync a 60 Hz. É isso que se faz aqui: uma
+// thread que sinaliza o evento a cada 16,67 ms.
+//
+// **O sinal é no `KReadableEvent`** — o filho, que é o objecto que o
+// guest recebe (o mesmo que o `applet_oe` faz, e pelo mesmo motivo:
+// o `Clear` não propaga do pai para o filho).
+// ─────────────────────────────────────────────────────────────────────────────
+std::mutex g_mu_vsync;
+Kernel::KReadableEvent* g_evento_vsync = nullptr;
+std::atomic<bool> g_vsync_corre{false};
+
+void ThreadDoVsync(Core::System& system) {
+    while (g_vsync_corre.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::microseconds(16667));
+        Kernel::KReadableEvent* evento = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_mu_vsync);
+            evento = g_evento_vsync;
+        }
+        if (evento == nullptr)
+            continue;
+        auto& kernel = system.Kernel();
+        evento->Signal(kernel);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -204,6 +240,16 @@ protected:
             auto& processo = Kernel::GetCurrentProcess(kernel);
             evento_ = new Kernel::KEvent(kernel);
             evento_->Initialize(kernel, &processo);
+
+            // Regista o evento de leitura e arranca a thread do vsync.
+            {
+                std::lock_guard<std::mutex> lk(g_mu_vsync);
+                g_evento_vsync = &evento_->GetReadableEvent();
+            }
+            if (!g_vsync_corre.exchange(true)) {
+                std::thread(ThreadDoVsync, std::ref(system_)).detach();
+                LOG_DEBUG(Service_VI, "vsync: a thread do vsync arrancou (60 Hz)");
+            }
         }
 
         ResponseBuilder rb{ctx, 3, 1};

@@ -3565,6 +3565,55 @@ Ou seja: o que falta não é o tradutor — é o **sinal** que o trabalho
 terminou. Sem ele, o jogo bloqueia antes de desenhar o primeiro
 quadro, e por isso o push buffer ainda está a zeros.
 
+### Onde o jogo bloqueia — a sequência do driver, medida
+
+Os ioctls que o jogo faz, por ordem (log `boot_p9a.log`):
+
+| # | ioctl | o que é |
+|---|---|---|
+| 1 | `0x47/0x05` (176 B) | características da GPU |
+| 2 | `0x47/0x06` | máscaras de TPC |
+| 3 | `0x47/0x01`, `0x47/0x02` | contexto, ZCull |
+| 4 | **`QueryEvent`** (comando 4 do `nvdrv`) | o handle do evento — **devolvido** ✓ |
+| 5 | `0x41/0x09`, `0x41/0x08`, `0x41/0x02` | `AllocateSpace` (4 GiB) |
+| 6 | `nvmap`: `IocCreate`/`IocAlloc` ×5 | handles 1..5 (4 KB, 64 KB, **313 MB**, 216 MB, 4 KB) |
+| 7 | `0x41/0x06` ×N | `MapBufferEx` de cada handle |
+| 8 | `0x48/0x01` | `SetNVMAPfd` (handle 3) |
+| 9 | `0x48/0x1A` | `AllocGPFIFOEx2` |
+| 10 | `SubmitGPFIFO` ×3 | a submissão (3 entradas, todas `is_push_buffer=1`) |
+
+E depois: `SetMemoryAttribute` (a marcar os buffers como memória de
+dispositivo) e **o bloqueio** — o *thread* principal à espera de um
+*futex* (`WaitProcessWideKeyAtomic addr=0x10a2c7d58`), que ninguém
+desperta.
+
+**O que já se排除iu** (por medição, não por suposição):
+
+- **não** é o `MapBufferEx` (a casa devolve o VA certo, e o upstream
+  usa `size = mapping_size ? mapping_size : handle->orig_size`);
+- **não** é o `QueryEvent` (devolve o handle: `0x8000000c` ✓);
+- **não** é o evento de **vsync** — o jogo **nunca** o pede (medido: o
+  `GetDisplayVsyncEvent` não é chamado). O vsync a 60 Hz ficou
+  implementado na mesma (é comportamento correcto do display), mas
+  não é a chave;
+- **não** é um SVC por implementar: o `svc_wait_synchronization`
+  existe, e o log mostra que **não** é chamado.
+
+**A pista que fica**: o jogo esperou num *futex* de chave de processo
+(`WaitProcessWideKeyAtomic`), e o seu *thread* de GPU parou depois de
+sinalizar outros futexes. O caminho que falta é o **sinal de "a GPU
+terminou"** — seja pela *fence* (o `nvhost-gpu` devolve `fence.id` e
+`fence.value`, e o upstream incrementa o syncpoint do canal), seja
+pelo **semáforo** que o jogo cria no `nvmap`.
+
+**O próximo passo medido**: registrar *qual* o `event_id` que o jogo
+pede no `QueryEvent`, e *dumpar a stack do guest* no
+`WaitProcessWideKeyAtomic` (a casa já o faz no
+`svc_wait_synchronization`: mostra o handle, o `sp` e o conteúdo da
+stack). Com a stack do guest e o `main` do jogo (NSO0, descomprimível
+pelo carregador da casa) dá para ver **qual** caminho do SDK está a
+esperar — e aí está a resposta.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native
