@@ -230,6 +230,13 @@ endif()
 add_executable(g610_input tests/probe_input.cpp)
 target_link_libraries(g610_input PRIVATE g610_core)
 
+# mostra: a PRIMEIRA IMAGEM NA TELA — SDL2 (sessao Wayland do board) +
+# swapchain Vulkan no Mali-G610. Nao e' a cadeia do motor (essa e' o
+# gpu_exec); e' o apresentador, e ha' prova de pixel via grim no
+# cabecalho do ficheiro.
+add_executable(g610_mostra tests/mostra.cpp)
+target_link_libraries(g610_mostra PRIVATE g610_core)
+
 # Teste do mapeamento de input. Nao precisa de hardware: a logica do A/B
 # e' testada directamente, o que o torna um teste a serio em vez de um
 # teste que so' passa com o DS4 ligado.

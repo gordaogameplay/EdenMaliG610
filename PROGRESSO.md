@@ -446,6 +446,48 @@ Próxima parede: derrubar o **drop fantasma do pump** — medido a 1/boot
 
 ---
 
+## Passo 5-b — a primeira imagem na TELA (apresentador)
+
+Decisão de apresentação, medida e não por gosto: **Wayland**. A sessão gráfica
+do board É sway (pid 98746, HDMI-A-1); não há sessão X pura (pgrep Xorg = 0) —
+o que existe é o gateway **Xwayland** (pid 632056), um tradutor a mais por
+frame; Vulkan WSI directo no Wayland é o caminho nativo do compositor. A
+ferramenta (`tests/mostra.cpp`, alvo `g610_mostra`) usa **SDL2** (já PUBLIC no
+`g610_core`, 2.30.0) — o SDL cria a janela e chama o WSI: zero protocolo
+wl/xdg-shell à mão. A cadeia de shaders do MOTOR segue no `test_gpu_exec`
+(20/20); este apresentador é outra cadeia, só de apresentação.
+
+**A imagem na HDMI-A-1, medida por captura** (`grim`, analise com `pix.py`):
+triângulo laranja sobre fundo `#101720`; centro da captura (255, 115, 26) =
+laranja exato; cantos (16, 23, 32) = fundo exato; 15.9% de pixels laranja,
+bbox x 435..1485, y 300..985 em 1920×1200. **903 quadros em 15012 ms =
+60.1 fps** no FIFO/vsync (panvk + Mali-G610 + Wayland, janela full-screen
+sobre o compositor do board).
+
+Cinco bugs/detalhes medidos a caminho, todos do "precisa de medir", não de
+"deve ser":
+
+1. `std::setenv` não existe (é POSIX global, por isso `::setenv`); sem
+   `<cstdint>` o resto é cascade de "not declared".
+2. O env: o ssh traz `XDG_RUNTIME_DIR=/run/user/1000` (sessão tty) e NÃO traz
+   `WAYLAND_DISPLAY` — sem ele libwayland tenta `wayland-0`, não existe.
+   **O compositor esteve são o tempo todo**; com os dois envs certos, 10/10
+   capturas. O `mostra.cpp` agora seta os dois (os valores alvo são os mesmos
+   dentro da sessão do sway).
+3. panvk reporta `currentExtent = 0xFFFFFFFF` no primeiro query (superfície
+   Wayland ainda não configurada); passa-se o extent da janela SDL.
+4. `pMultisampleState` nunca declarado no `ppci` → segfault do panvk
+   (campo obrigatório; sem validação, nada avisa).
+5. O primeiro acquire chega `VK_SUBOPTIMAL_KHR` (1000001003) — o swapchain
+   nasceu antes da configuração da superfície. Dance WSI padrão: o
+   apresentador recria swapchain no `OUT_OF_DATE`/`SUBOPTIMAL`
+   (`construir_swap`/`destruir_swap`), com viewport/scissor dinâmicos.
+
+Honesto: é o apresentador do caminho de render (SDL→WSI→panvk→Mali→
+compositor→HDMI). **A imagem do JOGO fica atrás do drop fantasma do
+`SendSyncRequest`** — passo 6. Nota: se corrido em fundo e o ssh fecha no
+meio, o teardown segfaulta; em primeiro plano a saída é limpa (exit 0).
+
 ## Não confirmado (não inventar)
 
 - `__tls_align` do SDK oficial → usamos 16 como mínimo.
