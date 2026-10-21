@@ -1184,7 +1184,21 @@ private:
     std::uint32_t proximo_nvmap_ = 0;
     // O par (VA da GPU -> endereco do guest), que o tradutor Maxwell ->
     // Vulkan usa para traduzir os comandos do push buffer.
-    std::map<std::uint64_t, std::uint64_t> mapeamentos_;
+    // **O mapeamento** ✗ — o `Mapping` do upstream
+    // (`nvhost_as_gpu.h:167-180` ✗): o `ptr` ✗ (o endereco base ✗), o
+    // `size` ✗ e o `fixed` ✗.
+    //
+    // **O `Remap` precisa do `ptr` base** ✗ — o upstream faz
+    // `device_address = mapping->ptr + params.buffer_offset`
+    // (`nvhost_as_gpu.cpp:343` ✗) ✗ ✗. Com a casa a guardar so' o
+    // endereco final ✗, o `buffer_offset` era aplicado **duas vezes**
+    // ✗ ✗ — ou nenhuma ✗ ✗.
+    struct Mapeamento {
+        std::uint64_t ptr = 0;    // o endereco base (o `ptr` do upstream)
+        std::uint64_t size = 0;   // o tamanho do mapeamento
+        bool fixed = false;
+    };
+    std::map<std::uint64_t, Mapeamento> mapeamentos_;
 
     // 0x01/0x01: `IocCreate` — criar um handle de `size` bytes.
     void IocCreate(HLERequestContext& ctx) {
@@ -1440,6 +1454,12 @@ private:
         const std::uint64_t tamanho =
             params.mapping_size != 0 ? params.mapping_size : it->second.tamanho;
 
+        // **O endereco base** ✗ — o `nvmap` do handle ✗, **mais** o
+        // `buffer_offset` ✗ ✗.
+        //
+        // **O `buffer_offset` conta a partir do handle** ✗ — e o upstream
+        // (`nvhost_as_gpu.cpp:369-375` ✗) faz `device_address = ptr +
+        // buffer_offset` ✗, onde o `ptr` e' o do **mapeamento** ✗ ✗.
         const std::uint64_t endereco = it->second.endereco + params.buffer_offset;
         LOG_DEBUG(Service_NVDRV,
                   "MapBufferEx: handle={} va=0x{:X} -> 0x{:X} tamanho=0x{:X} flags=0x{:X}",
@@ -1466,15 +1486,76 @@ private:
         // flags=0x100` ✗ ✗ — o `0x100` e' o `Remap` ✗ ✗.
         constexpr std::uint32_t kMappingFixed = 1u << 0;
         constexpr std::uint32_t kMappingRemap = 1u << 8;
+
         if ((params.flags & kMappingRemap) != 0) {
-            // O `Remap` ✗ — o VA **fica** ✗ (o upstream nao o altera ✗) ✗.
+            // ── O `Remap` ✗ ──────────────────────────────────────────────
+            //
+            // O upstream (`nvhost_as_gpu.cpp:331-348` ✗):
+            //
+            //     auto mapping{mapping_map.at(params.offset)};
+            //     if (mapping->size < params.mapping_size) { return BadValue; }
+            //     u64 gpu_address{params.offset + params.buffer_offset};
+            //     VAddr device_address{mapping->ptr + params.buffer_offset};
+            //     gmmu->Map(gpu_address, device_address, params.mapping_size, ...);
+            //
+            // **O VA tem de estar mapeado** ✗ — o `mapping_map.at()` ✗
+            // **lanca** se nao estiver ✗ ✗. A casa aceitava o `Remap` de
+            // um VA desconhecido ✗ ✗ ✗.
+            const auto mapeamento_it = mapeamentos_.find(static_cast<std::uint64_t>(params.offset));
+            if (mapeamento_it == mapeamentos_.end()) {
+                LOG_WARNING(Service_NVDRV,
+                           "MapBufferEx: Remap de um VA nao mapeado (0x{:X})", params.offset);
+                RespostaErro(ctx, NvResult::BadValue, "ioctl");
+                return;
+            }
+
+            const Mapeamento& mapeamento = mapeamento_it->second;
+            if (mapeamento.size < params.mapping_size) {
+                LOG_WARNING(Service_NVDRV,
+                           "MapBufferEx: Remap de um mapeamento menor do que o pedido "
+                           "(0x{:X} < 0x{:X})",
+                           mapeamento.size, params.mapping_size);
+                RespostaErro(ctx, NvResult::BadValue, "ioctl");
+                return;
+            }
+
+            // O endereco final ✗ — o `ptr` base **mais** o `buffer_offset`
+            // ✗ (o upstream ✗) ✗.
+            //
+            // **O `ptr` base nao muda** ✗ — o upstream nao o altera ✗
+            // (`nvhost_as_gpu.cpp:343` ✗ usa `mapping->ptr` ✗, o base ✗,
+            // e nao o resultado anterior ✗) ✗. A casa acumulava ✗ ✗ —
+            // cada remap somava o `buffer_offset` ao anterior ✗ ✗.
+            const std::uint64_t endereco_remap =
+                mapeamento.ptr + static_cast<std::uint64_t>(params.buffer_offset);
+            LOG_DEBUG(Service_NVDRV,
+                      "MapBufferEx: Remap: ptr base=0x{:X} buffer_offset=0x{:X}", mapeamento.ptr,
+                      static_cast<std::uint64_t>(params.buffer_offset));
+
+            // **O VA nao muda** ✗ ✗.
             params.offset = static_cast<std::int64_t>(params.offset);
-        } else if ((params.flags & kMappingFixed) != 0) {
+
+            LOG_DEBUG(Service_NVDRV,
+                      "MapBufferEx: Remap va=0x{:X} handle={} -> 0x{:X} tamanho=0x{:X}",
+                      params.offset, params.handle, endereco_remap, params.mapping_size);
+
+            EscreverSaida(ctx, params);
+            RespostaOk(ctx);
+            return;
+        }
+
+        if ((params.flags & kMappingFixed) != 0) {
             params.offset = static_cast<std::int64_t>(params.offset);
         } else {
             params.offset = static_cast<std::int64_t>(endereco);
         }
-        mapeamentos_.emplace(static_cast<std::uint64_t>(params.offset), endereco);
+        {
+            Mapeamento mapeamento{};
+            mapeamento.ptr = endereco;
+            mapeamento.size = tamanho;
+            mapeamento.fixed = (params.flags & kMappingFixed) != 0;
+            mapeamentos_[static_cast<std::uint64_t>(params.offset)] = mapeamento;
+        }
 
         EscreverSaida(ctx, params);
         RespostaOk(ctx);
