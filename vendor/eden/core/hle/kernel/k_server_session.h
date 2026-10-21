@@ -52,6 +52,16 @@ public:
     }
 
     bool IsSignaled(KernelCore& kernel) const override;
+
+    // Diagnóstico g610 (passo 6): estado das filas internas sem perturbar
+    // o kernel. Só leitura; nada destes métodos altera o estado.
+    void* DebugCurrentRequest() const {
+        return reinterpret_cast<void*>(m_current_request);
+    }
+    unsigned DebugRequestCount() const {
+        return static_cast<unsigned>(m_request_list.size());
+    }
+
     void OnClientClosed(KernelCore& kernel);
 
     Result OnRequest(KernelCore& kernel, KSessionRequest* request);

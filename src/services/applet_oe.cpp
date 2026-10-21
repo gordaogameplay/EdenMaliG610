@@ -1098,6 +1098,18 @@ private:
     }
 
     void SetTerminateResult(HLERequestContext& ctx) {
+        // **Instrumento.** O `SetTerminateResult` é o pranto do guest:
+        // o Result que ele manda é o código exacto do nn::erro que o
+        // matou (o módulo no byte alto, o desc no baixo). Sem este
+        // número, não se sabe qual peça falta.
+        RequestParser rp{ctx};
+        const u32 resultado = rp.PopRaw<u32>();
+        LOG_WARNING(Service_AM,
+                    "SetTerminateResult: modulo={} desc={} (0x{:08X})",
+                    static_cast<unsigned>((resultado >> 0) & 0x1FF),
+                    static_cast<unsigned>((resultado >> 9) & 0x3FFF),
+                    resultado);
+
         ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }

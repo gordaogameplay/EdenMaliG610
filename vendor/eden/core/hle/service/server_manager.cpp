@@ -356,6 +356,25 @@ Result ServerManager::ProcessPendingSynchronously() {
             std::fprintf(stderr,
                          "[ipc] pump varrer: servidores=%zu sessoes=%zu\n",
                          m_servers.size(), m_sessions.size());
+        if (std::getenv("IA_IPC_TRACE") != nullptr) {
+            for (auto& server : m_servers) {
+                auto* p = static_cast<Kernel::KServerPort*>(server.GetNativeHandle());
+                std::fprintf(stderr,
+                             "[ipc]   porta=%p sinal=%d\n",
+                             reinterpret_cast<void*>(p),
+                             static_cast<int>(p->IsSignaled(kernel)));
+            }
+            for (auto& session : m_sessions) {
+                auto* ss =
+                    static_cast<Kernel::KServerSession*>(session.GetNativeHandle());
+                std::fprintf(stderr,
+                             "[ipc]   sessao=%p req=%u corrente=%p sinal=%d\n",
+                             reinterpret_cast<void*>(ss),
+                             ss->DebugRequestCount(),
+                             ss->DebugCurrentRequest(),
+                             static_cast<int>(ss->IsSignaled(kernel)));
+            }
+        }
 
         // Uma ligação recém-criada fica na fila do KServerPort até ser aceite.
         for (auto& server : m_servers) {

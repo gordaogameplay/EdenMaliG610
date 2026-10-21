@@ -258,11 +258,13 @@ void ::Core::System::RunServer(
 
 auto ::Core::System::ProcessPendingSynchronously() -> ::Result {
     bool progresso = false;
-    for (const auto& servidor : servidores_) {
+    for (std::size_t i = 0; i < servidores_.size(); ++i) {
+        const auto& servidor = servidores_[i];
         const Result resultado = servidor->ProcessPendingSynchronously();
         if (std::getenv("IA_IPC_TRACE") != nullptr)
             std::fprintf(stderr,
-                         "[ipc] pump servidor=%zu Result=%u (progresso=%d)\n",
+                         "[ipc] pump servidor=%zu/%zu Result=%u (progresso=%d)\n",
+                         i,
                          servidores_.size(),
                          static_cast<unsigned>(resultado.GetInnerValue()),
                          resultado == ResultSuccess ? 1 : 0);
