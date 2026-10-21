@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <thread>
 #include <cstdio>
 #include <csetjmp>
 #include <cstdio>
@@ -372,7 +373,21 @@ inline std::uint64_t dispatch_token(GuestThreadState* st) {
 // thread — trap aninhada — ou (b) o teto de spin estourou. Em ambos os
 // casos o chamador trata a trap como fault e sai pela recuperação.
 inline bool dispatch_take(std::uint64_t me) {
-    for (int i = 0; i < 200000; ++i) {
+    // **Espera pelo dono** — em vez de desistir ao fim de um spin.
+    //
+    // Medido (`boot_p9s.log`): o jogo tem várias threads, e as correm
+    // como threads do host (em paralelo). Quando duas fazem um SVC ao
+    // mesmo tempo, a segunda encontra a posse tomada e — com o spin
+    // antigo — batia no "teto de spin" e a trap era tratada como
+    // **fault** (`fault_pc` = o BRK do SVC, `fault_addr` = 0). Era
+    // esse o fault: não era o guest a ler de um ponteiro nulo, era a
+    // segunda thread a ser recusada.
+    //
+    // A posse é transferida quando o dono acaba o despacho ou quando
+    // estaciona (um SVC bloqueante larga o dono antes de dormir ✓),
+    // por isso esperar é o comportamento certo.
+    const auto limite = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    for (;;) {
         std::uint64_t expect = kOwnerFree;
         if (g_dispatch_owner.compare_exchange_strong(expect, me,
                                                      std::memory_order_acq_rel,
@@ -380,8 +395,12 @@ inline bool dispatch_take(std::uint64_t me) {
             return true;
         if (g_dispatch_owner.load(std::memory_order_acquire) == me)
             return false; // trap aninhada: o próprio dono
+        if (std::chrono::steady_clock::now() > limite)
+            return false; // o dono nao largou a posse em 5 s
+        // Dorme: a espera e' por um despacho **breve** (o dono so' a
+        // segura enquanto responde a um SVC).
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
-    return false; // teto de spin: um despacho ficou demasiado tempo
 }
 
 // Liberta o dono. Só o próprio dono liberta; o `expect` do
@@ -737,25 +756,58 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
                       (unsigned long long)g_hooks.fault_sp);
         r.error = msg;
 
+        // **A stack do guest no fault.** O SDK usa um "contexto" whose
+        // o ponteiro está num slot da stack (`[sp+0x1f8]`, no dump do
+        // código) — e é null no fault. O dump mostra o que está à volta.
+        {
+            char linha[320];
+            std::size_t n = 0;
+            n += static_cast<std::size_t>(
+                std::snprintf(linha + n, sizeof(linha) - n, "[fault] stack sp=0x%llx:",
+                               (unsigned long long)g_hooks.fault_sp));
+            for (std::size_t off = 0; off <= 0x200; off += 8) {
+                std::uint64_t v = 0;
+                if (!svc_.read_guest(g_hooks.fault_sp + off, &v, sizeof v))
+                    continue;
+                if (v == 0)
+                    continue;
+                n += static_cast<std::size_t>(
+                    std::snprintf(linha + n, sizeof(linha) - n, " [%llx]=0x%llx",
+                                   (unsigned long long)off,
+                                   (unsigned long long)v));
+                if (n + 20 >= sizeof(linha))
+                    break;
+            }
+            if (n + 2 < sizeof(linha))
+                n += static_cast<std::size_t>(std::snprintf(linha + n, sizeof(linha) - n, "\n"));
+            const ssize_t w = ::write(2, linha, n);
+            (void)w;
+        }
+
         // **Os bytes do código no PC do fault.** O VA do guest é plano
         // (a reserva é um `mmap` de gama fixa — o endereço do guest é
         // o endereço do host), por isso se lêem direto. É o que diz o
         // que a instrução está a fazer — sem símbolos, os bytes são a
         // única pista.
         {
-            const auto* codigo = reinterpret_cast<const std::uint8_t*>(g_hooks.fault_pc);
-            char linha[256];
-            std::size_t n = 0;
-            n += static_cast<std::size_t>(
-                std::snprintf(linha + n, sizeof(linha) - n, "[fault] cod em 0x%llx:",
-                               (unsigned long long)g_hooks.fault_pc));
-            for (std::size_t i = 0; i < 48 && n + 4 < sizeof(linha); ++i)
+            // A leitura e' a segura do dispatcher: o acesso do host nao
+            // pode faultar (o `read` do guest usa um processo filho).
+            std::uint8_t codigo[64] = {0};
+            if (svc_.read_guest(g_hooks.fault_pc - 16, codigo, sizeof codigo)) {
+                char linha[320];
+                std::size_t n = 0;
                 n += static_cast<std::size_t>(
-                    std::snprintf(linha + n, sizeof(linha) - n, " %02x", codigo[i]));
-            if (n + 2 < sizeof(linha))
-                n += static_cast<std::size_t>(std::snprintf(linha + n, sizeof(linha) - n, "\n"));
-            const ssize_t w = ::write(2, linha, n);
-            (void)w;
+                    std::snprintf(linha + n, sizeof(linha) - n, "[fault] cod (pc-16) 0x%llx:",
+                                   (unsigned long long)g_hooks.fault_pc));
+                for (std::size_t i = 0; i < sizeof codigo && n + 4 < sizeof(linha); ++i)
+                    n += static_cast<std::size_t>(
+                        std::snprintf(linha + n, sizeof(linha) - n, " %02x", codigo[i]));
+                if (n + 2 < sizeof(linha))
+                    n += static_cast<std::size_t>(
+                        std::snprintf(linha + n, sizeof(linha) - n, "\n"));
+                const ssize_t w = ::write(2, linha, n);
+                (void)w;
+            }
         }
     }
 
