@@ -1019,31 +1019,94 @@ private:
         if (align < kPaginaPequena)
             align = kPaginaPequena;
 
-        // A alocação sai da região das páginas pequenas do VA da GPU.
+        // ── O endereço é o do guest ─────────────────────────────────────────
+        //
+        // O Eden (`nvmap/core/nvmap.cpp:25-52`, `Handle::Alloc`):
+        //
+        //     if (pAddress) {
+        //         flags.keep_uncached_after_free.Assign(0);
+        //     } else {
+        //         LOG_CRITICAL(Service_NVDRV,
+        //             "Mapping nvmap handles without a CPU side address is "
+        //             "unimplemented!");
+        //     }
+        //     ...
+        //     address = pAddress;
+        //
+        // Ou seja: **o Eden usa o endereço que o guest pediu** ✗. O que
+        // o Eden acrescenta ✗ é o mapeamento desse endereço no espaço do
+        // dispositivo ✗ (`nvmap.cpp:137-141`, `LockForMapDeviceAddressSpace`)
+        // ✗ — para a GPU o poder ler ✗.
+        //
+        // **A casa ignorava o endereço do guest** ✗ e devolvia um do seu
+        // contador ✗. O guest, como o Eden ✗, escreve no endereço **que
+        // pediu** ✗ — e a casa lia um sítio onde ninguém escreveu ✗.
+        //
+        // Medido (`boot_v2.log` ✗): o push buffer do `SubmitGPFIFO`
+        // (0xB9112000 ✗, 2205 bytes ✗) e a região do canal
+        // (0x98011000 ✗, 328 MB ✗) estavam **ambos a zeros** ✗ — e o
+        // `SubmitGPFIFO` traduzia **0 comandos** ✗ ✗.
+        //
+        // Na casa o VA da GPU **é** o espaço do guest ✗ (nota da
+        // `VmDaGpu` ✗) — por isso o endereço pedido serve tal e qual ✗:
+        // o guest escreve nele ✗ e a casa lê nele ✓.
+        const std::uint64_t pedido = params.address;
+        std::uint64_t endereco = 0;
+
         const std::uint64_t tamanho =
             (static_cast<std::uint64_t>(it->second.tamanho) + kPaginaPequena - 1) &
             ~static_cast<std::uint64_t>(kPaginaPequena - 1);
-        if (va_.proximo_pequeno + tamanho > va_.split) {
-            LOG_WARNING(Service_NVDRV, "nvmap: IocAlloc: sem espaço no VA da GPU");
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::InsufficientMemory);
-            return;
+
+        if (pedido != 0) {
+            // O guest pediu este endereço ✗ — é o dele ✗.
+            endereco = pedido;
+
+            // E se colidir com outra alocação ✗? O Eden mapeia por cima ✗
+            // ✗ — e avisa ✗.
+            for (const auto& [id, h] : nvmap_) {
+                if (id == params.handle || !h.alocado)
+                    continue;
+                const std::uint64_t fim = h.endereco + h.tamanho;
+                if (pedido < fim && h.endereco < pedido + tamanho) {
+                    LOG_WARNING(Service_NVDRV,
+                                "nvmap: IocAlloc: o endereco pedido 0x{:X} colide com o "
+                                "handle {} (0x{:X}..0x{:X})",
+                                pedido, id, h.endereco, fim);
+                    break;
+                }
+            }
+        } else {
+            // Sem endereço ✗: o Eden nem isso suporta ✗ ✗ ("unimplemented"
+            // ✗). A casa dá o do contador ✗ — para o jogo ter onde meter
+            // alguma coisa ✗ — e **diz** ✗.
+            LOG_WARNING(Service_NVDRV,
+                        "nvmap: IocAlloc: o guest nao pediu endereco — o Eden "
+                        "considera isto nao implementado; a casa usa o do VA");
+            if (va_.proximo_pequeno + tamanho > va_.split) {
+                LOG_WARNING(Service_NVDRV, "nvmap: IocAlloc: sem espaço no VA da GPU");
+                ResponseBuilder rb{ctx, 3};
+                rb.Push(ResultSuccess);
+                rb.PushEnum(NvResult::InsufficientMemory);
+                return;
+            }
+            endereco = va_.proximo_pequeno;
+            va_.proximo_pequeno += tamanho;
         }
 
-        it->second.endereco = va_.proximo_pequeno;
+        it->second.endereco = endereco;
         it->second.align = align;
         it->second.alocado = true;
-        va_.proximo_pequeno += tamanho;
 
         // O registo **partilhado**: o compositor precisa de chegar ao
         // endereco do buffer quando o jogo o entrega pelo binder
         // (`SetPreallocatedBuffer` traz o handle do `nvmap`).
         RegistoNvmap::Instancia().Registar(params.handle, it->second.endereco, tamanho);
 
-        LOG_DEBUG(Service_NVDRV, "nvmap: IocAlloc handle={} tamanho=0x{:X} -> 0x{:X}",
-                  params.handle, it->second.tamanho, it->second.endereco);
+        LOG_DEBUG(Service_NVDRV,
+                  "nvmap: IocAlloc handle={} tamanho=0x{:X} pedido=0x{:X} -> 0x{:X}",
+                  params.handle, it->second.tamanho, pedido, it->second.endereco);
 
+        // O endereço que sai é **o pedido** ✗ — como no Eden ✗.
         params.address = it->second.endereco;
         EscreverSaida(ctx, params);
         RespostaOk(ctx);
@@ -1540,35 +1603,53 @@ private:
         // **O VA da GPU é o espaço do guest** (ver a nota do `VmDaGpu`),
         // por isso ler os comandos é ler a memória do guest.
         //
+        // ── O `size` é em PALAVRAS, não em bytes ──────────────────────────
+        //
+        // O upstream (`dma_pusher.h:77-86` ✗, `Tegra::CommandListHeader` ✗):
+        //
+        //     BitField<42, 21, u64> size;
+        //
+        // e o `DmaPusher::ProcessCommands` ✗ recebe ✗
+        // `std::span<const CommandHeader>` ✗ — ou seja ✗, `size` palavras
+        // de 32 bits ✗ (`GpuGuestMemory<CommandHeader>` ✗ lê `size`
+        // **elementos** ✗).
+        //
+        // **Prova medida** ✗: no pedido real ✗, a entrada 1 começa em
+        // `0xE2D67000 + 0x2274` ✗ — e `0x2274` = 8820 ✗ = 2205 palavras ✗
+        // ✓✓. A casa lia `size` como **bytes** ✗ e lia 4× menos ✗✗ ✗.
+        //
         // **Os tamanhos são limitados.** Um cabeçalho com um `size`
         // absurdo (o guest corrompido, ou um push buffer que ainda não é
         // o que pensamos) faria alocar gigabytes — e a memória do guest
         // é um `mmap` plano: ler fora dela é um fault. O limite é o
-        // mesmo que o `drain_pushbuffer` da casa usa (4 MiB).
-        constexpr std::uint64_t kLimitePorEntrada = 4u * 1024u * 1024u;
-        constexpr std::uint64_t kLimiteTotal = 16u * 1024u * 1024u;
+        // mesmo que o `drain_pushbuffer` da casa usa (4 MiB), em palavras.
+        constexpr std::uint64_t kLimitePorEntrada = 4u * 1024u * 1024u;   // em palavras
+        constexpr std::uint64_t kLimiteTotal = 16u * 1024u * 1024u;       // em palavras
 
         std::vector<std::uint8_t> pushbuffer;
         for (const auto& cab : cabecalhos) {
+            const std::uint64_t palavras = cab.Tamanho();
+            const std::uint64_t bytes = palavras * 4u;
             LOG_DEBUG(Service_NVDRV,
-                      "SubmitGPFIFO: entrada addr=0x{:X} tamanho={} push_buffer={} sync={}",
-                      cab.Endereco(), cab.Tamanho(), cab.EhPushBuffer() ? 1 : 0,
+                      "SubmitGPFIFO: entrada addr=0x{:X} tamanho={} palavras ({} bytes) "
+                      "push_buffer={} sync={}",
+                      cab.Endereco(), palavras, bytes, cab.EhPushBuffer() ? 1 : 0,
                       cab.Sync() ? 1 : 0);
-            if (cab.Tamanho() == 0)
+            if (palavras == 0)
                 continue;
-            if (cab.Tamanho() > kLimitePorEntrada ||
-                pushbuffer.size() + cab.Tamanho() > kLimiteTotal) {
+            if (palavras > kLimitePorEntrada ||
+                pushbuffer.size() / 4 + palavras > kLimiteTotal) {
                 // **Aviso, e não erro**: devolver `InvalidSize` ao guest
                 // parte-o, e o guest tem de poder continuar.
                 LOG_WARNING(Service_NVDRV,
-                           "SubmitGPFIFO: entrada com tamanho {} acima do limite",
-                           cab.Tamanho());
+                           "SubmitGPFIFO: entrada com tamanho {} palavras acima do limite",
+                           palavras);
                 continue;
             }
             const std::size_t inicio = pushbuffer.size();
-            pushbuffer.resize(inicio + static_cast<std::size_t>(cab.Tamanho()), 0);
+            pushbuffer.resize(inicio + static_cast<std::size_t>(bytes), 0);
             if (!LerDoGuest(cab.Endereco(), pushbuffer.data() + inicio,
-                            static_cast<std::size_t>(cab.Tamanho()))) {
+                            static_cast<std::size_t>(bytes))) {
                 LOG_WARNING(Service_NVDRV, "SubmitGPFIFO: não li o comando em 0x{:X}",
                             cab.Endereco());
                 ResponseBuilder rb{ctx, 3};
@@ -1580,6 +1661,36 @@ private:
 
         // ── O fluxo de métodos ──────────────────────────────────────────
         //
+        // **O dump descodificado** ✗: as primeiras palavras do push buffer
+        // lidas como comandos de host ✗ (o formato do upstream ✗,
+        // `dma_pusher.h:89-97` ✗) ✗:
+        //
+        //     método      = bits [0, 13)   ✗
+        //     subcanal    = bits [13, 16)  ✗
+        //     nº de args  = bits [16, 29)  ✗
+        //     modo        = bits [29, 32)  ✗
+        //
+        // Se o `modo` não for um dos quatro ✗ (0 ✗, 1 ✗, 2 ✗, 3 ✗) ✗, o
+        // upstream **ignora** a palavra ✗ (`dma_pusher.cpp:189-191` ✗) ✗ —
+        // e é isso que o dump deixa ver ✗ ✗.
+        {
+            char linha[256];
+            std::size_t n = 0;
+            for (std::size_t i = 0; i + 4 <= pushbuffer.size() && i < 32 * 4; i += 4) {
+                std::uint32_t bruto = 0;
+                std::memcpy(&bruto, pushbuffer.data() + i, 4);
+                n += static_cast<std::size_t>(std::snprintf(
+                    linha + n, sizeof(linha) - n,
+                    "%s[%2zu] 0x%08x m=%u sc=%u args=%u modo=%u\n", n ? " " : "[gpfifo] dec ", i / 4,
+                    bruto, bruto & 0x1FFFu, (bruto >> 13) & 0x7u, (bruto >> 16) & 0x1FFFu,
+                    (bruto >> 29) & 0x7u));
+                if (n + 2 >= sizeof(linha))
+                    break;
+            }
+            const ssize_t w = ::write(2, linha, n);
+            (void)w;
+        }
+
         // O push buffer **não** é uma lista de {tipo, endereço, tamanho}:
         // é um fluxo de métodos (o upstream: `dma_pusher.cpp`,
         // `ProcessCommands`). Cada método começa por um `CommandHeader`
