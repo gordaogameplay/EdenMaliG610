@@ -3347,7 +3347,7 @@ O Eden implementa isso com a pilha completa do *surfaceflinger* do
 Android (`nvnflinger/buffer_queue_producer.cpp`, 36 KB, mais o
 `surface_flinger.cpp` e o `hardware_composer.cpp`).
 
-**O que a casa precisa,在这一Transactions**: o *binder* da casa é o
+**O que a casa precisa**: o *binder* da casa é o
 compositor — tem de responder a estas transacções (dar um buffer ao
 jogo, receber o buffer desenhado) e apresentá-lo. É a **fila de
 buffers** do Android, em versão mínima.
