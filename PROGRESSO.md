@@ -3748,6 +3748,32 @@ de argumentos nulo** — o que aponta para o *stack slot* do guest ter
 sido estragado (ou para o wrapper estar a ser chamado com um
 argumento que nunca foiposto).
 
+### Onde o jogo está — o mapa das cv (medido, `boot_p9w.log`)
+
+```
+4687  SignalProcessWideKey key=0x10a2c7764  acordados=0     (sinal pendente ✓)
+4695  WaitProcessWideKeyAtomic cv=0x10a2c7844 tag=0x20003   (worker A)
+4700  WaitProcessWideKeyAtomic cv=0x10a2c7b0c tag=0x28004   (worker B)
+4706  SignalProcessWideKey  key=0x10a2c7b0c acordados=1      ← worker B acorda ✓
+4708  WaitProcessWideKeyAtomic cv=0x10a2c7bec tag=0x28004   (worker B, próximo posto)
+11916 SignalProcessWideKey  key=0x10a2c7844 acordados=0      ← worker A NÃO é encontrado
+11917 WaitProcessWideKeyAtomic cv=0x10a2c7d64 tag=0x81ff    (main, à espera da frame)
+```
+
+**O worker B acorda ✓** (o signal pendente + o signal que acorda o
+*waiter* funinam ✓) — **o worker A não** ✗: o signal chega e a fila
+da cv está vazia ✗, apesar de o worker A ter estacionado lá (linha
+4695 ✓).
+
+E a correcção do *prazo de salvaguarda* (que tirei — com ele, o
+*waiter* desistia e saía da fila, e o signal posterior não tinha
+ninguém ✓) é o que torna isto visível.
+
+**O passo seguinte é exacto**: instrumentar a *inscrição* do *waiter*
+na fila da cv e a *consulta* no signal (quantos *waiters* há em cada
+fila, e com que chave) — para ver onde a inscrição do worker A se
+perde. É uma linha de instrumentação e fecha o caso.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native

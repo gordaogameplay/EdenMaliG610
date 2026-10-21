@@ -1977,11 +1977,25 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
             // o que uma *cv* bem usada faz.
             //
             // `IA_WAIT_MS` desliga a rede (espera infinita, como o Eden).
+            //
+            // **O prazo é só para diagnóstico** (`IA_WAIT_MS`). Com ele,
+            // o *waiter* desiste e sai da fila — e o sinal que chegava
+            // depois já não tinha ninguém para acordar (medido: o
+            // *worker* do jogo ficou à espera para sempre, e o jogo
+            // parou num "limite de traps").
+            //
+            // A espera normal é **sem fim**, como no Eden ✓ — e as
+            // perdas de sinal estão cobertas pelo "sinal pendente" e
+            // pelo signal que acorda o *waiter*.
             const char* prazo_ms = std::getenv("IA_WAIT_MS");
-            const auto limite = prazo_ms != nullptr
-                                    ? std::chrono::milliseconds(std::atoi(prazo_ms))
-                                    : std::chrono::milliseconds(16);
-            if (!g_arbiter.wake.wait_for(lock, limite, dono_acordou)) {
+            bool expirou = false;
+            if (prazo_ms != nullptr) {
+                expirou = !g_arbiter.wake.wait_for(
+                    lock, std::chrono::milliseconds(std::atoi(prazo_ms)), dono_acordou);
+            } else {
+                g_arbiter.wake.wait(lock, dono_acordou);
+            }
+            if (expirou) {
                 // Expirou: sai da fila (como o caminho do prazo).
                 if (auto cv = g_arbiter.cv_fila.find(cv_key);
                     cv != g_arbiter.cv_fila.end()) {
