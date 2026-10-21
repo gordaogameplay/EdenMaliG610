@@ -45,6 +45,8 @@
 #include "vendor/eden/core/hle/service/apm/apm_controller.h"
 #include "vendor/eden/core/hle/service/aoc/addon_content_manager.h"
 #include "g610/services/applet_oe.hpp"
+#include "g610/services/fsp_srv.hpp"
+#include "g610/services/nvdrv.hpp"
 #include "g610/services/time_u.hpp"
 #include "vendor/eden/core/hle/service/lm/lm.h"
 #include "vendor/eden/core/hle/service/pctl/pctl.h"
@@ -445,6 +447,22 @@ EdenSystem::EdenSystem(GuestMemory& memoria, std::uint64_t pid, std::uint64_t ti
     //    um `System` ainda em construção.
     kernel_ = std::make_unique<Kernel::KernelCore>(*this);
 
+    // 1b. O `KernelCore` fica ligado ao `System` **já**. O
+    //     `ServiceManager` (passo 5) constrói o `IpcController` no seu
+    //     construtor, e o `Controller` guarda uma referência ao
+    //     `KernelCore` — que, se ainda não estiver ligado, é uma
+    //     referência nula. O primeiro uso é o `CloneCurrentObject` (o SDK
+    //     converte a sessão do `fsp-srv` em domínio), e aí o motor
+    //     escreve no mutex de um `KernelCore` nulo e morre. Medido
+    //     (`boot_p6i.log`): o backtrace era
+    //     `CloneCurrentObject -> KSession::KSession ->
+    //     KernelCore::RegisterKernelObject`, com o fault em
+    //     `pthread_mutex_lock`.
+    //
+    //     A nota do passo 6 (abaixo) explica porque é que o `ligar()`
+    //     completo continua a ser preciso no fim.
+    ligar_kernel(*kernel_);
+
     // 2. A tabela de handles e os limites de recursos.
     handles_ = std::make_unique<Kernel::KHandleTable>(*kernel_);
     handles_->Initialize(*kernel_, kEntradasDaTabela);
@@ -520,19 +538,15 @@ EdenSystem::EdenSystem(GuestMemory& memoria, std::uint64_t pid, std::uint64_t ti
     //    "sm:" e chama-nos `RunServer` — que fica com a posse sem correr nada.
     sm_ = std::make_unique<Service::SM::ServiceManager>(*kernel_);
 
-    // 6. Só agora é que o `Core::System` tem o que apontar. Até aqui, `Kernel()`
-    //    devolveria uma referência a nada — e o `ServiceManager` acima chama-o
-    //    no seu construtor (`sm.cpp:31`), o que é a prova de que a ligação
-    //    tem de estar feita ANTES dele existir, e não depois.
+    // 6. O `Reporter` precisa de um `System&` no construtor, e só pode ser
+    //    construído aqui — o `EdenSystem` é o único que é um `System` completo
+    //    neste momento. Ver a nota do `ligar()` em `system_ref.h`.
     //
-    //    A volta que o Eden dá: `SM::ServiceManager` recebe `kernel.System()`
-    //    e usa-o. Nós construímos o `ServiceManager` **depois** do
-    //    `KernelCore`, e por isso o `System` já pode apontar para os dois
-    //    quando o `ServiceManager` é criado. Não há volta nenhuma — é a
-    //    mesma ordem que o Eden usa, lida ao contrário.
-    // O `Reporter` precisa de um `System&` no construtor, e só pode ser
-    // construido aqui — o `EdenSystem` é o único que é um `System` completo
-    // neste momento. Ver a nota do `ligar()` em `system_ref.h`.
+    //    O `kernel_` **já** está ligado (passo 1b): o `ServiceManager` do
+    //    passo 5 constrói o `IpcController` no seu construtor, e o
+    //    `Controller` guarda uma referência ao `KernelCore`. Sem a ligação
+    //    antecipada, essa referência é nula e o motor morre no primeiro
+    //    `CloneCurrentObject`. Ver a nota do `ligar_kernel()`.
     reporter_ = std::make_unique<Core::Reporter>(*this);
 
     ligar(*kernel_, *sm_, *reporter_);
@@ -588,6 +602,22 @@ EdenSystem::EdenSystem(GuestMemory& memoria, std::uint64_t pid, std::uint64_t ti
     // `SetTerminateResult` (o cap do passo 6). Ver
     // `src/services/time_u.cpp`.
     g610::services::registar_time_u(*this);
+
+    // O `fsp-srv` — o servidor de ficheiros. Medido (`boot_p6f.log`): é o
+    // **único** dos dez serviços que o SDK pede no arranque que faltava.
+    // Sem ele, o `sm:` defere o `GetService` e o guest aborta no reader
+    // CMIF (`modulo=10 desc=212`), porque o diferimento no motor nativo
+    // devolve uma resposta de 0 palavras em vez de deixar o guest
+    // bloqueado. Ver `src/services/fsp_srv.cpp`.
+    g610::services::registar_fsp_srv(*this);
+
+    // O `nvdrv` — o driver da NVIDIA, que e' a porta de entrada da GPU.
+    // Medido (`boot_p6l.log`): depois do `fsp-srv`, e' o proximo servico
+    // que o SDK pede e que faltava. O servico e' **fino** (a interface do
+    // Eden, com as formas das respostas, sem o driver): o trabalho de
+    // verdade — o push buffer para o tradutor Maxwell -> Vulkan da casa
+    // — e' o passo seguinte. Ver `src/services/nvdrv.cpp`.
+    g610::services::registar_nvdrv(*this);
 
     // A verificacao que esteve aqui -- `KObjectName::Find("sm:")` -- **partiu
     // o jogo**.
