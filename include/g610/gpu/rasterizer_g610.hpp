@@ -47,7 +47,20 @@ namespace g610::gpu {
 // Vulkan (o `ValhallBackend` ✗) entra por cima desta classe ✗. A
 // contagem não é decoração: é o que permite dizer, com medição, que o
 // jogo chegou a desenhar ✓ — e o que a telemetria mostra ✓.
-class RasterizerG610 final : public Tegra::VideoCore::RasterizerInterface {
+// **O namespace é o global `VideoCore`** ✓ — medido no upstream: o
+// `rasterizer_interface.h` fecha `namespace Tegra` na linha 27 e abre
+// `namespace VideoCore` na 29 ✓ (fora de `Tegra` ✓). E é assim que o
+// próprio upstream a usa ✓ (`maxwell_3d.cpp:43` ✓,
+// `kepler_memory.h:43` ✓, `puller.h:78` ✓): `VideoCore::RasterizerInterface`
+// ✓.
+//
+// **Cuidado**: existe *outro* `VideoCore` ✓ — o `Tegra::VideoCore` de
+// `video_core/video_core.h:16-27` ✓, que é onde vive o `RendererBase` ✓.
+// São dois `VideoCore` diferentes ✓ e o upstream não os unifica ✗.
+// Escrever `Tegra::VideoCore::RasterizerInterface` não compila ✗ — e o
+// erro que dá ("'Tegra::VideoCore' has not been declared" ✗) não diz
+// nada sobre o namespace certo ✗.
+class RasterizerG610 final : public VideoCore::RasterizerInterface {
 public:
     // O que a casa sabe fazer hoje, exposto para quem sabe escrever no
     // guest e sinalizar fences ✓.
@@ -83,7 +96,7 @@ public:
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
-    RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
+    VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
     void InvalidateRegion(DAddr addr, u64 size,
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void OnCacheInvalidation(PAddr addr, u64 size) override;

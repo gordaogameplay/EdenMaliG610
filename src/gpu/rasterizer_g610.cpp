@@ -8,6 +8,14 @@
 
 #include "vendor/eden/common/logging.h"
 
+// A definicao completa do `AccelerateDMAInterface` ✓.
+//
+// O `rasterizer_interface.h` so' o **declara** ✓ (linha 22 ✓) — a
+// definicao esta' em `video_core/engines/maxwell_dma.h` ✓ (linha 78 ✓).
+// Sem este include, a classe fica incompleta ✗ e o `override` nao
+// compila ✗.
+#include "video_core/engines/maxwell_dma.h"
+
 namespace g610::gpu {
 
 namespace {
@@ -24,10 +32,12 @@ public:
     bool BufferClear(GPUVAddr, u64, u32) override {
         return false;
     }
-    bool ImageToBuffer(const DMA::ImageCopy&, const DMA::ImageOperand&, const DMA::BufferOperand&) override {
+    bool ImageToBuffer(const Tegra::DMA::ImageCopy&, const Tegra::DMA::ImageOperand&,
+                       const Tegra::DMA::BufferOperand&) override {
         return false;
     }
-    bool BufferToImage(const DMA::ImageCopy&, const DMA::BufferOperand&, const DMA::ImageOperand&) override {
+    bool BufferToImage(const Tegra::DMA::ImageCopy&, const Tegra::DMA::BufferOperand&,
+                       const Tegra::DMA::ImageOperand&) override {
         return false;
     }
 };
@@ -96,7 +106,7 @@ void RasterizerG610::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
     // quando o pedido é de 64 ✗ e 32 quando é de 32 ✗. Sem o flag ✗,
     // escreve-se 64 ✓ (o registo do semáforo do Switch é de 64 bits ✓).
     const std::uint64_t valor = payload;
-    if (flags & VideoCommon::QueryPropertiesFlags::HasTimeout) {
+    if (True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout)) {
         // O pedido com prazo ✗ — o valor tem o prazo embebido ✗.
         const std::uint64_t com_prazo = payload;
         (void)com_prazo;
@@ -172,7 +182,7 @@ bool RasterizerG610::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheTyp
     return false;
 }
 
-RasterizerDownloadArea RasterizerG610::GetFlushArea(DAddr addr, u64 size) {
+VideoCore::RasterizerDownloadArea RasterizerG610::GetFlushArea(DAddr addr, u64 size) {
     (void)addr;
     (void)size;
     return {};
