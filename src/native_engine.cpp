@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
+#include <execinfo.h>
 #include <unistd.h>
 #include <ucontext.h>
 
@@ -1208,6 +1210,41 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         ++*ts.faults;
         *ts.last = TrapKind::GuestFault;
         g_hooks.tel->note_page_fault();
+
+        // **Instrumento: um fault do MOTOR, distinguido do fault do
+        // GUEST.**
+        //
+        // O PC do fault fora da reserva do guest (`[0x60000000,
+        // 0x310000000)`) é código **do motor** — tipicamente o handler
+        // de um SVC, a meio do serviço. Sem esta linha, o relatório
+        // dizia "fault de memória do guest" e o PC era um número sem
+        // dono; o diagnóstico parava aí.
+        //
+        // O `dladdr` não é async-signal-safe (o standard diz que não
+        // pode ser chamado de um handler), mas só **lê** a tabela de
+        // símbolos dinâmica, sem alocar — e o caminho já é o da morte
+        // do processo, onde a alternativa é não saber nada.
+        if (pc < 0x60000000ull || pc >= 0x310000000ull) {
+            Dl_info dl{};
+            if (::dladdr(reinterpret_cast<void*>(pc), &dl) != 0 &&
+                dl.dli_sname != nullptr) {
+                char b[256];
+                const int n = std::snprintf(
+                    b, sizeof(b),
+                    "[host-fault] pc=0x%llx em %s (+0x%llx) — codigo do MOTOR\n",
+                    (unsigned long long)pc, dl.dli_sname,
+                    (unsigned long long)(pc - (std::uintptr_t)dl.dli_saddr));
+                const ssize_t w = ::write(2, b, (size_t)n);
+                (void)w;
+            }
+            // O backtrace: o `dladdr` da só a função do topo, e o que
+            // interessa é quem chamou. `backtrace_symbols_fd` escreve
+            // directo no fd (sem alocar), o que é o que se pode fazer
+            // de um handler.
+            void* frames[24]{};
+            const int nframes = ::backtrace(frames, 24);
+            ::backtrace_symbols_fd(frames, nframes, 2);
+        }
 
         // Um fault de memória não pode continuar: deixar o sigreturn
         // re-executar a mesma instrução entraria em ciclo até o processo ser
