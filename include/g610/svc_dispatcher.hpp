@@ -515,6 +515,17 @@ private:
     // Cada grupo devolve Result; o resultado é escrito em ctx.ret.
     Result svc_set_heap_size(SvcContext&);
     Result svc_signal_process_wide_key(SvcContext&);
+
+    // O arbiter de mutex do nn::os (passo 4). Semântica medida no Eden:
+    // `KConditionVariable::WaitForAddress` / `SignalToAddress`
+    // (k_condition_variable.cpp:116,156) e `svc_lock.cpp`. O Lock só
+    // estaciona quando o u32 em `addr` é `handle | 0x40000000`
+    // (HandleWaitMask, svc_common.h:19); o Unlock escreve o tag do próximo
+    // dono e desperta-o. As duas JUNTAS são o mutex: implementar uma sem a
+    // outra deixa as threads em loop como antes.
+    Result svc_arbitrate_lock(SvcContext&);
+    Result svc_arbitrate_unlock(SvcContext&);
+
     Result svc_exit_process(SvcContext&);
     Result svc_close_handle(SvcContext&);
     Result svc_control_memory(SvcContext&);

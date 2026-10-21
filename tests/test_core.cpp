@@ -311,6 +311,76 @@ void test_svc_dispatch() {
         check(svc.exited(), "ExitProcess marca o processo como terminado");
         check(svc.exit_code() == 42, "ExitProcess guarda o código em x0");
     }
+
+    // ── ArbitrateLock / ArbitrateUnlock (0x1A / 0x1B) — passo 4 ────────
+    //
+    // Aqui apenas os caminhos SEM estacionamento: fora da trap não há
+    // dono do despacho, e o estacionamento devolve Invalid por desenho
+    // (só dentro de um despacho é possível). A transferência com fila
+    // (estacionar, entregar, acordar) é validada pelo boot no Pi — é
+    // exactamente o que o rtld/jogo fazem, e aí é o critério real:
+    // deixarem de queimar milhares de traps #26.
+    constexpr std::uint32_t kDonoHandle = 0x1234;
+    constexpr std::uint32_t kWaitMask   = 0x4000'0000u;
+    const std::uint64_t kLockAddr = kBase + 0x3000;
+    {
+        // Lock com palavra FREE (0): Success imediato, palavra intacta.
+        std::uint32_t livre = 0;
+        if (!mem.write(kLockAddr, &livre, sizeof livre, err))
+            return;
+        g610::SvcContext c;
+        c.x[0] = kDonoHandle;
+        c.x[1] = kLockAddr;
+        c.x[2] = 0x9999;          // tag do pedinte — irrelevante sem fila
+        svc.dispatch(static_cast<std::uint32_t>(g610::Svc::ArbitrateLock), c);
+        check(c.ret == 0, "ArbitrateLock com cabeça livre devolve Success");
+        std::uint32_t lida = 0xFFFF'FFFF;
+        mem.read(kLockAddr, &lida, sizeof lida, err);
+        check(lida == 0, "ArbitrateLock sem espera NÃO escreve na cabeça");
+
+        // Endereço desalinhado: InvalidAddress (Eden valida IsAligned 4).
+        g610::SvcContext mal;
+        mal.x[0] = kDonoHandle;
+        mal.x[1] = kLockAddr + 1;
+        mal.x[2] = 0x9999;
+        svc.dispatch(static_cast<std::uint32_t>(g610::Svc::ArbitrateLock), mal);
+        check(mal.ret != 0, "ArbitrateLock desalinhado é recusado");
+
+        // Unlock SEM fila: a cabeça volta a 0 (Eden escreve 0
+        // incondicionalmente — SignalToAddress, k_condition_variable.cpp:142).
+        std::uint32_t held = kDonoHandle | kWaitMask;
+        if (!mem.write(kLockAddr, &held, sizeof held, err))
+            return;
+        g610::SvcContext u;
+        u.x[0] = kLockAddr;
+        svc.dispatch(static_cast<std::uint32_t>(g610::Svc::ArbitrateUnlock), u);
+        check(u.ret == 0, "ArbitrateUnlock devolve Success");
+        mem.read(kLockAddr, &lida, sizeof lida, err);
+        check(lida == 0, "ArbitrateUnlock sem waiters escreve 0 (cabeça livre)");
+
+        // Unlock desalinhado: recusado.
+        g610::SvcContext um;
+        um.x[0] = kLockAddr + 2;
+        svc.dispatch(static_cast<std::uint32_t>(g610::Svc::ArbitrateUnlock), um);
+        check(um.ret != 0, "ArbitrateUnlock desalinhado é recusado");
+
+        // Lock com cabeça = dono | máscara: AQUI estacionaria, mas fora da
+        // trap não há dono do despacho — Invalid por desenho (e a palavra
+        // não muda). Documenta a fronteira, não inventa.
+        if (!mem.write(kLockAddr, &held, sizeof held, err))
+            return;
+        g610::SvcContext p;
+        p.x[0] = kDonoHandle;
+        p.x[1] = kLockAddr;
+        p.x[2] = 0x9999;
+        svc.dispatch(static_cast<std::uint32_t>(g610::Svc::ArbitrateLock), p);
+        check(p.ret != 0, "estacionar fora de despacho é Invalid (sem token)");
+        mem.read(kLockAddr, &lida, sizeof lida, err);
+        check(lida == held, "o estacionamento recusado não corrompe a cabeça");
+        // Limpa para o resto da suíte: sem fila à espera, write de 0.
+        std::uint32_t limpo = 0;
+        mem.write(kLockAddr, &limpo, sizeof limpo, err);
+    }
 }
 
 

@@ -10,6 +10,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <condition_variable>
+#include <map>
+#include <mutex>
 #include <sched.h>
 #include <thread>
 #include <vector>
@@ -123,6 +127,9 @@ std::string to_string(Svc s) {
     case Svc::FlushDataCache:          return "FlushDataCache";
     case Svc::MapPhysicalMemory:       return "MapPhysicalMemory";
     case Svc::UnmapPhysicalMemory:     return "UnmapPhysicalMemory";
+    case Svc::ArbitrateLock:           return "ArbitrateLock";
+    case Svc::ArbitrateUnlock:         return "ArbitrateUnlock";
+    case Svc::WaitProcessWideKeyAtomic: return "WaitProcessWideKeyAtomic";
     }
     return "Svc#" + std::to_string(static_cast<std::uint32_t>(s));
 }
@@ -263,6 +270,8 @@ void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
     case Svc::GetCurrentProcessorNumber: r = svc_get_current_processor_number(ctx); break;
     case Svc::CreateThread:         r = svc_create_thread(ctx); break;
     case Svc::StartThread:          r = svc_start_thread(ctx); break;
+    case Svc::ArbitrateLock:        r = svc_arbitrate_lock(ctx); break;
+    case Svc::ArbitrateUnlock:      r = svc_arbitrate_unlock(ctx); break;
     case Svc::SignalProcessWideKey: r = svc_signal_process_wide_key(ctx); break;
     default:                        r = svc_unsupported(ctx);    break;
     }
@@ -1215,6 +1224,166 @@ Result SvcDispatcher::svc_start_thread(SvcContext& ctx) {
 
     ctx.ret      = 0;
     ctx.has_ret  = true;
+    return Result::Success;
+}
+
+namespace {
+
+// ── O quadro de arbitragem (passo 4) ──────────────────────────────────────
+//
+// Semântica medida no Eden (fonte no Pi):
+//
+//   ArbitrateLock(h, addr, tag) → KConditionVariable::WaitForAddress
+//   (k_condition_variable.cpp:156): lê o u32 em `addr`; devolve Success
+//   LOGO se não for `handle | HandleWaitMask` (svc_common.h:19:
+//   HandleWaitMask = 1<<30 = 0x40000000). Só nesse estado é que a thread
+//   entra na fila do endereço.
+//
+//   ArbitrateUnlock(addr) → KConditionVariable::SignalToAddress (:116):
+//   remove o PRIMEIRO waiter; se houver mais, o próximo dono leva a
+//   máscara; escreve o tag do próximo dono em `addr` — write
+//   INCONDICIONAL, sem waiters escreve 0 — com fence seq_cst antes (:132),
+//   e SÓ ENTÃO desperta o removido (EndWait).
+//
+// Aqui a fila é por endereço, com (tag, token). O `token` é o dono do
+// despacho que a thread LARGA ao estacionar: é o identificador estável
+// usado no despertar (tipos na ABI: o `GetAddressKeyValue` do Eden é o
+// `tag`, e o despertar sai do quadro, não de uma KThread).
+//
+// Bloqueio REAL: como o Eden bloqueia a thread na fila do kernel, nós
+// bloqueamos a thread física dentro do SVC. Sem isso as threads andam em
+// loop de retry a queimar traps (a medição do passo 3: 8004 traps #26 por
+// boot, todas Unsupported porque o caso não existia).
+//
+// Serialização: a fila é tocada por (a) o unlocker — despachando, dono em
+// mãos; (b) a thread que estaciona/acorda — FORA do mundo do despacho
+// enquanto espera (largou o dono). O `gate` cobre os dois, e o
+// `std::map` aloca debaixo dele: natural aqui, porque o estacionamento
+// acontece no caminho do SVC (a alocação no handler é padrão deste
+// motor — ver o rtld), e a única reentrância possível da mesma thread é
+// uma trap aninhada, excluída enquanto a thread está estacionada (não
+// executa guest).
+
+struct ArbitrationBoard {
+    struct Waiter {
+        std::uint32_t tag;    // valor que o UNLOCKER escreve quando me torna dono
+        std::uint64_t token;  // dono do despacho que larguei; identidade do despertar
+    };
+
+    std::mutex gate;
+    std::condition_variable wake;
+    std::map<std::uint64_t, std::vector<Waiter>> fila;
+};
+
+ArbitrationBoard g_arbiter;
+
+constexpr std::uint32_t kArbWaitMask = 0x40000000u;  // HandleWaitMask, svc_common.h:19
+
+} // namespace
+
+Result SvcDispatcher::svc_arbitrate_lock(SvcContext& ctx) {
+    const std::uint32_t handle = static_cast<std::uint32_t>(ctx.x[0]);
+    const std::uint64_t addr   = ctx.x[1];
+    const std::uint32_t tag    = static_cast<std::uint32_t>(ctx.x[2]);
+
+    // Eden, svc_lock.cpp: `R_UNLESS(Common::IsAligned(address, sizeof(u32)),
+    // ResultInvalidAddress)`. (IsKernelAddress não se aplica aqui: não há
+    // metade kernel num processo destes.)
+    if (addr == 0 || (addr & 3) != 0)
+        return Result::InvalidAddress;
+
+    // O token EM CURSO desta thread é o que se larga ao estacionar e a
+    // identidade de despertar. thread_local: nenhum outro despacho o toca.
+    const std::uint64_t token = dispatch_owner_itself();
+    if (token == 0) {
+        // Estacionar sem despacho em curso não é possível nesta estrutura —
+        // o lock é chamado de dentro da trap. Se algum dia chegar 0, é um
+        // bug a registar, não semântica a burlar.
+        return Result::Invalid;
+    }
+
+    // Estacionar com a corrida fechada. A LEITURA da palavra entra no
+    // mesmo gate que o registo: se o dono largar ENTRE a leitura e o
+    // registo, estacionar era acordar uma fila que já se esvaziou — o
+    // notify perde-se e a thread dorme para sempre. Sob o gate, a ordem
+    // fica: [leitura → registo → largar o dono] numa única transacção
+    // perante o unlocker (que também corre sob o gate). É o papel do
+    // scheduler lock global no Eden.
+    {
+        std::unique_lock<std::mutex> lock(g_arbiter.gate);
+
+        std::uint32_t word = 0;
+        if (!read_guest(addr, &word, sizeof word))
+            return Result::Invalid;
+
+        // Eden WaitForAddress: "If the tag isn't the handle (with wait
+        // mask), we're done." Só estaciona quando o u32 em `addr` é o dono
+        // COM a máscara — o nn::os escreve `owner | 0x40000000` exactamente
+        // nesse caso, e é esse estado que este SVC consome. Os outros
+        // valores (0 = livre, tag puro, dono de outra thread) voltam
+        // Success imediato — inclusive ACABAR de largar (0 lido aqui).
+        if (word != (handle | kArbWaitMask))
+            return Result::Success;
+
+        g_arbiter.fila[addr].push_back({tag, token});
+        dispatch_owner_vacate();
+        g_arbiter.wake.wait(lock, [&] {
+            const auto it = g_arbiter.fila.find(addr);
+            if (it == g_arbiter.fila.end())
+                return true;
+            return std::none_of(it->second.begin(), it->second.end(),
+                                [&](const ArbitrationBoard::Waiter& w) {
+                                    return w.token == token;
+                                });
+        });
+    }
+
+    // O unlocker escreveu o NOVO dono (o meu tag) na memória do guest
+    // ANTES de despertar (Eden: WriteToUser, depois EndWait) — o resultado
+    // na memória já está. Voltar a tomar o despacho para continuar; se o
+    // teto de spin expirar (dono agarrado por muito tempo), a thread segue
+    // na mesma: o guest já É dono do mutex, e a janela sem dono é o preço
+    // do caso degenerado, não uma rota de erro.
+    dispatch_owner_set(token);
+    (void)dispatch_owner_claim();
+    return Result::Success;
+}
+
+Result SvcDispatcher::svc_arbitrate_unlock(SvcContext& ctx) {
+    const std::uint64_t addr = ctx.x[0];
+    if (addr == 0 || (addr & 3) != 0)
+        return Result::InvalidAddress;
+
+    std::uint32_t next    = 0;
+    std::uint64_t waker   = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(g_arbiter.gate);
+        const auto it = g_arbiter.fila.find(addr);
+        if (it != g_arbiter.fila.end() && !it->second.empty()) {
+            const ArbitrationBoard::Waiter w = it->second.front();
+            it->second.erase(it->second.begin());
+            if (it->second.empty())
+                g_arbiter.fila.erase(it);
+            // Eden :122: `if (has_waiters) next_value |= Svc::HandleWaitMask`
+            const bool more_waiters = g_arbiter.fila.count(addr) != 0;
+            next  = w.tag | (more_waiters ? kArbWaitMask : 0u);
+            waker = w.token;
+        }
+        // Eden :132-137: fence seq_cst antes do write; e o write é
+        // INCONDICIONAL — unlock sem waiters escreve 0 (cabeça livre). O
+        // rtld/jogo leem isto via CAS rápida própria no próximo lock.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (!write_guest(addr, &next, sizeof next))
+            return Result::Invalid;
+    }
+
+    // Despertar FORA do gate, e SÓ até quem saiu da fila. (notify_all e os
+    // outros endereços voltam a dormir pelo predicado — barato com 2-4
+    // threads, e mantém o quadro sem cond por endereço.)
+    if (waker != 0)
+        g_arbiter.wake.notify_all();
+
     return Result::Success;
 }
 

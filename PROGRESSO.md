@@ -2910,15 +2910,69 @@ no fim do processo.
 
 ## Parede de verdade que emerge
 
-As threads de guest entram num **loop determinístico de QueryMemory**
-(`[thrd] trap #26 ... sp=0x… x2=0x18002/0x81ff`) até queimar o limite
-de 4000 traps: 8004 traps de loop em 2 threads. Isto é o sinaisão de
-algo que o motor fica devolvendo errado a essas threads (região
-imaginada livre, ou resposta que não avança) — investigação do passo 4
-com a resposta do QueryMemory nas mãos.
+As threads de guest entram num **loop de retries determinístico** ao nível
+das traps `#26` (`[thrd] trap #26 ... sp=0x…`) até queimar o limite de
+4000 traps: 8004 traps de loop em 2 threads.
+
+**CORRECÇÃO ao ler as medidas de cima (passo 4, a 2026-10-21):** o
+número decimal 26 da trap é hex `0x1A`, e `0x1A` NO SWITCH NÃO É
+QueryMemory — é **ArbitrateLock** (a enum do próprio motor, e a do Eden
+`svc.h:411`: `ArbitrateLock = 0x1A`). O caso 0x1A não existia no switch
+do despachante → `svc_unsupported` (0x40) → o SDK relança o pedido em
+loop. Era UM MUTEX CRÍTICO do `nn::os` em espera, não um scan de
+memória. As implementações seguintes (passo 4) partem para a fonte Eden:
+`svc_lock.cpp` e `k_condition_variable.cpp` (WaitForAddress / SignalToAddress).
 
 ## Estado
 
 | | |
 |---|---|
 | `wip/passo-3-thread` | despacho serializado com dono por thread; 6/6 testes no Pi; sem observer a heap não corrige (3/3); as paredes deixaram de estar no motor |
+
+# 2026-10-21 — wip/passo-4-thread: ArbitrateLock/ArbitrateUnlock, o mutex do nn::os
+
+## Semântica medida na fonte (Eden no Pi)
+
+- `ArbitrateLock(handle, addr, tag)` → `KConditionVariable::WaitForAddress`
+  (`k_condition_variable.cpp:156`): lê o u32 em `addr`; **devolve Success LOGO** se
+  não for `handle | HandleWaitMask` — `HandleWaitMask = 1<<30`
+  (`svc_common.h:19`) = `0x40000000`. Só nesse estado entra na fila.
+- `ArbitrateUnlock(addr)` → `SignalToAddress` (:116): remove o PRIMEIRO
+  waiter; escreve na memória o tag do próximo dono (`|` máscara se houver
+  mais waiters, `<0>` sem nenhum) — **write incondicional** (:142), fence
+  `seq_cst` antes (:132) — e SÓ ENTÃO desperta o removido (`EndWait`).
+- `R_UNLESS(Common::IsAligned(address, sizeof(u32)), ResultInvalidAddress)`
+  (svc_lock.cpp): alinhamento 4 validado a ambas.
+
+## O que o passo 4 muda no motor
+
+1. **Dono do despacho exportável** (`native_engine.hpp`):
+   `dispatch_owner_itself()` / `_vacate()` / `_claim()` / `_set()` —
+   token `thread_local` post em curso no ponto do despacho. Um SVC
+   bloqueante LARGA o dono enquanto espera (senão o unlocker nunca
+   despacha → impasse) e volta a tomá-lo ao acordar, o mesmo que uma
+   syscall kernel bloqueante faz.
+2. **O quadro de arbitragem** (`svc_dispatcher.cpp`): fila por endereço
+   com (tag, token); `gate` de `std::mutex` + `condvar` única. A
+   transacção [leitura da palavra → registo → largar o dono] corre SOB o
+   gate — fechada face ao unlocker — porque fora do gate o unlocker pode
+   largar ENTRE a leitura e o registo e o notify perde-se (wake em rota).
+   O wait liberta o gate atomicamente.
+3. **Os casos 0x1A/0x1B no switch**, com nomes em `to_string(Svc)`, e a
+   fronteira honesta: fora de despacho (token 0) o estacionamento devolve
+   Invalid — não inventa Success.
+
+## Testes de unidade (caminhos sem estacionamento)
+
+`test_core.cpp` ganhou o bloco ArbitrateLock/Unlock: cabeça livre →
+Success sem alterar a palavra; desalinhado → recusado; unlock sem
+waiters → escreve 0; estacionamento fora de despacho → Invalid por
+desenho. A transferência com fila (estacionar/entregar/acordar) valida
+no boot real no Pi, que é o critério: as threads deixarem de queimar
+traps `#26`.
+
+## Estado
+
+| | |
+|---|---|
+| `wip/passo-4-thread` | arbiter à Eden + dono exportável; pendente Pi: compilar, 6/6+ testes, e medir os boots (traps #26 devem desabar de 8004) |

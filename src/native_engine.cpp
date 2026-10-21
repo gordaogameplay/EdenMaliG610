@@ -393,6 +393,56 @@ inline void dispatch_release(std::uint64_t me) {
 
 } // namespace
 
+// ── Exportações do dono do despacho (ver native_engine.hpp) ──────────────
+//
+// Implementa-se aqui, e não no SvcDispatcher, porque o estado (`g_dispatch_owner`)
+// vive neste TU. Os helpers anónimos acima são visíveis no mesmo TU a partir
+// da sua declaração, e as exportações são as únicas portas para fora.
+//
+// O token EM CURSO (`g_dispatch_owner_itself`) é distinto do dono atómico:
+// o dono muda de thread quando o serviço bloqueante solta; o token em curso
+// é o da thread PHYSICA que chamou. Uma thread estacionada sai do "em curso"
+// (aquela thread não está a despachar), e ao acordar repõe o LIDO antes de
+// soltar — o valor do despacho que ainda tem de terminar.
+
+namespace {
+
+// Nota de thread-safety: `thread_local` — cada thread física tem o SEU
+// token em curso, e não há global partilhado para colidir. Uma thread que
+// soltou e estacionou NÃO toca no dela até acordar. A inicialização é
+// constante (= 0), portanto sem guarda dinâmica de TLS no caminho da trap.
+//
+// Por que thread_local e não um global: uma thread estacionada (dono
+// largado) continua com o SEU token válido; um global único seria
+// sobrescrito pela thread que tomou o dono enquanto aquela espera.
+
+thread_local std::uint64_t t_dispatch_in_flight = 0;
+
+} // namespace
+
+std::uint64_t dispatch_owner_itself() {
+    return t_dispatch_in_flight;
+}
+
+void dispatch_owner_vacate() {
+    const std::uint64_t me = t_dispatch_in_flight;
+    if (me != 0) {
+        dispatch_release(me);
+        t_dispatch_in_flight = 0;
+    }
+}
+
+bool dispatch_owner_claim() {
+    const std::uint64_t me = t_dispatch_in_flight;
+    if (me == 0)
+        return false;
+    return dispatch_take(me);
+}
+
+void dispatch_owner_set(std::uint64_t token) {
+    t_dispatch_in_flight = token;
+}
+
 NativeEngine::NativeEngine(tel::Telemetry& tel, SvcDispatcher& svc)
     : tel_(tel), svc_(svc) {}
 
@@ -1044,8 +1094,13 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         const std::uint64_t me = dispatch_token(st);
         bool locked = dispatch_take(me);
         if (locked) {
+            // O token em curso parte antes do serviço: um SVC bloqueante
+            // (ArbitrateLock) larga o dono e repõe `me` ao acordar. `me` e o
+            // token em curso coincidem aqui; no fim, ambos voltam a 0.
+            dispatch_owner_set(me);
             g_hooks.svc->dispatch(number, c);
             dispatch_release(me);
+            dispatch_owner_set(0);
         } else {
             // O despacho não aconteceu: trap aninhada do próprio dono (um
             // fault do host no C++ do despacho), ou teto de spin estourou.

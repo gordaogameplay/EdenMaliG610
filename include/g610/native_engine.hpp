@@ -41,6 +41,34 @@ extern "C" void g610_run_guest(std::uint64_t entry, std::uint64_t arg,
 
 namespace g610 {
 
+// ── O dono do despacho, partilhado com o SVC que precisa estacionar ───────
+//
+// O SvcDispatcher é serializado por um dono atómico (`g_dispatch_owner` em
+// `native_engine.cpp`, passo 3). Um serviço que bloqueia (ArbitrateLock é o
+// primeiro: o Eden estaciona em `KConditionVariable::WaitForAddress`,
+// `k_condition_variable.cpp:156`) tem de SOLTAR o dono durante a espera —
+// senão o thread que o desbloqueia não consegue despachar o
+// `ArbitrateUnlock`, e o processo trava. É o que um kernel faz: a syscall
+// bloqueante abandona a CPU e volta a tomá-la quando acorda.
+//
+// O token é o que o `native_engine.cpp` usa (0 = livre, 1 = a principal,
+// GuestThreadState* = as threads de guest). Convenção: ler o token ANTES de
+// soltar (outro despacho pode trocá-lo); repor o MESMO ao acordar.
+
+// O token do despacho EM CURSO nesta thread. 0 fora dela.
+std::uint64_t dispatch_owner_itself();
+
+// Soltar o dono (só tem efeito se o dono em curso for o caller). Zera o
+// token em curso.
+void dispatch_owner_vacate();
+
+// Voltar a tomar, com o mesmo limite de spin do engine. true = tomado.
+bool dispatch_owner_claim();
+
+// Repor o token em curso (chamado pela thread que acorda, com o valor que
+// leu antes de soltar).
+void dispatch_owner_set(std::uint64_t token);
+
 // O que o guest fez na última trap. Registado para o relatório e para
 // distinguir uma paragem por serviço de uma por fault. Definido aqui, antes
 // de `GuestThreadState`, porque o estado de thread tem um campo deste tipo
