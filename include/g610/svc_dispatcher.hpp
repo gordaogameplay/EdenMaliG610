@@ -128,22 +128,52 @@ enum class Svc : std::uint32_t {
 
 // Códigos de resultado do Horizon. O guest verifica estes valores, portanto a
 // semântica importa: devolver 0 é sucesso, qualquer outro é erro.
+//
+// **E o VALOR importa tanto como a semântica.** O guest conhece os Results
+// do Eden, e um Result que ele não reconhece é fatal — o SDK aborta.
+//
+// **Medido** (`boot_p6q.log`): o `SetMemoryAttribute` devolveu o `Invalid`
+// desta tabela (o valor **inventado** 0x1), e o SDK foi logo ao
+// `SetTerminateResult(0x1)` e ao `Break`. O erro era verdadeiro (o
+// endereço 0 não está no espaço do processo), mas o **Result** não era um
+// Result: o Eden devolveria `ResultInvalidCurrentMemory` (54273), que o
+// SDK sabe ignorar. A diferença entre 1 e 54273 foi a diferença entre o
+// jogo morrer e o jogo continuar.
+//
+// Por isso os valores são os do Eden (`core/hle/kernel/svc_results.h`):
+// o módulo do kernel é 1 (`ErrorModule::Kernel`), e o valor no fio é
+// `descrição << 9 | 1`.
 enum class Result : std::uint32_t {
     Success              = 0,
-    Invalid              = 1,
-    NotInitialized       = 2,
-    NotSupported         = 3,
-    InvalidHandle        = 7,
-    OutOfMemory          = 8,
-    NotFound             = 14,
-    InvalidSize          = 16,
-    Busy                  = 16 + 1,
-    InvalidAddress        = 22,
-    Busy2                = 24,
-    OutOfResource        = 25,
-    PermissionDenied     = 26,
-    NotInitialized2      = 30,
-    InvalidMemorySize     = 31,
+    // `ResultInvalidAddress` (desc 102), `ResultInvalidSize` (101),
+    // `ResultInvalidCurrentMemory` (106), `ResultInvalidCombination` (116),
+    // `ResultInvalidHandle` (114), `ResultInvalidState` (125),
+    // `ResultInvalidPointer` (115), `ResultOutOfResource` (103),
+    // `ResultOutOfMemory` (104), `ResultNotFound` (121), `ResultBusy` (122),
+    // `ResultNotImplemented` (33), `ResultOutOfRange` (119),
+    // `ResultLimitReached` (132).
+    InvalidAddress       = (102u << 9) | 1u,
+    InvalidSize          = (101u << 9) | 1u,
+    InvalidCurrentMemory = (106u << 9) | 1u,
+    InvalidCombination   = (116u << 9) | 1u,
+    InvalidHandle        = (114u << 9) | 1u,
+    InvalidState         = (125u << 9) | 1u,
+    InvalidPointer       = (115u << 9) | 1u,
+    // `ResultInvalidNewMemoryPermission` (desc 108) — o Eden devolve-o
+    // quando as permissões de uma memória não são válidas
+    // (`svc_transfer_memory.cpp`, `IsValidTransferMemoryPermission`).
+    InvalidNewMemoryPermission = (108u << 9) | 1u,
+    OutOfResource        = (103u << 9) | 1u,
+    OutOfMemory          = (104u << 9) | 1u,
+    NotFound             = (121u << 9) | 1u,
+    Busy                 = (122u << 9) | 1u,
+    NotImplemented       = (33u  << 9) | 1u,
+    OutOfRange           = (119u << 9) | 1u,
+    LimitReached         = (132u << 9) | 1u,
+    // O `Unsupported` (0x40) **não** é um Result do Eden: é o marcador do
+    // motor para "esta SVC não está implementada". O guest trata-o como
+    // fatal — e é o que deve acontecer, porque uma SVC em falta é um
+    // buraco no emulador, não um erro de runtime do jogo.
     Unsupported           = 64,
     // `ResultTimedOut` do Eden (`svc_results.h:30`): modulo Kernel (1),
     // descricao 117. Vale 1 | (117 << 9) = 0xEA01.
@@ -151,11 +181,9 @@ enum class Result : std::uint32_t {
     // E' o que o `WaitSynchronization` devolve quando o prazo expira sem
     // nada acontecer — e o que o SDK sabe interpretar.
     TimedOut              = 1 | (117 << 9),
-    // `ResultInvalidCoreId` e `ResultInvalidCombination` do Eden
-    // (`kernel/svc_results.h:26` e `:29`): módulo Kernel (1), descrições
-    // 113 e 116.
+    // `ResultInvalidCoreId` do Eden (`kernel/svc_results.h:26`): módulo
+    // Kernel (1), descrição 113.
     InvalidCoreId         = 1 | (113 << 9),
-    InvalidCombination    = 1 | (116 << 9),
     // `ResultInvalidPriority` do Eden (`kernel/svc_results.h:25`): modulo
     // Kernel (1), descricao 112.
     InvalidPriority       = 1 | (112 << 9),
@@ -538,6 +566,8 @@ private:
     Result svc_map_memory(SvcContext&);
     Result svc_unmap_memory(SvcContext&);
     Result svc_map_shared_memory(SvcContext&);
+    Result svc_create_transfer_memory(SvcContext&);
+    Result svc_set_memory_attribute(SvcContext&);
     Result svc_query_memory(SvcContext&);
 
     // `svcGetInfo`. O VALOR volta em x1, o Result em x0 — ver a

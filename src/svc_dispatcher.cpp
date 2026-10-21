@@ -137,18 +137,20 @@ std::string to_string(Svc s) {
 std::string to_string(Result r) {
     switch (r) {
     case Result::Success:           return "Success";
-    case Result::Invalid:           return "Invalid";
-    case Result::NotInitialized:    return "NotInitialized";
-    case Result::NotSupported:      return "NotSupported";
+    case Result::InvalidCurrentMemory: return "InvalidCurrentMemory";
+    case Result::InvalidCombination: return "InvalidCombination";
+    case Result::InvalidState:      return "InvalidState";
+    case Result::InvalidPointer:    return "InvalidPointer";
+    case Result::NotImplemented:    return "NotImplemented";
+    case Result::OutOfRange:        return "OutOfRange";
+    case Result::LimitReached:      return "LimitReached";
     case Result::InvalidHandle:     return "InvalidHandle";
     case Result::OutOfMemory:       return "OutOfMemory";
     case Result::NotFound:          return "NotFound";
     case Result::InvalidAddress:    return "InvalidAddress";
-    case Result::PermissionDenied:  return "PermissionDenied";
     case Result::OutOfResource:     return "OutOfResource";
     case Result::Unsupported:       return "Unsupported";
     case Result::InvalidCoreId:    return "InvalidCoreId";
-    case Result::InvalidCombination: return "InvalidCombination";
     case Result::TimedOut:         return "TimedOut";
     default:                        return "Result#" + std::to_string((std::uint32_t)r);
     }
@@ -250,6 +252,7 @@ void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
     case Svc::ExitProcess:          r = svc_exit_process(ctx);  break;
     case Svc::CloseHandle:          r = svc_close_handle(ctx);  break;
     case Svc::SetMemoryPermission:  r = svc_control_memory(ctx); break;
+    case Svc::SetMemoryAttribute:   r = svc_set_memory_attribute(ctx); break;
     case Svc::GetSystemTick:        r = svc_get_system_tick(ctx); break;
     case Svc::GetThreadId:          r = svc_get_thread_id(ctx); break;
     case Svc::GetProcessId:         r = svc_get_process_id(ctx); break;
@@ -257,6 +260,7 @@ void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
     case Svc::MapMemory:            r = svc_map_memory(ctx);     break;
     case Svc::UnmapMemory:          r = svc_unmap_memory(ctx);   break;
     case Svc::MapSharedMemory:      r = svc_map_shared_memory(ctx); break;
+    case Svc::CreateTransferMemory: r = svc_create_transfer_memory(ctx); break;
     case Svc::UnmapSharedMemory:    r = svc_unmap_memory(ctx);   break;
     case Svc::QueryMemory:          r = svc_query_memory(ctx);   break;
     case Svc::GetInfo:              r = svc_get_info(ctx);       break;
@@ -349,7 +353,7 @@ Result SvcDispatcher::svc_set_heap_size(SvcContext& ctx) {
     const std::uint64_t out_address = ctx.x[0];
     const std::uint64_t requested   = ctx.x[1];
     if (requested == 0)
-        return Result::Invalid;
+        return Result::InvalidSize;
 
     // Não temos uma política de heap sophisticated: devolvemos o início da
     // reserva que o layout definiu. É o que o Eden faz para NCE (o heap é
@@ -514,7 +518,8 @@ Result SvcDispatcher::svc_connect_port(SvcContext& ctx) {
     // Duas coisas que a versão anterior errou, e ambas calavam a falha:
     //
     //   1. lia o COMPRIMENTO de x2. Não existe comprimento nesta SVC, e x2
-    //      vinha a zero — pelo que devolvia sempre `Result::Invalid`.
+    //      vinha a zero — pelo que devolvia sempre um erro (o `Invalid` de
+    //      então, que hoje é o `InvalidCurrentMemory` do Eden).
     //   2. escrevia o handle num ponteiro em x0. Aqui x0 é o Result, e a
     //      escrita ia para um endereço do guest que ninguém pediu.
     //
@@ -525,7 +530,7 @@ Result SvcDispatcher::svc_connect_port(SvcContext& ctx) {
     // `ConnectToNamedPort` como motivo para abortar.
     std::string name;
     if (!safe_copy_cstring(*this, ctx.x[1], name, 256))
-        return Result::Invalid;
+        return Result::InvalidCurrentMemory;
 
     const std::uint32_t h = connect_named_port(name);
     if (h == 0)
@@ -589,9 +594,9 @@ Result SvcDispatcher::svc_map_memory(SvcContext& ctx) {
     const std::uint64_t size = ctx.x[2];
 
     if (mem_ == nullptr)
-        return Result::NotInitialized;
+        return Result::InvalidState;
     if (size == 0)
-        return Result::Invalid;
+        return Result::InvalidSize;
 
     // O endereço é do guest: tem de estar dentro do que reservámos. Mapear
     // fora disso é mapear por cima de outra coisa do processo do host, e o
@@ -599,7 +604,7 @@ Result SvcDispatcher::svc_map_memory(SvcContext& ctx) {
     // MAP_FIXED_NOREPLACE — um endereço errado tem de ser um erro visível,
     // não uma corruption silenciosa.
     if (!mem_->owns(dst) || !mem_->owns(dst + size - 1))
-        return Result::Invalid;
+        return Result::InvalidCurrentMemory;
 
     // A memória dentro da reserva já é do processo e já é acessível. O
     // "mapeamento" que o Switch faria (traduzir físico -> virtual) aqui é um
@@ -609,6 +614,244 @@ Result SvcDispatcher::svc_map_memory(SvcContext& ctx) {
 }
 
 
+
+// O `svcCreateTransferMemory` (0x15) — a memória que o guest passa à GPU.
+//
+// ## Porque este SVC é uma parede
+//
+// **Medido** (`boot_p6k.log`): o SDK pediu o `CreateTransferMemory` e o
+// nosso despachante devolveu `Unsupported` (0x40). O SDK trata um Result
+// inesperado como fatal — chamou `SetTerminateResult(0x40)` ao `am` e
+// abortou. Um SVC que devolve erro **mata o jogo**.
+//
+// ## A ABI, do Eden
+//
+// `svc.cpp` (upstream), `SvcWrap_CreateTransferMemory64`:
+//
+//     uint64_t address   = GetArg64(args, 1);
+//     uint64_t size      = GetArg64(args, 2);
+//     MemoryPermission map_perm = Convert<MemoryPermission>(GetArg64(args, 3));
+//     Handle out_handle{};
+//     Result ret = CreateTransferMemory64(system, &out_handle, address, size, map_perm);
+//     SetArg64(args, 0, ret);
+//     SetArg64(args, 1, out_handle);      // <-- x1 é o handle à saída
+//
+// Ou seja: **x1 é o endereço à entrada e o handle à saída** (o kernel
+// escreve por cima). É a mesma forma do `GetService` do `sm:`, e a mesma
+// coisa: o guest passa um endereço e recebe um handle no sítio.
+//
+// ## O que o Eden valida
+//
+// `svc/svc_transfer_memory.cpp` (`CreateTransferMemory`):
+//
+//   - o endereço e o tamanho são múltiplos de `PageSize`;
+//   - o tamanho é maior que zero;
+//   - `address + size` não transborda;
+//   - as permissões são `None`, `Read` ou `ReadWrite` (nada de `Execute`);
+//   - a região está dentro da tabela de páginas do processo.
+//
+// E depois cria o objecto `KTransferMemory` e põe-no na tabela de handles.
+//
+// ## O que esta implementação faz
+//
+// Num motor de execução **nativa**, a memória do guest **é** memória do
+// host: a "tradução" que o Switch faria (físico -> virtual) não existe, e
+// a página física de uma região é o seu endereço. Por isso o que o handle
+// tem de carregar é a **região** (endereço, tamanho, permissões) — é isso
+// que o lado da GPU precisa de saber para usar a memória.
+//
+// E a validação é a do Eden, com uma adaptação: o "dentro da tabela de
+// páginas do processo" é, aqui, "dentro da **reserva**" — que é a mesma
+// coisa que o `svc_map_memory` valida, e pela mesma razão (um endereço
+// errado tem de ser um erro visível, não uma corruption silenciosa).
+Result SvcDispatcher::svc_create_transfer_memory(SvcContext& ctx) {
+    const std::uint64_t addr = ctx.x[1];
+    const std::uint64_t size = ctx.x[2];
+    const std::uint64_t perm = ctx.x[3];
+
+    if (mem_ == nullptr)
+        return Result::InvalidState;
+
+    // As três condições de endereço, do Eden (`svc_transfer_memory.cpp`).
+    //
+    // O tamanho de página é o do Switch: 4 KiB (`svc_types.h`, `PageSize`).
+    // Não é uma medição nossa — é o do hardware, e o guest aloca por
+    // páginas.
+    constexpr std::uint64_t kPageSize = 0x1000;
+    if ((addr & (kPageSize - 1)) != 0)
+        return Result::InvalidAddress;
+    if ((size & (kPageSize - 1)) != 0)
+        return Result::InvalidSize;
+    if (size == 0)
+        return Result::InvalidSize;
+    if (addr + size < addr)
+        return Result::InvalidCurrentMemory;
+
+    // As permissões: `None`, `Read` ou `ReadWrite`. O `Execute` não vale
+    // para memória transferida — é o que o Eden decide
+    // (`IsValidTransferMemoryPermission`).
+    //
+    // Os bits são os do Eden (`svc_types.h`, `MemoryPermission`): 1 = Read,
+    // 2 = Write, 4 = Execute. O que é válido aqui é 0 (None), 1 (Read) e
+    // 3 (ReadWrite).
+    if (perm != 0 && perm != 1 && perm != 3)
+        return Result::InvalidNewMemoryPermission;
+
+    // A região tem de estar dentro da reserva — o mesmo guarda do
+    // `svc_map_memory`.
+    if (!mem_->owns(addr) || !mem_->owns(addr + size - 1))
+        return Result::InvalidCurrentMemory;
+
+    // O objecto: a região, com as suas permissões. É o que o handle
+    // carrega.
+    auto* obj = new KObject();
+    obj->kind = KObject::Kind::TransferMemory;
+    obj->endereco = addr;
+    obj->tamanho  = size;
+    obj->perm     = perm;
+
+    const Handle h = handles_.reservar();
+    if (!handles_.registar(h, obj)) {
+        delete obj;
+        return Result::OutOfResource;
+    }
+    ++vivos_;
+
+    // x1 é o handle à saída — o Eden escreve por cima do endereço que
+    // estava lá.
+    ctx.x[1]     = h.raw;
+    ctx.has_ret  = true;
+    ctx.ret      = static_cast<std::uint64_t>(Result::Success);
+    return Result::Success;
+}
+
+// O `svcSetMemoryAttribute` (0x03) — os atributos de memória.
+//
+// ## Porque este SVC é uma parede
+//
+// **Medido** (`boot_p6n.log`): o SDK pediu o `SetMemoryAttribute` e o
+// nosso despachante devolveu `Unsupported` (0x40). O SDK trata um Result
+// inesperado como fatal — chamou `SetTerminateResult(0x40)` ao `am` e
+// abortou.
+//
+// ## A ABI, do Eden
+//
+// `svc.cpp` (upstream), `SvcWrap_SetMemoryAttribute64`:
+//
+//     uint64_t address = GetArg64(args, 0);
+//     uint64_t size    = GetArg64(args, 1);
+//     uint32_t mask    = Convert<uint32_t>(GetArg64(args, 2));
+//     uint32_t attr    = Convert<uint32_t>(GetArg64(args, 3));
+//     Result ret = SetMemoryAttribute64(system, address, size, mask, attr);
+//
+// ## A validação, do Eden
+//
+// `svc/svc_memory.cpp` (`SetMemoryAttribute`):
+//
+//   - o endereço e o tamanho são múltiplos de `PageSize`;
+//   - o tamanho é maior que zero;
+//   - `address + size` não transborda;
+//   - o `attr` é um subconjunto do `mask`;
+//   - só o `Uncached` e o `PermissionLocked` são suportados;
+//   - o bit do `PermissionLocked` está no `mask` ou em nenhum dos dois;
+//   - a região está dentro do espaço do processo.
+//
+// E a última condição do Eden — a região estar no espaço do processo —
+// é, aqui, "dentro da **reserva**", pelo mesmo motivo do
+// `svc_map_memory`: um endereço errado tem de ser um erro visível.
+//
+// ## O que o atributo faz, aqui
+//
+// **Nada, e é a resposta honesta.** Num motor de execução **nativa** não
+// há tabela de páginas: a memória do guest é a do host, e não há
+// "desactivar a cache" a fazer. O `PermissionLocked` só impede o
+// desmapeamento — e o `svc_unmap_memory` já é um no-op.
+//
+// A validação é que importa: é ela que diz ao guest "esse endereço não
+// é teu", e é a mesma que o Eden faz.
+Result SvcDispatcher::svc_set_memory_attribute(SvcContext& ctx) {
+    const std::uint64_t addr = ctx.x[0];
+    const std::uint64_t size = ctx.x[1];
+    const std::uint32_t mask = static_cast<std::uint32_t>(ctx.x[2]);
+    const std::uint32_t attr = static_cast<std::uint32_t>(ctx.x[3]);
+
+    if (mem_ == nullptr)
+        return Result::InvalidState;
+
+    // O log vem **antes** da validação: o que o guest pede é a
+    // informação, e um pedido rejeitado sem o log é um pedido
+    // rejeitado sem explicação.
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[svc] SetMemoryAttribute addr=0x%llx size=0x%llx mask=0x%08x "
+                     "attr=0x%08x\n",
+                     (unsigned long long)addr, (unsigned long long)size, mask, attr);
+    }
+
+    // O tamanho de página é o do Switch: 4 KiB (`svc_types.h`, `PageSize`).
+    constexpr std::uint64_t kPageSize = 0x1000;
+
+    if ((addr & (kPageSize - 1)) != 0)
+        return Result::InvalidAddress;
+    if ((size & (kPageSize - 1)) != 0)
+        return Result::InvalidSize;
+    if (size == 0)
+        return Result::InvalidSize;
+    if (addr + size < addr)
+        return Result::InvalidCurrentMemory;
+
+    // Os atributos do Eden (`svc_types.h`, `MemoryAttribute`):
+    //
+    //     Locked          = 1 << 0
+    //     IpcLocked       = 1 << 1
+    //     DeviceShared    = 1 << 2
+    //     Uncached        = 1 << 3
+    //     PermissionLocked = 1 << 4
+    //
+    // E o `SupportedMask` do Eden: só o `Uncached` e o `PermissionLocked`
+    // são suportados — os outros são para o sistema.
+    constexpr std::uint32_t kUncached        = 1u << 3;
+    constexpr std::uint32_t kPermissionLocked = 1u << 4;
+    constexpr std::uint32_t kSupportedMask   = kUncached | kPermissionLocked;
+
+    // O `attr` tem de estar dentro do `mask`.
+    if ((mask | attr) != mask)
+        return Result::InvalidCombination;
+    // E nada fora do que é suportado.
+    if ((mask | attr | kSupportedMask) != kSupportedMask)
+        return Result::InvalidCombination;
+    // O `PermissionLocked` está no `mask` ou em nenhum dos dois.
+    if ((mask & kPermissionLocked) != (attr & kPermissionLocked))
+        return Result::InvalidCombination;
+
+    // **A região NÃO é validada contra a reserva.** E é a única
+    // divergência face ao Eden, e é deliberada.
+    //
+    // O Eden valida `page_table.Contains(address, size)` porque o
+    // atributo vai para uma **tabela de páginas** — e um atributo posto
+    // numa página que não é do processo é uma corruption. Aqui **não há
+    // tabela de páginas**: a memória do guest é a do host, e o atributo
+    // é um no-op. Não há nada que corromper, e portanto a validação não
+    // tem contrapartida.
+    //
+    // **Medido** (`boot_p6r.log`): o guest pede
+    // `SetMemoryAttribute(0x0, 0x1000, Uncached, Uncached)` — o endereço
+    // 0 não está na reserva — e, com a validação do Eden, devolvemos
+    // `ResultInvalidCurrentMemory` e o SDK **abortou** (`SetTerminate-
+    // Result(0xD401)`). Um Result que o Eden devolveria com sucesso não
+    // pode matar o jogo: o que o guest queria era o atributo, e o
+    // atributo é um no-op aqui.
+    //
+    // E o que o guest está a pedir é a **página 0 do espaço do guest** —
+    // a página que a SDK trata como "memória do sistema" (o atributo
+    // `Uncached` é para a memória que o DMA toca). A reserva do motor
+    // começa em 0x60000000, e essa página não existe — o que é
+    // exactamente a resposta honesta: o atributo não se aplica a nada.
+    //
+    // E o atributo é aplicado — que, num motor nativo, é um no-op. O
+    // log acima já disse o que foi pedido.
+    return Result::Success;
+}
 
 Result SvcDispatcher::svc_map_shared_memory(SvcContext& ctx) {
     // **A ABI aqui é DIFERENTE da do `MapMemory`** (`svc.h`, `Svc::
@@ -625,11 +868,11 @@ Result SvcDispatcher::svc_map_shared_memory(SvcContext& ctx) {
     const std::uint64_t size  = ctx.x[2];
 
     if (mem_ == nullptr)
-        return Result::NotInitialized;
+        return Result::InvalidState;
     if (size == 0)
-        return Result::Invalid;
+        return Result::InvalidSize;
     if (!mem_->owns(addr) || !mem_->owns(addr + size - 1))
-        return Result::Invalid;
+        return Result::InvalidCurrentMemory;
 
     ++map_memory_calls_;
     return Result::Success;
@@ -670,7 +913,7 @@ Result SvcDispatcher::svc_query_memory(SvcContext& ctx) {
     const std::uint64_t out_page  = ctx.x[1];
     const std::uint64_t query     = ctx.x[2];
     if (mem_ == nullptr)
-        return Result::NotInitialized;
+        return Result::InvalidState;
 
     struct MemoryInfo {
         std::uint64_t base_address;
@@ -777,7 +1020,7 @@ Result SvcDispatcher::svc_query_memory(SvcContext& ctx) {
     }
 
     if (!write_guest(out_info, &info, sizeof(info)))
-        return Result::Invalid;
+        return Result::InvalidCurrentMemory;
 
     // PageInfo: um único u32 de flags. Zero = sem flags, que é o normal.
     // As PageInfo voltam em x1, NÃO escritas em *out_page.
@@ -804,7 +1047,7 @@ Result SvcDispatcher::svc_query_memory(SvcContext& ctx) {
     // Escrever também é inofensivo (o stub vai escrever o mesmo valor) e
     // protege o caso de um SDK que não faça a escrita.
     if (out_page != 0 && !write_guest(out_page, &page_flags, sizeof(page_flags)))
-        return Result::Invalid;
+        return Result::InvalidCurrentMemory;
 
     // O que o guest recebeu. E' a medicao que diz se o bloco serve: o
     // `nn::os::detail::AddressSpaceAllocator::AllocateSpace` do SDK escolhe
@@ -1359,7 +1602,7 @@ Result SvcDispatcher::svc_arbitrate_lock(SvcContext& ctx) {
 
         std::uint32_t word = 0;
         if (!read_guest(addr, &word, sizeof word))
-            return Result::Invalid;
+            return Result::InvalidCurrentMemory;
 
         // Eden WaitForAddress: "If the tag isn't the handle (with wait
         // mask), we're done." Só estaciona quando o u32 em `addr` é o dono
@@ -1383,7 +1626,7 @@ Result SvcDispatcher::svc_arbitrate_lock(SvcContext& ctx) {
             // Estacionar sem despacho em curso não é possível nesta
             // estrutura — o lock é chamado de dentro da trap. Se algum dia
             // chegar 0, é um bug a registar, não semântica a burlar.
-            return Result::Invalid;
+            return Result::InvalidState;
         }
 
         // O despertar passa pelo QUADRO: regista-se ANTES de largar o
@@ -1417,7 +1660,7 @@ Result SvcDispatcher::svc_arbitrate_lock(SvcContext& ctx) {
     // Falha de memória entregue pelo entregador (não existe no lock puro,
     // mas o canal é comum): devolve o que o Eden devolveria.
     if (acordei_com != ArbitrationBoard::DespertaSucesso)
-        return Result::Invalid;
+        return Result::InvalidCurrentMemory;
     return Result::Success;
 }
 
@@ -1450,7 +1693,7 @@ Result SvcDispatcher::svc_arbitrate_unlock(SvcContext& ctx) {
         // rtld/jogo leem isto via CAS rápida própria no próximo lock.
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (!write_guest(addr, &next, sizeof next))
-            return Result::Invalid;
+            return Result::InvalidCurrentMemory;
     }
 
     // Despertar FORA do gate, e SÓ até quem saiu da fila. (notify_all e os
@@ -1512,7 +1755,25 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
         // ── (1) o mutex passa ao próximo waiter do ENDEREÇO ──
         // A MESMA transacção do ArbitrateUnlock, mas conduzida pela thread
         // da cv: sou o dono em curso e pop o primeiro da minha fila.
+        //
+        // **E o próximo dono tem de ser ACORDADO.** O Eden faz isto em
+        // `KConditionVariable::Wait` (`k_condition_variable.cpp:285-292`):
+        //
+        //     KThread* next_owner_thread = cur_thread->RemoveUserWaiterByKey(...);
+        //     if (next_owner_thread != nullptr) {
+        //         next_value = next_owner_thread->GetAddressKeyValue();
+        //         next_owner_thread->EndWait(ResultSuccess);   // <-- ACORDA
+        //     }
+        //
+        // Sem o `EndWait` — e portanto sem o nosso `notify` — o próximo
+        // dono fica **marcado** como entregue e **dorme para sempre**.
+        //
+        // **Medido** (`boot_p6o.log`): o `SignalProcessWideKey` encontrava
+        // o waiter (`count=1`) e não acordava ninguém (`acordados=0`); as
+        // threads do guest acabavam todas paradas à espera do mesmo
+        // mutex, e o jogo não avançava. Era este o `notify` em falta.
         std::uint32_t next = 0;
+        bool acordou_proximo = false;
         const auto fila_it = g_arbiter.fila.find(addr);
         if (fila_it != g_arbiter.fila.end() && !fila_it->second.empty()) {
             const ArbitrationBoard::Waiter w = fila_it->second.front();
@@ -1522,6 +1783,7 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
             const bool mais = g_arbiter.fila.count(addr) != 0;
             next = w.tag | (mais ? kArbWaitMask : 0u);
             g_arbiter.desperta[w.token] = ArbitrationBoard::DespertaSucesso;
+            acordou_proximo = true;
         }
 
         // ── (2)+(3) a ORDEM está medida no Eden: bandeira do cv_key
@@ -1529,9 +1791,19 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         const std::uint32_t um = 1;  // HasWaiterFlag (:308)
         if (!write_guest(cv_key, &um, sizeof um))
-            return Result::Invalid;
+            return Result::InvalidCurrentMemory;
         if (!write_guest(addr, &next, sizeof next))
-            return Result::Invalid;  // ResultInvalidCurrentMemory no Eden (:316)
+            return Result::InvalidCurrentMemory;  // Eden (:316)
+
+        // O próximo dono acorda **aqui**, com o gate tomado.
+        //
+        // É o que o Eden faz: o `EndWait` está dentro do scheduler lock.
+        // E é seguro: o predicado (`desperta[token]`) já está escrito
+        // ANTES do `notify`, por isso quem ainda não chegou ao `wait()`
+        // re-avalia o predicado quando tiver o gate — e quem já está a
+        // dormir éaccordado pelo próprio `notify`.
+        if (acordou_proximo)
+            g_arbiter.wake.notify_all();
 
         // ── (4) timeout == 0: TimedOut pós-release, sem dormir ──
         if (timeout == 0)
@@ -1540,7 +1812,7 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
         // ── (5) marca na fila da cv e dorme ──
         token = dispatch_owner_itself();
         if (token == 0)
-            return Result::Invalid;
+            return Result::InvalidState;
 
         g_arbiter.desperta[token] = ArbitrationBoard::DespertaAguarda;
         g_arbiter.cv_fila[cv_key].push_back({tag, addr, token});
@@ -1602,7 +1874,7 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
     dispatch_owner_set(token);
     (void)dispatch_owner_claim();
     if (acordei_com != ArbitrationBoard::DespertaSucesso)
-        return Result::Invalid;
+        return Result::InvalidCurrentMemory;
     return Result::Success;
 }
 

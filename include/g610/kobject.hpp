@@ -128,7 +128,13 @@ inline constexpr Handle kInvalidHandle{};
 struct KObject {
     // `Thread`: uma thread de guest que o motor criou mas **nao** corre
     // (ver `svc_create_thread`). O objecto existe para o handle ser valido.
-    enum class Kind : std::uint8_t { Port, Session, Thread };
+    //
+    // `TransferMemory`: uma região de memória que o guest passa à GPU
+    // (ver `svc_create_transfer_memory`). Num motor nativo, a memória do
+    // guest **é** memória do host, por isso a região que o objecto
+    // carrega é o endereço, o tamanho e as permissões — é isso que o lado
+    // da GPU precisa de saber.
+    enum class Kind : std::uint8_t { Port, Session, Thread, TransferMemory };
 
     Kind kind = Kind::Port;
 
@@ -138,6 +144,14 @@ struct KObject {
     // Para uma sessão: o handle da porta mãe. É assim que um `SendSyncRequest`
     // sabe a que serviço tem de atender.
     Handle parent;
+
+    // Para uma `TransferMemory`: a região transferida.
+    //
+    // `endereco` e `tamanho` são os que o guest pediu; `perm` são os bits
+    // do `MemoryPermission` do Eden (1 = Read, 2 = Write, 4 = Execute).
+    std::uint64_t endereco = 0;
+    std::uint64_t tamanho  = 0;
+    std::uint64_t perm     = 0;
 
     // Contador de referências, no sentido mínimo: quantos handles apontam
     // para aqui. Não é a contagem do Eden (`KAutoObject::Open/Close` com
