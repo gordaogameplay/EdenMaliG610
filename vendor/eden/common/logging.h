@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-FileCopyrightText: 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
@@ -6,91 +6,63 @@
 
 #pragma once
 
-#include <chrono>
+// O logger da casa.
+//
+// ## Porque este ficheiro é uma ponte
+//
+// O upstream partiu o logger em **três** ficheiros ✓:
+//
+//     common/logging/formatter.h   os `fmt::formatter` dos enums e dos
+//                                  `SwapStructT` ✓
+//     common/logging/types.h       `Common::Log::Level` e `Common::Log::Class` ✓
+//     common/logging/log.h         `FmtLogMessage` e as macros `LOG_*` ✓
+//
+// A casa tinha **um** `common/logging.h` ✗ — o antigo, do Citra ✗ — com
+// **as mesmas três coisas** dentro ✗. Quando o `video_core` do upstream
+// entrou na casa ✗, as duas definições coexistiram ✗ e o compilador
+// queixou-se ✗:
+//
+//     formatter.h:17: error: redefinition of 'struct fmt::v11::formatter<T, ...>'
+//     types.h:11:    error: multiple definition of 'enum class Common::Log::Level'
+//     log.h:25:      error: redefinition of 'void Common::Log::FmtLogMessage(...)'
+//
+// **Nenhuma das duas cópias era a "certa"** ✗ — a da casa era a antiga ✗ e
+// a do upstream era a nova ✗; o que faltava era **uma só** ✓.
+//
+// ## A lista de classes é a mesma
+//
+// Medido ✓: as 99 classes do `log_classes.inc` da casa e as 99 do
+// `types.h` do upstream são **as mesmas** ✓ — nenhuma de um lado que não
+// exista do outro ✓. Por isso esta ponte pode ficar com a do upstream ✓
+// sem perder nada ✓.
+//
+// (O `log_classes.inc` da casa fica aqui ✓ — inerte ✗ — porque é a fonte
+// de verdade da lista ✓ e porque ninguém o deve apagar ✗.)
+//
+// ## O que fica aqui
+//
+// A API que **é da casa** ✓: o `Filter` ✓, o `Entry` ✓, o
+// `Initialize`/`Start`/`Stop` ✓ e as funções de impressão ✓.
+//
+// O upstream implementa-as em `common/logging/backend.cpp` ✗ — que a casa
+// **não** compila ✗. A implementação é `src/eden_log.cpp` ✓ (ver o
+// ficheiro ✗: são dois símbolos ✓ — `FmtLogMessageImpl` ✓ e `Stop` ✓).
+
 #include <algorithm>
-#include <type_traits>
-#include <fmt/ranges.h>
-#include "vendor/eden/common/swap.h"
+#include <array>
+#include <chrono>
+#include <string>
+#include <string_view>
 
-// adapted from https://github.com/fmtlib/fmt/issues/2704
-// a generic formatter for enum classes
-#if FMT_VERSION >= 80100
-template <typename T>
-struct fmt::formatter<T, std::enable_if_t<std::is_enum_v<T>, char>>
-    : formatter<std::underlying_type_t<T>> {
-    template <typename FormatContext>
-    auto format(const T& value, FormatContext& ctx) const -> decltype(ctx.out()) {
-        return fmt::formatter<std::underlying_type_t<T>>::format(
-            static_cast<std::underlying_type_t<T>>(value), ctx);
-    }
-};
-#endif
-
-template <typename T, typename U>
-struct fmt::formatter<SwapStructT<T, U>> {
-    constexpr auto parse(format_parse_context& ctx) {
-        return ctx.begin();
-    }
-    template <typename FormatContext>
-    auto format(const SwapStructT<T, U>& reg, FormatContext& ctx) const {
-        return fmt::format_to(ctx.out(), "{}", T(reg));
-    }
-};
-
-#ifdef _DEBUG
-#define LOG_TRACE(log_class, ...) \
-    Common::Log::FmtLogMessage(Common::Log::Class::log_class, Common::Log::Level::Trace, \
-       __FILE__, __LINE__, __func__, __VA_ARGS__)
-#else
-#define LOG_TRACE(log_class, fmt, ...) (void(0))
-#endif
-
-#define LOG_DEBUG(log_class, ...) \
-    ::Common::Log::FmtLogMessage(::Common::Log::Class::log_class, ::Common::Log::Level::Debug, \
-       __FILE__, __LINE__, __func__, __VA_ARGS__)
-#define LOG_INFO(log_class, ...) \
-    ::Common::Log::FmtLogMessage(::Common::Log::Class::log_class, ::Common::Log::Level::Info, \
-       __FILE__, __LINE__, __func__, __VA_ARGS__)
-#define LOG_WARNING(log_class, ...) \
-    ::Common::Log::FmtLogMessage(::Common::Log::Class::log_class, ::Common::Log::Level::Warning, \
-       __FILE__, __LINE__, __func__, __VA_ARGS__)
-#define LOG_ERROR(log_class, ...) \
-    ::Common::Log::FmtLogMessage(::Common::Log::Class::log_class, ::Common::Log::Level::Error, \
-       __FILE__, __LINE__, __func__, __VA_ARGS__)
-#define LOG_CRITICAL(log_class, ...) \
-    ::Common::Log::FmtLogMessage(::Common::Log::Class::log_class, ::Common::Log::Level::Critical, \
-       __FILE__, __LINE__, __func__, __VA_ARGS__)
+// O upstream ✓ — traz os `formatter` ✓, os tipos ✓, o `FmtLogMessage` ✓ e
+// as macros `LOG_*` ✓.
+//
+// **O caminho é o do upstream** ✓ (`common/logging/log.h` ✓) e não o da
+// casa ✗ (`vendor/eden/common/logging.h` ✗) — senão isto includia-se a
+// si próprio ✗.
+#include "common/logging/log.h"
 
 namespace Common::Log {
-
-/// Specifies the severity or level of detail of the log message.
-enum class Level : u8 {
-    Trace, ///< Extremely detailed and repetitive debugging information that is likely to pollute logs.
-    Debug, ///< Less detailed debugging information.
-    Info, ///< Status information from important points during execution.
-    Warning, ///< Minor or potential problems found during execution of a task.
-    Error, ///< Major problems found during execution of a task that prevent it from being completed.
-    Critical, ///< Major problems during execution that threaten the stability of the entire application.
-    Count ///< Total number of logging levels
-};
-
-/// Specifies the sub-system that generated the log message.
-enum class Class : u8 {
-#define SUB(A, B) A##_##B,
-#define CLS(A) A,
-#include "vendor/eden/common/log_classes.inc"
-#undef SUB
-#undef CLS
-    Count,
-};
-
-/// Logs a message to the global logger, using fmt
-void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args);
-
-template <typename... Args>
-void FmtLogMessage(Class log_class, Level log_level, const char* filename, unsigned int line_num, const char* function, fmt::format_string<Args...> format, const Args&... args) {
-    FmtLogMessageImpl(log_class, log_level, filename, line_num, function, format.get(), fmt::make_format_args(args...));
-}
 
 /// Implements a log message filter which allows different log classes to have different minimum
 /// severity levels. The filter can be changed at runtime and can be parsed from a string to allow
@@ -105,15 +77,16 @@ struct Filter {
         class_levels[std::size_t(log_class)] = level;
     }
     /// Parses a filter string and applies it to this filter.
+    ///
     /// A filter string consists of a space-separated list of filter rules, each of the format
     /// `<class>:<level>`. `<class>` is a log class name, with subclasses separated using periods.
     /// `*` is allowed as a class name and will reset all filters to the specified level. `<level>`
     /// a severity level name which will be set as the minimum logging level of the matched classes.
     /// Rules are applied left to right, with each rule overriding previous ones in the sequence.
     /// A few examples of filter rules:
-    ///  - `*:Info` -- Resets the level of all classes to Info.
-    ///  - `Service:Info` -- Sets the level of Service to Info.
-    ///  - `Service.FS:Trace` -- Sets the level of the Service.FS class to Trace.
+    ///  - `*:Info` -- Resets the filter to show all messages at `Info` level and above.
+    ///  - `Service:Info` -- Sets the minimum level of `Service` to `Info`.
+    ///  - `Service.FS:Trace` -- Sets the minimum level of `Service.FS` to `Trace`.
     void ParseFilterString(std::string_view filter_view);
     /// Matches class/level combination against the filter, returning true if it passed.
     [[nodiscard]] bool CheckMessage(Class log_class, Level level) const {
@@ -158,7 +131,7 @@ std::string FormatLogMessage(const Entry& entry) noexcept;
 /// Prints the same message as `PrintMessage`, but colored according to the severity level.
 void PrintColoredMessage(const Entry& entry) noexcept;
 
-/// Formats and prints a log entry to the android logcat.
+/// Formats and prints the log entry to the android logcat.
 void PrintMessageToLogcat(const Entry& entry) noexcept;
 
 } // namespace Common::Log
