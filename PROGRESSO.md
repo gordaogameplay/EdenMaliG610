@@ -4255,39 +4255,55 @@ falha ✗ ✗.
 
 ### Onde o jogo esta agora
 
-Medido ✗ (`/tmp/boot_v24.log` ✗):
+Medido (`/tmp/boot_clean.log`, depois da limpeza dos marcadores):
 
-- o `SetPreallocatedBuffer` **funciona** ✗ ✓ (os dois slots ✗);
-- o `Remap` **funciona** ✗ ✓ (o `ptr` base e' o do mapeamento ✗);
-- o `Connect` ✗ e o `Query` ✗ devolvem as dimensoes da fila ✗ ✓;
-- o jogo **continua a abortar** ✗ com `desc=3005` ✗ ✗ ✗.
+- o `SetPreallocatedBuffer` **funciona** — os dois slots, e o
+  `NvGraphicBuffer` lido tem os valores correctos: `buffer_id=2`,
+  `width=1920`, `height=1080`, `format=1` (Rgba8888);
+- o `Remap` **funciona** — o `ptr` base e' o do mapeamento, e o VA
+  devolvido e' o que o guest pediu;
+- o `Connect` e o `Query` devolvem as dimensoes da fila;
+- a fence funciona: `SubmitGPFIFO` com `flags=0x104` e `fence` de entrada
+  `(0,1)` da incremento de 1, e o syncpoint do canal avanca 0 -> 1;
+- **zero SVC devolvem erro** durante o arranque (o unico e' o `Break`
+  final) — logo o jogo **nao aborta por causa de um Result**;
+- o jogo **continua a abortar** com `desc=3005` e o `Break`.
 
-**A espera que bloqueia** ✗: `WaitProcessWideKeyAtomic addr=0x10a2c7d58
-cv=0x10a2c7d64 tag=0x81ff timeout=-1` ✗ — espera infinita ✗, e o sinal
-**nunca chega** ✗ ✗.
+**A espera que bloqueia**: `WaitProcessWideKeyAtomic addr=0x10a2c7d58
+cv=0x10a2c7d64 tag=0x81ff timeout=-1` — espera infinita, e o sinal
+**nunca chega**.
 
-**O que a medicao mostra** ✗ ✗:
+**O que esta medido, e o que nao esta**:
 
-- o `x30` da espera ✗ (`0x83abc1e8` ✗) e' uma **verificacao de erro**
-  ✗ ✗ (desassemblada ✗: `str w0,[sp,#8]` ✗ / `cbnz w0, ...` ✗ / `ret`
-  ✗) ✗ — ou seja ✗, o SVC **devolveu erro** ✗ ✗;
-- o SVC que falhou ✗ foi o `WaitProcessWideKeyAtomic` ✗ ✗;
-- mas esse SVC ✗ **nao pode falhar** ✗ com timeout=-1 ✗ — o upstream
-  (`svc_condition_variable.cpp:18-47` ✗) so' devolve erro ✗ de
-  endereco invalido ✗ ou de timeout ✗ zero ✗ ✗;
-- **a thread que espera ✗ esta a espera de um sinal de outra thread
-  do jogo** ✗ ✗ — e o jogo **nao** o da ✗ ✗.
+- **medido**: o codigo do guest em `0x83abc1e8` (desassemblado) e' o
+  **inicio de uma funcao** que contem o `WaitProcessWideKeyAtomic`; o
+  `str w0,[sp,#8]` e o `cbnz w0` verificam o resultado de um SVC
+  **anterior**. O SVC que volta para la tem `x0` = o endereco do mutex e
+  `ret=0`.
+- **medido**: o `WaitProcessWideKeyAtomic` com `timeout=-1` **nao pode
+  falhar** — o upstream (`svc_condition_variable.cpp:18-47`) so' devolve
+  erro de endereco invalido ou de timeout zero.
+- **medido**: o guest sinaliza `0x8434ed4c` 22 vezes com `count=-1` e
+  **nunca espera** nessa chave — o sinal fica pendente. As esperas do
+  guest sao em `0x10a2c78xx` (heap) e nos sinais em `0x8437e20c` /
+  `0x8434ed4c` (dados).
+- **medido**: o guest **nao** abre `/dev/nvhost-ctrl` (abre
+  `/dev/nvhost-ctrl-gpu` -> fd=1, `/dev/nvhost-as-gpu` -> fd=2,
+  `/dev/nvmap` -> fd=3, `/dev/nvhost-gpu` -> fd=4), logo **nao** espera
+  pela fence pelo `IocCtrlEventWait`.
+- **medido**: uma so submissao, e e' de **setup** — os ids de canal
+  presentes sao 0, 2 e 11, e **nao** ha `0x1D` (`SyncpointOperation`)
+  nem `0x07` (`SemaphoreTrigger`). O `draw_end` (1413) e o `draw_begin`
+  (1414) **nao estao** no buffer: o guest ainda nao desenhou. O `max id`
+  do buffer e' 3627.
+- **medido**: o jogo faz `SetPreallocatedBuffer` mas **nunca** pede
+  `DequeueBuffer`. O ciclo de render do Switch e' Dequeue -> desenhar ->
+  Queue, e o jogo **nao chega** ao Dequeue.
 
-**O push buffer** ✗: uma so submissao ✗ ✗, e ela e' de **setup** ✗ —
-os ids de canal presentes sao 0 ✗, 2 ✗ e 11 ✗ ✗, e **nao** ha `0x1D`
-(`SyncpointOperation` ✗) ✗ nem `0x07` (`SemaphoreTrigger` ✗) ✗ ✗. O
-`draw_end` (1413 ✗) e o `draw_begin` (1414 ✗) **nao estao** no buffer
-✗ ✗ — o guest ainda nao desenhou ✗ ✗.
-
-**A pista mais forte agora** ✗: o jogo faz `SetPreallocatedBuffer` ✗
-mas **nunca** pede `DequeueBuffer` ✗ ✗. O ciclo de render do Switch e'
-Dequeue ✗ -> desenhar ✗ -> Queue ✗ ✗, e o jogo **nao chega** ao
-Dequeue ✗ ✗.
+**O que falta por explicar**: porque e' que o jogo nao chega ao
+`DequeueBuffer`, sendo que todas as transaccoes do `android.gui` que
+fazem (`Connect`, `Query`, `SetPreallocatedBuffer`) respondem com
+`status=0` (`NoError`) e com os dados correctos.
 
 ### A parede actual
 
