@@ -517,6 +517,17 @@ static_assert(sizeof(IoctlAllocAsEx) == 40, "tamanho errado");
 // ─────────────────────────────────────────────────────────────────────────────
 // O `nvdrv` propriamente dito.
 // ─────────────────────────────────────────────────────────────────────────────
+// O handle do `nvmap` que o guest deu ao canal (`SetNVMAPfd`) — e a
+// região que ele representa.
+//
+// **É global de propósito**: a submissão e' um iocto do *canal*, mas a
+//Lookup por fd nem sempre dá o canal (o `fd` do iocto e' o do
+// dispositivo, e o canal pode ter sido aberto noutra sessao). O que
+// interessa e' a regiao do buffer, e essa e' a mesma para todos.
+std::uint32_t g_handle_do_buffer = 0;
+std::uint64_t g_endereco_do_buffer = 0;
+std::uint64_t g_tamanho_do_buffer = 0;
+
 class NvDrv final : public Service::ServiceFramework<NvDrv> {
 public:
     explicit NvDrv(Core::System& system, const char* nome)
@@ -1214,6 +1225,25 @@ private:
         if (auto* canal = CanalDoFd())
             canal->nvmap_fd = params.nvmap_fd;
 
+        // **A região do handle** — é aqui que está o push buffer (o
+        // guest aloca-o pelo `nvmap` e dá o handle ao canal). Despeja-la
+        // é a medição que diz o formato real.
+        {
+            RegistoNvmap::Regiao regiao{};
+            if (RegistoNvmap::Instancia().Procurar(
+                    static_cast<std::uint32_t>(params.nvmap_fd), regiao)) {
+                LOG_DEBUG(Service_NVDRV, "canal: SetNVMAPfd: handle={} -> 0x{:X} ({} bytes)",
+                          params.nvmap_fd, regiao.endereco, regiao.tamanho);
+                g_handle_do_buffer = static_cast<std::uint32_t>(params.nvmap_fd);
+                g_endereco_do_buffer = regiao.endereco;
+                g_tamanho_do_buffer = regiao.tamanho;
+                Despejar(regiao.endereco, 64, "nvmap");
+            } else {
+                LOG_DEBUG(Service_NVDRV, "canal: SetNVMAPfd: handle={} — sem região",
+                          params.nvmap_fd);
+            }
+        }
+
         EscreverSaida(ctx, params);
         RespostaOk(ctx);
     }
@@ -1526,6 +1556,15 @@ private:
             }
         }
 
+        // **A região do canal, no momento da submissão.** É aqui que o
+        // jogo já escreveu o push buffer (no `SetNVMAPfd` ainda estava a
+        // zeros — medido: 313 MB de zeros).
+        if (g_endereco_do_buffer != 0) {
+            LOG_DEBUG(Service_NVDRV, "canal: a região do buffer é 0x{:X} ({} bytes)",
+                      g_endereco_do_buffer, g_tamanho_do_buffer);
+            Despejar(g_endereco_do_buffer, 128, "pushbuffer");
+        }
+
         // O push buffer **cru**, em hexadecimal: é o que permite
         // descodificar o formato real (que **não** é o
         // {tipo, endereço, tamanho} que se supunha).
@@ -1628,6 +1667,31 @@ private:
 
         EscreverSaida(ctx, params);
         RespostaOk(ctx);
+    }
+
+    // Despeja `n` bytes de um endereço do guest, em hexadecimal.
+    //
+    // É o instrumento de medição do caminho da GPU: sem ver os bytes, o
+    // formato é uma suposição — e a medição de `boot_p7s.log` provou que
+    // a suposição estava errada.
+    void Despejar(std::uint64_t endereco, std::size_t n, const char* etiqueta) {
+        if (endereco == 0)
+            return;
+        std::vector<std::uint8_t> conteudo(n, 0);
+        if (!LerDoGuest(endereco, conteudo.data(), conteudo.size()))
+            return;
+        char linha[512];
+        std::size_t p = 0;
+        p += static_cast<std::size_t>(
+            std::snprintf(linha + p, sizeof(linha) - p, "[%s] 0x%llX:", etiqueta,
+                          (unsigned long long)endereco));
+        for (std::size_t i = 0; i < conteudo.size() && p + 4 < sizeof(linha); ++i)
+            p += static_cast<std::size_t>(
+                std::snprintf(linha + p, sizeof(linha) - p, " %02x", conteudo[i]));
+        if (p + 2 < sizeof(linha))
+            p += static_cast<std::size_t>(std::snprintf(linha + p, sizeof(linha) - p, "\n"));
+        const ssize_t w = ::write(2, linha, p);
+        (void)w;
     }
 
     // O canal do device de um ioctl (o `fd` do comando).
