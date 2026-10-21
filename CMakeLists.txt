@@ -162,6 +162,23 @@ target_include_directories(spirv_reflect PUBLIC vendor/third_party/SPIRV-Reflect
 #
 # target_sources(g610_core PRIVATE ${IA_FONTES_SHADER_RECOMPILER})
 # target_link_libraries(g610_core PUBLIC SPIRV-Tools sirit spirv_reflect)
+
+# --- o motor Maxwell do Eden (video_core) -----------------------------------
+#
+# Entra no MESMO alvo do `core/` ✓ — sao as duas metades do mesmo motor e
+# separadas dariam um circulo ao linker ✓.
+#
+# **Sem os renderers** ✓: o motor fala com o renderizador pela
+# `RasterizerInterface` ✓ (uma interface abstracta ✓), e a casa
+# implementa-a (o `ValhallBackend` ✓ do desenho). O `renderer_vulkan` do
+# upstream traz shaders gerados ✗ (glslang ✗) e o PanVK ✗ — e nao e'
+# preciso para o motor ✓.
+target_sources(g610_core PRIVATE ${IA_FONTES_VIDEO_CORE})
+target_include_directories(g610_core PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/vendor/eden/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/vendor/third_party/Vulkan-Headers/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/vendor/third_party/SPIRV-Headers/include
+)
 target_compile_definitions(g610_core PUBLIC ANKERL_UNORDERED_DENSE_STD_MODULE=1)
 target_link_libraries(g610_core PUBLIC Vulkan::Vulkan SDL2::SDL2 fmt::fmt pthread)
 
