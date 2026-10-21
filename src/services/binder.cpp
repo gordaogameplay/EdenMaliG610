@@ -56,12 +56,44 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 #include "vendor/eden/common/logging.h"
+#include "vendor/eden/core/hle/kernel/k_process_bridge.h"
 #include "g610/services/nvmap_registry.hpp"
 
 namespace g610::services {
 
 namespace {
+
+// Despeja a native window — o diagnostico de "o jogo desenhou?".
+void DespejarJanela();
+void VarrerRegiaoDoCanal();
+
+} // namespace
+
+void DespejarJanelaDoCompositor() {
+    DespejarJanela();
+}
+
+void VarrerRegiaoDoCanalDoCompositor() {
+    VarrerRegiaoDoCanal();
+}
+
+namespace {
+
+// Ler memória do guest — a mesma leitura que o `nvdrv` faz (o VA da GPU
+// é o espaço do guest).
+//
+// O processo corrente é o da **ponte** (`Bridge::processo()`), que é
+// global: é o mesmo que o `nvdrv` usa.
+bool LerDoGuest(std::uint64_t endereco, void* destino, std::size_t tamanho) {
+    auto* processo = Kernel::Bridge::processo();
+    if (processo == nullptr)
+        return false;
+    return processo->GetMemory().ReadBlock(static_cast<Common::ProcessAddress>(endereco),
+                                          destino, tamanho);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // O `Status` do Android (`nvnflinger/status.h`).
@@ -277,10 +309,103 @@ struct FilaDeBuffers {
     std::uint64_t submissoes = 0;
 };
 
+// A **janela** — o buffer onde o jogo desenha (a native window).
+//
+// É a mesma reserva que o `nvdrv` dá ao jogo (o espaço de VA da GPU), e
+// é a partir de 0x98000000 — à frente das alocações do `nvmap`.
+std::uint64_t g_janela = 0;
+std::uint64_t g_tamanho_janela = 0;
+
+// A **regiao do canal da GPU**: varre-a a procura de qualquer coisa
+// escrita.
+//
+// E' a medicao que decide onde esta o desenho: o guest deu ao canal um
+// buffer de 313 MB (medido), e a native window de 1280x720 (medido).
+// Se a regiao do canal tiver conteudo, e' ali que o jogo desenha.
+void VarrerRegiaoDoCanal() {
+    RegistoNvmap::Regiao regiao{};
+    if (!RegistoNvmap::Instancia().ProcurarCanal(regiao)) {
+        LOG_DEBUG(Service_NVDRV, "[canal] o registo nao sabe o canal");
+        return;
+    }
+    constexpr std::uint64_t kBloco = 1ull << 20;  // 1 MiB
+    std::vector<std::uint8_t> bloco(static_cast<std::size_t>(kBloco), 0);
+    for (std::uint64_t off = 0; off + kBloco <= regiao.tamanho; off += kBloco) {
+        if (!LerDoGuest(regiao.endereco + off, bloco.data(), bloco.size()))
+            continue;
+        bool vazio = true;
+        for (std::uint8_t b : bloco) {
+            if (b != 0) {
+                vazio = false;
+                break;
+            }
+        }
+        if (vazio)
+            continue;
+        // **Escreveu**: mostra o inicio do bloco.
+        LOG_DEBUG(Service_NVDRV, "[canal] escrita a partir de +0x{:X} (regiao 0x{:X}, {} bytes)",
+                  off, regiao.endereco, regiao.tamanho);
+        char linha[256];
+        std::size_t n = 0;
+        n += static_cast<std::size_t>(
+            std::snprintf(linha + n, sizeof(linha) - n, "[canal] +0x%llX:",
+                           (unsigned long long)off));
+        for (std::size_t i = 0; i < 64 && n + 4 < sizeof(linha); ++i)
+            n += static_cast<std::size_t>(
+                std::snprintf(linha + n, sizeof(linha) - n, " %02x", bloco[i]));
+        if (n + 2 < sizeof(linha))
+            n += static_cast<std::size_t>(std::snprintf(linha + n, sizeof(linha) - n, "\n"));
+        const ssize_t w = ::write(2, linha, n);
+        (void)w;
+        return;
+    }
+    LOG_DEBUG(Service_NVDRV, "[canal] a regiao de {} bytes esta toda a ZEROS",
+              regiao.tamanho);
+}
+
+// A native window: os primeiros bytes, em hexadecimal.
+void DespejarJanela() {
+    if (g_janela == 0)
+        return;
+    std::uint8_t janela[64] = {0};
+    if (!LerDoGuest(g_janela, janela, sizeof(janela)))
+        return;
+    char linha[256];
+    std::size_t n = 0;
+    n += static_cast<std::size_t>(
+        std::snprintf(linha + n, sizeof(linha) - n, "[janela] 0x%llX:",
+                       (unsigned long long)g_janela));
+    for (std::size_t i = 0; i < sizeof(janela) && n + 4 < sizeof(linha); ++i)
+        n += static_cast<std::size_t>(
+            std::snprintf(linha + n, sizeof(linha) - n, " %02x", janela[i]));
+    if (n + 2 < sizeof(linha))
+        n += static_cast<std::size_t>(std::snprintf(linha + n, sizeof(linha) - n, "\n"));
+    const ssize_t w = ::write(2, linha, n);
+    (void)w;
+}
+
 FilaDeBuffers& Fila() {
     static FilaDeBuffers f;
     return f;
 }
+
+} // namespace
+
+std::uint64_t AlocarJanelaDoCompositor(std::uint64_t tamanho) {
+    // A janela fica **noutra** zona: o `nvmap` aloca a partir de
+    // 0x98000000 (e o guest pediu 313 MB), por isso a native window
+    // fica logo acima, em 0x9C800000.
+    static std::uint64_t proximo = 0x9C800000ull;
+    constexpr std::uint64_t kFim = 0x9CC00000ull;  // 4 MiB
+    if (proximo + tamanho > kFim)
+        return 0;
+    g_janela = proximo;
+    g_tamanho_janela = tamanho;
+    proximo += (tamanho + 0xFFF) & ~0xFFFull;
+    return g_janela;
+}
+
+namespace {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // O `Fence` do Android (`nvnflinger/ui/fence.h`, 36 bytes): o número de
@@ -480,6 +605,28 @@ std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
         LOG_DEBUG(Service_NVDRV,
                   "compositor: QueueBuffer: slot={} desenho em 0x{:X} ({} bytes)", slot,
                   s.endereco, s.tamanho);
+
+        // **A janela, em hexadecimal.** É aqui que o desenho tem de
+        // estar: se isto não tiver pixels, o jogo não desenhou (e o
+        // caminho da GPU não é o que pensávamos).
+        {
+            std::uint8_t janela[64] = {0};
+            if (LerDoGuest(g_janela, janela, sizeof(janela))) {
+                char linha[256];
+                std::size_t n = 0;
+                n += static_cast<std::size_t>(
+                    std::snprintf(linha + n, sizeof(linha) - n, "[janela] 0x%llX:",
+                                   (unsigned long long)g_janela));
+                for (std::size_t i = 0; i < sizeof(janela) && n + 4 < sizeof(linha); ++i)
+                    n += static_cast<std::size_t>(
+                        std::snprintf(linha + n, sizeof(linha) - n, " %02x", janela[i]));
+                if (n + 2 < sizeof(linha))
+                    n += static_cast<std::size_t>(
+                        std::snprintf(linha + n, sizeof(linha) - n, "\n"));
+                const ssize_t w = ::write(2, linha, n);
+                (void)w;
+            }
+        }
         break;
     }
     case 2: {  // SetBufferCount

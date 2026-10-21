@@ -61,6 +61,7 @@
 #include "vendor/eden/core/hle/service/service.h"
 
 #include "g610/gpu/maxwell_translator.hpp"
+#include "g610/services/binder.hpp"
 #include "g610/services/nvmap_registry.hpp"
 #include "g610/telemetry.hpp"
 
@@ -380,14 +381,30 @@ struct IoctlSetTimeslice {
 static_assert(sizeof(IoctlSetTimeslice) == 4, "tamanho errado");
 
 // O cabeçalho de uma entrada da fila de comandos (`Tegra::
-// CommandListHeader`, do Eden): o tipo, o endereço do comando e o
-// tamanho.
+// CommandListHeader`, do Eden — `src/video_core/dma_pusher.h`).
+//
+// **É um `u64` com os campos em bits** — e não três `u32`. A versão
+// anterior da casa tratava-o como {tipo, endereço, tamanho} (12
+// bytes), e a medição do dump provou que essa leitura era falsa: os
+// "endereços" que se viam eram as metades de um `u64`.
+//
+//   bits  0..39  o endereço (VA da GPU, em bytes — o Eden usa-o
+//                directamente, sem escala: `dma_state.dma_get =
+//                command_list_header.addr`)
+//   bit      40  `allow_flush`
+//   bit      41  `is_push_buffer`
+//   bits 42..62  o tamanho, em bytes
+//   bit      63  `sync`
 struct CommandListHeader {
-    std::uint32_t type;
-    std::uint32_t address;
-    std::uint32_t size;
+    std::uint64_t bruto = 0;
+
+    std::uint64_t Endereco() const { return bruto & 0xFFFFFFFFFFull; }
+    bool AllowFlush() const { return ((bruto >> 40) & 1ull) != 0; }
+    bool EhPushBuffer() const { return ((bruto >> 41) & 1ull) != 0; }
+    std::uint64_t Tamanho() const { return (bruto >> 42) & 0x1FFFFFull; }
+    bool Sync() const { return ((bruto >> 63) & 1ull) != 0; }
 };
-static_assert(sizeof(CommandListHeader) == 12, "tamanho errado");
+static_assert(sizeof(CommandListHeader) == 8, "tamanho errado");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // As structs do `nvmap` (do Eden, `devices/nvmap.h`).
@@ -1235,6 +1252,7 @@ private:
                 LOG_DEBUG(Service_NVDRV, "canal: SetNVMAPfd: handle={} -> 0x{:X} ({} bytes)",
                           params.nvmap_fd, regiao.endereco, regiao.tamanho);
                 g_handle_do_buffer = static_cast<std::uint32_t>(params.nvmap_fd);
+                RegistoNvmap::Instancia().MarcarCanal(g_handle_do_buffer);
                 g_endereco_do_buffer = regiao.endereco;
                 g_tamanho_do_buffer = regiao.tamanho;
                 Despejar(regiao.endereco, 64, "nvmap");
@@ -1428,6 +1446,18 @@ private:
                   cabecalhos_no_endereco ? 1 : 0);
 
         // Os cabeçalhos.
+        // **A região do canal, no momento da submissão.** É aqui que o
+        // jogo já escreveu o push buffer (no `SetNVMAPfd` ainda estava a
+        // zeros — medido: 313 MB de zeros).
+        if (g_endereco_do_buffer != 0) {
+            LOG_DEBUG(Service_NVDRV, "canal: a região do buffer é 0x{:X} ({} bytes)",
+                      g_endereco_do_buffer, g_tamanho_do_buffer);
+            Despejar(g_endereco_do_buffer, 128, "pushbuffer");
+        }
+
+        // A native window: o diagnostico de "o jogo desenhou?".
+        DespejarJanelaDoCompositor();
+
         const std::size_t bytes_cabec =
             static_cast<std::size_t>(params.num_entries) * sizeof(CommandListHeader);
         std::vector<std::uint8_t> bruto_cabec(bytes_cabec, 0);
@@ -1455,27 +1485,17 @@ private:
             (void)w;
         }
 
-        // **A leitura em cascata**: cada palavra dos cabeçalhos que
-        // pareca um endereço é seguida, e o seu conteudo é despejado.
-        //
-        // E' a forma de descobrir o formato **sem adivinhar**: o dump
-        // medido mostra tres palavras, todas enderecos — e sao eles que
-        // dizem o que a estrutura e'.
-        for (std::size_t i = 0; i + 3 < bruto_cabec.size() + 3 && i < 24; i += 4) {
-            std::uint32_t valor = 0;
-            std::memcpy(&valor, bruto_cabec.data() + i, sizeof(valor));
-            if (valor == 0 || (valor & 0xF) != 0)
-                continue;
-            std::uint8_t conteudo[32] = {0};
-            if (!LerDoGuest(valor, conteudo, sizeof(conteudo)))
-                continue;
-            char linha[192];
+        // Os cabeçalhos **crus**: com o formato certo (8 bytes por
+        // entrada), sao eles que dizem onde esta o push buffer.
+        {
+            char linha[320];
             std::size_t n = 0;
-            n += static_cast<std::size_t>(std::snprintf(
-                linha + n, sizeof(linha) - n, "[gpfifo] 0x{:X} ->", valor));
-            for (std::size_t k = 0; k < sizeof(conteudo) && n + 4 < sizeof(linha); ++k)
+            n += static_cast<std::size_t>(
+                std::snprintf(linha + n, sizeof(linha) - n, "[gpfifo] cabecalhos crus:"));
+            for (std::size_t i = 0; i < bruto_cabec.size() && i < 64 && n + 4 < sizeof(linha);
+                 ++i)
                 n += static_cast<std::size_t>(
-                    std::snprintf(linha + n, sizeof(linha) - n, " %02x", conteudo[k]));
+                    std::snprintf(linha + n, sizeof(linha) - n, " %02x", bruto_cabec[i]));
             if (n + 2 < sizeof(linha))
                 n += static_cast<std::size_t>(std::snprintf(linha + n, sizeof(linha) - n, "\n"));
             const ssize_t w = ::write(2, linha, n);
@@ -1529,40 +1549,31 @@ private:
         std::vector<std::uint8_t> pushbuffer;
         for (const auto& cab : cabecalhos) {
             LOG_DEBUG(Service_NVDRV,
-                      "SubmitGPFIFO: entrada tipo={} endereco=0x{:X} tamanho={}", cab.type,
-                      cab.address, cab.size);
-            if (cab.size == 0)
+                      "SubmitGPFIFO: entrada addr=0x{:X} tamanho={} push_buffer={} sync={}",
+                      cab.Endereco(), cab.Tamanho(), cab.EhPushBuffer() ? 1 : 0,
+                      cab.Sync() ? 1 : 0);
+            if (cab.Tamanho() == 0)
                 continue;
-            if (cab.size > kLimitePorEntrada ||
-                pushbuffer.size() + cab.size > kLimiteTotal) {
+            if (cab.Tamanho() > kLimitePorEntrada ||
+                pushbuffer.size() + cab.Tamanho() > kLimiteTotal) {
+                // **Aviso, e não erro**: devolver `InvalidSize` ao guest
+                // parte-o, e o guest tem de poder continuar.
                 LOG_WARNING(Service_NVDRV,
-                           "SubmitGPFIFO: entrada com tamanho {} acima do limite — "
-                           "o push buffer não é o que esperamos",
-                           cab.size);
-                ResponseBuilder rb{ctx, 3};
-                rb.Push(ResultSuccess);
-                rb.PushEnum(NvResult::InvalidSize);
-                return;
+                           "SubmitGPFIFO: entrada com tamanho {} acima do limite",
+                           cab.Tamanho());
+                continue;
             }
             const std::size_t inicio = pushbuffer.size();
-            pushbuffer.resize(inicio + cab.size, 0);
-            if (!LerDoGuest(cab.address, pushbuffer.data() + inicio, cab.size)) {
+            pushbuffer.resize(inicio + static_cast<std::size_t>(cab.Tamanho()), 0);
+            if (!LerDoGuest(cab.Endereco(), pushbuffer.data() + inicio,
+                            static_cast<std::size_t>(cab.Tamanho()))) {
                 LOG_WARNING(Service_NVDRV, "SubmitGPFIFO: não li o comando em 0x{:X}",
-                            cab.address);
+                            cab.Endereco());
                 ResponseBuilder rb{ctx, 3};
                 rb.Push(ResultSuccess);
                 rb.PushEnum(NvResult::InvalidAddress);
                 return;
             }
-        }
-
-        // **A região do canal, no momento da submissão.** É aqui que o
-        // jogo já escreveu o push buffer (no `SetNVMAPfd` ainda estava a
-        // zeros — medido: 313 MB de zeros).
-        if (g_endereco_do_buffer != 0) {
-            LOG_DEBUG(Service_NVDRV, "canal: a região do buffer é 0x{:X} ({} bytes)",
-                      g_endereco_do_buffer, g_tamanho_do_buffer);
-            Despejar(g_endereco_do_buffer, 128, "pushbuffer");
         }
 
         // O push buffer **cru**, em hexadecimal: é o que permite

@@ -21,4 +21,15 @@ namespace g610::services {
 std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
                                                const std::vector<std::uint8_t>& entrada);
 
+// Aloca o buffer da **native window** (onde o jogo desenha) e devolve o
+// endereco (0 se nao houver espaco).
+std::uint64_t AlocarJanelaDoCompositor(std::uint64_t tamanho);
+
+// Despeja os primeiros bytes da native window (o diagnostico de "o jogo
+// desenhou?").
+void DespejarJanelaDoCompositor();
+
+// Varre a regiao do canal da GPU a procura de conteudo escrito.
+void VarrerRegiaoDoCanalDoCompositor();
+
 } // namespace g610::services

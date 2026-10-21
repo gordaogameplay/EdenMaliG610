@@ -643,16 +643,12 @@ private:
     //
     // Devolve `true` se alocar.
     static bool AlocarJanela(std::uint64_t tamanho, std::uint64_t& endereco) {
-        // A reserva do VA da GPU: a mesma que o `nvdrv` usa (a região
-        // de alias, 0x60000000..0x80000000, é do *alias*; o VA da GPU
-        // começa em 0x98000000, depois do heap do guest).
-        static std::uint64_t proximo = 0x98000000ull;
-        constexpr std::uint64_t kFim = 0xC0000000ull;
-        if (proximo + tamanho > kFim)
-            return false;
-        endereco = proximo;
-        proximo += (tamanho + 0xFFF) & ~0xFFFull;
-        return true;
+        // **É o compositor que a aloca** (`src/services/binder.cpp`): é
+        // quem precisa de saber onde está, porque é quem apresenta o
+        // desenho. A reserva é a do VA da GPU (a mesma que o `nvdrv` dá
+        // ao jogo).
+        endereco = AlocarJanelaDoCompositor(tamanho);
+        return endereco != 0;
     }
 
     // 100: o *relay service* (o driver do *binder*).

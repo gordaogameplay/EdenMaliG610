@@ -36,6 +36,7 @@
 #include <ucontext.h>
 
 #include "g610/guest_program.hpp"
+#include "g610/services/binder.hpp"
 #include "g610/guest_memory.hpp"
 #include "g610/native_engine.hpp"
 #include "g610/svc_dispatcher.hpp"
@@ -932,6 +933,9 @@ int main(int argc, char** argv) {
     tel.set_live_console(false);
     tel.start("0000000000000000", "boot-trace");
 
+    // O **diagnóstico final**: o que há na native window? Se o jogo
+    // desenhou, é aqui que se vê. É a pergunta que decide se o caminho
+    // da GPU é o caminho do desenho.
     // ── 1. carregar e mapear ──────────────────────────────────────────────
     g610::GuestProgram prog(tel);
     std::string err;
@@ -1623,6 +1627,10 @@ int main(int argc, char** argv) {
     }
 
     // ── 4. relatório ──────────────────────────────────────────────────────
+    // O que há na native window? É a pergunta que decide se o caminho
+    // da GPU é o caminho do desenho.
+    g610::services::DespejarJanelaDoCompositor();
+    g610::services::VarrerRegiaoDoCanalDoCompositor();
     std::printf("\n══════ resultado ══════\n");
     std::printf("  parou por   : %s\n",
                 r.error.empty() ? "(sem erro)" : r.error.c_str());

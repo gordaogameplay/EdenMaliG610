@@ -66,9 +66,30 @@ public:
         return true;
     }
 
+    // O **canal da GPU**: o handle do `nvmap` que o guest deu ao canal
+    // (`SetNVMAPfd`). E' a regiao onde o jogo escreve o desenho — e o
+    // registo e' partilhado para que o compositor possa procurar la
+    // (sem o `nvdrv` nao ha servicos a falar).
+    void MarcarCanal(std::uint32_t handle) {
+        std::lock_guard<std::mutex> lk(mu_);
+        canal_ = handle;
+    }
+
+    bool ProcurarCanal(Regiao& saida) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (canal_ == 0)
+            return false;
+        const auto it = regiao_.find(canal_);
+        if (it == regiao_.end())
+            return false;
+        saida = it->second;
+        return true;
+    }
+
 private:
     mutable std::mutex mu_;
     std::map<std::uint32_t, Regiao> regiao_;
+    std::uint32_t canal_ = 0;
 };
 
 } // namespace g610::services

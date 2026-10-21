@@ -3415,6 +3415,80 @@ recebe (`SetNVMAPfd`) e **despejar o conteúdo dessa região** — é aí
 que está o push buffer real, e é com esse dump que a tabela de opcodes
 se valida.
 
+### O formato do push buffer — a correcção (fonte: upstream)
+
+A leitura anterior (`{tipo, endereço, tamanho}`, 12 bytes) **era falsa**.
+O upstream do Eden define o cabeçalho em
+`src/video_core/dma_pusher.h`:
+
+```cpp
+struct CommandListHeader {
+    union {
+        u64 raw;
+        BitField<0, 40, GPUVAddr> addr;      // o endereço (bytes)
+        BitField<40, 1, u64> allow_flush;
+        BitField<41, 1, u64> is_push_buffer;
+        BitField<42, 21, u64> size;           // o tamanho (bytes)
+        BitField<63, 1, u64> sync;
+    };
+};
+```
+
+Ou seja: **8 bytes por entrada, com os campos em bits**. E o Eden usa o
+endereço **directly**, sem escala (`dma_state.dma_get =
+command_list_header.addr`).
+
+A casa tratava-o como três `u32` — e a medição do dump provou que a
+leitura era falsa: os "endereços" que se viam eram as metades de um
+`u64`. **Corrigido** (`src/services/nvdrv.cpp`): o cabeçalho é agora o
+`u64` do upstream, com os mesmos campos.
+
+**Como a submissão do guest de teste se descodifica** (medido, depois
+da correcção):
+
+| entrada | addr | tamanho | push_buffer | sync |
+|---|---|---|---|---|
+| 0 | `0xB9112000` | 2205 | 1 | 1 |
+| 1 | `0xB9114274` | 1 | 1 | 1 |
+| 2 | `0xB9114278` | 10 | 1 | 1 |
+
+### O guest de teste **não desenha** — medição definitiva
+
+Três medições independentes, todas do mesmo arranque:
+
+| região | tamanho | conteúdo |
+|---|---|---|
+| o push buffer (`0xB9112000`, 2205 bytes) | 2205 | **zeros** |
+| a região do canal (`nvmap` handle 3) | 313 MB | **zeros** (varredura completa) |
+| a native window (`0x9C800000`, 1280×720) | 3,6 MB | **zeros** |
+
+O guest submete uma lista de **três** push buffers (o formato é
+correcto!) mas **escreve-os a zeros**. Não há trabalho de GPU para
+executar — e portanto **o caminho da GPU não pode ser validado com o
+guest de teste**: o tradutor (item 3) e o backend (item 4) não têm
+entrada.
+
+### O jogo real — o que há e o que faltava
+
+- O NSP **está no Pi**: `~/piDroid/roms/Pokemon Shield
+  [01008DB008C2C000][v0] (9.53 GB).nsp` (9,53 GB, PFS0).
+- O `exefs_pokemon/` do workspace local **é uma cópia do guest de
+  teste** (md5 do `main` **igual** ao do `piDroid_Test_ARM`) — nunca
+  foi o jogo.
+- O `main` **real** existe localmente em `main_uncompressed` — e é
+  **NSO0** ✓, que é o formato que o carregador da casa sabe ler (com
+  descompressão LZ4). O `main_elf` é a mesma coisa em ELF.
+- O `hactool` **não existia** (era o que o `pokemon_convert.log`
+  complainha). **Compilado no Pi** (Makefile, mbedtls) ✓.
+- A estrutura do NSP (medida): 6 partições PFS0 — o *program* NCA tem
+  9,5 GB (é standard crypto), e o **ExeFS está dentro dele**; os
+  restantes NCAs são 964 KB, 251 KB e 114 KB, e há o `.cnmt`.
+
+O caminho passa a ser: `hactool --exefsdir` sobre o *program* NCA →
+`main`/`rtld`/`sdk`/`subsdk*`/`main.npdm` reais → o motor carrega-os
+(o carregador de NSO já existe e está testado) → e aí o guest **real**
+faz o trabalho de GPU, com o push buffer *host1x* a sério.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native
