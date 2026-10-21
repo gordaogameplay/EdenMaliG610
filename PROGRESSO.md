@@ -3268,66 +3268,75 @@ dados válidos e saltou para um ponteiro lixo (`0x40011e2d407c3`).
 ## Onde estamos
 
 O guest **não aborta** e **não dá erro de SVC**. Chega ao fim da
-inicialização do driver da GPU (31 ioctls), e pára num fault de memória
-**dentro do SDK** (`0x83b98c00`, a ler `0x20`).
+inicialização do driver da GPU e do **display**, e pára num fault de
+memória **dentro do SDK** (`0x83b98c00` → depois `0x837982bc`, um
+endereço no vão entre módulos — um ponteiro de função lixo).
 
-### O fault, desmontado
+### O canal, e a lição do despacho
 
-O módulo `sdk` foi desempacotado (`tools/unpack_nso.cpp` →
-`/tmp/sdk_text.bin`) e o código do fault é este:
+O `nvdrv` fino despachava os ioctls **só pelo grupo**. Isso não
+basta: **o device importa**. O grupo 0x00 tem comandos nos dois
+devices — no `nvhost-ctrl` é o `IocCtrlEventUnregisterBatch` (0x21) e no
+`nvhost_gpu` é o `GetWaitbase` (0x03).
 
-```
-40bc00:  ldr  x8, [x0, #32]!     ; <-- x0 é NULO: o fault em 0x20
-40bc04:  cmp  x8, x1
-40bc08:  b.eq 0x40bc24
-40bc0c:  cbz  x8, 0x40bc38
-40bc10:  mov  x9, x8
-40bc14:  ldr  x8, [x8, #16]       ; percorre a lista
-40bc18:  cmp  x8, x1
-40bc1c:  b.ne 0x40bc0c
-40bc20:  add  x0, x9, #0x10
-40bc24:  ldr  x8, [x1, #16]
-40bc28:  str  x8, [x0]
-```
+Agora o `Open` guarda o **tipo** do device (pelo nome, como o Eden) e o
+despacho é por **(device, grupo, comando)**, com as tabelas de cada
+device.
 
-É uma **inserção numa lista encadeada** (o nó novo em `x1`, a lista em
-`x0`), e a lista é nula. O caller (`0x413630`) carrega a lista de
-`*(x19 + 0xe08)` — um campo do objecto do SDK que ficou a nulo.
+**Medido** (`boot_p7g.log`): de 31 para **45 ioctls**, e o
+`SetTerminateResult` deixou de aparecer.
 
-E quem chamou o caller? A função `0x413528`, cujo resultado é testado
-com `tbz w0, #0` — o bit 0 do resultado. **O bit 0 é o `NvResult`** (o
-wrapper de ioctl do SDK está em `0x4137a0`, e o `tst w0, #0xff` em
-`0x413840` é o teste do `NvResult`).
+### A submissão — a porta de entrada do tradutor
 
-O `0x4137a0` é o **wrapper de ioctl do SDK**: monta o pedido, põe o
-fd, põe o buffer, põe o comando (`w4 = 0x21`) e envia.
+O `SubmitGPFIFOBase1` (grupo `'H'`, comandos 0x08 e 0x1b) é onde o
+trabalho do jogo chega à GPU: o guest escreveu os comandos Maxwell num
+endereço do VA da GPU e submete a lista de cabeçalhos.
 
-**O comando 0x21, no grupo 0x0, é o `IocCtrlEventUnregisterBatch`** — o
-comando do `nvhost-ctrl` (`devices/nvhost_ctrl.cpp`).
+**As duas variantes** (o Eden, `nvhost_gpu.cpp`): no 0x08 os cabeçalhos
+vêm **no pedido**; no 0x1b estão **no endereço**. Os comandos de cada
+entrada são lidos de lá, e é o **push buffer** que vai para o tradutor
+(`MaxwellTranslator::translate`, `src/gpu/`).
 
-**E o ioctl nunca chegou ao nosso serviço** — o log não tem nenhum
-ioctl do grupo 0x00. Ou seja: **o SDK não conseguiu enviá-lo**, e tomou
-o caminho de erro, e foi nesse caminho que desreferenciou o objecto
-nulo.
+**O VA da GPU é o espaço do guest** — num motor nativo não há tradução,
+e o push buffer é lido de lá. Por isso o tradutor e o `nvdrv` partilham
+a mesma memória, e o `MapBufferEx` regista o par (VA → endereço do
+guest) para a tradução.
 
-**O que o guest abriu** (medido): `/dev/nvhost-ctrl-gpu` (fd 1),
-`/dev/nvhost-as-gpu` (fd 2), `/dev/nvmap` (fd 3) e `/dev/nvhost-gpu`
-(fd 4) — e **nenhum `/dev/nvhost-ctrl`**, que é o dono do ioctl que o
-SDK queria usar. O `/dev/nvhost-gpu` (o canal) foi aberto e **fechado
-sem um único ioctl**.
+### O `vi` (o display) e a lição do `AlwaysMoveHandles`
 
-**A leitura honesta**: o nosso `Open` entrega um fd para **qualquer**
-nome, e o device que o guest recebeu não é o device que o Eden lhe
-daria. O `nvhost-gpu` (o canal) é um device com os seus próprios
-ioctls (grupos `0x0` e `'H'`), e o nosso `nvdrv` fino só sabe
-despachar pelo **grupo** — que chega para `'G'`, `'A'` e `0x01`, e
-não chega para o canal.
+O guest pediu `GetService("vi:m")` — o serviço de vídeo. São três
+serviços ("vi:m", "vi:s", "vi:u"), cada um com o seu display.
 
-**Honestidade sobre o que ainda não está feito**: o tradutor Maxwell →
-Vulkan (`src/gpu/`) continua por ligar ao IPC — o `nvdrv` dá-lhe o VA e
-os buffers, mas ninguém consome o push buffer. E falta o **canal**
-(`nvhost-gpu`), que é o device por onde o trabalho chega à GPU. São os
-dois próximos passos, e esta medição diz qual é a ordem.
+Duas lições que a medição deu:
+
+1. **O "vi:m" devolve o display da APLICACÃO**
+   (`Out<SharedPointer<IApplicationDisplayService>>`, no upstream). Devolver
+   o display do *manager* dava ao guest outra tabela: ele pedia o 100
+   (`GetRelayService`), que no display do *manager* não existe.
+2. **Um comando que devolve uma interface tem de devolver uma
+   interface.** O `GetRelayService` respondido pelo *auto-stub* (sucesso
+   e zeros) deu ao guest um handle nulo, e ele desreferenciou-o: o
+   salto para `0x837982bc`. O `AlwaysMoveHandles` (como o `sm:` faz no
+   `GetService`) é o que garante o handle — **a sessão pode ser um
+   domínio**, e nesse caso o objecto ia parar à lista de domínio sem
+   nunca ser escrito.
+
+### A parede actual
+
+O `OpenLayer` (comando 2020 do display da aplicação) — a **native
+window**, que é o *buffer* onde o jogo desenha. É o ponto de ligação
+com o caminho de render da casa (Wayland/SDL2 + panvk): o buffer que
+o Eden dá ao jogo é o mesmo que o compositor da casa apresentaria.
+
+E, a montante, o **canal** ainda não submeteu nada: o
+`SubmitGPFIFO` nunca chegou a correr (0 submissões), porque o guest
+parou antes no display.
+
+**Honestidade sobre o que ainda não está feito**: o tradutor
+Maxwell → Vulkan (`src/gpu/`) **traduz** o push buffer, mas **não
+executa** — a execução é do `ValhallBackend` (PanVK), e essa ligação
+ainda não está feita. O `nvdrv` já dá-lhe o VA e os buffers; falta quem
+consome os comandos traduzidos e apresenta o frame.
 
 ## Estado
 
