@@ -298,6 +298,20 @@ void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
     if (!ctx.has_ret)
         ctx.ret = static_cast<std::uint64_t>(r);
 
+    // **O Result que o guest recebe** ✗ — e' o que o SDK verifica ✗
+    // (o codigo do guest em `0x83abc1e8` ✗ e' a verificacao ✗) ✗.
+    if (std::getenv("IA_SVC_TRACE") != nullptr && r != Result::Success) {
+        std::fprintf(stderr, "[svc] devolveu ERRO %u (0x%x)\n",
+                     static_cast<unsigned>(r), static_cast<unsigned>(r));
+    }
+
+    // **O x0 que o guest recebe** ✗ — o SDK le-o ✗ ✗.
+    if (std::getenv("IA_SVC_TRACE") != nullptr &&
+        (ctx.gpr[30] & ~std::uint64_t{3}) == 0x83abc1e8ull) {
+        std::fprintf(stderr, "[svc] SVC que devolveu a 0x83abc1e8: x0=0x%llx ret=0x%llx\n",
+                     (unsigned long long)ctx.x[0], (unsigned long long)ctx.ret);
+    }
+
     // **Um SVC que devolve erro mata o jogo.** O SDK trata um Result
     // inesperado como fatal: chama `SetTerminateResult` ao `am` e aborta.
     // Foi o que aconteceu com o SVC 0x0f (`SetThreadCoreMask`), que nao
