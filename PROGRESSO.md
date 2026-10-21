@@ -3321,6 +3321,37 @@ Duas lições que a medição deu:
    domínio**, e nesse caso o objecto ia parar à lista de domínio sem
    nunca ser escrito.
 
+### O que o jogo entrega: o protocolo do *binder* do Android
+
+Com a native window, o guest passou a falar com o **binder** (o
+`IHOSBinderDriver`): `AdjustRefcount`, `GetNativeHandle` e
+`TransactParcelAuto` — e o *parcel* que ele manda foi medido
+(`boot_p7m.log`):
+
+```
+5c 00 00 00   data_size = 92
+10 00 00 00   data_offset = 16
+00 00 00 00   objects_size = 0
+6c 00 00 00   objects_offset = 108
+00 01 00 00   0x100
+22 00 00 00   34 (o comprimento do token, em caracteres)
+61 00 6e 00 64 00 72 00 6f 00 69 00 64 00 2e 00 67 00 75 00 69 00 2e 00
+             "android.gui." em UTF-16
+```
+
+Ou seja: o jogo fala o **protocolo do *binder* do Android**, com o token
+de interface `android.gui.IGraphicBufferProducer` (34 caracteres), e
+manda as transacções **9, 10 e 14**.
+
+O Eden implementa isso com a pilha completa do *surfaceflinger* do
+Android (`nvnflinger/buffer_queue_producer.cpp`, 36 KB, mais o
+`surface_flinger.cpp` e o `hardware_composer.cpp`).
+
+**O que a casa precisa,在这一Transactions**: o *binder* da casa é o
+compositor — tem de responder a estas transacções (dar um buffer ao
+jogo, receber o buffer desenhado) e apresentá-lo. É a **fila de
+buffers** do Android, em versão mínima.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native

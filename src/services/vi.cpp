@@ -47,6 +47,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <unistd.h>
 #include <map>
 #include <memory>
 #include <string>
@@ -308,15 +309,59 @@ private:
     // volta — um bloco de zeros, com o tamanho que o guest pediu.
     void TransactParcel(HLERequestContext& ctx) {
         RequestParser rp{ctx};
-        (void)rp.PopRaw<std::int32_t>();   // o binder_id
-        (void)rp.PopRaw<std::uint32_t>();  // o transaction_id
-        // O `parcel` de entrada é um buffer (o `InBuffer` do Eden) e o de
-        // saída outro — o `RequestParser` não os lê, e o Eden também não
-        // os lê no `RequestParser` (vêm dos descritores).
+        const std::int32_t binder_id = rp.PopRaw<std::int32_t>();
+        const std::uint32_t transacao = rp.PopRaw<std::uint32_t>();
+
+        // O parcel de entrada: um buffer de entrada (o `InBuffer` do
+        // Eden). A resposta vai para o buffer de saída (índice 0).
+        const auto entrada = ctx.ReadBufferCopy(0);
+
+        // O cabeçalho do parcel (`ParcelHeader`, 16 bytes).
+        ParcelHeader cabecalho{};
+        if (entrada.size() >= sizeof(cabecalho))
+            std::memcpy(&cabecalho, entrada.data(), sizeof(cabecalho));
+
+        LOG_DEBUG(Service_NVDRV,
+                  "binder: TransactParcel id={} transacao={} parcel={} bytes "
+                  "(dados={}@{}, objectos={}@{})",
+                  binder_id, transacao, entrada.size(), cabecalho.data_size,
+                  cabecalho.data_offset, cabecalho.objects_size, cabecalho.objects_offset);
+
+        // Os primeiros bytes do parcel, em hexadecimal: é o que permite
+        // decodificar o formato **real** em vez de o adivinhar.
+        {
+            // **Os limites são contados.** Um `snprintf` que devolve o
+            // tamanho *que teria escrito* pode passar do fim do tampão, e
+            // o `sizeof(linha) - n` deixa de ser um tamanho: vira um
+            // número gigante e o motor escreve fora do tampão. Foi o que
+            // aconteceu (o processo morreu no fim do arranque).
+            char linha[320];
+            std::size_t n = 0;
+            n += static_cast<std::size_t>(
+                std::snprintf(linha + n, sizeof(linha) - n, "[binder] parcel:"));
+            for (std::size_t i = 0; i < entrada.size() && i < 48 && n + 4 < sizeof(linha); ++i)
+                n += static_cast<std::size_t>(
+                    std::snprintf(linha + n, sizeof(linha) - n, " %02x", entrada[i]));
+            if (n + 2 < sizeof(linha))
+                n += static_cast<std::size_t>(
+                    std::snprintf(linha + n, sizeof(linha) - n, "\n"));
+            const ssize_t w = ::write(2, linha, n);
+            (void)w;
+        }
+
+        // A resposta: um parcel em branco — o cabeçalho, sem dados.
+        std::vector<std::uint8_t> reply(sizeof(ParcelHeader), 0);
+        ParcelHeader cab{};
+        cab.data_size = 0;
+        cab.data_offset = sizeof(ParcelHeader);
+        cab.objects_size = 0;
+        cab.objects_offset = sizeof(ParcelHeader);
+        std::memcpy(reply.data(), &cab, sizeof(cab));
+
         const std::size_t tamanho = ctx.GetWriteBufferSize(0);
         if (tamanho > 0) {
-            const std::vector<std::uint8_t> zeros(tamanho, 0);
-            ctx.WriteBuffer(zeros.data(), zeros.size());
+            const std::size_t n = std::min(tamanho, reply.size());
+            ctx.WriteBuffer(reply.data(), n, 0);
         }
         ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
