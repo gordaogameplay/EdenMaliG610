@@ -4195,6 +4195,100 @@ cv `0x10a2c7d64` ✗ e' do **proprio jogo** ✗ (o dump mostra
 `mutex=0x81ff cv=0x0` ✗) ✗, e o `tag=0x81ff` ✗ tem o bit 0x8000 ✗
 ligado ✗ — que no Eden e' o bit de "**waiter removido**" ✗ ✗.
 
+### O `android.gui` — o token do parcel e o `Remap`
+
+**O token da interface e' lido SEM alinhamento** ✗ — o upstream usa
+`ReadUnaligned<u16>()` (`nvnflinger/parcel.h:96` ✗). A casa alinhava a 4
+bytes depois de cada caracter ✗ ✗.
+
+Medido ✗ (`/tmp/boot_v17.log` ✗): o indice do parcel saltava de **16**
+para **164** depois do token ✗, quando devia ficar em **48** ✗ (16 do
+`data_offset` ✗ + 8 do cabecalho ✗ + 24 dos 12 caracteres ✗). A
+diferenca ✗ — 116 bytes ✗ — era o desperdicio de 2 bytes por caracter ✗.
+
+**Consequencia medida** ✗: o `SetPreallocatedBuffer` (transaccao 14 ✗)
+lia o *slot* ✗ e o *objecto* ✗ de sitios errados ✗ ✗, o `LeObjecto`
+falhava ✗ ✗ e o compositor devolvia `StatusBadValue` ✗ ✗ — o jogo
+ficava sem poder desenhar ✗ ✗.
+
+**O handle do `nvmap` e' o `buffer_id`** (offset **44** ✗), nao o
+`Handle` (offset **116** ✗) — o upstream
+(`nvnflinger/ui/graphic_buffer.cpp:23-25` ✗) usa `BufferId()` ✗ para o
+`DuplicateHandle` ✗ e o `PinHandle` ✗. O `Handle` e' o handle do
+*buffer de video* ✗ ✗.
+
+**As dimensoes da fila** ✗ — o upstream (`buffer_queue_core.h:89-91` ✗)
+tem `default_width` ✗, `default_height` ✗ e `default_buffer_format` ✗,
+que o `SetPreallocatedBuffer` define ✗
+(`buffer_queue_producer.cpp:814-816` ✗) e que o `Connect` ✗ e o `Query`
+✗ devolvem ✗. A casa devolvia **1280x720 fixos** ✗ — um palpite ✗, nao
+o upstream ✗ ✗.
+
+**A `api` do `Connect`** ✗ tem de ser uma das quatro ✗ (Egl ✗, Cpu ✗,
+Media ✗, Camera ✗ — `buffer_queue_producer.cpp:716-726` ✗); o resto e'
+`Status::BadValue` ✗. A casa aceitava qualquer uma ✗ ✗.
+
+**O `Remap` do `MapBufferEx`** ✗ (bit 8 das flags ✗ — o upstream,
+`nvhost_as_gpu.h:46` ✗) remapeia um VA **ja existente** ✗ e **nao
+altera o `params.offset`** ✗ ✗. A casa tratava-o como o caminho normal
+✗ e devolvia o **endereco da memoria** ✗ ✗.
+
+Medido ✗ (`/tmp/boot_v20.log` ✗): `MapBufferEx: handle=0 va=0xE5D39000
+-> 0xF4CEF000 tamanho=0x870000 flags=0x100` ✗ ✗ — o `0x100` e' o
+`Remap` ✗ ✗. O guest escrevia num sitio ✗ e lia noutro ✗ — o
+framebuffer ficava partido ✗ ✗.
+
+O `Mapping` do upstream (`nvhost_as_gpu.h:167-180` ✗) guarda o `ptr`
+base ✗, o `size` ✗ e o `fixed` ✗ — e e' o `ptr` **base** ✗ que o
+`Remap` usa ✗ (`nvhost_as_gpu.cpp:343` ✗), nao o `ptr` do handle ✗ ✗.
+Medido ✗: o remap do VA `0xE5D39000` dava `0xF8559000` ✗, quando o
+correcto e' `0xE5D39000 + 0x12820000` ✗ ✓.
+
+O `Remap` tambem exige ✗ (o upstream ✗): que o VA esteja mapeado ✗ (o
+`mapping_map.at()` ✗ **lanca** ✗) ✗ e que o tamanho do mapeamento
+baste ✗ (`BadValue` ✗ se nao ✗) ✗.
+
+**O `ResultNotFound` do pump nao e' um erro** ✗ — e' "ainda nao ha nada
+para atender" ✗. O upstream trata-o explicitamente ✗
+(`svc/svc_ipc.cpp:91` ✗). A casa devolvia-o ao guest como se fosse
+falha ✗ ✗.
+
+### Onde o jogo esta agora
+
+Medido ✗ (`/tmp/boot_v24.log` ✗):
+
+- o `SetPreallocatedBuffer` **funciona** ✗ ✓ (os dois slots ✗);
+- o `Remap` **funciona** ✗ ✓ (o `ptr` base e' o do mapeamento ✗);
+- o `Connect` ✗ e o `Query` ✗ devolvem as dimensoes da fila ✗ ✓;
+- o jogo **continua a abortar** ✗ com `desc=3005` ✗ ✗ ✗.
+
+**A espera que bloqueia** ✗: `WaitProcessWideKeyAtomic addr=0x10a2c7d58
+cv=0x10a2c7d64 tag=0x81ff timeout=-1` ✗ — espera infinita ✗, e o sinal
+**nunca chega** ✗ ✗.
+
+**O que a medicao mostra** ✗ ✗:
+
+- o `x30` da espera ✗ (`0x83abc1e8` ✗) e' uma **verificacao de erro**
+  ✗ ✗ (desassemblada ✗: `str w0,[sp,#8]` ✗ / `cbnz w0, ...` ✗ / `ret`
+  ✗) ✗ — ou seja ✗, o SVC **devolveu erro** ✗ ✗;
+- o SVC que falhou ✗ foi o `WaitProcessWideKeyAtomic` ✗ ✗;
+- mas esse SVC ✗ **nao pode falhar** ✗ com timeout=-1 ✗ — o upstream
+  (`svc_condition_variable.cpp:18-47` ✗) so' devolve erro ✗ de
+  endereco invalido ✗ ou de timeout ✗ zero ✗ ✗;
+- **a thread que espera ✗ esta a espera de um sinal de outra thread
+  do jogo** ✗ ✗ — e o jogo **nao** o da ✗ ✗.
+
+**O push buffer** ✗: uma so submissao ✗ ✗, e ela e' de **setup** ✗ —
+os ids de canal presentes sao 0 ✗, 2 ✗ e 11 ✗ ✗, e **nao** ha `0x1D`
+(`SyncpointOperation` ✗) ✗ nem `0x07` (`SemaphoreTrigger` ✗) ✗ ✗. O
+`draw_end` (1413 ✗) e o `draw_begin` (1414 ✗) **nao estao** no buffer
+✗ ✗ — o guest ainda nao desenhou ✗ ✗.
+
+**A pista mais forte agora** ✗: o jogo faz `SetPreallocatedBuffer` ✗
+mas **nunca** pede `DequeueBuffer` ✗ ✗. O ciclo de render do Switch e'
+Dequeue ✗ -> desenhar ✗ -> Queue ✗ ✗, e o jogo **nao chega** ao
+Dequeue ✗ ✗.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native
