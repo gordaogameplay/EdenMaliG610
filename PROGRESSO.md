@@ -3699,6 +3699,25 @@ O caminho 1 é o mais provável, e é onde está a correcção a fazer: o
 `SignalImpl`, tem de ser **incondicional** (como no Eden), e não
 depender da contagem de *waiters* que a casa faz.
 
+### Onde está o jogo agora — medido
+
+| | antes | agora |
+|---|---|---|
+| fim do arranque | `limite de traps atingido (4000)` — impasse | **`fault de memoria do guest em 0x83b0bb44`** (endereco `0x0`) |
+| o signal da cv | `acordados=0` — ninguém acordava | **`acordados=1`** ✓ |
+| threads do jogo | todos parados | um corre até ao fault |
+
+**O impasse da cv está resolvido**: o *waiter* é acordado e o jogo
+executa código a sério. O que aparece a seguir é **um problema novo**:
+um acesso a `0x0` dentro do wrapper de futex do SDK (`0x83b0bb44`),
+com `sp=0x30fffe950`.
+
+**O próximo passo, com a medição à mão**: despejar os **bytes do
+código no PC do fault** (o tratador de traps do motor tem o PC ✓) e
+descobrir o que o SDK carrega de um ponteiro nulo — é a mesma técnica
+que o dump da stack no `wait` usou, e que já disse onde o jogo
+estava bloqueado.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native

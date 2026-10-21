@@ -2108,10 +2108,14 @@ Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
                 // nível) e deixa o waiter na fila da mutex — o dono
                 // continua a ter a mutex, e o waiter vai buscá-la quando
                 // puder (o SDK re-avalia o predicado e volta a travar).
-                const std::uint32_t novo = prev | kArbWaitMask;
+                //
+                // E **dá-lhe a mutex**: a palavra passa a ser o tag
+                // dele (como no ramo "a mutex estava livre"), e ele
+                // acorda **dono** — que é o que o Eden devolve a quem
+                // espera por uma cv cuja mutex ficou livre.
+                const std::uint32_t novo = w.tag;
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 if (write_guest(w.addr, &novo, sizeof novo)) {
-                    g_arbiter.fila[w.addr].push_back({w.tag, w.token});
                     g_arbiter.desperta[w.token] = ArbitrationBoard::DespertaSucesso;
                     ++acordados;
                     wakers.push_back(w.token);
