@@ -488,6 +488,30 @@ compositor→HDMI). **A imagem do JOGO fica atrás do drop fantasma do
 `SendSyncRequest`** — passo 6. Nota: se corrido em fundo e o ssh fecha no
 meio, o teardown segfaulta; em primeiro plano a saída é limpa (exit 0).
 
+## Passo 6 (aberto) — o fatal **estanca no `SetTerminateResult`** do app
+
+Medição nova (boot_p6 + boot_p6_r2, e conferido contra os três boot_p5_r1..3 —
+todos param no MESMO ponto; o "16 SFCO" de antes era de outra passagem e não
+deve ser usado como estado):
+
+- O app chega a `IApplicationFunctions: comando 22 (SetTerminateResult)` — o
+  caminho de erro fatal do SDK nn. A resposta sai com o cookie `SFCO`
+  (0x4F434653).
+- Depois disso o pump do servidor é chamado e fica **vazio**:
+  `pump servidor=6 Result=61953 (progresso=0)` — nada pendente.
+- Logo em seguida o guest chama `svc #0x26 Break` (x0=0x40) e o thread entra
+  no spin infinito `0x8390d1e8` (`b .+0` da SDK, medido por objdump) — é aí
+  que o boot pendura (exit 124).
+- Circunstância suspeita da hora da morte: um `SignalProcessWideKey
+  key=0x8434ed4c count=-1` corre com **acordados=0** imediatamente antes do
+  Break — se alguém dormia nessa cv, devia acordar; acordados=0 sugere que o
+  thread que devia consumir o resultado nunca ficou na fila.
+
+Filho do passo 6: apurar (a) o contexto de quem chama SetTerminateResult
+(qual resultado o app recebeu falhado), e (b) a fila de waiters no instante
+do `acordados=0` — o instrumento está no quadro `g_arbiter`
+(`src/svc_dispatcher.cpp`).
+
 ## Não confirmado (não inventar)
 
 - `__tls_align` do SDK oficial → usamos 16 como mínimo.
