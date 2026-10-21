@@ -3879,6 +3879,50 @@ O que falta para compilar isto dentro da casa: as dependências do
 `renderer_vulkan` (o **PanVK** ✗ — o driver Vulkan-sobre-Vulkan que o
 Eden usa ✗) e as flags de compilação ✗. É mecânico, mas não é trivial.
 
+### O que falta para compilar o `video_core` na casa (medido)
+
+As dependências declaradas no `CMakeLists.txt` do upstream (que ficou
+vendorizado ✓) são:
+
+| alvo | precisa de | na casa |
+|---|---|---|
+| `video_core` | `Vulkan::UtilityHeaders` (Vulkan-Headers) | **falta** |
+| | `GPUOpen::VulkanMemoryAllocator` (VMA) | **falta** |
+| | `dynarmic` (o JIT do guest) | **não é preciso** — o guest corre nativamente ✓ |
+| | `xbyak` (só em x86-64) | **não é preciso** ✓ |
+| `shader_recompiler` | `common`, `fmt` | **já tem** ✓ |
+| | `sirit::sirit` (SPIRV-Reflect) | **falta** |
+| | `SPIRV-Tools::SPIRV-Tools` | **falta** |
+
+**O PanVK não é uma dependência de compilação** ✓ — o upstream
+carrega-o em *runtime* (é um ICD ✗ que o carregador de Vulkan
+encontra ✗), e o Pi já o tem ✓ (é o que o `tests/mostra.cpp` usa ✓✓).
+
+**A receita, passo a passo:**
+
+1. `tools/vendorizar_video_core.py` já traz o `video_core` e o
+   `shader_recompiler` ✓; falta trazer (e compilar):
+   - `KhronosGroup/Vulkan-Headers` ✓ (só cabeçalhos ✗),
+   - `GPUOpen-GameFoundations/VulkanMemoryAllocator` ✓,
+   - `KhronosGroup/SPIRV-Headers` ✓, `KhronosGroup/SPIRV-Tools` ✓,
+     `KhronosGroup/SPIRV-Reflect` ✓.
+2. No `CMakeLists.txt` da casa: os alvos `video_core` e
+   `shader_recompiler` ✓, com os includes do upstream (`vendor/eden/src`
+   ✗ — o upstream usa `src/` ✗, e o prefixo muda ✗ → ou um
+   `target_include_directories` com `vendor/eden` ✗ e um *symlink*
+   `src` → `vendor/eden/src` ✗, ou compilar com `-I` ✗).
+3. O `video_core` referencia `core/` e `common/` ✗ — já vendorizados ✓
+   — e `fmt` ✓.
+
+**O atalho que o desenho da casa já previa**: o motor Maxwell fala com
+um `RasterizerInterface` ✓ (uma interface abstracta ✓ do upstream ✗) —
+por isso a casa **não precisa** do `renderer_vulkan` ✗ nem do PanVK
+✗✗: basta implementar a interface ✓ com o backend de Vulkan ✓
+(o `ValhallBackend` ✗ que o desenho já nomeia ✗). O `renderer_vulkan`
+do upstream fica de fora ✗ — e com ele o PanVK ✗ e o VMA ✗ — e o
+`shader_recompiler` ✗ pode ser ligado depois ✓ (é o que troca o
+*placeholder* do `ShaderCache` ✓).
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native
