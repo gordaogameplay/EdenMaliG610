@@ -329,6 +329,68 @@ struct TrapState {
           guest_returned(&s.guest_returned), illegal_insn(&s.illegal_insn) {}
 };
 
+// ---------------------------------------------------------------------------
+// O dono do despacho: UM despacho de SVC de cada vez no processo inteiro
+// ---------------------------------------------------------------------------
+//
+// O `SvcDispatcher` é UM por processo (`g_hooks.svc`), e desde o passo 2 há
+// threads de guest a despachar AO MESMO TEMPO. Medição A/B no Pi (3
+// execuções do MESMO binário): o processo morre com `double free or
+// corruption (!prev/(!out))` em posições diferentes (SVC final 261/262; e o
+// número de `[thrd] trap` variou 195 → 31 de uma execução para outra) —
+// corrida, não determinismo do jogo. Suspeitos no estado interno do
+// despacho: `handles_` (std::map), `new KObject` em `svc_create_thread`, e
+// o buffer de mensagem de IPC que o Eden partilha por processo
+// (`Bridge::thread()`, `k_server_session.cpp:379`).
+//
+// A serialização é FEITA AQUI (à volta da chamada `dispatch`), não dentro
+// do repositório: é o mesmo papel de um só kernel despachando uma sysCall
+// de cada vez, que é exactamente o modelo do Eden/NCE.
+//
+// O dono é por thread, com um caso explícito: se a MESMA thread voltar a
+// entrar NESTED (um fault do host dentro do C++ do despacho — os handlers
+// têm SA_NODEFER), ela não re-entra; trata a trap como fault e sai pela
+// recuperação. Por isso o release é manual nos pontos de saída: o
+// `siglongjmp` da recuperação NÃO desmonta o frame do despacho (nenhum
+// destructor corre), e um spinlock locker por RAII ficaria enleixado lá
+// dentro.
+constexpr std::uint64_t kOwnerFree = 0;
+constexpr std::uint64_t kOwnerMain = 1; // a thread principal, em `run()`
+
+std::atomic<std::uint64_t> g_dispatch_owner{kOwnerFree};
+
+// O token desta thread no mapa de donos: as threads de guest usam o
+// ponteiro do SEU `GuestThreadState` (estável durante a vida da thread), a
+// principal usa `kOwnerMain`.
+inline std::uint64_t dispatch_token(GuestThreadState* st) {
+    return st != nullptr ? reinterpret_cast<std::uint64_t>(st) : kOwnerMain;
+}
+
+// Tenta tomar o poder de despachar. Devolve false se (a) o dono é a MESMA
+// thread — trap aninhada — ou (b) o teto de spin estourou. Em ambos os
+// casos o chamador trata a trap como fault e sai pela recuperação.
+inline bool dispatch_take(std::uint64_t me) {
+    for (int i = 0; i < 200000; ++i) {
+        std::uint64_t expect = kOwnerFree;
+        if (g_dispatch_owner.compare_exchange_strong(expect, me,
+                                                     std::memory_order_acq_rel,
+                                                     std::memory_order_acquire))
+            return true;
+        if (g_dispatch_owner.load(std::memory_order_acquire) == me)
+            return false; // trap aninhada: o próprio dono
+    }
+    return false; // teto de spin: um despacho ficou demasiado tempo
+}
+
+// Liberta o dono. Só o próprio dono liberta; o `expect` do
+// compare_exchange dá essa garantia sem lock.
+inline void dispatch_release(std::uint64_t me) {
+    std::uint64_t expect = me;
+    g_dispatch_owner.compare_exchange_strong(expect, kOwnerFree,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire);
+}
+
 } // namespace
 
 NativeEngine::NativeEngine(tel::Telemetry& tel, SvcDispatcher& svc)
@@ -558,6 +620,11 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
     if (g_hooks.guest_tls != 0)
         write_thread_pointer(g_hooks.host_tls);
 
+    // Se o dono do despacho ficou enleixo DA PRINCIPAL (a trap aninhada
+    // abandonou o frame do despacho por `siglongjmp`, que não corre
+    // destructors), liberta aqui. Em execuções sãs o CAS não faz nada.
+    dispatch_release(kOwnerMain);
+
     if (jumped == 0) {
         g_have_run_jmp = true;
 
@@ -766,6 +833,10 @@ int NativeEngine::run_guest_thread(std::uint64_t entry, std::uint64_t arg,
         // "pc=0xa... (addr 0x0)" — lixo de outra thread.
         st->have_jmp = false;
         write_thread_pointer(st->host_tls);
+        // A thread sai — e se o dono do despacho ficou enleixo DELA (o caso
+        // da trap aninhada abandonou o frame do despacho por `siglongjmp`,
+        // que não corre destructors), liberta aqui.
+        dispatch_release(reinterpret_cast<std::uint64_t>(st));
         std::fprintf(stderr,
                      "[thrd] a thread de guest parou: pc=0x%llx addr=0x%llx "
                      "sp=0x%llx (traps=%llu faults=%llu)\n",
@@ -789,6 +860,7 @@ int NativeEngine::run_guest_thread(std::uint64_t entry, std::uint64_t arg,
 
     write_thread_pointer(st->host_tls);
     st->have_jmp = false;
+    dispatch_release(reinterpret_cast<std::uint64_t>(st));
     unregister_guest_thread_state(st);
     return 0;
 }
@@ -969,7 +1041,26 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
                              g_hooks.observer_user);
 
         const auto t0 = g_hooks.tel->time_now();
-        g_hooks.svc->dispatch(number, c);
+        const std::uint64_t me = dispatch_token(st);
+        bool locked = dispatch_take(me);
+        if (locked) {
+            g_hooks.svc->dispatch(number, c);
+            dispatch_release(me);
+        } else {
+            // O despacho não aconteceu: trap aninhada do próprio dono (um
+            // fault do host no C++ do despacho), ou teto de spin estourou.
+            // Trata como fault — a thread sai pela recuperação, que liberta
+            // o dono DELA nos seus pontos de fim. Não incrementa `svc_calls`
+            // nem `svc_time_ns`: o serviço não correu.
+            *ts.last = TrapKind::GuestFault;
+            *ts.fault_pc = pc;
+            *ts.fault_sp = static_cast<std::uint64_t>(uc->uc_mcontext.sp);
+            *ts.fault_addr = 0;
+            *ts.faulted = true;
+            uc->uc_mcontext.sp = rec_sp;
+            uc->uc_mcontext.pc = g_hooks.recovery_pc;
+            return;
+        }
         *ts.svc_time_ns +=
             static_cast<std::uint64_t>(g_hooks.tel->time_now() - t0);
         ++*ts.svc_calls;

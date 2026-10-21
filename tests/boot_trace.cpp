@@ -1394,8 +1394,15 @@ int main(int argc, char** argv) {
     } else {
         engine.set_trap_limit(4000);
     }
-    engine.set_observer(&on_svc, nullptr);
-    engine.set_trapper(&on_trap, nullptr);
+    // IA_NOOB=1: o observer é desligado para a medição por subtração — se a
+    // heap deixa de corromper sem o observer, o corruptor é o caminho de
+    // diagnóstico (printf/string/dump) a correr de dentro do handler em
+    // várias threads. Com IA_TRACE=0 os prints do [h]/[run] desaparecem, mas
+    // o observer (printf/„string") mantém-se — [svc] sempre printa.
+    if (::getenv("IA_NOOB") == nullptr) {
+        engine.set_observer(&on_svc, nullptr);
+        engine.set_trapper(&on_trap, nullptr);
+    }
     if (!engine.install_handlers(err)) {
         std::printf("  handlers: %s\n", err.c_str());
         return 1;

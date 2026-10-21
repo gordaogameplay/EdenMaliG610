@@ -2867,3 +2867,58 @@ continua estável na v0.1.0.
 |---|---|
 | `main` | **estável** (tag v0.1.0, `8c27236`): 6/6 testes |
 | `wip/passo-2-thread` | a thread de guest com estado e TLS próprios; **6/6 testes no Pi**; 195 traps reais de guest; a seguir: serializar o despacho (passo 3) |
+
+# 2026-10-21 — wip/passo-3-thread: o despacho serializado e a medição por subtração
+
+## A parede do passo 2, com medida adicional
+
+`double free or corruption (!prev/(!out))` a morrer em posições
+diferentes entre execuções do MESMO binário (SVC final 261/262; traps
+de guest 195 → 31) — **corrida, não determinismo do jogo**. Suspeitos:
+o despacho concorrente no `SvcDispatcher` partilhado.
+
+## O que o passo 3 muda
+
+Um **dono atómico por thread** à volta de `g_hooks.svc->dispatch()`
+(`g_dispatch_owner`): o despacho de SVC corre UM de cada vez no
+processo inteiro — o papel de um kernel a despachar syscalls uma a uma,
+que é o modelo do Eden/NCE. Caso explícito: trap **aninhada** do próprio
+dono (fault do host no C++ do despacho — handlers são `SA_NODEFER`)
+não re-entra; trata como fault e sai pela recuperação. O release é
+manual nos pontos de fim (`run()` e a frame da thread), porque o
+`siglongjmp` da recuperação NÃO desmonta o frame do despacho:
+destructor nenhum corre e um lock por RAII ficaria enleixado.
+
+## A B por subtração (o observador do tracer desligado — `IA_NOOB=1`)
+
+| configuração | saida | corrupção de heap | traps `[thrd]` |
+|---|---|---|---|
+| com observer (+IA_TRACE) | exit 134 | **há** (3/3) | 31-198, svc final 261/520 |
+| com observer, 3× (despacho serializado) | exit 134 | **há** (3/3) | 53-198 |
+| **sem observer (`IA_NOOB=1`), 3×** | exit 139 | **ZERO (3/3)** | **8004** |
+
+Leitura honesta: o motor sem caminho de diagnóstico **não corrige a
+heap** — a corrupção só aparece quando o observador/tracer (printf,
+`std::string`, dumps de ficheiro a correr de dentro do handler em
+várias threads) está ligado. Com ele desligado, o motor corre até à
+colocação própria do limite: **limite de traps POR THREAD funciona**
+("[thrd] a thread de guest parou ... (traps=4000 faults=0)" — a thread
+para a SEU número), 8004 traps de guest em 3 execuções, e "[boot] fim"
+é impressionado. Fica uma regressão nova: **exit 139 (SIGSEGV) depois
+do "[boot] fim"** — alguma thread desligada ou destructores de saída
+no fim do processo.
+
+## Parede de verdade que emerge
+
+As threads de guest entram num **loop determinístico de QueryMemory**
+(`[thrd] trap #26 ... sp=0x… x2=0x18002/0x81ff`) até queimar o limite
+de 4000 traps: 8004 traps de loop em 2 threads. Isto é o sinaisão de
+algo que o motor fica devolvendo errado a essas threads (região
+imaginada livre, ou resposta que não avança) — investigação do passo 4
+com a resposta do QueryMemory nas mãos.
+
+## Estado
+
+| | |
+|---|---|
+| `wip/passo-3-thread` | despacho serializado com dono por thread; 6/6 testes no Pi; sem observer a heap não corrige (3/3); as paredes deixaram de estar no motor |
