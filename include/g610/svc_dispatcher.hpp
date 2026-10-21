@@ -307,6 +307,33 @@ public:
     // o tipo está completo.
     ~SvcDispatcher();
 
+    // ── O sinal de "a GPU terminou" ───────────────────────────────────────
+    //
+    // O driver (`nvdrv`) chama isto no fim de uma submissão: o trabalho
+    // acabou, e o guest tem de ser acordado.
+    //
+    // **Medido**: o jogo bloqueia numa espera de *condition variable*
+    // (`WaitProcessWideKeyAtomic`, cv em `0x10a2c7d64`) e ninguém a
+    // acorda — e o `SignalProcessWideKey` do próprio jogo só acorda o
+    // que o *jogo* sinaliza, e o jogo está à espera do driver.
+    //
+    // O mecanismo é o do Eden (`SignalImpl`,
+    // `k_condition_variable.cpp:209-220`): a palavra do mutex passa a
+    // zero (liberta) e o *waiter* acorda **já dono**.
+    static void DespertarCvWaitersDoGuest();
+
+    // ── A fence: "o trabalho da GPU já acabou" ────────────────────────────
+    //
+    // O driver chama isto no fim de uma submissão. **Medido**: o jogo
+    // submete e *depois* espera — a espera vem depois da submissão, por
+    // isso o sinal tem de estar *pronto* quando o guest chega lá, e não
+    // ser um sinal主动 no momento da submissão.
+    //
+    // É a semântica da fence do upstream (`SubmitGPFIFOImpl`): o `valor`
+    // da fence devolve o syncpoint já incrementado, e o guest que espera
+    // por ele prossegue logo.
+    static void RegistarTrabalhoGpu();
+
     // Liga o espaço de endereçamento do guest.
     //
     // Sem isto, os SVC que recebem um endereço do guest (MapMemory,

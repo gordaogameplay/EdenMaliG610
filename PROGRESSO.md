@@ -3614,6 +3614,57 @@ stack). Com a stack do guest e o `main` do jogo (NSO0, descomprimível
 pelo carregador da casa) dá para ver **qual** caminho do SDK está a
 esperar — e aí está a resposta.
 
+### O deadlock — medido ao milímetro
+
+O log tem a sequência exacta (`boot_p9l.log`):
+
+```
+4689  [svc] WaitProcessWideKeyAtomic addr=0x10a2c7b08 cv=0x10a2c7b0c tag=0x28004 timeout=-1
+4695  [svc] SignalProcessWideKey  key=0x10a2c7b0c count=1 acordados=0      ← o sinal CHEGA
+4698  [svc] WaitProcessWideKeyAtomic addr=0x10a2c7be0 cv=0x10a2c7bec tag=0x28004 timeout=-1
+```
+
+**O sinal chega depois do `wait`** (não é um sinal perdido) — e mesmo
+assim **não acorda ninguém** (`acordados=0`).
+
+**Porquê?** A regra do Eden (`SignalImpl`,
+`k_condition_variable.cpp:198-248`): o `signal` só acorda o *waiter* se
+a palavra da **mutex** estiver a **zero**; se estiver ocupada, o
+*waiter* passa para a fila da mutex e só acorda quando o dono
+**destrava** (`ArbitrateUnlock`).
+
+E é aqui que o motor falha: **o jogo nunca destrava** — no log não há
+um único `ArbitrateUnlock` (`grep -c` = **0**). O *render thread*
+(0x28004) fica com a mutex, espera na cv, o sinal encontra a mutex
+ocupada, e o deadlock fecha-se: ninguém acorda o *waiter* e ninguém
+destrava a mutex.
+
+**A correcção, com o upstream como referência** (`k_condition_variable.cpp:271-330`,
+`KConditionVariable::Wait`):
+
+1. ao esperar, o *waiter* **retira-se da fila da mutex** e o próximo
+   dono passa a ser o próximo da fila (`next_value = tag (+ máscara)`),
+   e é **acordado** (`EndWait`);
+2. a palavra da cv recebe a bandeira de "há quem espere";
+3. a palavra da mutex recebe o `next_value`.
+
+A casa faz o 1 e o 3 — **mas não o "acordar" de quem fica com a
+mutex** quando a mutex estava ocupada por outro, e o
+`ArbitrateUnlock` do jogo nunca chega ao quadro.
+
+**O que fica instrumentado** (para fechar isto):
+- o dump da stack do guest no `WaitProcessWideKeyAtomic` (o PC, a
+  cadeia de chamadas e os bytes do código) — é o que_allowed dizer que
+  caminho do SDK está bloqueado;
+- o rasto da arbitragem (`[arb] unlock`/`[arb] signal`): a palavra da
+  mutex, quantos *waiters* há na fila, e o ramo que o sinal tomou;
+- o **sinal pendente**: um `signal` que chegue antes do `wait` fica
+  registado e a espera seguinte consome-o (é o que uma cv ao nível faz,
+  e o que o Eden garante por serializar os dois no *scheduler lock*);
+- a espera infinita passou a ter **prazo de salvaguarda** (16 ms,
+  `IA_WAIT_MS` desliga) — o guest re-avalia o seu predicado, como uma
+  cv bem usada faz.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native

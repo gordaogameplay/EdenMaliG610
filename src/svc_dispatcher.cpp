@@ -11,9 +11,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sched.h>
 #include <thread>
 #include <vector>
@@ -436,7 +438,14 @@ Result SvcDispatcher::svc_get_thread_id(SvcContext& ctx) {
     return Result::Success;
 }
 
-SvcDispatcher::SvcDispatcher(tel::Telemetry& tel) : tel_(tel) {}
+// A instância corrente — a do processo guest. É o que permite ao
+// sinal de "a GPU terminou" (uma função estática) escrever na memória
+// do guest.
+static SvcDispatcher* g_dispatcher_atual = nullptr;
+
+SvcDispatcher::SvcDispatcher(tel::Telemetry& tel) : tel_(tel) {
+    g_dispatcher_atual = this;
+}
 SvcDispatcher::~SvcDispatcher() = default;
 
 void SvcDispatcher::set_eden_tls(std::uint64_t endereco) noexcept {
@@ -612,7 +621,6 @@ Result SvcDispatcher::svc_map_memory(SvcContext& ctx) {
     ++map_memory_calls_;
     return Result::Success;
 }
-
 
 
 // O `svcCreateTransferMemory` (0x15) — a memória que o guest passa à GPU.
@@ -1126,7 +1134,6 @@ Result SvcDispatcher::svc_get_info(SvcContext& ctx) {
     const std::uint32_t type    = static_cast<std::uint32_t>(ctx.x[1]);
     const std::uint32_t subtype = static_cast<std::uint32_t>(ctx.x[3]);
 
-
     std::uint64_t value = 0;
     switch (type) {
     // Os números são `InfoType` do Eden (svc_types.h:130-159), copiados um a
@@ -1567,6 +1574,22 @@ struct ArbitrationBoard {
 
 ArbitrationBoard g_arbiter;
 
+// O trabalho da GPU está pronto (a fence foi cumprida). O próximo
+// espera do guest prossegue — é a semântica da fence: o valor devolvido
+// já é o do syncpoint incrementado.
+std::atomic<bool> g_gpu_trabalho_pronto{false};
+
+// Os sinais **pendentes**: um `signal` que chegou antes do `wait`.
+//
+// **Medido**: o jogo perde um sinal assim — o `signal` do *main* chega
+// e o *render thread* ainda não estacionou. No Eden os dois são
+// serializados pelo *scheduler lock*, e o nosso quadro não os serializa
+// nessa janela.
+//
+// A correção é a mesma que a de uma *cv* ao nível: o sinal fica
+// registado, e a espera seguinte consome-o.
+std::set<std::uint64_t> g_cv_pendente;
+
 constexpr std::uint32_t kArbWaitMask = 0x40000000u;  // HandleWaitMask, svc_common.h:19
 
 } // namespace
@@ -1674,6 +1697,15 @@ Result SvcDispatcher::svc_arbitrate_unlock(SvcContext& ctx) {
 
     {
         std::lock_guard<std::mutex> lock(g_arbiter.gate);
+        if (std::getenv("IA_IPC_TRACE") != nullptr) {
+            std::uint32_t prev = 0;
+            (void)read_guest(addr, &prev, sizeof prev);
+            const auto it = g_arbiter.fila.find(addr);
+            const std::size_t na_fila =
+                it == g_arbiter.fila.end() ? 0 : it->second.size();
+            std::fprintf(stderr, "[arb] unlock addr=0x%llx palavra=0x%x na_fila=%zu\n",
+                         static_cast<unsigned long long>(addr), prev, na_fila);
+        }
         const auto it = g_arbiter.fila.find(addr);
         if (it != g_arbiter.fila.end() && !it->second.empty()) {
             const ArbitrationBoard::Waiter w = it->second.front();
@@ -1733,13 +1765,88 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
     const std::uint32_t tag     = static_cast<std::uint32_t>(ctx.x[2]);
     const std::int64_t  timeout = static_cast<std::int64_t>(ctx.x[3]);
 
-    if (std::getenv("IA_IPC_TRACE") != nullptr)
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
         std::fprintf(stderr,
                      "[svc] WaitProcessWideKeyAtomic addr=0x%llx cv=0x%llx tag=0x%x "
                      "timeout=%lld\n",
                      static_cast<unsigned long long>(addr),
                      static_cast<unsigned long long>(cv_key), tag,
                      static_cast<long long>(timeout));
+
+        // **Onde está o guest.** O `x30` é o endereço de retorno — ou
+        // seja, o PC do guest que está a esperar. Sem símbolos, é o
+        // único way de saber *que* caminho do SDK está bloqueado.
+        std::fprintf(stderr, "  [x30=0x%llx]", static_cast<unsigned long long>(ctx.gpr[30]));
+        // A stack do guest: o SDK guarda o estado do objecto de
+        // sincronização num slot da stack.
+        const std::uint64_t sp = ctx.sp;
+        for (std::uint64_t off = 0; off < 0x80; off += 8) {
+            std::uint64_t v = 0;
+            if (read_guest(sp + off, &v, sizeof v))
+                std::fprintf(stderr, " [sp+%llx=0x%llx]",
+                             static_cast<unsigned long long>(off),
+                             static_cast<unsigned long long>(v));
+        }
+        // E o **conteúdo do mutex** e da cv — o que o guest espera que
+        // mude.
+        std::uint32_t v_addr = 0;
+        std::uint32_t v_cv = 0;
+        (void)read_guest(addr, &v_addr, sizeof v_addr);
+        (void)read_guest(cv_key, &v_cv, sizeof v_cv);
+        std::fprintf(stderr, " [mutex=0x%x cv=0x%x]\n", v_addr, v_cv);
+
+        // **O código do guest** — o PC e a cadeia de chamadas. Sem
+        // símbolos, os bytes são a única forma de saber que caminho do
+        // SDK está bloqueado.
+        auto despejar_codigo = [this](std::uint64_t pc) {
+            std::uint8_t bytes[48] = {0};
+            if (!read_guest(pc, bytes, sizeof bytes))
+                return;
+            std::fprintf(stderr, "  [cod 0x%llx]:", static_cast<unsigned long long>(pc));
+            for (std::uint8_t b : bytes)
+                std::fprintf(stderr, " %02x", b);
+            std::fprintf(stderr, "\n");
+        };
+        despejar_codigo(ctx.gpr[30]);
+        // A cadeia: os valores da stack que são endereços do módulo
+        // principal (0x80000000..0x84000000).
+        for (std::uint64_t off = 0; off < 0x80; off += 8) {
+            std::uint64_t v = 0;
+            if (!read_guest(sp + off, &v, sizeof v))
+                continue;
+            if (v >= 0x80000000ull && v < 0x84000000ull && v != ctx.gpr[30])
+                despejar_codigo(v);
+        }
+    }
+
+    // **Havia um sinal pendente nesta cv?** (o `signal` chegou antes do
+    // `wait` — ver a nota de `g_cv_pendente`.)
+    {
+        std::lock_guard<std::mutex> lock(g_arbiter.gate);
+        const auto it = g_cv_pendente.find(cv_key);
+        if (it != g_cv_pendente.end()) {
+            g_cv_pendente.erase(it);
+            std::fprintf(stderr,
+                         "[svc] WaitProcessWideKeyAtomic: sinal pendente na cv 0x%llx\n",
+                         static_cast<unsigned long long>(cv_key));
+            ctx.ret     = 0;
+            ctx.has_ret = true;
+            ctx.x[1]    = 0;
+            return Result::Success;
+        }
+    }
+
+    // **A fence está cumprida?** Se o driver já entregou o trabalho da
+    // GPU, esta espera é a espera *pela fence* — e prossegue logo (é o
+    // que a fence significa: o valor devolvido já é o syncpoint
+    // incrementado).
+    if (g_gpu_trabalho_pronto.exchange(false, std::memory_order_acq_rel)) {
+        std::fprintf(stderr, "[svc] WaitProcessWideKeyAtomic: a fence da GPU está cumprida\n");
+        ctx.ret     = 0;
+        ctx.has_ret = true;
+        ctx.x[1]    = 0;
+        return Result::Success;
+    }
 
     // Eden :20-21: R_UNLESS(!IsKernelAddress(address), InvalidCurrentMemory) e
     // alinhamento sizeof(s32) → InvalidAddress. (IsKernelAddress não se
@@ -1860,8 +1967,44 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
                 return Result::TimedOut;
             }
         } else {
-            // negativo: espera sem fim.
-            g_arbiter.wake.wait(lock, dono_acordou);
+            // Negativo: espera sem fim.
+            //
+            // **Com uma rede de segurança.** Medido: o jogo perde um
+            // sinal (o `signal` chega *antes* do `wait` — no Eden os
+            // dois são serializados pelo scheduler lock, e o nosso quadro
+            // não os serializa nessa janela). Com a espera a expirar, o
+            // guest re-avalia o seu predicado e volta a esperar — que é
+            // o que uma *cv* bem usada faz.
+            //
+            // `IA_WAIT_MS` desliga a rede (espera infinita, como o Eden).
+            const char* prazo_ms = std::getenv("IA_WAIT_MS");
+            const auto limite = prazo_ms != nullptr
+                                    ? std::chrono::milliseconds(std::atoi(prazo_ms))
+                                    : std::chrono::milliseconds(16);
+            if (!g_arbiter.wake.wait_for(lock, limite, dono_acordou)) {
+                // Expirou: sai da fila (como o caminho do prazo).
+                if (auto cv = g_arbiter.cv_fila.find(cv_key);
+                    cv != g_arbiter.cv_fila.end()) {
+                    auto& fila = cv->second;
+                    for (auto w = fila.begin(); w != fila.end(); ++w)
+                        if (w->token == token) { fila.erase(w); break; }
+                    if (fila.empty())
+                        g_arbiter.cv_fila.erase(cv);
+                }
+                for (auto f = g_arbiter.fila.begin(); f != g_arbiter.fila.end();) {
+                    auto& fila = f->second;
+                    for (auto w = fila.begin(); w != fila.end(); ++w)
+                        if (w->token == token) { fila.erase(w); break; }
+                    if (fila.empty())
+                        f = g_arbiter.fila.erase(f);
+                    else
+                        ++f;
+                }
+                g_arbiter.desperta.erase(token);
+                dispatch_owner_set(token);
+                (void)dispatch_owner_claim();
+                return Result::TimedOut;
+            }
         }
 
         acordei_com = g_arbiter.desperta.at(token);
@@ -1927,6 +2070,14 @@ Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
                 continue;
             }
 
+            if (std::getenv("IA_IPC_TRACE") != nullptr) {
+                std::fprintf(stderr,
+                             "[arb] signal cv=0x%llx mutex=0x%llx palavra=0x%x tag=0x%x "
+                             "-> %s\n",
+                             static_cast<unsigned long long>(cv_key),
+                             static_cast<unsigned long long>(w.addr), prev, w.tag,
+                             prev == 0 ? "acorda (dono)" : "mexe para a fila do mutex");
+            }
             if (prev == 0) {
                 // :217-220 — prev_tag == Svc::InvalidHandle: a palavra
                 // passa ao waiter e ele acorda JÁ dono.
@@ -1958,6 +2109,13 @@ Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
                 }
             }
         }
+
+        // **O sinal fica registado** se não havia ninguém à espera: o
+        // `wait` que vier a seguir consome-o. É o que uma *cv* ao nível
+        // faz — e o que o Eden garante por serializar `signal` e `wait`
+        // no *scheduler lock*.
+        if (total == 0)
+            g_cv_pendente.insert(cv_key);
 
         // Eden :253-258 — fila da chave esgotada (ou nunca cheia): a
         // palavra do cv_key volta a 0, com a mesma tolerância do retorno.
@@ -2011,6 +2169,49 @@ std::uint64_t SvcDispatcher::random_u64() {
 
 Result SvcDispatcher::svc_unsupported(SvcContext&) {
     return Result::Unsupported;
+}
+
+// ── O sinal de "a GPU terminou" ────────────────────────────────────────────
+//
+// O driver chama isto no fim de uma submissão. **Medido**: sem ele, o
+// jogo fica à espera de uma *condition variable* que ninguém acorda —
+// e o `SignalProcessWideKey` do próprio jogo não ajuda, porque o que o
+// jogo está a esperar é o driver.
+//
+// O mecanismo é o do Eden (`SignalImpl`,
+// `k_condition_variable.cpp:209-220`): a palavra do mutex passa a zero
+// (liberta) e o *waiter* acorda **já dono** — por isso é preciso
+// escrever na memória do guest, e não só tocar no token.
+void g610::SvcDispatcher::RegistarTrabalhoGpu() {
+    g_gpu_trabalho_pronto.store(true, std::memory_order_release);
+}
+
+void g610::SvcDispatcher::DespertarCvWaitersDoGuest() {
+    if (g_dispatcher_atual == nullptr)
+        return;
+
+    std::unique_lock<std::mutex> lock(g_arbiter.gate);
+    std::size_t acordados = 0;
+    for (auto& [cv_key, fila] : g_arbiter.cv_fila) {
+        (void)cv_key;
+        while (!fila.empty()) {
+            const ArbitrationBoard::CvWaiter w = fila.front();
+            fila.erase(fila.begin());
+
+            // Liberta o mutex: a palavra tem de estar a zero para o
+            // waiter acordar dono.
+            const std::uint32_t zero = 0;
+            (void)g_dispatcher_atual->write_guest(w.addr, &zero, sizeof zero);
+
+            g_arbiter.desperta[w.token] = ArbitrationBoard::DespertaSucesso;
+            ++acordados;
+        }
+    }
+
+    if (acordados > 0) {
+        std::fprintf(stderr, "[gpu] a GPU terminou: %zu waiter(s) acordados\n", acordados);
+        g_arbiter.wake.notify_all();
+    }
 }
 
 } // namespace g610

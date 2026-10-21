@@ -62,6 +62,7 @@
 
 #include "g610/gpu/maxwell_translator.hpp"
 #include "g610/services/binder.hpp"
+#include "g610/svc_dispatcher.hpp"
 #include "g610/services/nvmap_registry.hpp"
 #include "g610/telemetry.hpp"
 
@@ -1603,6 +1604,13 @@ private:
                   "(desconhecidos {}, descartados {}){}",
                   pushbuffer.size(), n, tradutor_.commands_unknown(),
                   tradutor_.commands_dropped_feature(), erro.empty() ? "" : (" — " + erro));
+
+        // **A GPU terminou.** O driver tem de acordar o guest: medido, o
+        // jogo fica à espera de uma *condition variable* que ninguém
+        // sinaliza — e o `SignalProcessWideKey` do próprio jogo não
+        // resolve, porque o que o jogo espera aqui é o driver.
+        SvcDispatcher::RegistarTrabalhoGpu();
+        SvcDispatcher::DespertarCvWaitersDoGuest();
 
         // A fence: o `id` é o syncpoint do canal e o `valor` incrementa
         // (a regra do Eden, `SubmitGPFIFOImpl`).
