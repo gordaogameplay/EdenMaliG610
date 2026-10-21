@@ -1836,18 +1836,6 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
         }
     }
 
-    // **A fence está cumprida?** Se o driver já entregou o trabalho da
-    // GPU, esta espera é a espera *pela fence* — e prossegue logo (é o
-    // que a fence significa: o valor devolvido já é o syncpoint
-    // incrementado).
-    if (g_gpu_trabalho_pronto.exchange(false, std::memory_order_acq_rel)) {
-        std::fprintf(stderr, "[svc] WaitProcessWideKeyAtomic: a fence da GPU está cumprida\n");
-        ctx.ret     = 0;
-        ctx.has_ret = true;
-        ctx.x[1]    = 0;
-        return Result::Success;
-    }
-
     // Eden :20-21: R_UNLESS(!IsKernelAddress(address), InvalidCurrentMemory) e
     // alinhamento sizeof(s32) → InvalidAddress. (IsKernelAddress não se
     // aplica a este guest: o espaço do processo não cruza a metade kernel.)
@@ -1923,6 +1911,13 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
 
         g_arbiter.desperta[token] = ArbitrationBoard::DespertaAguarda;
         g_arbiter.cv_fila[cv_key].push_back({tag, addr, token});
+        if (std::getenv("IA_IPC_TRACE") != nullptr && cv_key >= 0x100000000ull &&
+            cv_key < 0x200000000ull) {
+            std::fprintf(stderr, "[arb] registado cv=0x%llx tag=0x%x fila=%zu token=0x%llx\n",
+                         static_cast<unsigned long long>(cv_key), tag,
+                         g_arbiter.cv_fila[cv_key].size(),
+                         static_cast<unsigned long long>(token));
+        }
         dispatch_owner_vacate();
 
         const auto dono_acordou = [&] {
@@ -2068,6 +2063,11 @@ Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
                                       ? total
                                       : std::min(static_cast<std::size_t>(count),
                                                  total);
+        if (std::getenv("IA_IPC_TRACE") != nullptr && cv_key >= 0x100000000ull &&
+            cv_key < 0x200000000ull) {
+            std::fprintf(stderr, "[arb] signal cv=0x%llx waiters=%zu count=%d\n",
+                         static_cast<unsigned long long>(cv_key), total, count);
+        }
 
         for (std::size_t i = 0; i < quero; ++i) {
             const ArbitrationBoard::CvWaiter w = cv->second.front();

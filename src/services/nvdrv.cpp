@@ -1609,8 +1609,12 @@ private:
         // jogo fica à espera de uma *condition variable* que ninguém
         // sinaliza — e o `SignalProcessWideKey` do próprio jogo não
         // resolve, porque o que o jogo espera aqui é o driver.
-        SvcDispatcher::RegistarTrabalhoGpu();
-        SvcDispatcher::DespertarCvWaitersDoGuest();
+        // **Nada de "acordar todos" aqui.** A primeira versão desta
+        // chamada (a `DespertarCvWaitersDoGuest`) **esvaziava as filas
+        // das cv** — emedia-se a inscrição dos *waiters* do jogo, que
+        // depois já não eram encontrados pelo signal (medido: o worker
+        // do jogo ficou à espera para sempre). O sinal da fence é do
+        // *waiter* que a espera, não um varredor de filas.
 
         // A fence: o `id` é o syncpoint do canal e o `valor` incrementa
         // (a regra do Eden, `SubmitGPFIFOImpl`).
