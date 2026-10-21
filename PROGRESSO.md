@@ -3958,6 +3958,45 @@ o `renderer_vulkan` precisa dos mesmos shaders gerados ✗.
 A 2ª é a que dá o backend **da casa** ✓ (e não o do Eden ✗) — e é
 também a que evita o glslang ✗.
 
+### O rasterizador da casa (passo 2)
+
+`include/g610/gpu/rasterizer_g610.hpp` + `src/gpu/rasterizer_g610.cpp` ✓ — a
+implementação da `RasterizerInterface` do upstream ✓ (~40 métodos ✓):
+
+- **`Query()`** ✓ — escreve o *payload* na memória do guest ✓: é o
+  **semáforo** ✓, por onde o jogo fica a saber que o trabalho acabou ✓✓;
+- **`SignalSyncPoint()`** ✓ — a **fence** ✓ (o *hook* é o `nvdrv` ✓);
+- **`Draw()`**/`Clear()`/`DrawTexture()`/`DispatchCompute()` ✓ — contados ✓
+  (o backend Vulkan entra por cima ✓ — o `ValhallBackend` ✓ do desenho);
+- as caches ✓ — **no-ops com propósito** ✓: a casa não tem caches de
+  GPU ✗ (a memória do guest é um `mmap` plano ✓ e o motor escreve
+  directamente nela ✓);
+- **`AccessAccelerateDMA()`** ✓ — a implementação vazia ✓ (o motor cai
+  no caminho normal ✓, como no Eden ✓).
+
+**Três erros que faltam resolver** ✓ (todos no acoplamento da casa ao
+upstream ✓):
+
+1. **`Settings::Values`** ✗ — o override da casa (`tools/overrides/common/
+   settings.h` ✓) é um *subconjunto* ✗ e o `video_core` usa campos que
+   ele não tem ✗ (`skip_cpu_inner_invalidation` ✗ e mais ✗). A correção
+   é adicionar os campos ✗ ao override ✓ — o mecanismo dos overrides
+   existe para isso ✓.
+2. **Definições duplicadas** ✗ em `common/logging/*` ✗ — o `common/` do
+   upstream e o da casa são o mesmo directório ✗ (agora com um symlink ✓
+   — `vendor/eden/src/common -> ../common` ✓ — para que as *overrides*
+   da casa valham para o motor do upstream ✓✓). Falta ver porque é que
+   o mesmo ficheiro é compilado duas vezes ✗.
+3. **`Tegra::VideoCore`** ✗ — o nome do namespace ✗ — é consequência do
+   (1) e do (2) ✗ (o cabeçalho não chega a compilar ✗).
+
+**Nota (do utilizador, registada para depois)** ✓: os jogos que correm
+nativamente no Switch usam **OpenGL 3.1** ✓ e **Vulkan 1.0–1.1** ✓ — e o
+Eden exige **OpenGL 4.3** ✗, mais do que o Switch dá ✗. Vale a pena
+registar: se a parte de Vulkan ficar feita ✓, talvez se possa eliminar a
+dependência do OpenGL 4.3 ✗ e deixar disponível também o OpenGL do
+Switch ✓ (alguns jogos são só OpenGL ✓).
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native
