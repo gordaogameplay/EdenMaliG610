@@ -703,25 +703,19 @@ private:
 
         if (!initialized_) {
             LOG_WARNING(Service_NVDRV, "Close: NvServices ainda não foi inicializado");
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::NotInitialized);
+            RespostaErro(ctx, NvResult::NotInitialized, "ioctl");
             return;
         }
 
         const auto it = dispositivos_.find(fd);
         if (it == dispositivos_.end()) {
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::DeviceNotFound);
+            RespostaErro(ctx, NvResult::DeviceNotFound, "ioctl");
             return;
         }
         LOG_DEBUG(Service_NVDRV, "Close: fd={} ('{}')", fd, it->second);
         dispositivos_.erase(it);
 
-        ResponseBuilder rb{ctx, 3};
-        rb.Push(ResultSuccess);
-        rb.PushEnum(NvResult::Success);
+        RespostaErro(ctx, NvResult::Success, "ioctl");
     }
 
     // 3: inicializar. O Eden lê o handle do processo e o da memória
@@ -741,9 +735,7 @@ private:
         initialized_ = true;
         LOG_DEBUG(Service_NVDRV, "Initialize: buffer de trabalho de {} bytes", tamanho);
 
-        ResponseBuilder rb{ctx, 3};
-        rb.Push(ResultSuccess);
-        rb.PushEnum(NvResult::Success);
+        RespostaErro(ctx, NvResult::Success, "ioctl");
     }
 
     // 4: o evento de um dispositivo. O Eden devolve um **handle de
@@ -764,9 +756,7 @@ private:
 
         if (!initialized_) {
             LOG_WARNING(Service_NVDRV, "QueryEvent: NvServices ainda não foi inicializado");
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::NotInitialized);
+            RespostaErro(ctx, NvResult::NotInitialized, "ioctl");
             return;
         }
 
@@ -783,17 +773,13 @@ private:
             // baixos ✗ e o syncpoint nos altos ✗ ✗.
             const std::uint32_t slot = evento & 0xFFu;
             if (slot >= g610::gpu::kMaxNvEvents) {
-                ResponseBuilder rb{ctx, 3};
-                rb.Push(ResultSuccess);
-                rb.PushEnum(NvResult::BadParameter);
+                RespostaErro(ctx, NvResult::BadParameter, "ioctl");
                 return;
             }
             auto& nv = eventos_nv_[slot];
             if (!nv.registado || nv.kevent == nullptr) {
                 LOG_WARNING(Service_NVDRV, "QueryEvent: o evento NV {} não está registado", slot);
-                ResponseBuilder rb{ctx, 3};
-                rb.Push(ResultSuccess);
-                rb.PushEnum(NvResult::BadParameter);
+                RespostaErro(ctx, NvResult::BadParameter, "ioctl");
                 return;
             }
             if (nv.fd != fd) {
@@ -802,9 +788,7 @@ private:
                 LOG_WARNING(Service_NVDRV,
                            "QueryEvent: o evento NV {} pertence ao device {}, não ao {}",
                            slot, nv.fd, fd);
-                ResponseBuilder rb{ctx, 3};
-                rb.Push(ResultSuccess);
-                rb.PushEnum(NvResult::BadParameter);
+                RespostaErro(ctx, NvResult::BadParameter, "ioctl");
                 return;
             }
 
@@ -832,9 +816,7 @@ private:
 
     // 6: o estado do driver. O Eden responde `Success` e mais nada.
     void GetStatus(HLERequestContext& ctx) {
-        ResponseBuilder rb{ctx, 3};
-        rb.Push(ResultSuccess);
-        rb.PushEnum(NvResult::Success);
+        RespostaErro(ctx, NvResult::Success, "ioctl");
     }
 
     // 8: o APU id do processo.
@@ -842,9 +824,7 @@ private:
         RequestParser rp{ctx};
         const std::uint64_t pid = rp.Pop<std::uint64_t>();
         LOG_DEBUG(Service_NVDRV, "SetAruid: pid=0x{:016X}", pid);
-        ResponseBuilder rb{ctx, 3};
-        rb.Push(ResultSuccess);
-        rb.PushEnum(NvResult::Success);
+        RespostaErro(ctx, NvResult::Success, "ioctl");
     }
 
     // 9: despejar a informação da memória gráfica. No Switch real isto
@@ -938,9 +918,7 @@ private:
 
         // O Eden: um tipo acima do suportado é `BadParameter` ✗.
         if (params.type > kTiposZbc) {
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::BadParameter);
+            RespostaErro(ctx, NvResult::BadParameter, "ioctl");
             return;
         }
 
@@ -961,9 +939,7 @@ private:
                   params.index_size);
 
         if (params.type > kTiposZbc) {
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::BadParameter);
+            RespostaErro(ctx, NvResult::BadParameter, "ioctl");
             return;
         }
 
@@ -1129,9 +1105,7 @@ private:
 
         if (!va_.iniciado) {
             LOG_WARNING(Service_NVDRV, "AllocateSpace: o espaço de VA ainda não foi criado");
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::BadValue);
+            RespostaErro(ctx, NvResult::BadValue, "ioctl");
             return;
         }
 
@@ -1158,18 +1132,14 @@ private:
         } else {
             LOG_WARNING(Service_NVDRV, "AllocateSpace: tamanho de página inválido 0x{:X}",
                         params.page_size);
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::BadValue);
+            RespostaErro(ctx, NvResult::BadValue, "ioctl");
             return;
         }
 
         const std::uint64_t tamanho = static_cast<std::uint64_t>(params.pages) * passo;
         if (*proximo + tamanho > limite) {
             LOG_WARNING(Service_NVDRV, "AllocateSpace: sem espaço no VA da GPU");
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::InsufficientMemory);
+            RespostaErro(ctx, NvResult::InsufficientMemory, "ioctl");
             return;
         }
 
@@ -1199,7 +1169,19 @@ private:
         bool alocado = false;
     };
     std::map<std::uint32_t, HandleNvmap> nvmap_;
-    std::uint32_t proximo_nvmap_ = 1;
+    // **O primeiro handle e' o 0** ✗ — o upstream
+    // (`nvmap/core/nvmap.cpp:134` ✗) faz `fetch_add` a partir de zero ✗:
+    //
+    //     u32 id{next_handle_id.fetch_add(HandleIdIncrement, ...)};
+    //
+    // A casa comecava em **1** ✗ — e o guest, ao mapear um buffer, pede
+    // o handle **0** ✗ ✗ ✗.
+    //
+    // **Medido** (`/tmp/boot_v12.log` ✗): `MapBufferEx: handle 0 não
+    // está alocado` ✗ — cinco vezes ✗ — e o `NvResult` de erro (11 ✗,
+    // `BadValue` ✗) mata o jogo ✗ ✗: o SDK aborta com
+    // `SetTerminateResult modulo=2 desc=3005` ✗ ✗.
+    std::uint32_t proximo_nvmap_ = 0;
     // O par (VA da GPU -> endereco do guest), que o tradutor Maxwell ->
     // Vulkan usa para traduzir os comandos do push buffer.
     std::map<std::uint64_t, std::uint64_t> mapeamentos_;
@@ -1229,9 +1211,7 @@ private:
         const auto it = nvmap_.find(params.handle);
         if (it == nvmap_.end() || it->second.alocado) {
             LOG_WARNING(Service_NVDRV, "nvmap: IocAlloc: handle {} inválido", params.handle);
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::BadValue);
+            RespostaErro(ctx, NvResult::BadValue, "ioctl");
             return;
         }
 
@@ -1306,9 +1286,7 @@ private:
                         "considera isto nao implementado; a casa usa o do VA");
             if (va_.proximo_pequeno + tamanho > va_.split) {
                 LOG_WARNING(Service_NVDRV, "nvmap: IocAlloc: sem espaço no VA da GPU");
-                ResponseBuilder rb{ctx, 3};
-                rb.Push(ResultSuccess);
-                rb.PushEnum(NvResult::InsufficientMemory);
+                RespostaErro(ctx, NvResult::InsufficientMemory, "ioctl");
                 return;
             }
             endereco = va_.proximo_pequeno;
@@ -1344,9 +1322,7 @@ private:
 
         const auto it = nvmap_.find(params.handle);
         if (it == nvmap_.end()) {
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::BadValue);
+            RespostaErro(ctx, NvResult::BadValue, "ioctl");
             return;
         }
 
@@ -1367,9 +1343,7 @@ private:
             params.result = 0;
             break;
         default:
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::BadValue);
+            RespostaErro(ctx, NvResult::BadValue, "ioctl");
             return;
         }
 
@@ -1411,9 +1385,7 @@ private:
         LerEntrada(ctx, params);
 
         if (params.id == 0 || nvmap_.count(params.id) == 0) {
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::BadValue);
+            RespostaErro(ctx, NvResult::BadValue, "ioctl");
             return;
         }
         params.handle = params.id;
@@ -1427,9 +1399,7 @@ private:
         LerEntrada(ctx, params);
 
         if (params.handle == 0 || nvmap_.count(params.handle) == 0) {
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::AccessDenied);
+            RespostaErro(ctx, NvResult::AccessDenied, "ioctl");
             return;
         }
         params.id = params.handle;
@@ -1453,9 +1423,7 @@ private:
         const auto it = nvmap_.find(params.handle);
         if (it == nvmap_.end() || !it->second.alocado) {
             LOG_WARNING(Service_NVDRV, "MapBufferEx: handle {} não está alocado", params.handle);
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::BadValue);
+            RespostaErro(ctx, NvResult::BadValue, "ioctl");
             return;
         }
 
@@ -1593,9 +1561,7 @@ private:
         LOG_DEBUG(Service_NVDRV, "canal: SetChannelPriority: 0x{:X}", params.priority);
         if (params.priority != kBaixa && params.priority != kMedia &&
             params.priority != kAlta) {
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::BadParameter);
+            RespostaErro(ctx, NvResult::BadParameter, "ioctl");
             return;
         }
         if (auto* canal = CanalDoFd())
@@ -1643,9 +1609,7 @@ private:
         // repetido da mesma classe é `AlreadyAllocated`.
         if (auto* canal = CanalDoFd()) {
             if (canal->contextos.count(params.class_num) != 0) {
-                ResponseBuilder rb{ctx, 3};
-                rb.Push(ResultSuccess);
-                rb.PushEnum(NvResult::AlreadyAllocated);
+                RespostaErro(ctx, NvResult::AlreadyAllocated, "ioctl");
                 return;
             }
             canal->contextos.emplace(params.class_num, true);
@@ -1816,9 +1780,7 @@ private:
                 std::vector<std::uint8_t> bruto(bytes, 0);
                 if (!LerDoGuest(params.address, bruto.data(), bruto.size())) {
                     LOG_WARNING(Service_NVDRV, "SubmitGPFIFO: não li os cabeçalhos");
-                    ResponseBuilder rb{ctx, 3};
-                    rb.Push(ResultSuccess);
-                    rb.PushEnum(NvResult::InvalidAddress);
+                    RespostaErro(ctx, NvResult::InvalidAddress, "ioctl");
                     return;
                 }
                 for (std::uint32_t i = 0; i < params.num_entries; ++i) {
@@ -1894,9 +1856,7 @@ private:
                             static_cast<std::size_t>(bytes))) {
                 LOG_WARNING(Service_NVDRV, "SubmitGPFIFO: não li o comando em 0x{:X}",
                             cab.Endereco());
-                ResponseBuilder rb{ctx, 3};
-                rb.Push(ResultSuccess);
-                rb.PushEnum(NvResult::InvalidAddress);
+                RespostaErro(ctx, NvResult::InvalidAddress, "ioctl");
                 return;
             }
         }
@@ -2175,9 +2135,7 @@ private:
 
         LOG_DEBUG(Service_NVDRV, "canal: ChannelSetTimeslice: {}", params.timeslice);
         if (params.timeslice < 1000 || params.timeslice > 5000) {
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::BadParameter);
+            RespostaErro(ctx, NvResult::BadParameter, "ioctl");
             return;
         }
         if (auto* canal = CanalDoFd())
@@ -2238,9 +2196,7 @@ private:
         LOG_DEBUG(Service_NVDRV, "CtrlEventRegister: event_id={}", event_id);
 
         if (event_id >= g610::gpu::kMaxNvEvents) {
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::BadParameter);
+            RespostaErro(ctx, NvResult::BadParameter, "ioctl");
             return;
         }
 
@@ -2249,9 +2205,7 @@ private:
         auto& evento = eventos_nv_[event_id];
         if (evento.registado) {
             if (evento.em_uso) {
-                ResponseBuilder rb{ctx, 3};
-                rb.Push(ResultSuccess);
-                rb.PushEnum(NvResult::Busy);
+                RespostaErro(ctx, NvResult::Busy, "ioctl");
                 return;
             }
             LibertarEventoNv(event_id);
@@ -2266,9 +2220,7 @@ private:
         evento.em_uso = false;
         evento.fd = fd_em_curso_;
 
-        ResponseBuilder rb{ctx, 3};
-        rb.Push(ResultSuccess);
-        rb.PushEnum(NvResult::Success);
+        RespostaErro(ctx, NvResult::Success, "ioctl");
     }
 
     // 0x00/0x20: `IocCtrlEventUnregister` — o guest liberta um evento ✗.
@@ -2280,31 +2232,23 @@ private:
         LOG_DEBUG(Service_NVDRV, "CtrlEventUnregister: event_id={}", event_id);
 
         if (event_id >= g610::gpu::kMaxNvEvents) {
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::BadParameter);
+            RespostaErro(ctx, NvResult::BadParameter, "ioctl");
             return;
         }
 
         auto& evento = eventos_nv_[event_id];
         if (!evento.registado) {
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::Success);
+            RespostaErro(ctx, NvResult::Success, "ioctl");
             return;
         }
         if (evento.em_uso) {
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::Busy);
+            RespostaErro(ctx, NvResult::Busy, "ioctl");
             return;
         }
 
         LibertarEventoNv(event_id);
 
-        ResponseBuilder rb{ctx, 3};
-        rb.Push(ResultSuccess);
-        rb.PushEnum(NvResult::Success);
+        RespostaErro(ctx, NvResult::Success, "ioctl");
     }
 
     // 0x00/0x21: `IocCtrlEventUnregisterBatch` — liberta varios ✗.
@@ -2355,9 +2299,7 @@ private:
             }
         }
 
-        ResponseBuilder rb{ctx, 3};
-        rb.Push(ResultSuccess);
-        rb.PushEnum(NvResult::Success);
+        RespostaErro(ctx, NvResult::Success, "ioctl");
     }
 
     // 0x00/0x1d e 0x00/0x1e: `IocCtrlEventWait` — a espera ✗.
@@ -2391,9 +2333,7 @@ private:
         // O upstream: `fence_id` fora do intervalo e' `BadParameter` ✗.
         if (params.fence_id < 0 ||
             static_cast<std::uint32_t>(params.fence_id) >= g610::gpu::kMaxSyncpoints) {
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::BadParameter);
+            RespostaErro(ctx, NvResult::BadParameter, "ioctl");
             return;
         }
         const std::uint32_t fence_id = static_cast<std::uint32_t>(params.fence_id);
@@ -2403,9 +2343,7 @@ private:
         if (params.fence_value == 0) {
             params.value = syncpoints_.Valor(fence_id);
             EscreverSaida(ctx, params);
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::Success);
+            RespostaErro(ctx, NvResult::Success, "ioctl");
             return;
         }
 
@@ -2413,9 +2351,7 @@ private:
         if (syncpoints_.EstaSinalizado(fence_id, params.fence_value)) {
             params.value = syncpoints_.Valor(fence_id);
             EscreverSaida(ctx, params);
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::Success);
+            RespostaErro(ctx, NvResult::Success, "ioctl");
             return;
         }
 
@@ -2424,30 +2360,22 @@ private:
         if (alocacao) {
             slot = EventoNvLivre(fence_id);
             if (slot >= g610::gpu::kMaxNvEvents) {
-                ResponseBuilder rb{ctx, 3};
-                rb.Push(ResultSuccess);
-                rb.PushEnum(NvResult::BadParameter);
+                RespostaErro(ctx, NvResult::BadParameter, "ioctl");
                 return;
             }
         } else if (slot >= g610::gpu::kMaxNvEvents) {
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::BadParameter);
+            RespostaErro(ctx, NvResult::BadParameter, "ioctl");
             return;
         }
 
         auto& evento = eventos_nv_[slot];
         if (!evento.registado) {
             // O upstream: um evento nao registado e' `BadParameter` ✗.
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::BadParameter);
+            RespostaErro(ctx, NvResult::BadParameter, "ioctl");
             return;
         }
         if (evento.em_uso) {
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::BadParameter);
+            RespostaErro(ctx, NvResult::BadParameter, "ioctl");
             return;
         }
 
@@ -2463,9 +2391,7 @@ private:
             SinalizarEventoNv(slot, kevent);
             params.value = syncpoints_.Valor(fence_id);
             EscreverSaida(ctx, params);
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::Success);
+            RespostaErro(ctx, NvResult::Success, "ioctl");
             return;
         }
 
@@ -2490,9 +2416,7 @@ private:
         // `Timeout` ✗ — o upstream usa-o para dizer "ainda nao, mas ja'
         // estou a ver" ✗. **Nao e' um erro** ✗ — e' o que o guest
         // espera ✗.
-        ResponseBuilder rb{ctx, 3};
-        rb.Push(ResultSuccess);
-        rb.PushEnum(NvResult::Timeout);
+        RespostaErro(ctx, NvResult::Timeout, "ioctl");
     }
 
     // O slot de evento livre ✗ — o `FindFreeNvEvent` do upstream ✗.
@@ -2588,9 +2512,7 @@ private:
 
         if (!initialized_) {
             LOG_WARNING(Service_NVDRV, "Ioctl: NvServices ainda não foi inicializado");
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::NotInitialized);
+            RespostaErro(ctx, NvResult::NotInitialized, "ioctl");
             return;
         }
 
@@ -2602,9 +2524,7 @@ private:
         fd_em_curso_ = fd;
         if (tipo == TipoDeDevice::Desconhecido) {
             LOG_WARNING(Service_NVDRV, "Ioctl: fd={} não é um device aberto", fd);
-            ResponseBuilder rb{ctx, 3};
-            rb.Push(ResultSuccess);
-            rb.PushEnum(NvResult::BadValue);
+            RespostaErro(ctx, NvResult::BadValue, "ioctl");
             return;
         }
 
@@ -2816,9 +2736,7 @@ private:
         LOG_WARNING(Service_NVDRV, "Ioctl: grupo=0x{:02X} cmd=0x{:02X} NÃO IMPLEMENTADO",
                     comando.group(), comando.cmd());
 
-        ResponseBuilder rb{ctx, 3};
-        rb.Push(ResultSuccess);
-        rb.PushEnum(NvResult::NotImplemented);
+        RespostaErro(ctx, NvResult::NotImplemented, "ioctl");
     }
 
     // O `GetCharacteristics1` (grupo `'G'`, comando 0x05) — as
@@ -2894,9 +2812,7 @@ private:
         if (n > 0)
             ctx.WriteBuffer(&params, n);
 
-        ResponseBuilder rb{ctx, 3};
-        rb.Push(ResultSuccess);
-        rb.PushEnum(NvResult::Success);
+        RespostaErro(ctx, NvResult::Success, "ioctl");
     }
 
     bool initialized_ = false;
@@ -3009,11 +2925,26 @@ private:
             ctx.WriteBuffer(&params, n);
     }
 
-    // A resposta de um ioctl que correu bem: `Result` + `NvResult`.
-    static void RespostaOk(HLERequestContext& ctx) {
+    // A resposta de um ioctl que correu **mal** ✗ — e o registo de
+    // qual foi ✗ ✗.
+    //
+    // **Um `NvResult` diferente de `Success` mata o jogo** ✗ ✗: o SDK
+    // trata-o como motivo para abortar ✗ ✗ (e o `SetTerminateResult` que
+    // aparece no log e' o pranto ✗ ✗).
+    static void RespostaErro(HLERequestContext& ctx, NvResult resultado,
+                             const char* onde) {
+        if (resultado != NvResult::Success && std::getenv("IA_IPC_TRACE") != nullptr) {
+            std::fprintf(stderr, "[nvdrv] ERRO %s: NvResult=%u\n", onde,
+                         static_cast<unsigned>(resultado));
+        }
         ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
-        rb.PushEnum(NvResult::Success);
+        rb.PushEnum(resultado);
+    }
+
+    // A resposta de um ioctl que correu bem: `Result` + `NvResult`.
+    static void RespostaOk(HLERequestContext& ctx) {
+        RespostaErro(ctx, NvResult::Success, "ioctl");
     }
 };
 
