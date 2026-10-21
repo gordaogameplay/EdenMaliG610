@@ -570,45 +570,6 @@ set(IA_FONTES_VIDEO_CORE
   vendor/eden/src/video_core/gpu_thread.cpp
   vendor/eden/src/video_core/memory_manager.cpp
   vendor/eden/src/video_core/renderer_base.cpp
-  vendor/eden/src/video_core/renderer_null/null_rasterizer.cpp
-  vendor/eden/src/video_core/renderer_null/renderer_null.cpp
-  vendor/eden/src/video_core/renderer_vulkan/present/filters.cpp
-  vendor/eden/src/video_core/renderer_vulkan/present/fsr.cpp
-  vendor/eden/src/video_core/renderer_vulkan/present/fxaa.cpp
-  vendor/eden/src/video_core/renderer_vulkan/present/layer.cpp
-  vendor/eden/src/video_core/renderer_vulkan/present/smaa.cpp
-  vendor/eden/src/video_core/renderer_vulkan/present/util.cpp
-  vendor/eden/src/video_core/renderer_vulkan/present/window_adapt_pass.cpp
-  vendor/eden/src/video_core/renderer_vulkan/blit_image.cpp
-  vendor/eden/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
-  vendor/eden/src/video_core/renderer_vulkan/maxwell_to_vk.cpp
-  vendor/eden/src/video_core/renderer_vulkan/pipeline_statistics.cpp
-  vendor/eden/src/video_core/renderer_vulkan/renderer_vulkan.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_blit_screen.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_buffer_cache_base.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_command_pool.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_compute_pass.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_descriptor_pool.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_fence_manager.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_present_manager.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_query_cache.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_rasterizer.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_render_pass_cache.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_resource_pool.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_scheduler.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_shader_util.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_state_tracker.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_swapchain.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_texture_cache.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_texture_cache_base.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_turbo_mode.cpp
-  vendor/eden/src/video_core/renderer_vulkan/vk_update_descriptor.cpp
   vendor/eden/src/video_core/shader_cache.cpp
   vendor/eden/src/video_core/shader_environment.cpp
   vendor/eden/src/video_core/shader_notify.cpp

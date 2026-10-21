@@ -91,8 +91,16 @@ target_include_directories(g610_core PUBLIC
 #
 # As fontes vem do `CMakeLists.txt` do upstream — extraidas por
 # `tools/extrair_fontes_upstream.py` (a fonte da verdade e' o upstream).
+#
+# **Não entra no build** ✗: o `video_core` do upstream está acoplado ao
+# Eden inteiro — o `texture_cache` puxa o `bcdec` ✗, o `GPU` puxa o
+# `Core::System` completo ✗, e os renderers puxam shaders gerados ✗
+# (glslang ✗). A casa tem o **seu** tradutor ✓ — e agora com a ISA
+# **real** ✓ (`g610/gpu/maxwell_comandos.hpp` ✓, extraída do upstream ✓).
+#
+# O que fica vendorizado ✓ (e é a referência): o `video_core` ✓, o
+# `shader_recompiler` ✓ e o `core/` completo ✓.
 include(cmake/ia_fontes.cmake)
-target_sources(g610_core PRIVATE ${IA_FONTES_VIDEO_CORE})
 target_compile_definitions(g610_core PUBLIC ANKERL_UNORDERED_DENSE_STD_MODULE=1)
 target_link_libraries(g610_core PUBLIC Vulkan::Vulkan SDL2::SDL2 fmt::fmt pthread)
 
@@ -215,6 +223,13 @@ target_include_directories(g610_exec PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generat
 add_dependencies(g610_exec guest_sizes)
 add_test(NAME exec COMMAND g610_exec)
 add_test(NAME core COMMAND g610_tests)
+
+# O leitor do push buffer e o tradutor Maxwell, com o formato e os IDs
+# reais (do upstream). E' o teste que distingue "o push buffer esta mal
+# lido" de "o shader e' esquisito".
+add_executable(g610_pushbuffer tests/test_pushbuffer.cpp)
+target_link_libraries(g610_pushbuffer PRIVATE g610_core)
+add_test(NAME pushbuffer COMMAND g610_pushbuffer)
 
 # Teste do programa multi-modulo. Precisa de um ExeFS real, por isso nao e'
 # um add_test sem argumentos: corre contra os ROMs do utilizador.

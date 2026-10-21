@@ -39,6 +39,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "g610/gpu/maxwell_comandos.hpp"
 #include "g610/telemetry.hpp"
 
 namespace g610::gpu {
@@ -80,33 +81,29 @@ namespace g610::gpu {
 // valores duplicados produziria etiquetas de `case` duplicadas no switch, que
 // não compilam, e forçaria a distinguir ops que o descodificador ainda não sabe
 // distinguir.
-enum class MaxwellOp : std::uint32_t {
-    Nop                    = 0x000,
-    SetStencil             = 0x004,
-    SetViewport            = 0x00B,
-    Clear                  = 0x013,
-    SetState               = 0x012,
-    BindShader             = 0x016,
-    DrawArrays             = 0x018, // 0x62 >> 2
-    DrawElementsBaseVertex = 0x01A, // 0x68 >> 2
-    DrawInstanced          = 0x020, // 0x82/0x84 >> 2
-    SetScissor             = 0x029,
-    SetDepthRange          = 0x03D,
-    SemaphoreIncrement     = 0x044,
-    BindComputeProgram     = 0x06C,
-    DispatchCompute        = 0x06E,
-};
-
-std::string to_string(MaxwellOp op);
-
+// Os comandos do Maxwell 3D.
+//
+// **Estes IDs não são adivinhados**: são os índices dos registos no
+// motor do upstream (`offsetof(Regs, campo) / 4` — a macro
+// `MAXWELL3D_REG_INDEX` ✓), extraídos *compilando* o cabeçalho do
+// upstream ✓ (`tools/extrair_comandos_maxwell.py` ✓). Ver
+// `g610/gpu/maxwell_comandos.hpp` ✓ — 168 comandos ✓.
+//
+// O ID de um método **é** o índice do registo ✓: no push buffer, o
+// cabeçalho do método traz esse ID nos bits 0..12 ✓ (ver
+// `g610/gpu/pushbuffer.hpp` ✓).
 // ---------------------------------------------------------------------------
 // Um comando já traduzido.
 // ---------------------------------------------------------------------------
 struct DrawCommand {
-    MaxwellOp     op{};
+    // O método que deu origem ao desenho (o ID real ✓).
+    std::uint32_t method = 0;
+    // Se o desenho é indexado (o upstream: `draw_state.draw_indexed` ✓).
+    bool           indexado = false;
     std::uint32_t instance_count = 0;
     std::uint32_t vertex_count   = 0;
     std::uint32_t index_count    = 0;
+    std::uint32_t index_first    = 0;
     std::uint32_t base_vertex    = 0;
     std::uint32_t group_x = 1, group_y = 1, group_z = 1;
 

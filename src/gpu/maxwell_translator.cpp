@@ -2,62 +2,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — implementação da tradução Maxwell -> Vulkan.
 #include "g610/gpu/maxwell_translator.hpp"
+#include "g610/gpu/pushbuffer.hpp"
 
 #include <cstring>
 
 namespace g610::gpu {
 
+// O ficheiro de registos do motor (o upstream: `Regs::reg_array` ✓).
+//
+// Cada método escreve o seu argumento no registo correspondente — e é
+// assim que os comandos empacotados (a topologia, o início, a
+// contagem) se lêem ✓.
 namespace {
-
+constexpr std::size_t kMaxRegistos = 0xE00;
+// O alinhamento do push buffer: o fluxo de métodos são palavras de 32
+// bits ✓ (o upstream: `Tegra::CommandHeader` ✓).
 constexpr std::size_t kWord = 4;
-
-// Header: bit 0 = tem payload, bit 1 = tem segundo bloco, bits 2..15 = opcode.
-inline bool has_payload(std::uint32_t h) { return (h & 1u) != 0; }
-inline bool has_more(std::uint32_t h)    { return (h & 2u) != 0; }
-inline MaxwellOp opcode_of(std::uint32_t h) {
-    return static_cast<MaxwellOp>((h >> 2) & 0x3FFu);
-}
-inline bool is_nop(std::uint32_t h) { return (h & 0xFFFF'FFFCu) == 0; }
-
-// Devolve o número de palavras ocupadas pelo payload de um comando, contando a
-// palavra de comprimento. Devolve 0 se o comprimento não couber no que resta do
-// buffer — é o que impede a leitura de correr fora.
-std::size_t payload_words(std::uint32_t head, const std::uint32_t* words,
-                          std::size_t avail) {
-    if (!has_payload(head) || avail < 2)
-        return 0;
-
-    const std::uint32_t len = words[1]; // comprimento em bytes
-    // Comprimentos absurdos indicam buffer corrompido ou leitura já
-    // dessincronizada. Descartar é melhor do que aceitar e correr fora.
-    if (len < kWord || (len % kWord) != 0)
-        return 0;
-
-    const std::size_t total = 1 + len / kWord; // 1 = a palavra de comprimento
-    return (total <= avail) ? total : 0;
-}
-
-} // namespace
-
-std::string to_string(MaxwellOp op) {
-    switch (op) {
-    case MaxwellOp::Nop:                    return "Nop";
-    case MaxwellOp::SetStencil:             return "SetStencil";
-    case MaxwellOp::SetViewport:            return "SetViewport";
-    case MaxwellOp::Clear:                  return "Clear";
-    case MaxwellOp::SetState:               return "SetState";
-    case MaxwellOp::BindShader:             return "BindShader";
-    case MaxwellOp::DrawArrays:             return "DrawArrays";
-    case MaxwellOp::DrawElementsBaseVertex: return "DrawElementsBaseVertex";
-    case MaxwellOp::DrawInstanced:          return "DrawInstanced";
-    case MaxwellOp::SetScissor:             return "SetScissor";
-    case MaxwellOp::SetDepthRange:          return "SetDepthRange";
-    case MaxwellOp::SemaphoreIncrement:     return "SemaphoreIncrement";
-    case MaxwellOp::BindComputeProgram:     return "BindComputeProgram";
-    case MaxwellOp::DispatchCompute:        return "DispatchCompute";
-    }
-    return "MaxwellOp#" + std::to_string(static_cast<std::uint32_t>(op));
-}
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // ShaderCache
@@ -147,130 +108,106 @@ std::uint32_t ShaderCache::compile(const std::vector<std::uint8_t>& blob,
 // ---------------------------------------------------------------------------
 
 std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbuffer,
-                                         std::vector<DrawCommand>& out,
-                                         std::string& error) {
+                                         std::vector<DrawCommand>& out, std::string& error) {
     const tel::Nanos t0 = tel_.time_now();
     out.clear();
+    error.clear();
 
-    if (pushbuffer.size() < kWord) {
-        error = "push buffer vazio";
-        return 0;
-    }
+    gpu::PushBufferReader leitor;
 
-    const std::size_t words = pushbuffer.size() / kWord;
-    const auto* p = reinterpret_cast<const std::uint32_t*>(pushbuffer.data());
+    // O ficheiro de registos — no upstream, cada método escreve o seu
+    // argumento no registo correspondente (`Regs::reg_array`) ✓.
+    std::vector<std::uint32_t> regs(kMaxRegistos, 0);
 
-    std::size_t i = 0;
-    while (i < words) {
-        const std::uint32_t head = p[i];
-        if (is_nop(head)) {
-            ++i;
-            continue;
-        }
+    // O estado do desenho (o `draw_state` do upstream, `draw_manager.cpp` ✓).
+    //
+    // **Os contadores vivem nos registos** ✓ — como no upstream ✓, onde
+    // o `draw.end` lê `regs.vertex_buffer.count` e `regs.index_buffer` ✗.
+    // Por isso não se reiniciam no `draw.begin` ✓: quem os escreve é o
+    // método correspondente ✓, e valem até ao próximo desenho ✓.
+    std::uint32_t index_first = 0;
+    std::uint32_t instance_count = 0;
+    bool indexado = false;
+    bool dentro = false;
 
-        const MaxwellOp op = opcode_of(head);
-        const std::size_t plen = payload_words(head, p + i, words - i);
+    leitor.for_each(pushbuffer, [&](const gpu::MethodCall& m) {
         ++cmds_total_;
 
-        DrawCommand c;
-        c.op = op;
+        if (m.method < regs.size())
+            regs[m.method] = m.argument;
 
-        // Pay = início do payload. A palavra 0 é o cabeçalho e a palavra 1 é o
-        // comprimento, por isso os parâmetros começam em i+2.
-        const std::size_t pay = i + 2;
-        const auto avail = [&] { return plen >= 3 && (pay + 1) <= words; };
+        switch (m.method) {
+        case gpu::maxwell3d::vertex_buffer_count:
+            // O valor fica no registo ✓ (é de lá que o `draw.end` o
+            // lê ✓, como no upstream ✓).
+            break;
 
-        switch (op) {
-        case MaxwellOp::DrawArrays: {
-            if (!avail()) { ++cmds_unknown_; break; }
-            c.vertex_count   = p[pay];
-            c.instance_count = p[pay + 1];
-            if (c.instance_count == 0) c.instance_count = 1;
-            c.est_triangles = (static_cast<std::uint64_t>(c.vertex_count) *
-                               c.instance_count) / 3;
+        case gpu::maxwell3d::index_buffer_count:
+            // O upstream: `index_buffer.count` marca o desenho como
+            // indexado (`draw_state.draw_indexed = true`) ✓.
+            indexado = true;
+            break;
+
+        case gpu::maxwell3d::index_buffer_first:
+            index_first = m.argument;
+            break;
+
+        case gpu::maxwell3d::global_base_vertex_index:
+            break;  // já está no ficheiro de registos
+
+        case gpu::maxwell3d::draw_begin:
+            // O `draw.begin` é o início de um desenho (`DrawBegin` no
+            // upstream ✓): reinicia a contagem de instâncias e o modo.
+            dentro = true;
+            instance_count = 0;
+            break;
+
+        case gpu::maxwell3d::draw_end: {
+            // O `draw.end` é o desenho (`DrawEnd` no upstream ✓).
+            if (!dentro)
+                break;
+            dentro = false;
+
+            // Os contagens vêm dos registos ✓ — como no upstream ✓.
+            const std::uint32_t vertex_count = regs[gpu::maxwell3d::vertex_buffer_count];
+            const std::uint32_t index_count = regs[gpu::maxwell3d::index_buffer_count];
+
+            DrawCommand c;
+            c.method = m.method;
+            c.indexado = indexado;
+            c.index_count = indexado ? index_count : 0;
+            c.index_first = index_first;
+            c.vertex_count = indexado ? 0 : vertex_count;
+            c.base_vertex = regs[gpu::maxwell3d::global_base_vertex_index];
+            c.instance_count = instance_count != 0 ? instance_count : 1;
+            c.est_triangles = static_cast<std::uint64_t>(
+                                 indexado ? c.index_count : c.vertex_count) / 3;
             out.push_back(c);
             tel_.frame_draw(static_cast<std::uint32_t>(c.est_triangles));
+            // O upstream limpa a marca de "indexado" no fim do desenho ✓.
+            indexado = false;
             break;
         }
-        case MaxwellOp::DrawInstanced: {
-            if (!avail()) { ++cmds_unknown_; break; }
-            c.vertex_count   = p[pay];
-            c.index_count    = c.vertex_count;
-            c.instance_count = p[pay + 1];
-            if (c.instance_count == 0) c.instance_count = 1;
-            c.est_triangles = (static_cast<std::uint64_t>(c.vertex_count) *
-                               c.instance_count) / 3;
-            out.push_back(c);
-            tel_.frame_draw(static_cast<std::uint32_t>(c.est_triangles));
-            break;
-        }
-        case MaxwellOp::DrawElementsBaseVertex: {
-            if (!avail()) { ++cmds_unknown_; break; }
-            c.index_count = p[pay];
-            c.base_vertex  = p[pay + 1];
-            c.instance_count = 1;
-            c.est_triangles = c.index_count / 3;
-            out.push_back(c);
-            tel_.frame_draw(static_cast<std::uint32_t>(c.est_triangles));
-            break;
-        }
-        case MaxwellOp::DispatchCompute: {
-            if (!avail()) { ++cmds_unknown_; break; }
-            c.group_x = p[pay];
-            c.group_y = p[pay + 1];
-            c.group_z = (pay + 2 < words) ? p[pay + 2] : 1;
-            if (!c.group_x) c.group_x = 1;
-            if (!c.group_y) c.group_y = 1;
-            if (!c.group_z) c.group_z = 1;
-            out.push_back(c);
-            break;
-        }
-        case MaxwellOp::BindShader: {
-            if (!avail()) { ++cmds_unknown_; break; }
-            c.vertex_shader = p[pay];
-            break;
-        }
-        case MaxwellOp::SetViewport:
-            // A Mali tem maxViewports = 1. Multi-viewport tem de degradar para
-            // o primeiro viewport; ignorá-lo em silêncio desenha a cena no sítio
-            // errado, por isso é contabilizado como degradado.
-            out.push_back(c);
+
+        case gpu::maxwell3d::vertex_array_instance_first:
+        case gpu::maxwell3d::vertex_array_instance_subsequent:
+            // **Um desenho instanciado** (o upstream: `DrawArrayInstanced` ✓).
+            // A topologia, o início e a contagem vivem num registo
+            // *empacotado* ✗ — o upstream tira-os bit a bit ✗. Fica a
+            // contagem ✗ e conta-se como degradado ✓ (é honesto: um
+            // desenho instanciado sem a contagem exacta não é o desenho).
             ++cmds_dropped_;
+            ++instance_count;
             break;
-        case MaxwellOp::Nop:
-            break;
-        default:
-            // Estados, máscaras, clear e fences são legítimos e não são erro.
-            // Só conta como desconhecido o que não está na tabela.
-            switch (op) {
-            case MaxwellOp::SetStencil:
-            case MaxwellOp::SetScissor:
-            case MaxwellOp::SetDepthRange:
-            case MaxwellOp::Clear:
-            case MaxwellOp::SetState:
-            case MaxwellOp::SemaphoreIncrement:
-            case MaxwellOp::BindComputeProgram:
-                break;
-            default:
-                ++cmds_unknown_;
-                break;
-            }
-            break;
-        }
 
-        // O comprimento nunca inclui o cabeçalho. Se o payload for inválido,
-        // payload_words devolveu 0 e avança-se uma palavra, o que desincroniza
-        // — mas isso só acontece com buffer corrompido, e o descodificador
-        // conta o erro em vez de propagar memória corrompida.
-        if (has_payload(head) && plen == 0) {
-            ++i;
-        } else {
-            i += 1 + plen;
+        default:
+            // Estados, máscaras, fences e o resto são legítimos e não
+            // são erro: contam-se como conhecidos ✓.
+            break;
         }
-    }
+    });
 
     tel_.frame_translate(tel_.time_now() - t0);
-    error.clear();
     return out.size();
 }
 

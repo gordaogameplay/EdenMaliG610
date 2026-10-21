@@ -61,9 +61,12 @@ def extrair(caminho: str, prefixo: str, indice: set[str], faltantes: list[str]) 
             continue
         if not t.endswith((".cpp", ".c", ".cc")):
             continue
-        # O renderer OpenGL e' peso morto para a casa (que e' Vulkan) e
-        # traz shaders gerados que nao temos como gerar. Fica de fora.
-        if t.startswith("renderer_opengl/"):
+        # Os renderers ficam de fora: a casa implementa a
+        # `RasterizerInterface` (o `ValhallBackend` do desenho), e os
+        # shaders do host que eles precisam sao gerados pelo upstream
+        # (com glslang) — nao ha' como os gerar aqui.
+        if t.startswith(("renderer_opengl/", "renderer_vulkan/", "renderer_null/",
+                         "host_shaders/")):
             continue
         if f"{prefixo}/{t}" in indice:
             fontes.append(f"{prefixo}/{t}")
