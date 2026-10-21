@@ -4075,6 +4075,126 @@ Ou seja ✗: o guest **alocou a regiao do canal da GPU** ✗ (328 MB ✗) e
 **canal do NVDRV** ✗ ✗: onde o guest escreve os comandos ✗, e de onde a
 casa os tem de ler ✗.
 
+### O canal do NVDRV — quatro correcoes medidas
+
+O `SubmitGPFIFO` chegou a correr e a ler o push buffer, mas o jogo
+abortava com `SetTerminateResult modulo=2 desc=3005` ✗ — o pranto do SDK
+quando uma chamada devolve um resultado inesperado ✗ ✗.
+
+**1. A tabela `SubmissionMode` estava errada** ✗ — e era o bug que
+des-sincronizava o leitor ✗.
+
+A casa tinha (`include/g610/gpu/pushbuffer.hpp` ✗):
+
+    Increasing = 0, NonIncreasing = 1, Inline = 2, IncreaseOnce = 3
+
+O upstream (`video_core/dma_pusher.h:35-42` ✗):
+
+    IncreasingOld = 0, Increasing = 1, NonIncreasingOld = 2,
+    NonIncreasing = 3, Inline = 4, IncreaseOnce = 5
+
+Todos deslocados ✗. E o pior ✗: **os modos 0 e 2 nao existem no
+upstream** ✗ — o `ProcessCommands` (`dma_pusher.cpp:189-191` ✗) cai no
+`default` e **ignora** a palavra ✗. A casa tratava-os como validos ✗ e
+comia o fluxo ✗ ✗.
+
+Medido ✗: o leitor passou de **1404 metodos / 47 descartados** ✗ (errado
+✗) para **624 / 6** ✗ ✓.
+
+**2. O `size` do `CommandListHeader` e' em PALAVRAS** ✗. O upstream le
+`GpuGuestMemory<CommandHeader>` ✗ — `size` **elementos** de 4 bytes ✗ ✗.
+A casa lia o `size` como bytes ✗ (4x menos ✗).
+
+Prova no pedido real ✗: a entrada 1 comeca em `0xE2D67000 + 0x2274` ✗, e
+`0x2274` = 8820 = **2205 palavras** ✗ ✓.
+
+**3. O `MapBufferEx` com `mapping_size = 0`** ✗ mapeia o handle inteiro ✗
+(upstream ✗, `nvhost_as_gpu.cpp:369` ✗). A casa mapeava **zero bytes** ✗ ✗.
+
+**4. O primeiro handle do `nvmap` e' o 0** ✗. O upstream
+(`nvmap/core/nvmap.cpp:134` ✗) faz `fetch_add` a partir de zero ✗; a
+casa comecava em 1 ✗ ✗.
+
+Medido ✗ (`boot_v12.log` ✗): `MapBufferEx: handle 0 nao esta alocado` ✗ —
+cinco vezes ✗ — e o `NvResult` de erro (11 ✗, `BadValue` ✗) **mata o
+jogo** ✗ ✗.
+
+**Instrumento novo** ✗: o `RespostaErro` no `nvdrv` ✗ escreve so
+quando o `NvResult` **nao** e' `Success` ✗ ✗. E' o que encontrou este
+bug em segundos ✗ ✗.
+
+### O `/dev/nvhost-ctrl` — o device da espera pela fence
+
+`TipoDeDevice::Controle` existia na enum ✗ mas **nao tinha caso no
+despacho** ✗ — e os ioctls do grupo 0x00 caíam em "nao implementado" ✗ ✗.
+
+O upstream (`nvhost_ctrl.cpp:41-57` ✗) tem ai ✗:
+
+    0x1b NvOsGetConfigU32
+    0x1c IocCtrlClearEventWait
+    0x1d IocCtrlEventWait (alocacao)
+    0x1e IocCtrlEventWait (espera)
+    0x1f IocCtrlEventRegister
+    0x20 IocCtrlEventUnregister
+    0x21 IocCtrlEventUnregisterBatch
+
+Implementados ✗ ✗, com um **syncpoint manager** novo
+(`include/g610/gpu/syncpoint.hpp` ✗) ✗ e um `KEvent` por slot ✗ — o
+mesmo `KEvent` que o upstream sinaliza ✗ (`nvhost_ctrl.cpp:297-320` ✗) ✗.
+
+O `QueryEvent` (comando 4) agora resolve o evento pelo **fd do device**
+✗, como o upstream (`nvdrv.cpp:211-229` ✗) ✗.
+
+**A diferenca para o upstream** ✗: o upstream avanca o syncpoint numa
+thread de GPU ✗; aqui avanca **no `SubmitGPFIFO`** ✗ — que e' quando o
+trabalho e' "executado" ✗ ✗. O guest ve o mesmo ✗ ✗.
+
+### A fence
+
+O upstream (`nvhost_gpu.cpp:367-372` ✗):
+
+    params.fence.id = channel_syncpoint;
+    u32 increment{(flags.fence_increment ? 2 : 0) +
+                  (flags.increment_value ? params.fence.value : 0)};
+    params.fence.value =
+        syncpoint_manager.IncrementSyncpointMaxExt(channel_syncpoint, increment);
+
+**O incremento pode ser zero** ✗ ✗ — e nesse caso o syncpoint **nao sobe**
+✗ ✗. A casa incrementava sempre ✗ ✗, e devolvia um valor de fence que o
+Eden nunca devolveria ✗ ✗.
+
+O `AllocGPFIFOEx` aloca o syncpoint do canal ✗ (o upstream aloca-o na
+criacao do canal ✗) ✗, e devolve o par (syncpoint ✗, valor **actual** ✗)
+✗ ✗.
+
+### Onde o jogo esta agora
+
+Medido ✗ (`boot_v13.log` ✗):
+
+- o `NvResult` de erro do `nvmap` **desapareceu** ✗ ✓;
+- o syncpoint do canal avanca (0 -> 1) na submissao ✗ ✓;
+- o jogo **continua a abortar** ✗ com `desc=3005` ✗ ✗.
+
+**A espera que bloqueia** ✗: `WaitProcessWideKeyAtomic addr=0x10a2c7d58
+cv=0x10a2c7d64 tag=0x81ff timeout=-1` ✗ — espera infinita ✗, e o sinal
+**nunca chega** ✗ ✗.
+
+**O que se sabe** ✗ ✗:
+
+- o guest **nao** espera pela fence pelo ioctl ✗ — abre
+  `/dev/nvhost-ctrl-gpu` (fd=1 ✗) e nunca `/dev/nvhost-ctrl` ✗ ✗;
+- a submissao que o jogo fez e' de **setup** ✗ (bind de objectos ✗, mem
+  ops ✗, registos 3D ✗) ✗ — os ids de canal presentes sao 0 ✗, 2 ✗ e
+  11 ✗ ✗, e **nao** ha `0x1D` (`SyncpointOperation` ✗) ✗ nem `0x07`
+  (`SemaphoreOperation` ✗) ✗ ✗;
+- logo: **o jogo ainda nao submeteu o trabalho** ✗ — a thread de render
+  esta bloqueada **antes** ✗ ✗.
+
+**A proxima medicao** ✗: o que a thread de render esta a esperar ✗ — a
+cv `0x10a2c7d64` ✗ e' do **proprio jogo** ✗ (o dump mostra
+`mutex=0x81ff cv=0x0` ✗) ✗, e o `tag=0x81ff` ✗ tem o bit 0x8000 ✗
+ligado ✗ — que no Eden e' o bit de "**waiter removido**" ✗ ✗.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native
