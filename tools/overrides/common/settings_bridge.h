@@ -34,6 +34,7 @@
 // comentário, para que esse dia não comece por reescrever isto.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -67,6 +68,39 @@ public:
 
 private:
     T valor_{};
+};
+
+// A informação de escala da resolução.
+//
+// **Do upstream** ✓ (`common/settings.h` ✓) — copiada tal e qual ✓, porque
+// é uma struct simples ✗ (sem a máquina de `Setting<>` ✗) e porque o
+// `texture_cache` do upstream lê os seus campos ✓ (`texture_cache.h:458-459`
+// ✓, `681` ✓, `1204` ✓, `1266-1269` ✓).
+//
+// O valor por omissão é a **identidade** ✓ (`up_scale = 1` ✓,
+// `down_shift = 0` ✓) — ou seja, o motor do upstream não escala nada ✓,
+// que é o que a casa quer ✓ (o Pi presents o que o guest desenhou ✗).
+struct ResolutionScalingInfo {
+    u32 up_scale{1};
+    u32 down_shift{0};
+    f32 up_factor{1.0f};
+    f32 down_factor{1.0f};
+    bool active{};
+    bool downscale{};
+
+    s32 ScaleUp(s32 value) const {
+        if (value == 0) {
+            return 0;
+        }
+        return (std::max)((value * static_cast<s32>(up_scale)) >> static_cast<s32>(down_shift), 1);
+    }
+
+    u32 ScaleUp(u32 value) const {
+        if (value == 0U) {
+            return 0U;
+        }
+        return (std::max)((value * up_scale) >> down_shift, 1U);
+    }
 };
 
 struct Values {
@@ -128,6 +162,37 @@ struct Values {
     Valor<bool> use_fast_gpu_time{false};
     Valor<std::uint32_t> fast_gpu_time{0};
     Valor<bool> skip_cpu_inner_invalidation{false};
+
+    // ── Os campos que o resto do motor (o `core` e o `video_core`) lê ────
+    //
+    // **Medido**: `grep -oE "Settings::values\.[a-z_0-9]+"` sobre os
+    // **ficheiros que a casa compila** — a lista real, tirada dos objectos
+    // do build (`find CMakeFiles -name '*.o'` ✓). São 22 campos ✓, e
+    // estes são os que faltavam ✗ depois dos de cima ✓.
+    //
+    // Os valores por omissão são os do upstream ✓, menos os que a casa
+    // tem de escolher ✗ — e nesses a nota diz porquê ✓.
+    Valor<bool> descriptor_indexing{false};
+    Valor<bool> disable_shader_loop_safety_checks{false};
+    Valor<std::uint8_t> dyna_state{0};
+    Valor<bool> enable_compute_pipelines{false};
+    Valor<bool> enable_nsight_aftermath{false};
+    Valor<bool> provoking_vertex{false};
+    Valor<bool> renderer_shader_feedback{false};
+    Valor<bool> vertex_input_dynamic_state{true};
+    Valor<VramUsageMode> vram_usage_mode{VramUsageMode::Conservative};
+
+    // O layout da memória física do dispositivo ✓ — 4 GiB ✓, o default do
+    // upstream ✓.
+    //
+    // **Medido**: `core/device_memory_manager.inc:166` ✓ e `182` ✓ escolhem
+    // entre `physical_min_bits` (32 ✓ = 4 GiB ✗) e `physical_max_bits`
+    // (33 ✓ = 8 GiB ✗). A VA de GPU do guest vive em 0x98000000-0x9C800000
+    // ✓ — dentro dos 4 GiB ✓ — por isso o default do upstream serve ✓.
+    Valor<MemoryLayout> memory_layout_mode{MemoryLayout::Memory_4Gb};
+
+    // A escala da resolução — a **identidade** ✓ (ver a struct acima ✓).
+    ResolutionScalingInfo resolution_info{};
 };
 
 // A definição global. O Eden põe isto numa função para não haver uma ordem de
@@ -142,5 +207,70 @@ Values& ValuesRef();
 // not name a type» — que não menciona namespaces e faz o erro parecer de um
 // include em falta.
 extern Values& values;
+
+// ── A política de precisão ──────────────────────────────────────────────
+//
+// O upstream declara estas cinco funções em `common/settings.h` ✗ e
+// implementa-as em `common/settings.cpp` ✗ — que a casa **não** compila ✗
+// (o `settings.cpp` do Eden depende de `common/fs.cpp` ✗ e de um directório
+// de relatórios ✗ — o mesmo motivo que levou a casa a escrever o seu
+// `src/eden_log.cpp` ✗).
+//
+// **Medido**: `grep -oE "Settings::[A-Z]\w*\s*\("` sobre os ficheiros do
+// `video_core` que a casa compila — são exactamente estas cinco ✓.
+//
+// ## A escolha da casa
+//
+// O `dma_pusher.cpp` do upstream (linha 106 ✓) escolhe o caminho de leitura
+// do push buffer assim ✓:
+//
+//     const bool use_safe = Settings::IsDMALevelDefault()
+//                               ? (Settings::IsGPULevelMedium() ||
+//                                  Settings::IsGPULevelHigh())
+//                               : Settings::IsDMALevelSafe();
+//
+// O caminho `safe` lê os comandos **verificando** a memória do guest ✓; o
+// `unsafe` lê sem verificar ✗.
+//
+// **A casa só tem o caminho seguro** ✗ — o `PushBuffer` da casa valida
+// cada comando ✓ (ver `src/gpu/pushbuffer.cpp` ✓) — e é o caminho que o
+// motor do upstream usa quando a precisão é alta ✓.
+//
+// Logo: precisão **alta** ✓ e DMA **default** ✓ -> `use_safe = true` ✓.
+//
+// `IsGPULevelLow()` é `false` ✓ porque a casa não tem modo de baixa
+// precisão ✗ — não é uma omissão ✗, é uma escolha ✓ (a telemetria é o
+// que mede, e medir com leituras não verificadas seria medir lixo ✗).
+inline void UpdateGPUAccuracy() {
+    // A casa tem uma só precisão ✓. Não há `values.gpu_accuracy` ✗ para
+    // copiar — e não precisa ✗.
+}
+
+inline bool IsGPULevelLow() {
+    return false;
+}
+
+inline bool IsGPULevelMedium() {
+    return false;
+}
+
+inline bool IsGPULevelHigh() {
+    return true;
+}
+
+inline bool IsDMALevelDefault() {
+    return true;
+}
+
+inline bool IsDMALevelSafe() {
+    return true;
+}
+
+// O Switch pode estar "docked" (num dock, com ecrã grande ✓). A casa
+// corre num Pi ✗ — não há dock ✗ — e o valor por omissão é **desligado** ✓
+// (o upstream: `values.docked_mode.GetValue()` ✗).
+inline bool IsDockedMode() {
+    return false;
+}
 
 } // namespace Settings
