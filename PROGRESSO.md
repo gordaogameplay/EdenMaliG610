@@ -3549,6 +3549,22 @@ params.fence.value = syncpoint_manager.IncrementSyncpointMaxExt(channel_syncpoin
 A casa já tem o `svc_wait_synchronization` e o `KEvent` (usados no
 `time:u` e no `applet:oe`) — falta é ligá-los ao canal do `nvdrv`.
 
+**O mecanismo, com o upstream como referência** (é o que faz o guest
+desbloquear):
+
+1. O jogo cria um handle de **semáforo** no `nvmap` (`IocCreate` com as
+   bandeiras de semáforo) e dá-o ao canal.
+2. O `nvmap` devolve ao guest o **handle de `KEvent`** desse
+   semáforo (é o `IocMap`/`IocParam` do semáforo que o dá) — e é
+   por esse handle que o *thread* de GPU do jogo espera
+   (`svcWaitSynchronization`).
+3. O `nvdrv`, no fim da submissão, incrementa o syncpoint do canal e
+   **sinaliza** o `KEvent` do semáforo.
+
+Ou seja: o que falta não é o tradutor — é o **sinal** que o trabalho
+terminou. Sem ele, o jogo bloqueia antes de desenhar o primeiro
+quadro, e por isso o push buffer ainda está a zeros.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native
