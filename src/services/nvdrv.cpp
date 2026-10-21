@@ -1425,6 +1425,33 @@ private:
             (void)w;
         }
 
+        // **A leitura em cascata**: cada palavra dos cabeçalhos que
+        // pareca um endereço é seguida, e o seu conteudo é despejado.
+        //
+        // E' a forma de descobrir o formato **sem adivinhar**: o dump
+        // medido mostra tres palavras, todas enderecos — e sao eles que
+        // dizem o que a estrutura e'.
+        for (std::size_t i = 0; i + 3 < bruto_cabec.size() + 3 && i < 24; i += 4) {
+            std::uint32_t valor = 0;
+            std::memcpy(&valor, bruto_cabec.data() + i, sizeof(valor));
+            if (valor == 0 || (valor & 0xF) != 0)
+                continue;
+            std::uint8_t conteudo[32] = {0};
+            if (!LerDoGuest(valor, conteudo, sizeof(conteudo)))
+                continue;
+            char linha[192];
+            std::size_t n = 0;
+            n += static_cast<std::size_t>(std::snprintf(
+                linha + n, sizeof(linha) - n, "[gpfifo] 0x{:X} ->", valor));
+            for (std::size_t k = 0; k < sizeof(conteudo) && n + 4 < sizeof(linha); ++k)
+                n += static_cast<std::size_t>(
+                    std::snprintf(linha + n, sizeof(linha) - n, " %02x", conteudo[k]));
+            if (n + 2 < sizeof(linha))
+                n += static_cast<std::size_t>(std::snprintf(linha + n, sizeof(linha) - n, "\n"));
+            const ssize_t w = ::write(2, linha, n);
+            (void)w;
+        }
+
         std::vector<CommandListHeader> cabecalhos;
         if (params.num_entries > 0) {
             if (cabecalhos_no_endereco) {

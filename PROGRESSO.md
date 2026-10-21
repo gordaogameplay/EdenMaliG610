@@ -3378,6 +3378,43 @@ dump capturado"*.
 **O dump existe agora** (acima). Falta descodificá-lo contra a
 referência do *host1x*/*Tegra*.
 
+### A descodificação — o que a medição **desmente**
+
+A leitura em cascata (cada palavra dos cabeçalhos que pareça um
+endereço é seguida, e o seu conteúdo é despejado) diz o seguinte
+(`boot_p7s.log`):
+
+| endereço | conteúdo |
+|---|---|
+| `0xB9112000` | 32 bytes a **zeros** |
+| `0x80227600` | `0a 01 00 34 60 06 40 f9 08 00 40 f9 …` — **código AArch64** |
+| `0xB9114274` | `fd 7b 41 a9 f3 07 42 f8 c0 03 5f d6 …` — **código** |
+| `0x80000600` | `f4 4f 45 a9 f6 57 44 a9 ff c3 01 91 …` — **código** |
+| `0xB9114278` | `fd 7b 01 a9 fd 43 00 91 b4 24 01 90` — **código** |
+| `0x80002A00` | (a seguir) — **código** |
+
+**Isto desmente a leitura `{tipo, endereço, tamanho}`**: os campos não
+são um tipo e um tamanho — são **ponteiros para funções do próprio
+jogo** (`stp x29, x30, [sp, #-16]!` é o prólogo de uma função).
+
+E desmente também a leitura "o push buffer do jogo": a primeira
+entrada é uma região a **zeros** (uma lista de comandos vazia) e as
+restas são código. Ou seja: **o que o guest submeteu não é o push
+buffer da GPU** — é uma lista de *callbacks* (é o que o
+`nvhost-ctrl-gpu` recebe do `nvhost` do driver quando não há trabalho
+de GPU a fazer).
+
+**Onde está então o push buffer?** No **`nvmap`**: o guest aloca o
+buffer (`IocCreate`/`IocAlloc`), dá-lhe o handle ao canal
+(`SetNVMAPfd: handle=3` — medido) e submete com
+`SubmitGPFIFO(address=…)`. O handle 3 está no **registo partilhado**
+da casa, com o seu endereço — que é o que falta seguir.
+
+**O próximo passo concreto**: seguir o handle do `nvmap` que o canal
+recebe (`SetNVMAPfd`) e **despejar o conteúdo dessa região** — é aí
+que está o push buffer real, e é com esse dump que a tabela de opcodes
+se valida.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native
