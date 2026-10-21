@@ -1,3 +1,4 @@
+common/settings.h
 core/hle/service/apm/apm_controller.cpp
 core/hle/service/apm/apm_controller.h
 core/hle/service/hle_ipc.cpp

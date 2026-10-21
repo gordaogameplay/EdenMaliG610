@@ -245,6 +245,35 @@ public:
         reporter_ = &reporter;
     }
 
+    // Liga **só** o `KernelCore`, e antes do resto.
+    //
+    // **Porquê é preciso, e o que acontece sem isto.**
+    //
+    // O `ServiceManager` constrói o `IpcController` no **seu** construtor
+    // (`sm.cpp:31`: `controller_interface = std::make_unique<Controller>
+    // (kernel.System())`), e o `Controller` — como todo o `SessionRequest-
+    // Handler` — guarda uma **referência** ao `KernelCore`
+    // (`hle_ipc.h:84`). Essa referência é ligada a `system.Kernel()`, que
+    // devolve `*kernel_` — o ponteiro **deste** `System`.
+    //
+    // Se o `ServiceManager` for construído antes de `ligar()`, essa
+    // referência fica ligada a um `KernelCore` que ainda não existe (a
+    // referência é nula, e é isso que se sente). O primeiro uso dela é o
+    // `CloneCurrentObject` do `IpcController` — que cria uma sessão — e
+    // aí o motor escreve no mutex de um `KernelCore` nulo e morre:
+    //
+    //     [host-fault] pc=... em pthread_mutex_lock — codigo do MOTOR
+    //     KSession::KSession -> KernelCore::RegisterKernelObject
+    //
+    // No Eden a ordem é natural: o `KernelCore` nasce no construtor do
+    // `System`, e o `ServiceManager` logo a seguir (`core.cpp`). Aqui o
+    // `KernelCore` é um membro do `EdenSystem` (que *é* o `System`), e por
+    // isso o `ligar()` completo só pode ser feito no fim — mas o `kernel_`
+    // tem de estar ligado **antes** do `ServiceManager`.
+    void ligar_kernel(Kernel::KernelCore& kernel) {
+        kernel_ = &kernel;
+    }
+
     // O `RunServer` acima **não corre nada**, e é de propósito.
     //
     // No Eden, `RunServer` arranca as threads que gerem as portas e esperam

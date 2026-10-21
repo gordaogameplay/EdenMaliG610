@@ -2,11 +2,12 @@
 //
 // ## O que o código vendorizado pede
 //
-// **Dois campos**, medidos com `grep -rhoE "Settings::values\.[a-z_]+"` sobre
+// **Três campos**, medidos com `grep -rhoE "Settings::values\.[a-z_]+"` sobre
 // `vendor/eden`:
 //
 //     Settings::values.use_auto_stub
 //     Settings::values.use_debug_asserts
+//     Settings::values.disabled_addons
 //
 // E é tudo. O `Settings` do Eden tem dezenas — resolução,海湾 de memória, o
 // caminho do ROM, a lista de serviços a stubbar, chaves de debug — e **nada
@@ -33,6 +34,11 @@
 // comentário, para que esse dia não comece por reescrever isto.
 #pragma once
 
+#include <cstdint>
+#include <map>
+#include <string>
+#include <vector>
+
 namespace Settings {
 
 struct Values {
@@ -54,6 +60,25 @@ struct Values {
     // o silencio.
     bool use_auto_stub = true;
     bool use_debug_asserts = false;
+
+    // Os DLC desativados, por id de programa. **Vazio** — este motor não
+    // tem DLC (não há `NCA` com conteúdo).
+    //
+    // O tipo é o do Eden (`common/settings.h:874`), e o campo tem de
+    // existir mesmo vazio: o `aoc` **indexa** este mapa com o id do
+    // programa corrente (`aoc/addon_content_manager.cpp:121`), e sem o
+    // campo essa leitura é lixo — e o `std::find` sobre um vector lixo
+    // mata o motor.
+    //
+    // **E o mapa tem de estar NESTE tipo.** Se existirem dois
+    // `Settings::Values` diferentes no mesmo binário — o nosso e o do Eden
+    // — o `Settings::values` é o **mesmo símbolo** para os dois, e o `aoc`
+    // lê `disabled_addons` a um deslocamento que não existe no objecto
+    // nosso. Por isso o `settings.h` vendorizado é **substituído** por este
+    // ficheiro (ver `tools/overrides/common/settings.h`): há um só tipo em
+    // jogo. Medido (`boot_p6j.log`): o fault foi um `std::find` sobre um
+    // mapa lixo, dentro do `CountAddOnContent`.
+    std::map<std::uint64_t, std::vector<std::string>> disabled_addons;
 };
 
 // A definição global. O Eden põe isto numa função para não haver uma ordem de
