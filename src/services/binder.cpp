@@ -382,9 +382,19 @@ struct FilaDeBuffers {
     // **Antes do `SetPreallocatedBuffer`** ✗, os valores sao **1** ✗ (o
     // upstream ✗ — `default_width{1}` ✗) ✗. A casa devolvia 1280×720 ✗
     // fixos ✗ ✗ — o que era um palpite ✗, nao o upstream ✗ ✗.
+    // **Os valores por omissao** ✗ — o upstream
+    // (`nvnflinger/buffer_queue_core.h:88-91` ✗):
+    //
+    //     PixelFormat default_buffer_format{PixelFormat::Rgba8888};
+    //     u32 default_width{1};
+    //     u32 default_height{1};
+    //
+    // **O formato por omissao e' `Rgba8888` (=1)** ✗ — e a casa punha
+    // **0** ✗ (`NoFormat` ✗) ✗ ✗. O jogo perguntou o formato ✗
+    // (`Query` com `o_que=2` ✗) e recebeu `0` ✗ ✗.
     std::uint32_t largura = 1;
     std::uint32_t altura = 1;
-    std::uint32_t formato = 0;
+    std::uint32_t formato = 1;  // Rgba8888
 };
 
 // A **janela** — o buffer onde o jogo desenha (a native window).
@@ -550,6 +560,9 @@ std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
     switch (codigo) {
     case 9: {  // Query
         const std::int32_t o_que = leitor.Le<std::int32_t>();
+        if (std::getenv("IA_IPC_TRACE") != nullptr) {
+            std::fprintf(stderr, "[binder] Query: o_que=%d\n", o_que);
+        }
         std::int32_t valor = 0;
         switch (o_que) {
         case WindowWidth:
@@ -747,6 +760,9 @@ std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
 
     // O `Status` no fim — como o Eden.
     escritor.Escreve<std::int32_t>(status);
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr, "[binder] transaccao %u -> status=%d\\n", codigo, status);
+    }
     return escritor.Serializa();
 }
 

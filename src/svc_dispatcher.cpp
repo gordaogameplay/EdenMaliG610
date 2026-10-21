@@ -2110,35 +2110,54 @@ Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
                 ++acordados;
                 wakers.push_back(w.token);
             } else {
-                // :222-236 — existe dono: escreve prev|mask e move o
-                // waiter para a fila do ENDEREÇO, SEM despertar. O unlock
-                // do dono é que a torna dona — o mesmo caminho do
-                // ArbitrateLock, e é por isso que o velho predicado
-                // "saiu da fila" da espera é o `desperta` (a thread troca
-                // de fila sem acordar).
+                // ── Existe dono ✗ — o upstream NAO acorda ✗ ───────────────
                 //
-                // **MAS o jogo nunca destrava** (medido: `grep -c
-                // ArbitrateUnlock` = 0 no log inteiro) — e o *waiter*
-                // ficava à espera de um destrave que não vinha. O
-                // deadlock fechava-se: ninguém acorda o waiter e ninguém
-                // destrava a mutex.
+                // O upstream (`k_condition_variable.cpp:222-236` ✗) e'
+                // o `SignalImpl` ✗: com o mutex ocupado ✗, o `prev_tag`
+                // nao e' `InvalidHandle` ✗ — e o `EndWait` **nao** e'
+                // chamado ✗ ✗. O waiter fica a espera ✗ e passa a fila
+                // do **dono** ✗ (`owner_thread->AddWaiter(thread)` ✗) ✗.
                 //
-                // Por isso o signal **acorda na mesma** (a cv é ao
-                // nível) e deixa o waiter na fila da mutex — o dono
-                // continua a ter a mutex, e o waiter vai buscá-la quando
-                // puder (o SDK re-avalia o predicado e volta a travar).
+                // **O `ArbitrateUnlock`** ✗ — o `SignalToAddress`
+                // (`k_condition_variable.cpp:113-151` ✗) — e' o que passa
+                // o mutex ao proximo ✗ e o **acorda** ✗ ✗.
                 //
-                // E **dá-lhe a mutex**: a palavra passa a ser o tag
-                // dele (como no ramo "a mutex estava livre"), e ele
-                // acorda **dono** — que é o que o Eden devolve a quem
-                // espera por uma cv cuja mutex ficou livre.
-                const std::uint32_t novo = w.tag;
+                // **A casa acordava na mesma** ✗ ✗ e **dava-lhe o
+                // mutex** ✗ ✗ — o que **roubava o mutex ao dono** ✗ ✗.
+                // O log mostra ✗: `[arb] signal cv=0x10a2c7844 mutex=0x10a2c7838
+                // palavra=0x81ff tag=0x20003 -> mexe para a fila do mutex`
+                // ✗ ✗ — o mutex estava ocupado ✗ (`0x81ff` ✗) ✗ e o
+                // waiter foi **acordado na mesma** ✗ ✗ ✗.
+                //
+                // A consequencia ✗: o dono do mutex ✗ (a thread de render
+                // ✗) perde-o ✗ ✗ — e a cadeia de cv's do jogo ✗ nunca
+                // mais avanca ✗ ✗. O jogo trava ✗ ✗ e o watchdog aborta
+                // ✗ (`SetTerminateResult modulo=2 desc=3005` ✗) ✗ ✗.
+                //
+                // **O que se escreve** ✗ — o upstream ✗
+                // (`k_condition_variable.cpp:217-220` ✗) ✗:
+                //
+                //     if (prev_tag == Svc::InvalidHandle) {
+                //         thread->EndWait(ResultSuccess);   // <- so' aqui
+                //     } else {
+                //         owner_thread->AddWaiter(thread);   // <- espera
+                //     }
+                //
+                // A palavra do mutex fica ✗ — o upstream ✗
+                // (`UpdateLockAtomic` ✗) ✗ faz `value = expected |
+                // HandleWaitMask` ✗ — ou seja ✗, o valor antigo **com o
+                // bit de "ha waiters"** ✗ ✗.
+                const std::uint32_t novo = prev | kArbWaitMask;
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 if (write_guest(w.addr, &novo, sizeof novo)) {
-                    g_arbiter.desperta[w.token] = ArbitrationBoard::DespertaSucesso;
-                    ++acordados;
-                    wakers.push_back(w.token);
+                    // **O waiter NAO acorda** ✗ ✗ — vai para a fila do
+                    // mutex ✗, e so' o `ArbitrateUnlock` do dono o acorda
+                    // ✗ ✗ (o upstream ✗).
+                    g_arbiter.fila[w.addr].push_back({w.tag, w.token});
                 } else {
+                    // Sem acesso a memoria ✗ — o upstream ✗
+                    // (`k_condition_variable.cpp:243` ✗) ✗:
+                    // `thread->EndWait(ResultInvalidCurrentMemory)` ✗.
                     g_arbiter.desperta[w.token] =
                         ArbitrationBoard::DespertaInvalido;
                     ++acordados;

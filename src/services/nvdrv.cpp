@@ -2163,6 +2163,12 @@ private:
                 incremento += 2;
             if ((params.flags & kIncrementValue) != 0)
                 incremento += params.fence_value;
+            if (std::getenv("IA_IPC_TRACE") != nullptr) {
+                std::fprintf(stderr,
+                             "[nvdrv] SubmitGPFIFO: flags=0x%x fence de entrada=(%d,%u) "
+                             "incremento=%u\n",
+                             params.flags, params.fence_id, params.fence_value, incremento);
+            }
             canal->submissoes += 1;
 
             // **O syncpoint avanca** ✗ — e e' isto que cumpre a espera do
