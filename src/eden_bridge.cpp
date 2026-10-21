@@ -863,13 +863,32 @@ bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_ha
     // thread do ServerManager acordaria, receberia e responderia; aqui não há
     // thread host, portanto fazemos exactamente essas duas fases agora, no
     // fluxo síncrono do guest.
-    const bool processado = R_SUCCEEDED(kernel.System().ProcessPendingSynchronously());
-    if (!processado && std::getenv("IA_IPC_TRACE") != nullptr) {
+    const Result resultado = kernel.System().ProcessPendingSynchronously();
+
+    // **`ResultNotFound` nao e' um erro** — e' "ainda nao ha nada para
+    // atender".
+    //
+    // O upstream (`server_manager.cpp:418`) lanca `ResultNotFound` quando o
+    // pump nao encontrou trabalho ✗ — e o `svc_ipc.cpp:91` trata-o
+    // explicitamente como "continua a espera" ✗, nao como falha ✗.
+    //
+    // **Medido** ✗: o pump da casa devolvia `ResultNotFound` (61953 ✗) e o
+    // `eden_send_sync_request` devolvia `false` ✗ — o que o
+    // `svc_send_sync_request` traduzia em `Result::InvalidHandle` ✗ ✗.
+    // O guest recebia um erro num pedido **legitimo** ✗ ✗ e abortava ✗
+    // (`SetTerminateResult modulo=2 desc=3005` ✗) ✗.
+    //
+    // **O que e' um erro a serio** ✗: o `SendSyncRequest` enfileirar o
+    // pedido ✗ (linha acima ✗) ✗. O pump e' um **extra** ✗ — o pedido ja
+    // esta' na fila do servidor ✗ e sera' atendido no proximo ciclo ✗ ✗.
+    const bool processado = R_SUCCEEDED(resultado);
+    if (!processado && resultado != Kernel::ResultNotFound &&
+        std::getenv("IA_IPC_TRACE") != nullptr) {
         std::fprintf(stderr,
-                     "[ipc] SendSyncRequest handle=0x%x PROCESSAMENTO falhou (ProcessPendingSynchronously != Success)\n",
-                     session_handle);
+                     "[ipc] SendSyncRequest handle=0x%x PROCESSAMENTO falhou (Result=%u)\n",
+                     session_handle, static_cast<unsigned>(resultado.GetInnerValue()));
     }
-    return processado;
+    return processado || resultado == Kernel::ResultNotFound;
 }
 
 } // namespace g610

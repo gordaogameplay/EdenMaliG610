@@ -1980,13 +1980,17 @@ private:
             {
                 std::string linha;
                 char tmp[64];
+                std::uint32_t max_id = 0;
                 for (const auto& [id, n] : metodos_vistos) {
                     std::snprintf(tmp, sizeof tmp, "%s%u:%u", linha.empty() ? "" : " ", id, n);
                     linha += tmp;
-                    if (linha.size() > 900)
-                        break;
+                    if (id > max_id)
+                        max_id = id;
                 }
                 LOG_DEBUG(Service_NVDRV, "SubmitGPFIFO: ids de método: {}", linha);
+                LOG_DEBUG(Service_NVDRV,
+                          "SubmitGPFIFO: max id={} (draw_begin=1414 draw_end=1413) total={}",
+                          max_id, metodos_vistos.size());
             }
         }
 

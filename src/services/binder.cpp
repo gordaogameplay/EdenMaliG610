@@ -169,11 +169,26 @@ public:
 
     // O token: o Eden lê um `u32` (o "0x100" que medimos) e o
     // comprimento, e depois (comprimento + 1) caracteres em UTF‑16.
+    //
+    // **Os caracteres NÃO são alinhados** ✗ — o upstream usa
+    // `ReadUnaligned<u16>()` (`parcel.h:96` ✗), que deixa o índice onde
+    // está ✗. A casa alinhava a 4 bytes **depois** de cada caracter ✗ ✗.
+    //
+    // **Medido** ✗ (`/tmp/boot_v17.log` ✗): o token do `android.gui`
+    // (11 caracteres ✗ + o terminador ✗ = 12 ✗) deixava o índice em
+    // **164** ✗ — quando 16 (o `data_offset` ✗) + 8 (o cabeçalho do token
+    // ✗) + 24 (os 12 caracteres ✗) = **48** ✗ ✗. A diferença ✗ — 116
+    // bytes ✗ — eram os 2 bytes de desperdício por caracter ✗ ✗.
+    //
+    // **Consequência medida** ✗: o `SetPreallocatedBuffer` (transacção 14
+    // ✗) lia o *slot* ✗ e o *handle* ✗ de sitios errados ✗ — e o
+    // `LeObjecto` falhava ✗, o que fazia o compositor devolver
+    // `StatusBadValue` ✗ ✗. O jogo ficava sem poder desenhar ✗ ✗.
     void TokenDaInterface() {
         (void)Le<u32>();
         const std::uint32_t comprimento = Le<u32>();
         for (std::uint32_t i = 0; i < comprimento + 1 && TemBytes(2); ++i)
-            (void)Le<std::uint16_t>();
+            (void)LeSemAlinhar<std::uint16_t>();
         Alinha();
     }
 
@@ -185,6 +200,18 @@ public:
             indice_ += sizeof(T);
         }
         Alinha();
+        return valor;
+    }
+
+    // A leitura **sem alinhamento** — o `ReadUnaligned` do upstream
+    // (`parcel.h:89-99` ✗). So o token a usa ✗.
+    template <typename T>
+    T LeSemAlinhar() {
+        T valor{};
+        if (TemBytes(sizeof(T))) {
+            std::memcpy(&valor, dados_.data() + indice_, sizeof(T));
+            indice_ += sizeof(T);
+        }
         return valor;
     }
 
@@ -279,7 +306,24 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 struct NvGraphicBuffer {
     std::uint8_t bytes[0x16C]{};
+    // O `buffer_id` (offset 44 ✗) e' o **handle do `nvmap`** ✗ — e e'
+    // ele que o compositor usa para chegar ao endereco ✗ ✗.
+    //
+    // **O upstream** (`nvnflinger/ui/graphic_buffer.cpp:23-25` ✗) usa
+    // `BufferId()` ✗ — o `nvmap->DuplicateHandle(this->BufferId(), true)` ✗
+    // e o `PinHandle` ✗ ✗. O `Handle()` (offset 116 ✗) e' o handle do
+    // **buffer de video** ✗ — nao do `nvmap` ✗ ✗.
+    //
+    // **A casa usava o `Handle()`** ✗ ✗ — o que dava o handle do `nvmap`
+    // errado ✗ (e o endereco errado ✗) ✗.
+    static constexpr std::size_t kOffsetBufferId = 44;
     static constexpr std::size_t kOffsetHandle = 116;
+
+    [[nodiscard]] std::uint32_t BufferId() const {
+        std::uint32_t h = 0;
+        std::memcpy(&h, bytes + kOffsetBufferId, sizeof(h));
+        return h;
+    }
 
     [[nodiscard]] std::uint32_t Handle() const {
         std::uint32_t h = 0;
@@ -539,10 +583,10 @@ std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
         // O handle é o do `nvmap` — e é por ele que se chega ao
         // endereço.
         RegistoNvmap::Regiao regiao{};
-        if (!RegistoNvmap::Instancia().Procurar(buffer.Handle(), regiao)) {
+        if (!RegistoNvmap::Instancia().Procurar(buffer.BufferId(), regiao)) {
             LOG_WARNING(Service_NVDRV,
-                        "compositor: SetPreallocatedBuffer: handle {} desconhecido",
-                        buffer.Handle());
+                        "compositor: SetPreallocatedBuffer: buffer_id {} desconhecido",
+                        buffer.BufferId());
             status = StatusBadValue;
             break;
         }
@@ -555,8 +599,9 @@ std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
         s.endereco = regiao.endereco;
         s.tamanho = regiao.tamanho;
         LOG_DEBUG(Service_NVDRV,
-                  "compositor: SetPreallocatedBuffer: slot={} handle={} -> 0x{:X} ({} bytes)",
-                  slot, buffer.Handle(), regiao.endereco, regiao.tamanho);
+                  "compositor: SetPreallocatedBuffer: slot={} buffer_id={} -> 0x{:X} "
+                  "({} bytes)",
+                  slot, buffer.BufferId(), regiao.endereco, regiao.tamanho);
         break;
     }
     case 3: {  // DequeueBuffer
