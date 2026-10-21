@@ -1446,11 +1446,34 @@ private:
                   params.handle, static_cast<std::uint64_t>(params.offset), endereco, tamanho,
                   params.flags);
 
-        // O VA devolvido: o do guest, se pediu um fixo; o da memória, se
-        // não (a identidade).
-        params.offset = (params.flags & 0x1u) != 0
-                            ? params.offset
-                            : static_cast<std::int64_t>(endereco);
+        // O VA devolvido.
+        //
+        // **O upstream tem tres caminhos** ✗ (`nvhost_as_gpu.cpp:331-408` ✗):
+        //
+        //   - `Remap` (bit 8 ✗) ✗ — remapeia um VA **ja existente** ✗ e
+        //     **nao altera o `params.offset`** ✗ ✗;
+        //   - `Fixed` (bit 0 ✗) ✗ — o VA e' o `params.offset` ✗ ✗;
+        //   - o resto ✗ — o VA e' **alocado** ✗ (o `allocator.Allocate` ✗)
+        //     e o `params.offset` passa a ser esse ✗ ✗.
+        //
+        // **A casa tratava o `Remap` como se fosse o caminho normal** ✗ ✗
+        // — e devolvia o **endereco da memoria** ✗ em vez do VA do guest
+        // ✗ ✗. O guest escrevia num sitio ✗ e lia noutro ✗ — o
+        // framebuffer ficava partido ✗ ✗.
+        //
+        // **Medido** ✗ (`/tmp/boot_v20.log` ✗): o guest pede
+        // `MapBufferEx: handle=0 va=0xE5D39000 -> 0xF4CEF000 tamanho=0x870000
+        // flags=0x100` ✗ ✗ — o `0x100` e' o `Remap` ✗ ✗.
+        constexpr std::uint32_t kMappingFixed = 1u << 0;
+        constexpr std::uint32_t kMappingRemap = 1u << 8;
+        if ((params.flags & kMappingRemap) != 0) {
+            // O `Remap` ✗ — o VA **fica** ✗ (o upstream nao o altera ✗) ✗.
+            params.offset = static_cast<std::int64_t>(params.offset);
+        } else if ((params.flags & kMappingFixed) != 0) {
+            params.offset = static_cast<std::int64_t>(params.offset);
+        } else {
+            params.offset = static_cast<std::int64_t>(endereco);
+        }
         mapeamentos_.emplace(static_cast<std::uint64_t>(params.offset), endereco);
 
         EscreverSaida(ctx, params);

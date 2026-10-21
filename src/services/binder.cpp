@@ -330,6 +330,27 @@ struct NvGraphicBuffer {
         std::memcpy(&h, bytes + kOffsetHandle, sizeof(h));
         return h;
     }
+
+    // A largura ✗ — o offset 4 ✗ (`nvnflinger/ui/graphic_buffer.h` ✗).
+    [[nodiscard]] std::uint32_t Width() const {
+        std::int32_t w = 0;
+        std::memcpy(&w, bytes + 4, sizeof(w));
+        return static_cast<std::uint32_t>(w);
+    }
+
+    // A altura ✗ — o offset 8 ✗.
+    [[nodiscard]] std::uint32_t Height() const {
+        std::int32_t h = 0;
+        std::memcpy(&h, bytes + 8, sizeof(h));
+        return static_cast<std::uint32_t>(h);
+    }
+
+    // O formato ✗ — o offset 16 ✗.
+    [[nodiscard]] std::uint32_t Format() const {
+        std::uint32_t f = 0;
+        std::memcpy(&f, bytes + 16, sizeof(f));
+        return f;
+    }
 };
 static_assert(sizeof(NvGraphicBuffer) == 0x16C, "tamanho errado");
 
@@ -351,6 +372,19 @@ struct FilaDeBuffers {
     std::uint64_t ultimo_desenhado = 0;
     std::uint64_t tamanho_ultimo = 0;
     std::uint64_t submissoes = 0;
+
+    // **As dimensoes da fila** ✗ — o upstream (`buffer_queue_core.h:89-91`
+    // ✗) tem `default_width` ✗, `default_height` ✗ e
+    // `default_buffer_format` ✗, que o `SetPreallocatedBuffer` define ✗
+    // (`buffer_queue_producer.cpp:814-816` ✗) e que o `Connect` ✗ e o
+    // `Query` ✗ devolvem ✗ ✗.
+    //
+    // **Antes do `SetPreallocatedBuffer`** ✗, os valores sao **1** ✗ (o
+    // upstream ✗ — `default_width{1}` ✗) ✗. A casa devolvia 1280×720 ✗
+    // fixos ✗ ✗ — o que era um palpite ✗, nao o upstream ✗ ✗.
+    std::uint32_t largura = 1;
+    std::uint32_t altura = 1;
+    std::uint32_t formato = 0;
 };
 
 // A **janela** — o buffer onde o jogo desenha (a native window).
@@ -520,14 +554,14 @@ std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
         switch (o_que) {
         case WindowWidth:
         case WindowDefaultWidth:
-            valor = kLargura;
+            valor = static_cast<std::int32_t>(Fila().largura);
             break;
         case WindowHeight:
         case WindowDefaultHeight:
-            valor = kAltura;
+            valor = static_cast<std::int32_t>(Fila().altura);
             break;
         case WindowFormat:
-            valor = static_cast<std::int32_t>(FormatRgba8888);
+            valor = static_cast<std::int32_t>(Fila().formato);
             break;
         case WindowMinUndequeuedBuffers:
             valor = 2;
@@ -563,11 +597,26 @@ std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
     }
     case 10: {  // Connect
         (void)leitor.Le<std::uint8_t>();   // o enable_listener
-        (void)leitor.Le<std::int32_t>();  // o api
+        const std::int32_t api = leitor.Le<std::int32_t>();  // o api
         (void)leitor.Le<std::uint8_t>();   // o producer_controlled_by_app
+
+        // **A `api` tem de ser uma das quatro** ✗ — o upstream
+        // (`buffer_queue_producer.cpp:716-726` ✗) so' aceita `Egl` ✗,
+        // `Cpu` ✗, `Media` ✗ e `Camera` ✗; o resto e' `Status::BadValue`
+        // ✗ ✗.
+        //
+        // A casa aceitava qualquer uma ✗ ✗ — e devolvia a saida ✗ como
+        // se fosse valida ✗ ✗.
+        if (api < 1 || api > 4) {
+            status = StatusBadValue;
+            break;
+        }
+
         QueueBufferOutput saida{};
-        saida.width = kLargura;
-        saida.height = kAltura;
+        // **As dimensoes da fila** ✗ — o upstream (`buffer_queue_producer.cpp:723`
+        // ✗) devolve o `default_width` ✗ e o `default_height` ✗ ✗.
+        saida.width = Fila().largura;
+        saida.height = Fila().altura;
         saida.transform_hint = 0;
         saida.num_pending_buffers = 0;
         escritor.EscreveBytes(&saida, sizeof(saida));
@@ -598,6 +647,12 @@ std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
         s.ocupado = true;
         s.endereco = regiao.endereco;
         s.tamanho = regiao.tamanho;
+        // **As dimensoes** ✗ — o upstream (`buffer_queue_producer.cpp:814-816`
+        // ✗) guarda-as no `BufferQueueCore` ✗, e o `Connect` ✗ e o `Query`
+        // ✗ devolvem-nas ✗ ✗.
+        Fila().largura = buffer.Width();
+        Fila().altura = buffer.Height();
+        Fila().formato = buffer.Format();
         LOG_DEBUG(Service_NVDRV,
                   "compositor: SetPreallocatedBuffer: slot={} buffer_id={} -> 0x{:X} "
                   "({} bytes)",
