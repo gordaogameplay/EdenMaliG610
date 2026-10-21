@@ -611,10 +611,28 @@ Result SvcDispatcher::svc_map_memory(SvcContext& ctx) {
 
 
 Result SvcDispatcher::svc_map_shared_memory(SvcContext& ctx) {
-    // Mesma semântica que MapMemory num guest nativo: "partilhar" memória
-    // entre processos dentro do mesmo espaço é um no-op, porque já é a mesma
-    // memória física.
-    return svc_map_memory(ctx);
+    // **A ABI aqui é DIFERENTE da do `MapMemory`** (`svc.h`, `Svc::
+    // MapSharedMemory`): `x0` = handle, `x1` = endereço, `x2` = tamanho,
+    // `x3` = permissões. O alias directo a `svc_map_memory` validava
+    // `x0` **como endereço** — o valor do handle — e falhava sempre.
+    //
+    // Num processo único: o handle não se resolve a páginas (não há
+    // `KSharedMemory` no kernel vendorizado); o que o guest precisa é
+    // de que a zona que ele escolheu fique (ou continue) legível. É o
+    // que se valida — o mesmo guarda do `svc_map_memory`, no endereço
+    // certo.
+    const std::uint64_t addr  = ctx.x[1];
+    const std::uint64_t size  = ctx.x[2];
+
+    if (mem_ == nullptr)
+        return Result::NotInitialized;
+    if (size == 0)
+        return Result::Invalid;
+    if (!mem_->owns(addr) || !mem_->owns(addr + size - 1))
+        return Result::Invalid;
+
+    ++map_memory_calls_;
+    return Result::Success;
 }
 
 Result SvcDispatcher::svc_unmap_memory(SvcContext&) {

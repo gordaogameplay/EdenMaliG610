@@ -1276,20 +1276,37 @@ int main(int argc, char** argv) {
     // Nintendo usa para instalar o seu heap e o seu estado. Ver a nota em
     // `SvcDispatcher::set_aslr_region`.
     //
-    // A base é a do primeiro módulo (o rtld, em 0x80000000) e o tamanho é a
-    // soma dos textos — o mesmo que o Eden calcula para a região de código.
+    // **A região tem de ser a RESERVA inteira, não o alcance dos módulos.**
+    //
+    // A primeira versão punha `[base, fim_dos_textos)`. Medido
+    // (`boot_p6e.log`): o `nn::os::detail::AddressSpaceAllocator::
+    // AllocateSpace` do SDK (que aloca o endereço do mapeamento do
+    // `GetSharedMemoryNativeHandle`) escolhe endereços dentro da região,
+    // pergunta o `svcQueryMemory` e **exige um bloco `Free`** — e o
+    // alcance dos textos está, por construção, **inteiro tapado** pelas
+    // doze regiões dos módulos: 1030 sondas, zero blocos livres, e o
+    // SDK abortou com `SetTerminateResult: modulo=162 desc=1`
+    // (o assert da libnn) depois de percorrer o mapa todo.
+    //
+    // No Eden, o `KAddressSpaceInfo` (39-bit, `k_address_space_info.cpp`)
+    // põe a região de código em `[128 MiB, +512 GiB)` — centenas de GiB —
+    // e a maior parte é livre. Aqui a mesma ideia, capada à **reserva**
+    // do processo (o que este motor consegue de facto responder: o
+    // `svc_map_memory`/`svc_map_shared_memory` só aceitam endereços de
+    // lá). O heap (0x9000_0000) e a stack (0x2900_0000_0) vivem no mesmo
+    // intervalo e têm as suas entradas de região próprias.
     {
         std::uint64_t base = 0;
-        std::uint64_t fim = 0;
         for (const auto& m : prog.modules()) {
             const std::uint64_t ini = m.vaddr_base + m.nso.segments[0].vaddr;
-            const std::uint64_t f = ini + m.nso.segments[0].size;
             if (base == 0 || ini < base)
                 base = ini;
-            if (f > fim)
-                fim = f;
         }
-        svc.set_aslr_region(base, fim - base);
+        const auto& reserva = prog.memory();
+        const std::uint64_t fim =
+            reserva.base() != 0 ? reserva.base() + reserva.size() : 0x310000000ull;
+        if (base != 0 && fim > base)
+            svc.set_aslr_region(base, fim - base);
     }
 
     // A tabela que o rtld vai=varrer. Dumpada porque uma região com o
