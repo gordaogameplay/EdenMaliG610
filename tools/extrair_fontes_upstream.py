@@ -68,6 +68,31 @@ def extrair(caminho: str, prefixo: str, indice: set[str], faltantes: list[str]) 
         if t.startswith(("renderer_opengl/", "renderer_vulkan/", "renderer_null/",
                          "host_shaders/")):
             continue
+        # Os descodificadores de textura do *host* (BCn, ASTC, ...): o
+        # upstream usa forks proprios (o `bc_decoder.h` com o enum `bcn`
+        # nao existe em nenhum repositorio publico) e nao fazem falta ao
+        # caminho do motor — sao para carregar texturas do host.
+        if t.startswith("texture_cache/decode_"):
+            continue
+        # Os conversores de textura do *host* (BCn, ASTC): o upstream
+        # usa forks proprios que nao estao em nenhum repositorio publico
+        # (`stb_dxt.h`, o `astc_decoder.comp`) — e nao fazem falta ao
+        # caminho do motor, que so precisa dos *formatos*.
+        if t.startswith("textures/"):
+            continue
+        # O `video_core.cpp` e' o que *cria* o renderizador do upstream
+        # (e por isso puxa o renderer OpenGL, o `glad`, e o `stb`). A
+        # casa implementa a `RasterizerInterface` — o `ValhallBackend` do
+        # desenho — por isso este ficheiro nao e' preciso: e' ele que
+        # escolhe o renderer.
+        if t == "video_core.cpp":
+            continue
+        # O apoio do renderer Vulkan (`vulkan_common/`): traz o
+        # `vk_enum_string_helper.h` de um fork do Vulkan-Headers que nao
+        # existe em nenhum repositorio publico. O renderer Vulkan do
+        # upstream ja ficou de fora — e a casa faz o seu proprio backend.
+        if t.startswith("vulkan_common/"):
+            continue
         if f"{prefixo}/{t}" in indice:
             fontes.append(f"{prefixo}/{t}")
         elif t in indice:

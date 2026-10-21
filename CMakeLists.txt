@@ -178,6 +178,7 @@ target_include_directories(g610_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/vendor/eden/src
   ${CMAKE_CURRENT_SOURCE_DIR}/vendor/third_party/Vulkan-Headers/include
   ${CMAKE_CURRENT_SOURCE_DIR}/vendor/third_party/SPIRV-Headers/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/vendor/third_party/bcdec
 )
 target_compile_definitions(g610_core PUBLIC ANKERL_UNORDERED_DENSE_STD_MODULE=1)
 target_link_libraries(g610_core PUBLIC Vulkan::Vulkan SDL2::SDL2 fmt::fmt pthread)

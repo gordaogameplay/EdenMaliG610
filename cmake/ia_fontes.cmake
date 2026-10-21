@@ -575,7 +575,6 @@ set(IA_FONTES_VIDEO_CORE
   vendor/eden/src/video_core/shader_notify.cpp
   vendor/eden/src/video_core/surface.cpp
   vendor/eden/src/video_core/texture_cache/accelerated_swizzle.cpp
-  vendor/eden/src/video_core/texture_cache/decode_bc.cpp
   vendor/eden/src/video_core/texture_cache/formatter.cpp
   vendor/eden/src/video_core/texture_cache/format_lookup_table.cpp
   vendor/eden/src/video_core/texture_cache/image_base.cpp
@@ -584,21 +583,7 @@ set(IA_FONTES_VIDEO_CORE
   vendor/eden/src/video_core/texture_cache/image_view_info.cpp
   vendor/eden/src/video_core/texture_cache/texture_cache.cpp
   vendor/eden/src/video_core/texture_cache/util.cpp
-  vendor/eden/src/video_core/textures/astc.cpp
-  vendor/eden/src/video_core/textures/bcn.cpp
-  vendor/eden/src/video_core/textures/decoders.cpp
-  vendor/eden/src/video_core/textures/texture.cpp
-  vendor/eden/src/video_core/textures/workers.cpp
   vendor/eden/src/video_core/transform_feedback.cpp
-  vendor/eden/src/video_core/video_core.cpp
-  vendor/eden/src/video_core/vulkan_common/vulkan_debug_callback.cpp
-  vendor/eden/src/video_core/vulkan_common/vulkan_device.cpp
-  vendor/eden/src/video_core/vulkan_common/vulkan_instance.cpp
-  vendor/eden/src/video_core/vulkan_common/vulkan_library.cpp
-  vendor/eden/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
-  vendor/eden/src/video_core/vulkan_common/vulkan_surface.cpp
-  vendor/eden/src/video_core/vulkan_common/vulkan_wrapper.cpp
-  vendor/eden/src/video_core/vulkan_common/nsight_aftermath_tracker.cpp
 )
 
 set(IA_FONTES_SHADER_RECOMPILER
