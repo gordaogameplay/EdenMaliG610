@@ -60,6 +60,9 @@
 #include "vendor/eden/core/hle/service/server_manager.h"
 #include "vendor/eden/core/hle/service/service.h"
 
+#include "g610/gpu/maxwell_translator.hpp"
+#include "g610/telemetry.hpp"
+
 namespace g610::services {
 
 namespace {
@@ -211,6 +214,179 @@ struct IoctlAllocSpace {
     std::uint64_t offset;  // (a union com `align`)
 };
 static_assert(sizeof(IoctlAllocSpace) == 24, "tamanho errado");
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Os tipos de device.
+//
+// O Eden tem um device **por nome** (`core/hle/service/nvdrv/nvdrv.cpp`,
+// `Module::Module`: o mapa `builders` vai de "/dev/nvhost-ctrl" a
+// "/dev/nvhost-vic"), e cada um tem a sua tabela de ioctls.
+//
+// **O tipo importa**: o grupo 0x00 é do `nvhost-ctrl` (o `nvhost_ctrl`) e
+// o grupo 0x00 do `nvhost_gpu` é o `GetWaitbase` — o **mesmo** grupo, o
+// **mesmo** comando, e coisas completamente diferentes. Despachar só pelo
+// grupo (como a versão anterior fazia) não chega: é preciso o device
+// também.
+// ─────────────────────────────────────────────────────────────────────────────
+enum class TipoDeDevice : std::uint8_t {
+    Desconhecido,
+    Controle,       // /dev/nvhost-ctrl
+    ControleGpu,    // /dev/nvhost-ctrl-gpu
+    Gpu,            // /dev/nvhost-gpu  (o canal)
+    AsGpu,          // /dev/nvhost-as-gpu
+    Nvmap,          // /dev/nvmap
+    Display,        // /dev/nvdisp_disp0
+    Nvdec,          // /dev/nvhost-nvdec
+    Nvjpg,          // /dev/nvhost-nvjpg
+    Vic,            // /dev/nvhost-vic
+};
+
+// O device de um nome (os nomes são os do Eden, `nvdrv.cpp`).
+TipoDeDevice DeviceDeNome(const std::string& nome) {
+    if (nome == "/dev/nvhost-ctrl")     return TipoDeDevice::Controle;
+    if (nome == "/dev/nvhost-ctrl-gpu") return TipoDeDevice::ControleGpu;
+    if (nome == "/dev/nvhost-gpu")      return TipoDeDevice::Gpu;
+    if (nome == "/dev/nvhost-as-gpu")   return TipoDeDevice::AsGpu;
+    if (nome == "/dev/nvmap")           return TipoDeDevice::Nvmap;
+    if (nome == "/dev/nvdisp_disp0")    return TipoDeDevice::Display;
+    if (nome == "/dev/nvhost-nvdec")    return TipoDeDevice::Nvdec;
+    if (nome == "/dev/nvhost-nvjpg")    return TipoDeDevice::Nvjpg;
+    if (nome == "/dev/nvhost-vic")      return TipoDeDevice::Vic;
+    return TipoDeDevice::Desconhecido;
+}
+
+// O estado de um **canal** (o device `/dev/nvhost-gpu`).
+//
+// O canal é o device por onde o trabalho chega à GPU: o guest diz-lhe
+// que handle do `nvmap` é a memória, aloca o contexto de objectos, e
+// submete o push buffer.
+struct Canal {
+    // O handle do `nvmap` que o canal usa (`SetNVMAPfd`).
+    std::int32_t nvmap_fd = -1;
+    // A *fence* do canal: o par (id, valor) que o Eden devolve no
+    // `AllocGPFIFOEx` e que o guest usa para sincronizar. O valor
+    // **incrementa** a cada submissão — é o que diz ao guest "isto já
+    // chegou à GPU".
+    std::int32_t fence_id = 0;
+    std::uint32_t fence_valor = 0;
+    // Os contextos de objectos, por classe (o Eden tem 6: 2D, 3D,
+    // compute, kepler, DMA, gpfifo).
+    std::map<std::uint32_t, bool> contextos;
+    // Os parâmetros do `ZCullBind`.
+    std::uint64_t zcull_va = 0;
+    std::uint32_t zcull_modo = 0;
+    // A prioridade do canal.
+    std::uint32_t prioridade = 0;
+    // A fatia de tempo do canal (`ChannelSetTimeslice`).
+    std::uint32_t fatia_de_tempo = 0;
+    // Os dados do cliente (`SetClientData`).
+    std::uint64_t dados_cliente = 0;
+    // Quantas submissões já foram feitas (para a telemetria).
+    std::uint64_t submissoes = 0;
+};
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// As structs do canal (do Eden, `devices/nvhost_gpu.h`).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// `IoctlSetNvmapFD`: qual handle do `nvmap` é a memória do canal.
+struct IoctlSetNvmapFD {
+    std::int32_t nvmap_fd;
+};
+static_assert(sizeof(IoctlSetNvmapFD) == 4, "tamanho errado");
+
+// `IoctlChannelSetTimeout`: o prazo do canal.
+struct IoctlChannelSetTimeout {
+    std::uint32_t timeout;
+};
+static_assert(sizeof(IoctlChannelSetTimeout) == 4, "tamanho errado");
+
+// `IoctlChannelSetPriority`: a prioridade do canal.
+struct IoctlChannelSetPriority {
+    std::uint32_t priority;
+};
+static_assert(sizeof(IoctlChannelSetPriority) == 4, "tamanho errado");
+
+// `IoctlGetWaitbase`: o valor base da espera.
+struct IoctlGetWaitbase {
+    std::uint32_t unknown;
+    std::uint32_t value;
+};
+static_assert(sizeof(IoctlGetWaitbase) == 8, "tamanho errado");
+
+// `IoctlSetErrorNotifier`: o evento de erro do canal.
+struct IoctlSetErrorNotifier {
+    std::uint64_t offset;
+    std::uint64_t size;
+    std::uint32_t mem;
+    std::uint32_t padding;
+};
+static_assert(sizeof(IoctlSetErrorNotifier) == 24, "tamanho errado");
+
+// `IoctlAllocObjCtx`: o contexto de objectos de uma classe.
+struct IoctlAllocObjCtx {
+    std::uint32_t class_num;
+    std::uint32_t flags;
+    std::uint64_t obj_id;
+};
+static_assert(sizeof(IoctlAllocObjCtx) == 16, "tamanho errado");
+
+// `IoctlZCullBind`: a ligação do ZCull ao VA da GPU.
+struct IoctlZCullBind {
+    std::uint64_t gpu_va;
+    std::uint32_t mode;
+    std::uint32_t padding;
+};
+static_assert(sizeof(IoctlZCullBind) == 16, "tamanho errado");
+
+// `IoctlAllocGpfifoEx`: a alocação da fila de comandos da GPU.
+struct IoctlAllocGpfifoEx {
+    std::uint32_t num_entries;
+    std::uint32_t num_jobs;
+    std::uint32_t flags;
+    std::int32_t fence_id;      // NvFence::id
+    std::uint32_t fence_value;  // NvFence::value
+    std::uint32_t reserved[3];
+};
+static_assert(sizeof(IoctlAllocGpfifoEx) == 32, "tamanho errado");
+
+// `IoctlSubmitGpfifo`: a submissão do push buffer.
+//
+// A disposition é a do Eden (`nvhost_gpu.h`): 16 bytes de entrada e a
+// `NvFence` (8 bytes) de saída. **As bandeiras** (`flags`) são um union
+// de bits: 0 = fence_wait, 1 = fence_increment, 2 = new_hw_format,
+// 4 = suppress_wfi, 8 = increment_value.
+struct IoctlSubmitGpfifo {
+    std::uint64_t address;   // onde está a lista de cabeçalhos
+    std::uint32_t num_entries;
+    std::uint32_t flags;
+    std::int32_t fence_id;      // NvFence::id
+    std::uint32_t fence_value;  // NvFence::value
+};
+static_assert(sizeof(IoctlSubmitGpfifo) == 16 + 8, "tamanho errado");
+
+// `IoctlClientData`: os dados do cliente que o canal guarda.
+struct IoctlClientData {
+    std::uint64_t data;
+};
+static_assert(sizeof(IoctlClientData) == 8, "tamanho errado");
+
+// `IoctlSetTimeslice`: a fatia de tempo do canal.
+struct IoctlSetTimeslice {
+    std::uint32_t timeslice;
+};
+static_assert(sizeof(IoctlSetTimeslice) == 4, "tamanho errado");
+
+// O cabeçalho de uma entrada da fila de comandos (`Tegra::
+// CommandListHeader`, do Eden): o tipo, o endereço do comando e o
+// tamanho.
+struct CommandListHeader {
+    std::uint32_t type;
+    std::uint32_t address;
+    std::uint32_t size;
+};
+static_assert(sizeof(CommandListHeader) == 12, "tamanho errado");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // As structs do `nvmap` (do Eden, `devices/nvmap.h`).
@@ -401,11 +577,27 @@ private:
             return;
         }
 
+        // O **tipo** do device, pelo nome (os nomes são os do Eden,
+        // `nvdrv.cpp`, `Module::Module`). O tipo é o que diz qual é a
+        // tabela de ioctls — e sem ele, um ioctl do grupo 0x00 podia
+        // ser tomado pelo device errado.
+        const TipoDeDevice tipo = DeviceDeNome(nome);
+        if (tipo == TipoDeDevice::Desconhecido) {
+            // O Eden não conhece o nome: o `Open` falha.
+            rb.Push<DeviceFD>(0);
+            rb.PushEnum(NvResult::FileOperationFailed);
+            LOG_WARNING(Service_NVDRV, "Open: '{}' — device desconhecido", nome);
+            return;
+        }
+
         // Um dispositivo novo. O `fd` é um número que o guest usa para
         // os ioctls seguintes — e que tem de ser **estável** enquanto o
         // dispositivo estiver aberto.
         const DeviceFD fd = proximo_fd_++;
         dispositivos_.emplace(fd, nome);
+        tipos_.emplace(fd, tipo);
+        if (tipo == TipoDeDevice::Gpu)
+            canais_.emplace(fd, Canal{});
         LOG_DEBUG(Service_NVDRV, "Open: '{}' -> fd={}", nome, fd);
 
         rb.Push<DeviceFD>(fd);
@@ -1000,6 +1192,308 @@ private:
         RespostaOk(ctx);
     }
 
+    // ── O CANAL (`/dev/nvhost-gpu`) ──
+    //
+    // O canal é o device por onde o trabalho chega à GPU. Os handlers são
+    // os do upstream (`devices/nvhost_gpu.cpp`).
+
+    // 0x48/0x01: `SetNVMAPfd` — o handle do `nvmap` que é a memória do
+    // canal.
+    void SetNVMAPfd(HLERequestContext& ctx) {
+        IoctlSetNvmapFD params{};
+        LerEntrada(ctx, params);
+
+        LOG_DEBUG(Service_NVDRV, "canal: SetNVMAPfd: handle={}", params.nvmap_fd);
+        if (auto* canal = CanalDoFd())
+            canal->nvmap_fd = params.nvmap_fd;
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x48/0x03: `ChannelSetTimeout` — o prazo do canal.
+    void ChannelSetTimeout(HLERequestContext& ctx) {
+        IoctlChannelSetTimeout params{};
+        LerEntrada(ctx, params);
+
+        LOG_DEBUG(Service_NVDRV, "canal: ChannelSetTimeout: 0x{:X}", params.timeout);
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x48/0x0d: `SetChannelPriority` — a prioridade do canal.
+    //
+    // O Eden (`nvhost_gpu.cpp`, `SetChannelPriority`) aceita três
+    // prioridades — `Low`, `Medium`, `High` — e o resto é `BadParameter`.
+    void SetChannelPriority(HLERequestContext& ctx) {
+        IoctlChannelSetPriority params{};
+        LerEntrada(ctx, params);
+
+        // Os valores do Eden (`nvhost_gpu.h`, `ChannelPriority`).
+        constexpr std::uint32_t kBaixa = 0x40;
+        constexpr std::uint32_t kMedia = 0x80;
+        constexpr std::uint32_t kAlta = 0xC0;
+
+        LOG_DEBUG(Service_NVDRV, "canal: SetChannelPriority: 0x{:X}", params.priority);
+        if (params.priority != kBaixa && params.priority != kMedia &&
+            params.priority != kAlta) {
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::BadParameter);
+            return;
+        }
+        if (auto* canal = CanalDoFd())
+            canal->prioridade = params.priority;
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x00/0x03: `GetWaitbase` — o valor base da espera.
+    void GetWaitbase(HLERequestContext& ctx) {
+        IoctlGetWaitbase params{};
+        LerEntrada(ctx, params);
+
+        // O Eden: `params.value = 0; // Seems to be hard coded at 0`.
+        params.value = 0;
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x48/0x0c: `SetErrorNotifier` — o evento de erro do canal.
+    void SetErrorNotifier(HLERequestContext& ctx) {
+        IoctlSetErrorNotifier params{};
+        LerEntrada(ctx, params);
+
+        LOG_DEBUG(Service_NVDRV, "canal: SetErrorNotifier: offset=0x{:X} size=0x{:X} handle={}",
+                  params.offset, params.size, params.mem);
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x48/0x09: `AllocateObjectContext` — o contexto de objectos de
+    // uma classe (2D, 3D, compute, kepler, DMA, gpfifo).
+    void AllocateObjectContext(HLERequestContext& ctx) {
+        IoctlAllocObjCtx params{};
+        LerEntrada(ctx, params);
+
+        LOG_DEBUG(Service_NVDRV, "canal: AllocateObjectContext: classe=0x{:X} flags=0x{:X}",
+                  params.class_num, params.flags);
+
+        // O Eden (`nvhost_gpu.cpp`, `AllocateObjectContext`): o contexto
+        // é adiado até o canal estar inicializado, e um contexto
+        // repetido da mesma classe é `AlreadyAllocated`.
+        if (auto* canal = CanalDoFd()) {
+            if (canal->contextos.count(params.class_num) != 0) {
+                ResponseBuilder rb{ctx, 3};
+                rb.Push(ResultSuccess);
+                rb.PushEnum(NvResult::AlreadyAllocated);
+                return;
+            }
+            canal->contextos.emplace(params.class_num, true);
+        }
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x48/0x0b: `ZCullBind` — a ligação do ZCull ao VA da GPU.
+    void ZCullBind(HLERequestContext& ctx) {
+        IoctlZCullBind params{};
+        LerEntrada(ctx, params);
+
+        LOG_DEBUG(Service_NVDRV, "canal: ZCullBind: va=0x{:X} modo=0x{:X}", params.gpu_va,
+                  params.mode);
+        if (auto* canal = CanalDoFd()) {
+            canal->zcull_va = params.gpu_va;
+            canal->zcull_modo = params.mode;
+        }
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x48/0x18 e 0x1a: `AllocGPFIFOEx` / `AllocGPFIFOEx2` — a fila
+    // de comandos da GPU.
+    //
+    // A *fence* que sai é o par (id, valor) do syncpoint do canal. **O
+    // valor incrementa a cada submissão** — é o que diz ao guest que o
+    // trabalho anterior já passou.
+    void AllocGPFIFOEx(HLERequestContext& ctx) {
+        IoctlAllocGpfifoEx params{};
+        LerEntrada(ctx, params);
+
+        LOG_DEBUG(Service_NVDRV, "canal: AllocGPFIFOEx: entradas={} jobs={} flags=0x{:X}",
+                  params.num_entries, params.num_jobs, params.flags);
+
+        if (auto* canal = CanalDoFd()) {
+            params.fence_id = canal->fence_id;
+            params.fence_value = canal->fence_valor;
+        }
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x48/0x08: `SubmitGPFIFOBase1` — **a submissão do push buffer**.
+    //
+    // É aqui que o trabalho do jogo chega à GPU: o guest escreveu os
+    // comandos Maxwell num endereço do VA da GPU e submete a lista.
+    //
+    // O Eden (`nvhost_gpu.cpp`, `SubmitGPFIFOBase1`): lê os
+    // `CommandListHeader` do buffer, e para cada um lê os comandos.
+    //
+    // **No motor nativo o VA da GPU é o espaço do guest** (ver a nota do
+    // `VmDaGpu`), por isso ler o push buffer é ler a memória do guest
+    // nesse endereço — sem tradução nenhuma.
+    void SubmitGPFIFOBase1(HLERequestContext& ctx) {
+        SubmitGPFIFO(ctx, false);
+    }
+
+    // 0x48/0x1b: a submissão com os cabeçalhos **no endereço** (a
+    // variante "kickoff" do Eden).
+    void SubmitGPFIFOKickoff(HLERequestContext& ctx) {
+        SubmitGPFIFO(ctx, true);
+    }
+
+    // A submissão — **a porta de entrada do tradutor**.
+    //
+    // O guest escreveu os comandos Maxwell num endereço do VA da GPU e
+    // submete a lista de cabeçalhos (`CommandListHeader`: o tipo, o
+    // endereço dos comandos e o tamanho).
+    //
+    // **As duas variantes** (o Eden, `nvhost_gpu.cpp`):
+    //
+    //   - 0x08 (`kickoff = false`): os cabeçalhos vêm **no pedido**,
+    //     a seguir à struct fixa;
+    //   - 0x1b (`kickoff = true`): os cabeçalhos estão **no endereço**
+    //     (`params.address`).
+    //
+    // E o que o Eden faz com a *fence* (`SubmitGPFIFOImpl`): o `id` é o
+    // syncpoint do canal, e o `valor` **incrementa** — o incremento é 2
+    // quando o guest pede `fence_increment`, mais o valor que o guest
+    // mandou, quando pede `increment_value`. E as bandeiras saem a zero.
+    void SubmitGPFIFO(HLERequestContext& ctx, bool cabecalhos_no_endereco) {
+        // O buffer de entrada: a struct fixa, e (na variante de ioctl
+        // variável) os cabeçalhos a seguir.
+        const auto entrada = ctx.ReadBufferCopy(0);
+        IoctlSubmitGpfifo params{};
+        const std::size_t lido = std::min(entrada.size(), sizeof(params));
+        if (lido > 0)
+            std::memcpy(&params, entrada.data(), lido);
+
+        LOG_DEBUG(Service_NVDRV,
+                  "canal: SubmitGPFIFO: address=0x{:X} entradas={} flags=0x{:X} kickoff={}",
+                  params.address, params.num_entries, params.flags,
+                  cabecalhos_no_endereco ? 1 : 0);
+
+        // Os cabeçalhos.
+        std::vector<CommandListHeader> cabecalhos;
+        if (params.num_entries > 0) {
+            if (cabecalhos_no_endereco) {
+                const std::size_t bytes =
+                    static_cast<std::size_t>(params.num_entries) * sizeof(CommandListHeader);
+                std::vector<std::uint8_t> bruto(bytes, 0);
+                if (!LerDoGuest(params.address, bruto.data(), bruto.size())) {
+                    LOG_WARNING(Service_NVDRV, "SubmitGPFIFO: não li os cabeçalhos");
+                    ResponseBuilder rb{ctx, 3};
+                    rb.Push(ResultSuccess);
+                    rb.PushEnum(NvResult::InvalidAddress);
+                    return;
+                }
+                for (std::uint32_t i = 0; i < params.num_entries; ++i) {
+                    CommandListHeader cab{};
+                    std::memcpy(&cab, bruto.data() + i * sizeof(cab), sizeof(cab));
+                    cabecalhos.push_back(cab);
+                }
+            } else {
+                // A seguir à struct fixa, no próprio pedido.
+                const std::size_t off = sizeof(params);
+                for (std::uint32_t i = 0; i < params.num_entries; ++i) {
+                    const std::size_t pos = off + i * sizeof(CommandListHeader);
+                    if (pos + sizeof(CommandListHeader) > entrada.size())
+                        break;
+                    CommandListHeader cab{};
+                    std::memcpy(&cab, entrada.data() + pos, sizeof(cab));
+                    cabecalhos.push_back(cab);
+                }
+            }
+        }
+
+        // O push buffer: a concatenação dos comandos de cada entrada.
+        //
+        // **O VA da GPU é o espaço do guest** (ver a nota do `VmDaGpu`),
+        // por isso ler os comandos é ler a memória do guest.
+        std::vector<std::uint8_t> pushbuffer;
+        for (const auto& cab : cabecalhos) {
+            if (cab.size == 0)
+                continue;
+            const std::size_t inicio = pushbuffer.size();
+            pushbuffer.resize(inicio + cab.size, 0);
+            if (!LerDoGuest(cab.address, pushbuffer.data() + inicio, cab.size)) {
+                LOG_WARNING(Service_NVDRV, "SubmitGPFIFO: não li o comando em 0x{:X}",
+                            cab.address);
+                ResponseBuilder rb{ctx, 3};
+                rb.Push(ResultSuccess);
+                rb.PushEnum(NvResult::InvalidAddress);
+                return;
+            }
+        }
+
+        // E a tradução — que é o **tradutor** da casa.
+        std::vector<g610::gpu::DrawCommand> comandos;
+        std::string erro;
+        const std::size_t n = tradutor_.translate(pushbuffer, comandos, erro);
+        LOG_DEBUG(Service_NVDRV,
+                  "canal: SubmitGPFIFO: {} bytes, {} comandos traduzidos "
+                  "(desconhecidos {}, descartados {}){}",
+                  pushbuffer.size(), n, tradutor_.commands_unknown(),
+                  tradutor_.commands_dropped_feature(), erro.empty() ? "" : (" — " + erro));
+
+        // A fence: o `id` é o syncpoint do canal e o `valor` incrementa
+        // (a regra do Eden, `SubmitGPFIFOImpl`).
+        constexpr std::uint32_t kFenceWait = 1u << 0;
+        constexpr std::uint32_t kFenceIncrement = 1u << 1;
+        constexpr std::uint32_t kIncrementValue = 1u << 8;
+        if (auto* canal = CanalDoFd()) {
+            std::uint32_t incremento = 0;
+            if ((params.flags & kFenceIncrement) != 0)
+                incremento += 2;
+            if ((params.flags & kIncrementValue) != 0)
+                incremento += params.fence_value;
+            canal->fence_valor += incremento != 0 ? incremento : 1;
+            canal->submissoes += 1;
+            params.fence_id = canal->fence_id;
+            params.fence_value = canal->fence_valor;
+        }
+        // As bandeiras saem a zero (o Eden faz o mesmo).
+        params.flags = 0;
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // O canal do device de um ioctl (o `fd` do comando).
+    Canal* CanalDoFd() {
+        const DeviceFD fd = fd_em_curso_;
+        const auto it = canais_.find(fd);
+        return it == canais_.end() ? nullptr : &it->second;
+    }
+
+    // Ler memória do **guest**.
+    //
+    // O VA da GPU é o espaço do guest (ver a nota do `VmDaGpu`), por isso
+    // ler o push buffer é ler a memória do guest nesse endereço. É a
+    // `Memory` do processo — a mesma que o `WriteToOutgoingCommandBuffer`
+    // do Eden usa para escrever a resposta.
+    bool LerDoGuest(std::uint64_t endereco, void* destino, std::size_t tamanho) {
+        auto& memoria = Kernel::GetCurrentMemory(system.Kernel());
+        return memoria.ReadBlock(static_cast<Common::ProcessAddress>(endereco), destino, tamanho);
+    }
+
     // O ioctl comum aos três comandos.
     //
     // A forma da resposta é a do Eden: `Result` + `NvResult`, e — quando
@@ -1023,75 +1517,168 @@ private:
             return;
         }
 
-        // O despacho pelos grupos e comandos — o do Eden
-        // (`nvhost_ctrl_gpu.cpp` e `nvhost_as_gpu.cpp`, `Ioctl1`).
+        // O **tipo** do device de que o ioctl fala, e o canal (se for
+        // um canal).
+        const auto tipo_it = tipos_.find(fd);
+        const TipoDeDevice tipo = tipo_it == tipos_.end() ? TipoDeDevice::Desconhecido
+                                                         : tipo_it->second;
+        fd_em_curso_ = fd;
+        if (tipo == TipoDeDevice::Desconhecido) {
+            LOG_WARNING(Service_NVDRV, "Ioctl: fd={} não é um device aberto", fd);
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::BadValue);
+            return;
+        }
+
+        // O despacho por **(device, grupo, comando)** — o do Eden.
         //
-        // O grupo `'G'` (0x47) é o do `nvhost-ctrl-gpu` e o `'A'` (0x41) o
-        // do `nvhost-as-gpu` — os dois dispositivos que o jogo abre.
-        if (comando.group() == 'G') {
-            switch (comando.cmd()) {
-            case 0x1:
-                ZCullGetCtxSize(ctx);
-                return;
-            case 0x2:
-                ZCullGetInfo(ctx);
-                return;
-            case 0x5:
-                GetCharacteristics1(ctx);
-                return;
-            case 0x6:
-                GetTPCMasks1(ctx);
-                return;
-            default:
-                break;
+        // **O device importa, não só o grupo.** O grupo 0x00 tem comandos
+        // nos dois devices: no `nvhost-ctrl` é o
+        // `IocCtrlEventUnregisterBatch` (0x21) e no `nvhost_gpu` é o
+        // `GetWaitbase` (0x03). Despachar só pelo grupo — como a versão
+        // anterior fazia — dá o comando ao device errado.
+        //
+        // A tabela de cada device é a do upstream:
+        // `nvhost_ctrl_gpu.cpp`, `nvhost_as_gpu.cpp`, `nvhost_gpu.cpp`,
+        // `nvmap.cpp`.
+        switch (tipo) {
+        case TipoDeDevice::ControleGpu:
+            if (comando.group() == 'G') {
+                switch (comando.cmd()) {
+                case 0x1:
+                    ZCullGetCtxSize(ctx);
+                    return;
+                case 0x2:
+                    ZCullGetInfo(ctx);
+                    return;
+                case 0x5:
+                    GetCharacteristics1(ctx);
+                    return;
+                case 0x6:
+                    GetTPCMasks1(ctx);
+                    return;
+                default:
+                    break;
+                }
             }
-        } else if (comando.group() == 'A') {
-            switch (comando.cmd()) {
-            case 0x1:
-                BindChannel(ctx);
-                return;
-            case 0x2:
-                AllocateSpace(ctx);
-                return;
-            case 0x3:
-                FreeSpace(ctx);
-                return;
-            case 0x6:
-                MapBufferEx(ctx);
-                return;
-            case 0x8:
-                GetVARegions1(ctx);
-                return;
-            case 0x9:
-                AllocAsEx(ctx);
-                return;
-            default:
-                break;
+            break;
+        case TipoDeDevice::AsGpu:
+            if (comando.group() == 'A') {
+                switch (comando.cmd()) {
+                case 0x1:
+                    BindChannel(ctx);
+                    return;
+                case 0x2:
+                    AllocateSpace(ctx);
+                    return;
+                case 0x3:
+                    FreeSpace(ctx);
+                    return;
+                case 0x6:
+                    MapBufferEx(ctx);
+                    return;
+                case 0x8:
+                    GetVARegions1(ctx);
+                    return;
+                case 0x9:
+                    AllocAsEx(ctx);
+                    return;
+                default:
+                    break;
+                }
             }
-        } else if (comando.group() == 0x01) {
-            // O grupo do `nvmap` (`devices/nvmap.cpp`).
-            switch (comando.cmd()) {
-            case 0x1:
-                IocCreate(ctx);
-                return;
-            case 0x3:
-                IocFromId(ctx);
-                return;
-            case 0x4:
-                IocAlloc(ctx);
-                return;
-            case 0x5:
-                IocFree(ctx);
-                return;
-            case 0x9:
-                IocParam(ctx);
-                return;
-            case 0xe:
-                IocGetId(ctx);
-                return;
-            default:
-                break;
+            break;
+        case TipoDeDevice::Gpu:
+            // O **canal**: o device por onde o trabalho chega à GPU.
+            if (comando.group() == 0x00) {
+                switch (comando.cmd()) {
+                case 0x3:
+                    GetWaitbase(ctx);
+                    return;
+                default:
+                    break;
+                }
+            } else if (comando.group() == 'H') {
+                switch (comando.cmd()) {
+                case 0x1:
+                    SetNVMAPfd(ctx);
+                    return;
+                case 0x3:
+                    ChannelSetTimeout(ctx);
+                    return;
+                case 0x1d:
+                    ChannelSetTimeslice(ctx);
+                    return;
+                case 0x8:
+                    SubmitGPFIFOBase1(ctx);
+                    return;
+                case 0x9:
+                    AllocateObjectContext(ctx);
+                    return;
+                case 0xb:
+                    ZCullBind(ctx);
+                    return;
+                case 0xc:
+                    SetErrorNotifier(ctx);
+                    return;
+                case 0xd:
+                    SetChannelPriority(ctx);
+                    return;
+                case 0x18:
+                    AllocGPFIFOEx(ctx);
+                    return;
+                case 0x1b:
+                    SubmitGPFIFOKickoff(ctx);
+                    return;
+                case 0x1a:
+                    AllocGPFIFOEx(ctx);
+                    return;
+                default:
+                    break;
+                }
+            } else if (comando.group() == 'G') {
+                // O `'G'` **do canal** (ver a nota do `SetClientData`).
+                switch (comando.cmd()) {
+                case 0x14:
+                    SetClientData(ctx);
+                    return;
+                case 0x15:
+                    GetClientData(ctx);
+                    return;
+                default:
+                    break;
+                }
             }
+            break;
+        case TipoDeDevice::Nvmap:
+            if (comando.group() == 0x01) {
+                switch (comando.cmd()) {
+                case 0x1:
+                    IocCreate(ctx);
+                    return;
+                case 0x3:
+                    IocFromId(ctx);
+                    return;
+                case 0x4:
+                    IocAlloc(ctx);
+                    return;
+                case 0x5:
+                    IocFree(ctx);
+                    return;
+                case 0x9:
+                    IocParam(ctx);
+                    return;
+                case 0xe:
+                    IocGetId(ctx);
+                    return;
+                default:
+                    break;
+                }
+            }
+            break;
+        default:
+            break;
         }
 
         // O que não está implementado: o Eden responde `NotImplemented` e
@@ -1196,6 +1783,16 @@ private:
     bool initialized_ = false;
     DeviceFD proximo_fd_ = 1;
     std::map<DeviceFD, std::string> dispositivos_;
+    // O **tipo** de cada device (pelo nome) e o estado do **canal** de
+    // cada `/dev/nvhost-gpu`.
+    std::map<DeviceFD, TipoDeDevice> tipos_;
+    std::map<DeviceFD, Canal> canais_;
+    // O device do ioctl em curso (o `fd` do comando) — o canal que o
+    // ioctl diz respeito.
+    DeviceFD fd_em_curso_ = -1;
+    // O **tradutor** Maxwell -> Vulkan da casa (`src/gpu/`). É ele que
+    // consome o push buffer que o guest submete.
+    g610::gpu::MaxwellTranslator tradutor_{g610::tel::Telemetria()};
     Kernel::KEvent* evento_ = nullptr;
     // O espaço de endereços virtual que o guest pediu para a GPU (o
     // `AllocAsEx`). Fica registado para o log e para o caminho da GPU.
@@ -1251,7 +1848,6 @@ private:
         if (lido > 0)
             std::memcpy(&params, entrada.data(), lido);
     }
-
     template <typename T>
     static void EscreverSaida(HLERequestContext& ctx, const T& params) {
         const std::size_t saida = ctx.GetWriteBufferSize(0);
