@@ -3123,3 +3123,161 @@ traps `#26`.
 | | |
 |---|---|
 | `wip/passo-4-thread` | arbiter à Eden medido no Pi: 6/6 testes, 11 traps de guest por boot (era 8004); a parede seguinte é o IPC da principal |
+
+---
+
+# Passo 6 — o arranque do jogo, serviço a serviço
+
+O objectivo continua o mesmo: **o jogo na tela**. O caminho agora não é
+o IPC (está destravado) mas a **cadeia de serviços** que o SDK pede no
+arranque — cada um deles é uma porta, e uma porta que não existe é uma
+morte.
+
+## A regra que o passo 6 revelou
+
+**Um serviço que falta mata o jogo, e mata de uma maneira específica.**
+
+O `sm:` **defere** o pedido de um serviço que não está registado
+(`sm.cpp:207-209`: `ctx.SetIsDeferred()`). No Eden isso é seguro: o
+guest **emulado** fica bloqueado no kernel à espera da resposta, e o
+`ServerManager` tenta o pedido de novo quando o serviço aparece.
+
+No nosso motor o guest é **nativo**: o `SendSyncRequest` é despachado em
+linha, dentro do SVC, e o resultado volta logo. E o deferimento
+responde com **0 palavras** — o `GetServiceCmif` do Eden devolve sem
+tocar no buffer quando o pedido foi diferido. O reader CMIF do guest
+recebe zero palavras onde espera a Result + handle, e aborta:
+
+```
+[eden:W] Service::AM: SetTerminateResult: modulo=162 desc=1 (0x000002A2)
+```
+
+O módulo 162 é o `UserlandAssert` da libnn.
+
+**A medição que decide tudo** (`boot_p6f.log`): o guest pede **dez**
+serviços no arranque — `time:u`, `pctl`, `pctl:a`, `pctl:r`, `pctl:s`,
+`lm`, `appletOE`, `apm`, `aoc:u` e `fsp-srv` — e **o `fsp-srv` era o
+único em falta**. Os outros nove tinham resposta.
+
+## A lista dos serviços, e o que cada um custou
+
+| serviço | medido | o que faltava |
+|---|---|---|
+| `time:u` | `p6c`–`p6f` | não existia: o SDK pedia-o e o `sm:` deferia |
+| `fsp-srv` | `p6f` | não existia (o único em falta) |
+| `nvdrv` | `p6m`–`p7b` | não existia; e os ioctls que o guest pede |
+| `appletOE`, `pctl*`, `lm`, `apm`, `aoc:u` | já estavam | — |
+
+## Os SVCs que faltavam (e matavam o jogo pelo mesmo mecanismo)
+
+Um SVC que devolve `Unsupported` (0x40) mata o jogo: o SDK trata um
+Result inesperado como fatal e chama `SetTerminateResult(0x40)`.
+
+| SVC | medido | o que faltava |
+|---|---|---|
+| `CreateTransferMemory` (0x15) | `p6k` | não existia |
+| `SetMemoryAttribute` (0x03) | `p6l` | não existia |
+| `SetMemoryAttribute` — o endereço | `p6r` | a validação da região (ver abaixo) |
+
+## Os `Result` inventados (uma armadilha que já tinha matado o jogo)
+
+A tabela de `Result` da casa tinha valores **inventados** (`Invalid = 1`,
+`NotInitialized = 2`, …). O guest conhece os Results do Eden, e um Result
+que ele não conhece é fatal.
+
+**Medido** (`boot_p6q.log`): o `SetMemoryAttribute` devolveu o `Invalid`
+(0x1) — um erro verdadeiro (o endereço 0 não está no espaço do processo) —
+e o SDK foi logo ao `SetTerminateResult(0x1)` e ao `Break`. O Eden
+devolveria `ResultInvalidCurrentMemory` (54273), que o SDK sabe ignorar.
+
+Agora os valores são os do Eden (`core/hle/kernel/svc_results.h`:
+`descrição << 9 | 1`) e **cada call-site devolve o Result que o Eden
+devolve** nessa SVC.
+
+## O `notify` que faltava (o deadlock)
+
+O Eden, ao **esperar** por uma condition variable, larga o mutex e
+**acorda o próximo dono** (`KConditionVariable::Wait`,
+`k_condition_variable.cpp:285-292`: `next_owner_thread->EndWait(...)`).
+
+O nosso código marcava o token como entregue e **não notificava** — o
+próximo dono dormia para sempre.
+
+**Medido** (`boot_p6o.log`): o `SignalProcessWideKey` encontrava o waiter
+(`count=1`) e não acordava ninguém (`acordados=0`); todas as threads do
+guest acabavam paradas à espera do mesmo mutex, e o jogo não avançava.
+
+## O `KernelCore` que não estava ligado a tempo
+
+O `ServiceManager` constrói o `IpcController` no **seu** construtor
+(`sm.cpp:31`), e o `Controller` guarda uma **referência** ao `KernelCore`.
+Se o `ServiceManager` for construído antes do `ligar()`, essa referência
+fica ligada a nada.
+
+O primeiro uso é o `CloneCurrentObject` (o SDK converte a sessão do
+`fsp-srv` em domínio), e aí o motor escreve no mutex de um
+`KernelCore` nulo e morre. **Medido** (`boot_p6i.log`): o backtrace era
+`CloneCurrentObject → KSession::KSession → KernelCore::
+RegisterKernelObject`, com o fault em `pthread_mutex_lock`.
+
+O instrumento que o achou: o tratador de `SIGSEGV` diz agora o **símbolo**
+de um fault do motor (`dladdr` + `backtrace_symbols_fd`).
+
+## Os dois `Settings::Values` (um conflito de tipos)
+
+A nossa ponte e o `settings.h` do Eden definem tipos diferentes, e os
+dois declaram `Settings::values` — o **mesmo símbolo**. O `aoc`
+vendorizado lia `Settings::values.disabled_addons` num offset que o nosso
+tipo não tem: lia lixo, e o `std::find` sobre um vector lixo matava o
+motor. **Medido** (`boot_p6j.log`).
+
+O `settings.h` vendorizado passa a **ser** a ponte (override novo), e a
+ponte ganhou o terceiro campo que o código vendorizado lê.
+
+## O caminho da GPU
+
+O `nvdrv` é **fino de propósito**: a interface é a do Eden (os IDs dos
+14 comandos, os nomes, as formas das respostas), o driver não vem. O que
+o guest pede, medido:
+
+| ioctl | grupo/comando | o que é |
+|---|---|---|
+| `GetCharacteristics1` | `'G'`/0x05 | as características da GPU (176 bytes) |
+| `GetTPCMasks1` | `'G'`/0x06 | as máscaras de TPC (24 bytes) |
+| `ZCullGetCtxSize` | `'G'`/0x01 | o tamanho do contexto de ZCull (4 bytes) |
+| `ZCullGetInfo` | `'G'`/0x02 | os alinhamentos de píxeis (40 bytes) |
+| `AllocAsEx` | `'A'`/0x09 | o espaço de endereços virtual da GPU |
+| `GetVARegions1` | `'A'`/0x08 | as regiões do VA (64 bytes) |
+| `AllocateSpace` | `'A'`/0x02 | alocar no VA |
+| `MapBufferEx` | `'A'`/0x06 | mapear a memória de um handle no VA |
+| `BindChannel` | `'A'`/0x01 | ligar o canal do `nvhost-gpu` |
+| `IocCreate`/`IocAlloc`/`IocParam`/`IocFree`/… | 0x01 | os handles de memória (`nvmap`) |
+
+**O VA da GPU é o espaço do guest** — num motor nativo não há tradução,
+e o push buffer que o guest submete é lido pelo tradutor Maxwell → Vulkan
+(`src/gpu/`) de lá.
+
+**Medido**: o guest pede **65536 páginas de 64 KiB = 4 GiB** de páginas
+grandes. Com 512 MiB (a região de alias) a alocação falhava, e o SDK
+com o VA sem espaço desreferenciava um ponteiro nulo (`0x10`).
+
+**Um ioctl que não existe dá `NotImplemented`, nunca "sucesso com
+zeros"**: com sucesso e um buffer a zeros, o guest usou os zeros como
+dados válidos e saltou para um ponteiro lixo (`0x40011e2d407c3`).
+
+## Onde estamos
+
+O guest **não aborta** e **não dá erro de SVC**. Chega ao fim da
+inicialização do driver da GPU (31 ioctls), e pára num fault de memória
+**dentro do SDK** (`0x83b98c00`, a ler `0x20`).
+
+**Honestidade sobre o que ainda não está feito**: o tradutor Maxwell →
+Vulkan (`src/gpu/`) continua por ligar ao IPC — o `nvdrv` dá-lhe o VA e
+os buffers, mas ninguém consome o push buffer. A próxima parede é essa,
+e o fault actual é o primeiro sintoma dela.
+
+## Estado
+
+| | |
+|---|---|
+| `wip/passo-4-thread` | passo 6: o `nn::time`, o `fsp-srv` e o `nvdrv` (fino) registados; os SVCs `CreateTransferMemory` e `SetMemoryAttribute` implementados; os `Result` com os valores do Eden; o `notify` do `WaitProcessWideKeyAtomic` corrigido. O guest chega ao fim da init do driver da GPU (31 ioctls) e pára num fault **dentro do SDK** — a próxima parede é ligar o tradutor Maxwell → Vulkan ao IPC |
