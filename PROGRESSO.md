@@ -3489,6 +3489,66 @@ O caminho passa a ser: `hactool --exefsdir` sobre o *program* NCA →
 (o carregador de NSO já existe e está testado) → e aí o guest **real**
 faz o trabalho de GPU, com o push buffer *host1x* a sério.
 
+### **O "app de teste" É O JOGO** (medido)
+
+O `exefs` que o motor arrancava (`piDroid_Test_ARM/work/exefs`) **é o
+`main` do Pokémon Shield**:
+
+```
+md5  exefs/main          = 9df91fc511ef73d7ae20c7065f431852
+md5  piDroid/pokemon/exefs/main
+                        = 9df91fc511ef73d7ae20c7065f431852   (igual)
+strings: "pokemon/", "qTownmap", "CAPTURE_POKEMON", "pokemon-gl.com"
+```
+
+O `exefs_pokemon/` do workspace local era **uma cópia** desse mesmo
+ficheiro — nunca o jogo. E o `main_uncompressed` local é o `main` real
+descomprimido (38,5 MB = o NSO0 de 20,4 MB descomprimido) ✓.
+
+**Estávamos a correr o jogo desde o início.** O que medimos antes
+(submissão, janela, canal) são medições *do jogo*.
+
+### O jogo real, extraído do NSP (no Pi)
+
+- `hactool` **compilado no Pi** (Makefile + mbedtls) ✓.
+- O NSP é um PFS0 com **6 partições**: o *program* NCA tem 9,5 GB
+  (standard crypto) e o **ExeFS está dentro dele**; há ainda NCAs de
+  964 KB, 251 KB e 114 KB e o `.cnmt`.
+- O NCA tem de ser extraído **a partir do offset 400** (o cabeçalho
+  PFS0 tem 16 bytes + 384 de tabela de strings) — foi essa a razão de
+  "Invalid NCA header": a cópia começava desalinhada.
+- `hactool --exefsdir` → o ExeFS: `main`, `main.npdm`, `rtld`, `sdk`,
+  `subsdk0`, `subsdk1` ✓ (e é o mesmo exefs que já estava a ser
+  arrancado).
+
+### Onde o jogo para — a sequência medida
+
+1. Display: `OpenLayer` → native window em `0x9C800000` (1280×720,
+   3,6 MB) ✓.
+2. Compositor: transacções **10, 9, 14, 14** (`IGraphicBufferProducer`)
+   ✓ — o jogo fala connosco.
+3. GPU: `MapBufferEx: handle=11 -> 0xB917C000` ✓ (o `MapBufferEx` está
+   de acordo com o upstream: `size = mapping_size ? mapping_size :
+   handle->orig_size` — o `tamanho=0x0` que aparece no log é o eco do
+   *input*, não um erro).
+4. **Bloqueio**: o jogo fica à espera de um *futex*
+   (`WaitProcessWideKeyAtomic`) — o seu *thread* de GPU está à espera
+   da **fence**, que **nunca é sinalizada** pela casa.
+
+É este o bloqueio, e é o passo seguinte: o canal do `nvdrv` tem de ter
+um **syncpoint** (um `KEvent`) e de o **sinalizar** quando a submissão
+acaba. O upstream dá o modelo exacto (`SubmitGPFIFOImpl`):
+
+```cpp
+params.fence.id = channel_syncpoint;
+u32 increment{(flags.fence_increment ? 2 : 0) +
+              (flags.increment_value ? params.fence.value : 0)};
+params.fence.value = syncpoint_manager.IncrementSyncpointMaxExt(channel_syncpoint, increment);
+```
+
+A casa já tem o `svc_wait_synchronization` e o `KEvent` (usados no
+`time:u` e no `applet:oe`) — falta é ligá-los ao canal do `nvdrv`.
+
 ### A parede actual
 
 O `OpenLayer` (comando 2020 do display da aplicação) — a **native
