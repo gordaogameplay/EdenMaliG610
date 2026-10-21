@@ -48,6 +48,7 @@
 #include "g610/services/fsp_srv.hpp"
 #include "g610/services/nvdrv.hpp"
 #include "g610/services/time_u.hpp"
+#include "g610/services/vi.hpp"
 #include "vendor/eden/core/hle/service/lm/lm.h"
 #include "vendor/eden/core/hle/service/pctl/pctl.h"
 #include "vendor/eden/core/hle/service/server_manager.h"
@@ -618,6 +619,13 @@ EdenSystem::EdenSystem(GuestMemory& memoria, std::uint64_t pid, std::uint64_t ti
     // verdade — o push buffer para o tradutor Maxwell -> Vulkan da casa
     // — e' o passo seguinte. Ver `src/services/nvdrv.cpp`.
     g610::services::registar_nvdrv(*this);
+
+    // O `vi` — o servico de **video** (o display). Medido
+    // (`boot_p7d.log`): depois do `nvdrv`, e' o proximo servico que o
+    // SDK pede e que faltava ("vi:m"). Sem ele, o `sm:` defere o pedido
+    // e o guest aborta no reader CMIF (`modulo=10 desc=212`).
+    // Ver `src/services/vi.cpp`.
+    g610::services::registar_vi(*this);
 
     // A verificacao que esteve aqui -- `KObjectName::Find("sm:")` -- **partiu
     // o jogo**.

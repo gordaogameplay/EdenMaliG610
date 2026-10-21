@@ -926,7 +926,9 @@ int main(int argc, char** argv) {
     std::printf("══════ arranque real do rtld ══════\n");
     std::printf("  exefs: %s\n\n", exefs.c_str());
 
-    g610::tel::Telemetry tel;
+    // A telemetria e' a **global** do motor (ver `telemetry.hpp`): e' a
+    // mesma que o `nvdrv` usa para medir a traducao Maxwell -> Vulkan.
+    g610::tel::Telemetry& tel = g610::tel::Telemetria();
     tel.set_live_console(false);
     tel.start("0000000000000000", "boot-trace");
 

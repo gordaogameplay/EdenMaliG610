@@ -373,4 +373,10 @@ void Telemetry::maybe_print_live() {
     std::fflush(stdout);
 }
 
+// A instância global (ver a nota em `telemetry.hpp`).
+Telemetry& Telemetria() {
+    static Telemetry t;
+    return t;
+}
+
 } // namespace g610::tel

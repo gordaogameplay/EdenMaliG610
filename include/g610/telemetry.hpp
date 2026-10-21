@@ -255,6 +255,23 @@ private:
     std::atomic<Nanos>*      sink_;
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// A telemetria do motor — **uma só instância**.
+//
+// É o mesmo padrão do `Settings::values` (`common/settings_bridge.h`): um
+// objecto que o código vendorizado e os serviços do motor partilham.
+//
+// **Porquê precisa de ser global:** o tradutor Maxwell -> Vulkan
+// (`src/gpu/`) mede o custo da tradução, e vive **dentro de um serviço**
+// (o `nvdrv`), que não tem acesso ao `NativeEngine` — o dono da
+// telemetria. Sem isto, a medição do caminho da GPU vive num sítio e a
+// do motor noutro, e o quadro fica sem a parte que mais interessa.
+//
+// A instância é criada na primeira chamada (a mesma raz��o do
+// `Settings::ValuesRef`: a ordem de inicialização das translation units
+// não é garantida).
+Telemetry& Telemetria();
+
 } // namespace g610::tel
 
 #define IA_SCOPE_TIMER(atomic_sink)                                             \
