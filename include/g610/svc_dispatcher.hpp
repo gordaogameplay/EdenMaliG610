@@ -146,7 +146,7 @@ enum class Result : std::uint32_t {
     InvalidMemorySize     = 31,
     Unsupported           = 64,
     // `ResultTimedOut` do Eden (`svc_results.h:30`): modulo Kernel (1),
-    // descricao 117. Vale 1 | (117 << 9) = 0x3AE1.
+    // descricao 117. Vale 1 | (117 << 9) = 0xEA01.
     //
     // E' o que o `WaitSynchronization` devolve quando o prazo expira sem
     // nada acontecer — e o que o SDK sabe interpretar.
@@ -515,6 +515,7 @@ private:
     // Cada grupo devolve Result; o resultado é escrito em ctx.ret.
     Result svc_set_heap_size(SvcContext&);
     Result svc_signal_process_wide_key(SvcContext&);
+    Result svc_wait_process_wide_key_atomic(SvcContext&);
 
     // O arbiter de mutex do nn::os (passo 4). Semântica medida no Eden:
     // `KConditionVariable::WaitForAddress` / `SignalToAddress`

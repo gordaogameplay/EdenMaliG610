@@ -389,6 +389,63 @@ dereference. Mapeámos [0x6000'0000, 0x8000'0000).
 
 ---
 
+## Passo 5 — `WaitProcessWideKeyAtomic` (0x1C) e `SignalProcessWideKey` reais
+
+O passo 4 fechou os locks (`ArbitrateLock`/`ArbitrateUnlock` à medida), mas as
+threads batiam `trap #28` → `Unsupported (0x40)`: o guest pede
+**`WaitProcessWideKeyAtomic` (0x1C)** logo após o drop do `SendSyncRequest`.
+As semânticas foram lidas por inteiro no futuro Eden, no Orange Pi
+(`k_condition_variable.cpp`):
+
+- `Wait` (:271): o PRIMEIRO waiter do endereço do mutex torna-se dono
+  (`next_value` = tag dele, +máscara se houver mais); escreve **1 na palavra
+  do `cv_key`** + fence seq_cst; SÓ DEPOIS escreve a palavra do mutex;
+  `timeout == 0` devolve `TimedOut` DEPOIS do release; timeout < 0 espera
+  sem fim.
+- `SignalImpl` (:198): `UpdateLockAtomic` na palavra do waiter acordado —
+  palavra 0 ⇒ escreve o TAG dele e desperta-o **já dono**; palavra ≠ 0 ⇒
+  escreve `prev | 0x40000000` e a thread vira **waiter do dono actual**
+  (passa da fila de cv para a fila do endereço SEM acordar).
+- `Signal` (:~247): consome até `count` (≤0 = todos) e, quando a fila da
+  chave esvazia, escreve **0** na palavra do `cv_key` — inclusive quando
+  nunca houve waiters.
+- ABI confirmada pelo trap medido: `x0=endereço do mutex, x1=cv_key
+  (endereço), x2=tag (0x18002 = handle nosso), x3=timeout (-1 = forever)`.
+
+Implementação (`src/svc_dispatcher.cpp`): o quadro ganhou fila por `cv_key`
+(`cv_fila`) e estado de despertar por token (`desperta`): quem entrega
+escreve o resultado do `EndWait` por token — **um só canal** para lock e cv,
+porque o SignalImpl move o waiter de fila sem acordar e o antigo predicado
+"saiu da fila" não exprime esse estado.
+
+**Medido no Orange Pi (3 boots, `IA_NOOB=1 stdbuf -o0`; 1 com `IA_IPC_TRACE=1`):**
+- `ctest` 6/6 no Pi.
+- `Unsupported (0x40)` do 0x1C: **0 ocorrências** (antes: cada trap #28
+  devolvia 0x40).
+- `[thrd] trap` impressos nas threads de guest: **5** por boot (antes 11/11/12).
+- run com trace: **3 waits reais de 0x1C**, **87 SignalProcessWideKey**, 59
+  `SendSyncRequest`, 16 respostas SFCO, 414 varrimentos do pump.
+- O boot **não acaba sozinho** (`timeout` mata aos 90-120 s); o force-stop do
+  amostrador segue a mesma rota ("última trap: breakpoint"), e as amostras
+  agora veem **PC do guest** (antes: dentro do kernel): `0x8390d1e8` = o
+  `b .+0` infinito do SDK, logo depois de `svc #0x26` = **`Break`**
+  (objdump sobre `text.bin`; o mapeamento validado com a referência
+  `svc #0x1a` @0x37eb2c).
+- A cadeia fecha: **1 send fantasma por boot persiste** (o pump devolve
+  `Kernel::ResultNotFound` = módulo 1, desc 121 = valor 61953 nos 6
+  servidores — a mensagem "não é sessão" do `last_ipc_` era rotulação errada;
+  a rota real é `ProcessPendingSynchronously != Success`), o guest recebe
+  `InvalidHandle` a torto e **aborta via `svc Break`** → o wrapper do SDK
+  entra no `b .+0` infinito.
+- O fim do boot agora pendura (exit 124): thread estacionada no cv nunca é
+  cancelada na desmontagem. O teardown vinha doente já no passo 3 (exit 139
+  SIGSEGV); o sintoma mudou, a doença não.
+
+Próxima parede: derrubar o **drop fantasma do pump** — medido a 1/boot
+(65 progressos vs 283 NotFound em 348 varrimentos).
+
+---
+
 ## Não confirmado (não inventar)
 
 - `__tls_align` do SDK oficial → usamos 16 como mínimo.
@@ -2595,7 +2652,7 @@ medidas:
 | Sintoma | Causa |
 |---|---|
 | `exit 70` ("sem ponto de regresso") | o `sigsetjmp` estava numa frame que **já tinha regressado**; um `siglongjmp` para um `sigjmp_buf` de uma frame morta é comportamento indefinido |
-| o guest lia o TLS do *host* | o `TPIDR_EL0` era global, e o motor新聞 tinha ficado a 0 — o guest escrevia por cima da `libc` |
+| o guest lia o TLS do *host* | o `TPIDR_EL0` era global, e o motor tinha ficado a 0 — o guest escrevia por cima da `libc` |
 
 E a lição de fundo, que é a resposta à pergunta "o Eden não faz?":
 

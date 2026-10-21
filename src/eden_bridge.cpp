@@ -260,12 +260,20 @@ auto ::Core::System::ProcessPendingSynchronously() -> ::Result {
     bool progresso = false;
     for (const auto& servidor : servidores_) {
         const Result resultado = servidor->ProcessPendingSynchronously();
+        if (std::getenv("IA_IPC_TRACE") != nullptr)
+            std::fprintf(stderr,
+                         "[ipc] pump servidor=%zu Result=%u (progresso=%d)\n",
+                         servidores_.size(),
+                         static_cast<unsigned>(resultado.GetInnerValue()),
+                         resultado == ResultSuccess ? 1 : 0);
         if (resultado == Kernel::ResultNotFound)
             continue;
         if (R_FAILED(resultado))
             return resultado;
         progresso = true;
     }
+    if (servidores_.empty() && std::getenv("IA_IPC_TRACE") != nullptr)
+        std::fprintf(stderr, "[ipc] pump SEM SERVIDORES registados (RunServer não correu)\n");
     return progresso ? ResultSuccess : Kernel::ResultNotFound;
 }
 
@@ -745,10 +753,16 @@ bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_ha
             // retém o objecto, nem altera o handle que se está a medir.
             auto raw = tabela.GetObject<Kernel::KAutoObject>(
                 kernel, Kernel::Handle{session_handle});
+            // O TIPO do objecto do handle separa três falhas diferentes:
+            // inexistente (o handle não foi criado), existir mas de OUTRO
+            // tipo (o pedido devia ir a outro SVC), e existir com geração
+            // velha (reuso do slot). É a mesma razão do "addr do fault".
+            const char* tipo = raw.IsNotNull() ? raw->GetTypeName()
+                                               : "(inexistente)";
             std::fprintf(stderr,
-                         "[ipc] SendSyncRequest handle=0x%x count=%zu size=%zu raw=%p typed=null\n",
+                         "[ipc] SendSyncRequest handle=0x%x count=%zu size=%zu raw=%p tipo=%s\n",
                          session_handle, tabela.GetCount(), tabela.GetTableSize(),
-                         static_cast<const void*>(raw.GetPointerUnsafe()));
+                         static_cast<const void*>(raw.GetPointerUnsafe()), tipo);
         }
         return false;
     }
@@ -761,17 +775,33 @@ bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_ha
     // `KScopedAutoObject` a sessão pode ser destruída a meio e o pedido
     // escreve para memória morta.
     Kernel::KScopedAutoObject<Kernel::KAutoObject> pai{kernel, sessao->GetParent()};
-    if (pai.IsNull())
+    if (pai.IsNull()) {
+        if (std::getenv("IA_IPC_TRACE") != nullptr)
+            std::fprintf(stderr,
+                         "[ipc] SendSyncRequest handle=0x%x SEM PAI (sessao sem parent)\n",
+                         session_handle);
         return false;
+    }
 
-    if (R_FAILED(sessao->SendSyncRequest(kernel, 0, 0)))
+    if (R_FAILED(sessao->SendSyncRequest(kernel, 0, 0))) {
+        if (std::getenv("IA_IPC_TRACE") != nullptr)
+            std::fprintf(stderr,
+                         "[ipc] SendSyncRequest handle=0x%x FILA falhou (KClientSession::SendSyncRequest != Success)\n",
+                         session_handle);
         return false;
+    }
 
     // `KClientSession::SendSyncRequest` enfileirou o pedido. No Eden uma
     // thread do ServerManager acordaria, receberia e responderia; aqui não há
     // thread host, portanto fazemos exactamente essas duas fases agora, no
     // fluxo síncrono do guest.
-    return R_SUCCEEDED(kernel.System().ProcessPendingSynchronously());
+    const bool processado = R_SUCCEEDED(kernel.System().ProcessPendingSynchronously());
+    if (!processado && std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[ipc] SendSyncRequest handle=0x%x PROCESSAMENTO falhou (ProcessPendingSynchronously != Success)\n",
+                     session_handle);
+    }
+    return processado;
 }
 
 } // namespace g610

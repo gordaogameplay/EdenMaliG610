@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "vendor/eden/common/scope_exit.h"
+#include <cstdio>   // o diagnóstico do pump imprime por IA_IPC_TRACE
+#include <cstdlib>
 
 #include "vendor/eden/core/system_ref.h"  // VER NOTA
 #include "vendor/eden/core/hle/kernel/k_client_port.h"
@@ -349,6 +351,11 @@ Result ServerManager::ProcessPendingSynchronously() {
     bool fez_progresso = false;
     for (;;) {
         bool fez_um_evento = false;
+
+        if (std::getenv("IA_IPC_TRACE") != nullptr)
+            std::fprintf(stderr,
+                         "[ipc] pump varrer: servidores=%zu sessoes=%zu\n",
+                         m_servers.size(), m_sessions.size());
 
         // Uma ligação recém-criada fica na fila do KServerPort até ser aceite.
         for (auto& server : m_servers) {
