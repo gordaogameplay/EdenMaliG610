@@ -87,6 +87,9 @@ def main() -> int:
         ("IA_FONTES_VIDEO_CORE",
          extrair(os.path.join(UPSTREAM, "video_core", "CMakeLists.txt"), "video_core",
                  indice, faltantes)),
+        ("IA_FONTES_SHADER_RECOMPILER",
+         extrair(os.path.join(UPSTREAM, "shader_recompiler", "CMakeLists.txt"),
+                 "shader_recompiler", indice, faltantes)),
     ]
     if faltantes:
         print("faltam (trazê-los do upstream):")

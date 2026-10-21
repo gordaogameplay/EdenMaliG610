@@ -101,6 +101,67 @@ target_include_directories(g610_core PUBLIC
 # O que fica vendorizado ✓ (e é a referência): o `video_core` ✓, o
 # `shader_recompiler` ✓ e o `core/` completo ✓.
 include(cmake/ia_fontes.cmake)
+
+# --- o shader_recompiler do upstream (NVIDIA GLSL -> SPIR-V) ----------------
+#
+# O `ShaderCache` da casa é um *placeholder* (copia o blob para dentro de
+# um vector `spirv`). O upstream faz a conversão a sério ✓ — e traz o
+# *frontend* Maxwell (o descompilador de SASS) ✓, que é a parte difícil.
+#
+# Depende do SPIRV-Tools ✓ e do SPIRV-Reflect ✓ (vendorizados ✓, com o
+# layout irmão que o SPIRV-Tools exige ✓).
+set(SPIRV-Headers_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/third_party/SPIRV-Headers)
+set(SPIRV-Tools_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/third_party/SPIRV-Tools)
+set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
+set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
+add_subdirectory(vendor/third_party/SPIRV-Headers
+  ${CMAKE_CURRENT_BINARY_DIR}/spirv-headers EXCLUDE_FROM_ALL)
+add_subdirectory(vendor/third_party/SPIRV-Tools
+  ${CMAKE_CURRENT_BINARY_DIR}/spirv-tools EXCLUDE_FROM_ALL)
+
+# O `sirit` (o assembler SPIR-V) — o upstream usa-o pelo nome do
+# pacote (`sirit::sirit`) e o `shader_recompiler` inclui `<sirit/sirit.h>`.
+# O SPIRV-Reflect do Khronos serve para reflectir o SPIR-V (nao para o
+# assemblar) — e o que o upstream tambem usa, ao lado.
+add_library(sirit STATIC
+  vendor/third_party/sirit/src/instructions/annotation.cpp
+  vendor/third_party/sirit/src/instructions/arithmetic.cpp
+  vendor/third_party/sirit/src/instructions/atomic.cpp
+  vendor/third_party/sirit/src/instructions/barrier.cpp
+  vendor/third_party/sirit/src/instructions/bit.cpp
+  vendor/third_party/sirit/src/instructions/constant.cpp
+  vendor/third_party/sirit/src/instructions/conversion.cpp
+  vendor/third_party/sirit/src/instructions/debug.cpp
+  vendor/third_party/sirit/src/instructions/derivatives.cpp
+  vendor/third_party/sirit/src/instructions/extension.cpp
+  vendor/third_party/sirit/src/instructions/flow.cpp
+  vendor/third_party/sirit/src/instructions/function.cpp
+  vendor/third_party/sirit/src/instructions/group.cpp
+  vendor/third_party/sirit/src/instructions/image.cpp
+  vendor/third_party/sirit/src/instructions/logical.cpp
+  vendor/third_party/sirit/src/instructions/memory.cpp
+  vendor/third_party/sirit/src/instructions/misc.cpp
+  vendor/third_party/sirit/src/instructions/type.cpp
+  vendor/third_party/sirit/src/sirit.cpp
+  vendor/third_party/sirit/src/stream.cpp
+)
+target_include_directories(sirit PUBLIC
+  vendor/third_party/sirit/include
+  vendor/third_party/sirit/src)   # osIncludes de `stream.h` (o `src/` do sirit)
+add_library(sirit::sirit ALIAS sirit)
+
+add_library(spirv_reflect STATIC vendor/third_party/SPIRV-Reflect/spirv_reflect.cpp)
+target_include_directories(spirv_reflect PUBLIC vendor/third_party/SPIRV-Reflect)
+
+#
+# **Não entra no build** ✗: o `sirit` disponível (o `yuzu-mirror/sirit` ✓)
+# tem a API antiga ✗ — o `PatchDeferredPhi` ✗ — e o upstream usa a nova ✗
+# (que devolve um par ✗). O `shader_recompiler` fica vendorizado ✓ como
+# referência ✓ (e é a via para a conversão NVIDIA GLSL -> SPIR-V ✓),
+# mas precisa do `sirit` certo ✗.
+#
+# target_sources(g610_core PRIVATE ${IA_FONTES_SHADER_RECOMPILER})
+# target_link_libraries(g610_core PUBLIC SPIRV-Tools sirit spirv_reflect)
 target_compile_definitions(g610_core PUBLIC ANKERL_UNORDERED_DENSE_STD_MODULE=1)
 target_link_libraries(g610_core PUBLIC Vulkan::Vulkan SDL2::SDL2 fmt::fmt pthread)
 

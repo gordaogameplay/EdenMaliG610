@@ -48,6 +48,9 @@ REPOS = [
     ("KhronosGroup/SPIRV-Headers", "SPIRV-Headers"),
     ("KhronosGroup/SPIRV-Reflect", "SPIRV-Reflect"),
     ("KhronosGroup/SPIRV-Tools", "SPIRV-Tools"),
+    # O "sirit" do upstream (o assembler SPIR-V) — o `shader_recompiler`
+    # inclui `<sirit/sirit.h>`, por isso o layout e' `sirit/sirit/...`.
+    ("yuzu-mirror/sirit", "sirit"),
 ]
 
 IGNORAR = {
@@ -121,6 +124,10 @@ def main() -> int:
         print(f"{nome:28} {branch:>12}  {len(ficheiros):>5} ficheiros  {tamanho / (1024 * 1024):>7.1f} MiB")
         if args.fetch:
             destino = os.path.join(DESTINO, nome)
+            if nome == "sirit":
+                # O upstream inclui `<sirit/sirit.h>`: o include tem de
+                # ser um directorio `sirit/` com o `sirit.h` dentro.
+                destino = os.path.join(DESTINO, "sirit")
             ok = 0
             for i, (caminho, _) in enumerate(ficheiros, 1):
                 if descarregar(repo, branch, caminho, destino):
