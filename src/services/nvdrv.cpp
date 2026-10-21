@@ -1028,7 +1028,7 @@ private:
         //
         // **A casa ignorava-o** ✗ e usava a sua regiao ✗ — o que
         // fazia o `MapBufferEx` devolver VAs **fora** da regiao que o
-        // guest reservou ✗ ✗ ✗.
+        // guest reservou ✗.
         //
         // A regiao por omissão da casa ✗ é a da reserva do guest ✗ (a nota
         // da `VmDaGpu` ✗) — de 0x98000000 ✗ a 0x290000000 ✗ — porque o VA
@@ -1175,7 +1175,7 @@ private:
     //     u32 id{next_handle_id.fetch_add(HandleIdIncrement, ...)};
     //
     // A casa comecava em **1** ✗ — e o guest, ao mapear um buffer, pede
-    // o handle **0** ✗ ✗ ✗.
+    // o handle **0** ✗.
     //
     // **Medido** (`/tmp/boot_v12.log` ✗): `MapBufferEx: handle 0 não
     // está alocado` ✗ — cinco vezes ✗ — e o `NvResult` de erro (11 ✗,
@@ -1500,7 +1500,7 @@ private:
             //
             // **O VA tem de estar mapeado** ✗ — o `mapping_map.at()` ✗
             // **lanca** se nao estiver ✗ ✗. A casa aceitava o `Remap` de
-            // um VA desconhecido ✗ ✗ ✗.
+            // um VA desconhecido ✗.
             const auto mapeamento_it = mapeamentos_.find(static_cast<std::uint64_t>(params.offset));
             if (mapeamento_it == mapeamentos_.end()) {
                 LOG_WARNING(Service_NVDRV,
@@ -1924,7 +1924,7 @@ private:
         //
         // **Prova medida** ✗: no pedido real ✗, a entrada 1 começa em
         // `0xE2D67000 + 0x2274` ✗ — e `0x2274` = 8820 ✗ = 2205 palavras ✗
-        // ✓✓. A casa lia `size` como **bytes** ✗ e lia 4× menos ✗✗ ✗.
+        // ✓✓. A casa lia `size` como **bytes** ✗ e lia 4× menos ✗.
         //
         // **Os tamanhos são limitados.** Um cabeçalho com um `size`
         // absurdo (o guest corrompido, ou um push buffer que ainda não é
