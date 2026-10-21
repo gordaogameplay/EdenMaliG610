@@ -96,6 +96,7 @@ enum class NvResult : std::uint32_t {
     OverFlow          = 0x11,
     FileOperationFailed = 0x30003,
     DeviceNotFound    = 0x30011,
+    AccessDenied      = 0x30010,
 };
 
 // O `DeviceFD` do Eden (`nvdata.h`): um `s32`, e `-1` é o inválido.
@@ -181,6 +182,111 @@ struct IoctlCharacteristics {
 };
 static_assert(sizeof(IoctlCharacteristics) == 176,
               "IoctlCharacteristics tem de ter 176 bytes, como no Eden");
+
+// A `VaRegion` do Eden (`nvhost_as_gpu.h`): uma região do espaço de
+// endereços virtual da GPU.
+struct VaRegion {
+    std::uint64_t offset;
+    std::uint32_t page_size;
+    std::uint32_t _pad0_;
+    std::uint64_t pages;
+};
+static_assert(sizeof(VaRegion) == 0x18, "tamanho errado");
+
+// O `IoctlGetVaRegions` do Eden: onde estão as regiões e quantas.
+struct IoctlGetVaRegions {
+    std::uint64_t buf_addr;  // (ignorado)
+    std::uint32_t buf_size;  // forçado a 2*sizeof(VaRegion)
+    std::uint32_t reserved;
+    VaRegion regions[2];
+};
+static_assert(sizeof(IoctlGetVaRegions) == 16 + sizeof(VaRegion) * 2, "tamanho errado");
+
+// O `IoctlAllocSpace` do Eden: o pedido de espaço.
+struct IoctlAllocSpace {
+    std::uint32_t pages;
+    std::uint32_t page_size;
+    std::uint32_t flags;
+    std::uint32_t padding;
+    std::uint64_t offset;  // (a union com `align`)
+};
+static_assert(sizeof(IoctlAllocSpace) == 24, "tamanho errado");
+
+// ─────────────────────────────────────────────────────────────────────────────
+// As structs do `nvmap` (do Eden, `devices/nvmap.h`).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// `IocCreateParams`: o tamanho pedido e o handle que sai.
+struct IocCreateParams {
+    std::uint32_t size;
+    std::uint32_t handle;
+};
+static_assert(sizeof(IocCreateParams) == 8, "tamanho errado");
+
+// `IocAllocParams`: a alocação de um handle.
+struct IocAllocParams {
+    std::uint32_t handle;
+    std::uint32_t heap_mask;
+    std::uint32_t flags;
+    std::uint32_t align;
+    std::uint8_t kind;
+    std::uint8_t padding[7];
+    std::uint64_t address;
+};
+static_assert(sizeof(IocAllocParams) == 32, "tamanho errado");
+
+// `IocParamParams`: um parâmetro de um handle (tamanho, alinhamento, …).
+struct IocParamParams {
+    std::uint32_t handle;
+    std::uint32_t param;
+    std::uint32_t result;
+};
+static_assert(sizeof(IocParamParams) == 12, "tamanho errado");
+
+// `IocFreeParams`: o_HANDLE e o que a libertação devolve.
+struct IocFreeParams {
+    std::uint32_t handle;
+    std::uint8_t padding[4];
+    std::uint64_t address;
+    std::uint32_t size;
+    std::uint32_t flags;
+};
+static_assert(sizeof(IocFreeParams) == 24, "tamanho errado");
+
+// `IocFromIdParams` e `IocGetIdParams`: o handle e o id (no Eden são o
+// mesmo valor).
+struct IocFromIdParams {
+    std::uint32_t id;
+    std::uint32_t handle;
+};
+static_assert(sizeof(IocFromIdParams) == 8, "tamanho errado");
+
+struct IocGetIdParams {
+    std::uint32_t id;
+    std::uint32_t handle;
+};
+static_assert(sizeof(IocGetIdParams) == 8, "tamanho errado");
+
+// O `IoctlMapBufferEx` do Eden (`nvhost_as_gpu.h`): mapear a memória de
+// um handle do `nvmap` dentro do VA da GPU.
+struct IoctlMapBufferEx {
+    std::uint32_t flags;          // bit0: offset fixo, bit2: cacheável
+    std::uint32_t kind;           // -1 é o default
+    std::uint32_t handle;         // o handle do `nvmap`
+    std::uint32_t page_size;      // 0 = não importa
+    std::int64_t buffer_offset;
+    std::uint64_t mapping_size;
+    std::int64_t offset;          // o VA (entrada e saída)
+};
+static_assert(sizeof(IoctlMapBufferEx) == 40, "tamanho errado");
+
+// O `IoctlFreeSpace` do Eden: libertar um espaço do VA.
+struct IoctlFreeSpace {
+    std::uint64_t offset;
+    std::uint32_t pages;
+    std::uint32_t page_size;
+};
+static_assert(sizeof(IoctlFreeSpace) == 16, "tamanho errado");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // As outras structs de ioctl que o guest pede.
@@ -505,7 +611,390 @@ private:
                   "AllocAsEx: flags={} big_page_size=0x{:X} va=[0x{:X}, 0x{:X}) split=0x{:X}",
                   params.flags, params.big_page_size, params.va_range_start,
                   params.va_range_end, params.va_range_split);
+
+        // O Eden: se o guest **não** escolheu o espaço, o driver usa os
+        // valores por omissão (`nvhost_as_gpu.cpp`, `AllocAsEx`: "If
+        // this is unspecified then default values should be used").
+        //
+        // **Aqui o espaço por omissão é o da casa** — a região de alias
+        // da reserva — e não o do Eden ([32 MiB, 8 GiB)), porque o VA
+        // tem de ser memória do **guest** (ver a nota da `VmDaGpu`).
+        //
+        // O tamanho de página grande, esse é o do guest (0x10000) — e o
+        // Eden só o aceita se for uma potência de dois dentro das
+        // suportadas (`SUPPORTED_BIG_PAGE_SIZES` = 0x30000).
+        if (params.big_page_size != 0 &&
+            (params.big_page_size & (params.big_page_size - 1)) == 0 &&
+            (params.big_page_size & 0x30000u) != 0) {
+            va_.pagina_grande = params.big_page_size;
+        }
+        va_.iniciado = true;
         espaco_va_ = params;
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // O `GetVARegions1` (grupo `'A'`, comando 0x08) — as regiões do
+    // espaço de endereços virtual da GPU.
+    //
+    // O Eden (`nvhost_as_gpu.cpp`, `GetVARegionsImpl`) devolve **duas**
+    // regiões: a das páginas pequenas e a das grandes, e força
+    // `buf_size = 2*sizeof(VaRegion)`.
+    void GetVARegions1(HLERequestContext& ctx) {
+        IoctlGetVaRegions params{};
+        LerEntrada(ctx, params);
+
+        LOG_DEBUG(Service_NVDRV, "GetVARegions1: va=[0x{:X}, 0x{:X}) split=0x{:X}",
+                  va_.base, va_.fim, va_.split);
+
+        params.buf_size = 2 * sizeof(VaRegion);
+        params.reserved = 0;
+        params.regions[0] = VaRegion{
+            .offset = va_.base,
+            .page_size = kPaginaPequena,
+            ._pad0_ = 0,
+            .pages = (va_.split - va_.base) / kPaginaPequena,
+        };
+        params.regions[1] = VaRegion{
+            .offset = va_.split,
+            .page_size = va_.pagina_grande,
+            ._pad0_ = 0,
+            .pages = (va_.fim - va_.split) / va_.pagina_grande,
+        };
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // O `AllocateSpace` (grupo `'A'`, comando 0x02) — alocar espaço
+    // no VA da GPU.
+    //
+    // **O VA da GPU é o espaço de endereços do próprio guest.** Num
+    // motor de execução nativa não há tradução: a "página física" de uma
+    // região é o seu endereço. Por isso o VA que o driver dá ao guest é
+    // uma zona **da reserva** — e o guest escreve lá directamente, e o
+    // tradutor Maxwell -> Vulkan lê o push buffer de lá.
+    //
+    // A alocação é um **contador** (o Eden usa um `FlatAllocator`; aqui
+    // basta o seguinte, porque o guest não liberta durante o arranque).
+    void AllocateSpace(HLERequestContext& ctx) {
+        IoctlAllocSpace params{};
+        LerEntrada(ctx, params);
+
+        if (!va_.iniciado) {
+            LOG_WARNING(Service_NVDRV, "AllocateSpace: o espaço de VA ainda não foi criado");
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::BadValue);
+            return;
+        }
+
+        LOG_DEBUG(Service_NVDRV, "AllocateSpace: pages={} page_size=0x{:X} flags=0x{:X}",
+                  params.pages, params.page_size, params.flags);
+
+        // O Eden: o tamanho de página tem de ser o das páginas
+        // pequenas ou o das grandes (`nvhost_as_gpu.cpp`,
+        // `AllocateSpace`); o resto é `BadValue`.
+        std::uint64_t* proximo = nullptr;
+        std::uint64_t base = 0;
+        std::uint64_t passo = 0;
+        std::uint64_t limite = 0;
+        if (params.page_size == kPaginaPequena) {
+            proximo = &va_.proximo_pequeno;
+            base = va_.base;
+            passo = kPaginaPequena;
+            limite = va_.split;
+        } else if (params.page_size == va_.pagina_grande) {
+            proximo = &va_.proximo_grande;
+            base = va_.split;
+            passo = va_.pagina_grande;
+            limite = va_.fim;
+        } else {
+            LOG_WARNING(Service_NVDRV, "AllocateSpace: tamanho de página inválido 0x{:X}",
+                        params.page_size);
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::BadValue);
+            return;
+        }
+
+        const std::uint64_t tamanho = static_cast<std::uint64_t>(params.pages) * passo;
+        if (*proximo + tamanho > limite) {
+            LOG_WARNING(Service_NVDRV, "AllocateSpace: sem espaço no VA da GPU");
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::InsufficientMemory);
+            return;
+        }
+
+        params.offset = *proximo;
+        *proximo += tamanho;
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // ── o `nvmap`: os handles de memória da GPU ──
+    //
+    // O guest abre o `/dev/nvmap` e pede handles (`IocCreate`), aloca
+    // memória para eles (`IocAlloc`), interroga parâmetros (`IocParam`)
+    // e liberta (`IocFree`). Os **IDs dos comandos** são os do Eden
+    // (`devices/nvmap.cpp`, grupo 0x01).
+    //
+    // **A memória do handle é a do VA da GPU.** Num motor nativo não há
+    // tradução: a "memória do dispositivo" é memória do guest, e é por
+    // isso que o guest escreve lá directamente e o tradutor Maxwell ->
+    // Vulkan lê o push buffer de lá. Por isso a alocação sai do **mesmo
+    // espaço** que o `AllocateSpace` dá ao guest.
+    struct HandleNvmap {
+        std::uint32_t tamanho = 0;
+        std::uint32_t align = 0;
+        std::uint64_t endereco = 0;
+        bool alocado = false;
+    };
+    std::map<std::uint32_t, HandleNvmap> nvmap_;
+    std::uint32_t proximo_nvmap_ = 1;
+    // O par (VA da GPU -> endereco do guest), que o tradutor Maxwell ->
+    // Vulkan usa para traduzir os comandos do push buffer.
+    std::map<std::uint64_t, std::uint64_t> mapeamentos_;
+
+    // 0x01/0x01: `IocCreate` — criar um handle de `size` bytes.
+    void IocCreate(HLERequestContext& ctx) {
+        IocCreateParams params{};
+        LerEntrada(ctx, params);
+
+        const std::uint32_t id = proximo_nvmap_++;
+        HandleNvmap h{};
+        h.tamanho = params.size;
+        nvmap_.emplace(id, h);
+
+        LOG_DEBUG(Service_NVDRV, "nvmap: IocCreate size=0x{:X} -> handle={}", params.size, id);
+
+        params.handle = id;
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x01/0x04: `IocAlloc` — alocar a memória de um handle.
+    void IocAlloc(HLERequestContext& ctx) {
+        IocAllocParams params{};
+        LerEntrada(ctx, params);
+
+        const auto it = nvmap_.find(params.handle);
+        if (it == nvmap_.end() || it->second.alocado) {
+            LOG_WARNING(Service_NVDRV, "nvmap: IocAlloc: handle {} inválido", params.handle);
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::BadValue);
+            return;
+        }
+
+        // O alinhamento mínimo é a página (o Eden: `params.align <
+        // YUZU_PAGESIZE` → sobe para a página).
+        std::uint32_t align = params.align != 0 ? params.align : kPaginaPequena;
+        if (align < kPaginaPequena)
+            align = kPaginaPequena;
+
+        // A alocação sai da região das páginas pequenas do VA da GPU.
+        const std::uint64_t tamanho =
+            (static_cast<std::uint64_t>(it->second.tamanho) + kPaginaPequena - 1) &
+            ~static_cast<std::uint64_t>(kPaginaPequena - 1);
+        if (va_.proximo_pequeno + tamanho > va_.split) {
+            LOG_WARNING(Service_NVDRV, "nvmap: IocAlloc: sem espaço no VA da GPU");
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::InsufficientMemory);
+            return;
+        }
+
+        it->second.endereco = va_.proximo_pequeno;
+        it->second.align = align;
+        it->second.alocado = true;
+        va_.proximo_pequeno += tamanho;
+
+        LOG_DEBUG(Service_NVDRV, "nvmap: IocAlloc handle={} tamanho=0x{:X} -> 0x{:X}",
+                  params.handle, it->second.tamanho, it->second.endereco);
+
+        params.address = it->second.endereco;
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x01/0x09: `IocParam` — um parâmetro de um handle.
+    //
+    // Os tipos são os do Eden (`devices/nvmap.h`, `HandleParameterType`):
+    // 1 = tamanho, 2 = alinhamento, 3 = base, 4 = heap, 5 = tipo.
+    void IocParam(HLERequestContext& ctx) {
+        IocParamParams params{};
+        LerEntrada(ctx, params);
+
+        const auto it = nvmap_.find(params.handle);
+        if (it == nvmap_.end()) {
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::BadValue);
+            return;
+        }
+
+        switch (params.param) {
+        case 1:  // tamanho
+            params.result = it->second.tamanho;
+            break;
+        case 2:  // alinhamento
+            params.result = it->second.align;
+            break;
+        case 3:  // base — o Eden devolve -22 (posix EINVAL)
+            params.result = static_cast<std::uint32_t>(-22);
+            break;
+        case 4:  // heap
+            params.result = it->second.alocado ? 0x40000000u : 0u;
+            break;
+        case 5:  // tipo
+            params.result = 0;
+            break;
+        default:
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::BadValue);
+            return;
+        }
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x01/0x05: `IocFree` — libertar a memória de um handle.
+    //
+    // **O Eden devolve o endereço e o tamanho libertados**
+    // (`nvmap.cpp`, `IocFree`: `params.address = freeInfo->address;
+    // params.size = freeInfo->size;`). O guest usa-os — e com o endereço
+    // a zeros, desreferenciava um ponteiro nulo (medido: um fault em
+    // `0x20`, que é `0 + 0x20`).
+    void IocFree(HLERequestContext& ctx) {
+        IocFreeParams params{};
+        LerEntrada(ctx, params);
+
+        const auto it = nvmap_.find(params.handle);
+        if (it != nvmap_.end()) {
+            params.address = it->second.endereco;
+            params.size = it->second.tamanho;
+            params.flags = 0;
+            LOG_DEBUG(Service_NVDRV, "nvmap: IocFree handle={} -> 0x{:X} tamanho=0x{:X}",
+                      params.handle, params.address, params.size);
+            it->second.alocado = false;
+            nvmap_.erase(it);
+        }
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x01/0x03: `IocFromId` — o handle a partir do id (no Eden, o mesmo
+    // valor).
+    void IocFromId(HLERequestContext& ctx) {
+        IocFromIdParams params{};
+        LerEntrada(ctx, params);
+
+        if (params.id == 0 || nvmap_.count(params.id) == 0) {
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::BadValue);
+            return;
+        }
+        params.handle = params.id;
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x01/0x0e: `IocGetId` — o id a partir do handle.
+    void IocGetId(HLERequestContext& ctx) {
+        IocGetIdParams params{};
+        LerEntrada(ctx, params);
+
+        if (params.handle == 0 || nvmap_.count(params.handle) == 0) {
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::AccessDenied);
+            return;
+        }
+        params.id = params.handle;
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x41/0x06: `MapBufferEx` — mapear a memória de um handle do
+    // `nvmap` dentro do VA da GPU.
+    //
+    // **No motor nativo o mapeamento é a identidade.** A memória do
+    // handle já é do guest (foi alocada no VA da GPU), por isso o VA
+    // que o guest pede e o endereço da memória são o mesmo número. O que
+    // fica registado é o **par** (VA → endereço do guest), que é o que o
+    // tradutor Maxwell -> Vulkan vai usar para traduzir os comandos do
+    // push buffer.
+    void MapBufferEx(HLERequestContext& ctx) {
+        IoctlMapBufferEx params{};
+        LerEntrada(ctx, params);
+
+        const auto it = nvmap_.find(params.handle);
+        if (it == nvmap_.end() || !it->second.alocado) {
+            LOG_WARNING(Service_NVDRV, "MapBufferEx: handle {} não está alocado", params.handle);
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.PushEnum(NvResult::BadValue);
+            return;
+        }
+
+        const std::uint64_t endereco = it->second.endereco + params.buffer_offset;
+        LOG_DEBUG(Service_NVDRV,
+                  "MapBufferEx: handle={} va=0x{:X} -> 0x{:X} tamanho=0x{:X} flags=0x{:X}",
+                  params.handle, static_cast<std::uint64_t>(params.offset), endereco,
+                  params.mapping_size, params.flags);
+
+        // O VA devolvido: o do guest, se pediu um fixo; o da memória, se
+        // não (a identidade).
+        params.offset = (params.flags & 0x1u) != 0
+                            ? params.offset
+                            : static_cast<std::int64_t>(endereco);
+        mapeamentos_.emplace(static_cast<std::uint64_t>(params.offset), endereco);
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x41/0x03: `FreeSpace` — libertar um espaço do VA.
+    //
+    // O Eden devolve a memória ao *allocator*. Aqui o allocator é um
+    // contador (a memória não volta a ser usada), por isso o que fica é
+    // o registo.
+    void FreeSpace(HLERequestContext& ctx) {
+        IoctlFreeSpace params{};
+        LerEntrada(ctx, params);
+
+        LOG_DEBUG(Service_NVDRV, "FreeSpace: va=0x{:X} pages={} page_size=0x{:X}",
+                  params.offset, params.pages, params.page_size);
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
+    // 0x41/0x01: `BindChannel` — ligar o canal do `nvhost-gpu` ao
+    // memory manager da GPU.
+    //
+    // O Eden (`nvhost_as_gpu.cpp`, `BindChannel`) põe o `memory_manager`
+    // no estado do canal. Aqui não há memory manager para ligar (a
+    // memória é a do guest, e o tradutor lê-a do push buffer), por isso
+    // o que fica é o registo do canal.
+    void BindChannel(HLERequestContext& ctx) {
+        struct IoctlBindChannel {
+            std::int32_t fd;
+        };
+        static_assert(sizeof(IoctlBindChannel) == 4, "tamanho errado");
+
+        IoctlBindChannel params{};
+        LerEntrada(ctx, params);
+
+        LOG_DEBUG(Service_NVDRV, "BindChannel: fd={}", params.fd);
 
         EscreverSaida(ctx, params);
         RespostaOk(ctx);
@@ -558,8 +1047,47 @@ private:
             }
         } else if (comando.group() == 'A') {
             switch (comando.cmd()) {
+            case 0x1:
+                BindChannel(ctx);
+                return;
+            case 0x2:
+                AllocateSpace(ctx);
+                return;
+            case 0x3:
+                FreeSpace(ctx);
+                return;
+            case 0x6:
+                MapBufferEx(ctx);
+                return;
+            case 0x8:
+                GetVARegions1(ctx);
+                return;
             case 0x9:
                 AllocAsEx(ctx);
+                return;
+            default:
+                break;
+            }
+        } else if (comando.group() == 0x01) {
+            // O grupo do `nvmap` (`devices/nvmap.cpp`).
+            switch (comando.cmd()) {
+            case 0x1:
+                IocCreate(ctx);
+                return;
+            case 0x3:
+                IocFromId(ctx);
+                return;
+            case 0x4:
+                IocAlloc(ctx);
+                return;
+            case 0x5:
+                IocFree(ctx);
+                return;
+            case 0x9:
+                IocParam(ctx);
+                return;
+            case 0xe:
+                IocGetId(ctx);
                 return;
             default:
                 break;
@@ -672,6 +1200,44 @@ private:
     // O espaço de endereços virtual que o guest pediu para a GPU (o
     // `AllocAsEx`). Fica registado para o log e para o caminho da GPU.
     IoctlAllocAsEx espaco_va_{};
+
+    // A "VM" da GPU — o espaço de endereços virtual, em **páginas do
+    // próprio guest**.
+    //
+    // **Porquê o espaço do guest?** Num motor de execução nativa não há
+    // tradução de endereços: a página física de uma região é o seu
+    // endereço. O push buffer que o guest submete é lido pelo tradutor
+    // Maxwell -> Vulkan (`src/gpu/`) de lá, e os comandos que lá estão
+    // referenciam o VA da GPU. Se o VA fosse um espaço à parte, o
+    // tradutor teria de manter uma tabela de tradução — e o mais simples
+    // é o VA **ser** o espaço do guest.
+    //
+    // **A zona:** de 0xA0000000 (depois dos 126 MiB que o guest pediu
+    // como heap) até à base da stack (0x290000000) — 4,75 GiB.
+    //
+    // **Não há colisão com o heap do guest**, e a razão é do layout da
+    // casa: a região do heap é declarada como `kNormal` (não `Free`) nas
+    // `memory_regions()`, por isso o `AddressSpaceAllocator` do SDK
+    // (queallocate por `QueryMemory`) **não a toma** — o espaço entre o
+    // heap declarado e a stack é nosso.
+    //
+    // E o tamanho: **medido** (`boot_p6v.log`), o guest pede **65536
+    // páginas de 64 KiB = 4 GiB** de páginas grandes. Com 512 MiB (a
+    // região de alias) a alocação falhava — e o SDK, com o VA sem
+    // espaço, desreferenciava um ponteiro nulo (`0x10`).
+    struct VmDaGpu {
+        bool iniciado = false;
+        std::uint64_t base = 0x98000000ull;  // depois do heap do guest
+        std::uint64_t split = 0xC0000000ull;  // a partir daqui: páginas grandes
+        std::uint64_t fim = 0x290000000ull;   // a base da stack
+        std::uint32_t pagina_grande = 0x10000;  // o que o guest pediu
+        std::uint64_t proximo_pequeno = 0x98000000ull;
+        std::uint64_t proximo_grande = 0xC0000000ull;
+    };
+    VmDaGpu va_{};
+
+    // A página pequena do Eden (`VM::YUZU_PAGESIZE`).
+    static constexpr std::uint32_t kPaginaPequena = 0x1000;
 
     // ── os três passos de um ioctl ──
     //
