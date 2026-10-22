@@ -5406,13 +5406,70 @@ normal** do `TimedWait`. O ciclo do SDK (asm 0x82d20770, chamador
 PLT `bl 0x82f1eb50` (GOT 0x836060xx/0x835fcxxx), lendo o tempo com
 `mrs x0, cntpct_el0`.
 
-**Quantifica o sinal:** no log de 90 s há UM único
+**Quantifica o sinal (medido, fechado):** no log de 90 s há UM único
 `[svc] SignalProcessWideKey key=0xd9c2c22c count=-1 acordados=0`, emitido
 ANTES de o waiter se registar — a casa registou o sinal pendente, consumiu-o
 uma vez (log `WaitProcessWideKeyAtomic: sinal pendente na cv 0xd9c2c22c`) e o
-guest voltou a esperar. Sem novo sinal, o wait repete. Quem devia acender o
-predicado desse cv é o produtor do lado do jogo; qual thread é esse produtor
-(por cima do PLT sem GOT resolvido no desmonte) está por apurar.
+guest voltou a esperar. Sem novo sinal, o wait repete.
+
+#### A produtora não existe no guest (22/10, instrumentação nova na Parede 2)
+
+Os instrumentos leves do despachante (commit, ctest 8/8):
+`G610_SVC_SIGNAL_TRACE` (a chave, o count e o **x30 do produtor** em cada
+sinal), `G610_CV_DUMP=base,key` (a janela do objecto a cada wait da chave, as
+24 primeiras mais 1 a cada 128) e `G610_MAP_TRACE` (cada
+`MapSharedMemory`). Corrida viva `/tmp/LOG6` (150 s, EXIT=139 do mesmo
+alarme; 11540 linhas; **1875 sinais**) e `/tmp/LOG7` (com o tracer dos
+maps):
+
+- **Todas as classes de sinal com o pc do produtor** (LOG7): 859×
+  `key=0x10a5096e4 count=1 x30=0x805e6eb8` — **a bomba sinaliza a própria
+  cv** (código do módulo `main`, base 0x80000000 → main+0x5E6EB8);
+  74×/28× `0x8437e20c`/`0x8437b55c` com `x30=0x83c2b83c` (SDK+0x49E83C);
+  43× `0x10a52c314 x30=0x805e2eb4` (main+0x5E2EB4); 25×+9×
+  `0x8434ed4c`/`0x30ffffddc` com `x30=0x83997d18`; **a parede: 1×
+  `key=0xd9c2c22c count=-1 x30=0x83ab2460`** (SDK+0x325460) — e mais
+  nenhuma classe. **O 0x83ab2460 é o único pc que toca o cv da parede, uma
+  vez por run** (o mesmo padrão em LOG2: 1847 sinais, 1× na 0xd9c2c22c).
+- **A ordem no fim do boot (LOG6 linhas 9940..9947, LOG2 idêntico):**
+  `GetSharedMemoryHandle` (hid) → `hid 109 (ActivateNpadWithRevision)` →
+  o sinal solitário `0xd9c2c22c x30=0x83ab2460` → `CreateThread
+  handle=0x38005 entry=0x83abb240 arg=0xd9c2bfe8 prio=44` → `StartThread` →
+  o sinal de arranque do recém-nascido `key=0xd9c2c194 count=1
+  x30=0x83ab6f60` → o sinal `0x8437e20c` ×3 → e a bomba volta ao seu ciclo.
+  Depois disso **nenhuma linha do run toca o objecto da parede**.
+- **O objecto congelado (cv-dump n=1..128..640, LOG6, janela
+  0xd9c2c200..0x2C):** a palavra 0 é **0x02000101 constante** — o byte que
+  o SDK lê, `[x20+18]` em 0xd9c2c202, fica **0x02**; o mutex em 0xd9c2c228
+  fica **0x00038005** (a tag da própria thread — ninguém mais alguma vez
+  o apanhou); os intervalos 0x004C4B40 (~5 ms) fixos; a palavra da cv
+  muda só 0→1 (a escrita da própria casa no protocolo do wait). **Em 640
+  esperas, nada muda.**
+- **As seis workers do portal 0x83abb240** (todas criadas com prio=44,
+  cada uma com o argumento=objecto próprio; desmonte do chamador do run
+  `0x83ab2774`: laço com o `LDRB [X20,#18]` e wait por timeout ~5 ms no
+  plano do SDK): a **bomba** (tag 0x20003, arg 0x10a509458, a cv da
+  0x10a5096e4) espera com **timeout=-1 e recebe sinal em cada ciclo**
+  (858 esperas ⇄ 859 sinais — o único par produtor-consumidor vivo);
+  **0x8000, 0x10001, 0x18002 e 0x28004 (um trap cada) estão
+  paradas eternamente** — as esperas das quatro ficam `timeout=-1`
+  registradas e nunca sinalizadas (medido no LOG2) — e a parede (0x38005)
+  repete os ~5 ms. **Cinco das seis workers do jogo não têm produtor
+  que corra.**
+- **O shmem do hid, medido em mapa (`G610_MAP_TRACE`):** três
+  `MapSharedMemory` no LOG7 — `0x1000@0x2ef804000` (o `time:u`),
+  `0x1100000@0x290804000` (o TTF do `pl:u`), **`0x40000@0x2d6c04000` logo
+  após o `GetSharedMemoryHandle` do hid** — e o objecto da parede
+  (0xd9c2bfe8/0xd9c2c228) **fora desse shmem**. A hipótese "a parede é o
+  shmem do hid" cai por chão: a parede é um objecto próprio do guest
+  (heap, 0xd9c2bfe8).
+- Desmonte do módulo `sdk` do jogo (NSO LZ4 cru decodificado a
+  `/tmp/sdk.text`; base 0x8378d000): o chamador 0x83ab2774 (o laço), o
+  wrapper do `TimedWait` em 0x83abc240 (timeout→0, sucesso→1; no timeout
+  0xEA01 desbloqueia o mutex e devolve 0) e o portal do
+  `WaitProcessWideKeyAtomic` em 0x83b0bb3c são do módulo `sdk`; a
+  verificação do predicate `0x83cb0c80` é um **PLT** (o alvo no GOT de
+  0x84398AA8, só resolvível no run).
 
 O watchdog "alarme de seguranca" do motor — tempo sem progresso com o mesmo
 pc — aborta: corrida de 90 s terminou **EXIT=133** (SIGTRAP), a de 240 s
@@ -5425,9 +5482,17 @@ Distribuição de wrappers `brk` do SDK no log de 240 s (contagem por pc):
 
 ### O que decidir no passo seguinte
 
-1. **cv**: medir o lado do produtor — que thread devia sinalizar 0xd9c2c22c e
-   por que não corre — ou alargar o limiar do watchdog para não abortar
-   repetições legítimas de `TimedWait`.
+1. **cv (Parede 2, fechado com medida)**: a produtora da cv 0xd9c2c22c **não
+   existe no guest** — enumerados todos os sinais com o `x30` do produtor,
+   o único toque é o do criador, uma vez por run, antes de o `Waiter`
+   existir. Cinco das seis workers do portal 0x83abb240 estão paradas sem
+   que ninguém despache trabalho para elas (a medida: o objecto
+   congelado, `timeout=-1` eterno nas quatro). O passo seguinte mede o
+   **poster de jobs do jogo**: desmontar `main+0x5E6EB8` (o único
+   produtor activo — o da bomba — vem desse pc no módulo `main`) e achar
+   o ramo que devia alimentar as cinco paradas, ou medir o que ficou
+   pendurado no fim de `hid ActivateNpadWithRevision` que devia ter
+   corrido a seguir.
 2. **GPU**: o desenho em si — a macro do desenho corre e mede desde
    a36ec92; o disparo do desenho vive dentro do blob da chamada de
    firmware 4 (`falcon[4]`), que o upstream também não executa (o
