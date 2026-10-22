@@ -401,6 +401,24 @@ private:
         // e' quem atende o protocolo do `IGraphicBufferProducer`.
         const std::vector<std::uint8_t> reply = TransactionarParcel(transacao, entrada);
 
+        // **A resposta, em hexadecimal.** E' o parcel que volta ao jogo ✗
+        // — e nunca foi medido ✗ ✗. O Eden (`parcel.h:155-170` ✗) escreve
+        // o cabecalho ✗, os dados ✗ e os objectos ✗ ✗.
+        if (std::getenv("IA_IPC_TRACE") != nullptr) {
+            char linha[320];
+            std::size_t n = 0;
+            n += static_cast<std::size_t>(
+                std::snprintf(linha + n, sizeof(linha) - n, "[binder] resposta:"));
+            for (std::size_t i = 0; i < reply.size() && i < 64 && n + 4 < sizeof(linha); ++i)
+                n += static_cast<std::size_t>(
+                    std::snprintf(linha + n, sizeof(linha) - n, " %02x", reply[i]));
+            if (n + 2 < sizeof(linha))
+                n += static_cast<std::size_t>(
+                    std::snprintf(linha + n, sizeof(linha) - n, "\n"));
+            const ssize_t w = ::write(2, linha, n);
+            (void)w;
+        }
+
         const std::size_t tamanho = ctx.GetWriteBufferSize(0);
         if (tamanho > 0) {
             const std::size_t n = std::min(tamanho, reply.size());
