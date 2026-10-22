@@ -127,6 +127,7 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
     const tel::Nanos t0 = tel_.time_now();
     out.clear();
     error.clear();
+    falcon_vas_.clear();
 
     // A leitura de palavra — a mesma da `palavra` da `pushbuffer.cpp`,
     // porque o buffer pode não estar alinhado (vindo de um vector do
@@ -241,6 +242,11 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
             // jogo (ela lê o rascunho 0xD00 e sai quando vale 0 no r1
             // decrementado).
             regs[0xD00] = 1;
+            // A medição do blob: o endereço que a macro entrega (o
+            // instrumento `G610_VA_DUMP` do nvdrv lê a memória do guest
+            // nesses VAs — a evidência vem antes de qualquer decisão
+            // de desenho).
+            falcon_vas_.push_back(valor);
             return;
 
         case gpu::maxwell3d::vertex_buffer_count:

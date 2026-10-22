@@ -2280,6 +2280,64 @@ private:
                   tradutor_.commands_dropped_feature(), tradutor_.macro_passos(),
                   tradutor_.macro_envios(), erro.empty() ? "" : (" — " + erro));
 
+        // ── O instrumento dos parámetros do blob (o ambiente:
+        // `G610_VA_DUMP`) ────────────────────────────────────────────────
+        //
+        // As macros entregam endereços ao `falcon[4]` (a chamada de
+        // firmware 4) e o tradutor os recolhe (`falcon_vas()`). Aqui
+        // lê-se a memória do guest nesses VAs — **VA de GPU é o espaço
+        // do guest**, como o bloco de leitura do push buffer acima
+        // documenta — para medir o conteúdo que o blob de hardware
+        // receberia. A decisão do desenho vem desta evidência, não de
+        // código novo. Um arquivo texto por submit (a disciplina do
+        // `G610_GPFIFO_DUMP`); sem a variável, zero custo.
+        {
+            const char* va_base = std::getenv("G610_VA_DUMP");
+            if (va_base != nullptr && *va_base != '\0' && !pushbuffer.empty()) {
+                static std::atomic<std::uint32_t> va_dump_seq{0};
+                const std::uint32_t seq = va_dump_seq.fetch_add(1);
+                char caminho[512];
+                std::snprintf(caminho, sizeof caminho, "%s.%06u.txt", va_base,
+                              static_cast<unsigned>(seq));
+                // Os VAs distintos, a ordem do primeiro recebimento
+                // preservada (a contagem por submit também é medida).
+                std::vector<std::uint32_t> vistos;
+                for (const std::uint32_t va : tradutor_.falcon_vas()) {
+                    bool ja = false;
+                    for (const std::uint32_t v : vistos)
+                        if (v == va) {
+                            ja = true;
+                            break;
+                        }
+                    if (!ja)
+                        vistos.push_back(va);
+                    if (vistos.size() >= 256)
+                        break;
+                }
+                if (std::FILE* f = std::fopen(caminho, "w"); f != nullptr) {
+                    std::fprintf(f,
+                                 "submit=%u bytes=%zu chamadas_falcon=%zu "
+                                 "vas_distintos=%zu\n",
+                                 seq, pushbuffer.size(),
+                                 tradutor_.falcon_vas().size(), vistos.size());
+                    for (const std::uint32_t va : vistos) {
+                        std::vector<std::uint8_t> janela(32, 0);
+                        const bool ok =
+                            LerDoGuest(va, janela.data(), janela.size());
+                        std::fprintf(f, "%s va=0x%08X", ok ? "" : "NAO_LIDO",
+                                     va);
+                        for (std::size_t j = 0; j < janela.size(); j += 4) {
+                            std::uint32_t d = 0;
+                            std::memcpy(&d, janela.data() + j, 4);
+                            std::fprintf(f, " d%zu=%08X", j / 4, d);
+                        }
+                        std::fprintf(f, "\n");
+                    }
+                    std::fclose(f);
+                }
+            }
+        }
+
         // **A GPU terminou.** O driver tem de acordar o guest: medido, o
         // jogo fica à espera de uma *condition variable* que ninguém
         // sinaliza — e o `SignalProcessWideKey` do próprio jogo não

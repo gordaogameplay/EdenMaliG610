@@ -175,6 +175,13 @@ public:
     std::uint64_t macro_passos() const { return macro_passos_; }
     std::uint64_t macro_envios() const { return macro_envios_; }
 
+    // Os endereços que as macros entregaram ao `falcon[4]` na ÚLTIMA
+    // `translate` (zerado no início dela). É a medição do que o blob
+    // da chamada de firmware 4 recebe: no run vivo, o nvdrv lê a
+    // memória do guest nesses VAs (o instrumento `G610_VA_DUMP`) —
+    // o verificador do conteúdo antes de qualquer decisão de desenho.
+    const std::vector<std::uint32_t>& falcon_vas() const { return falcon_vas_; }
+
     // Traduz o limite do PushBuffer. Se devolve false, o buffer não coube e o
     // erro é reportado — um runaway de writes é um sintoma, não um detalhe.
     bool drain_pushbuffer(std::vector<std::uint8_t>& buffer,
@@ -190,6 +197,10 @@ private:
     // `mme::Interpretador`; aquí somado entre execuções).
     std::uint64_t    macro_passos_ = 0;
     std::uint64_t    macro_envios_ = 0;
+    // Os VAs entregues ao `falcon[4]` na translate corrente (zerada no
+    // começo dela; a ordem do recebimento preservada, sem deduplicar —
+    // a contagem por submit também é medida).
+    std::vector<std::uint32_t> falcon_vas_;
 };
 
 } // namespace g610::gpu
