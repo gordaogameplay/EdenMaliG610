@@ -4863,3 +4863,28 @@ cada slot tem o **seu** buffer ✗ ✗.
 E o `DequeueBuffer` ✗ (a transaccao 3 ✗) — que e' onde o jogo vai
 **buscar um buffer para desenhar** ✗ — **nunca chega** ✗ ✗. Sem ele
 o jogo nunca desenha ✗ ✗.
+
+### O `MapBufferEx` e o `PinHandle` — porque a casa devolve o endereco do guest
+
+No Eden, o `MapBufferEx` (`nvhost_as_gpu.cpp:359` ✗) devolve o VA do
+**GMMU** (o espaco do dispositivo ✗) — e o `PinHandle` (`nvmap.cpp:160`
+✗) aloca essa memoria ✗ ✗.
+
+**Na casa o VA da GPU e' o espaco do guest** ✗ (a nota da `VmDaGpu` ✗) —
+por isso o endereco que o jogo pede serve tal e qual ✗ e o host le-o
+directamente ✗ ✗. Nao ha GMMU na casa ✗ ✗.
+
+**O `DuplicateHandle`** ✗ (o Eden duplica o handle do `nvmap` ✗ no
+`SetPreallocatedBuffer` ✗ — `ui/graphic_buffer.cpp:23-25` ✗) ✗ tambem
+nao tem efeito na casa ✗: o `RegistoNvmap` ✗ e' so' de leitura ✗ ✗.
+
+**O que fica por fazer** (a lista, do mais para o menos):
+
+1. O **`DequeueBuffer`** ✗ nunca chega ✗ — e sem ele o jogo nunca
+   desenha ✗ ✗. A casa responde `StatusBadValue` ✗ quando nao ha slot
+   livre ✗; o Eden responde `Status::Busy` ✗ ✗.
+2. O **tradutor** ✗ nao produz comandos ✗ porque o push buffer de
+   *desenho* ✗ (o que tem `draw.begin`/`draw.end` ✗) ainda nao chegou
+   ✗ ✗ — o que chegou ✗ foi um push buffer de *setup* ✗ ✗.
+3. **A execucao** ✗ — o tradutor traduz ✗, mas quem executa ✗ (o
+   `ValhallBackend` ✗, o PanVK ✗) ainda nao esta' ligado ✗ ✗.
