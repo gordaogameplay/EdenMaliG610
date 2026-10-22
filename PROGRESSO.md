@@ -5480,19 +5480,82 @@ Distribuição de wrappers `brk` do SDK no log de 240 s (contagem por pc):
 0x83b0bb3c ×1591, 0x83b0bb64 ×911, 0x83b0bb44 ×861, 0x83b0bb34 ×857,
 0x83b0bb2c ×26.
 
+#### O desmonte de main+0x5E6EB8 e a cadeia de frames (22/10 noite)
+
+Primeiro o `.text` do `main`: NSO decodificado (`/tmp/main.text`,
+seg0 comprimido 0xc48289 → 0x17ec300 = 25.084.672 bytes, LZ4 cru
+block-a-block com o mesmo decodificador validado no `sdk`).
+
+**O submitter e a sua família.** O `bl` do produtor da bomba fica em
+`0x805e6eb4` (o x30 medido é o retorno, `0x805e6eb8`) e o alvo é o PLT
+do `SignalProcessWideKey` (0x817e97b0). Varredura de todos os `bl` do
+`main` para esse PLT: **15 pontos**: `0x803ffc04/0x803ffc90/0x803ffd38/
+0x803ffe2c` (família `+0x200`), `0x805d67b4/0x805d6830/0x805d6984/
+0x805d6dd4/0x805d884c/0x805d88b4/0x805f7d5c/0x80ce0c38/0x815c03b4`
+(família `+0x350`), `0x805e6eb4` e `0x805e7138` (família `+0x380`). O
+padrão em todos é o mesmo: `lock` (PLT 0x817e93c0) → a operação →
+`signal` (PLT 0x817e97b0) → `unlock` (PLT 0x817e93d0) — a família
+`nn::os::Event::Set`.
+
+**O submitter `0x805e6970`** (o poster da bomba) desmontado completo:
+recebe (fila=x0, job=x1, indice=w2), trava `fila+0x360`, guarda o job
+nas listas `fila+0x300`/`fila+0x308` e `fila+0x330`/`fila+0x338`, guarda
+o índice na mesa-da-casa-actual (`GetRecord(w0)` (0x817e90b0) → `items[16]`
+em `+128`), e fecha com `signal(fila+0x380) → unlock` no fim
+(`0x805e6eb0..0x805e6ec4`). O cv da bomba = `fila+0x380`, logo
+**fila = 0x10a509364**.
+
+**Os 23 chamadores direccionais** são estrutura repetida (template
+inlinado): `bl 0x805e2500` (o gate) → `cmp w?, #1` (**com pendentes ≤1
+salta o post**) → `ldr x0, [dono+320]` (a fila do dono) → `bl
+0x805e6970`. O `0x805e2500` = troca da fila pendente do dono
+(`[dono+0x160]/[dono+0x168]`, destrutor do nó e tail-call pelo
+`vtable[3]`).
+
+**A medida que decide (LOG9/LOG10, `G610_SVC_SIGNAL_FP` + o commit
+295880d)** — a cadeia de frames por sinal, três níveis:
+
+- **bomba 0x10a5096e4 (859/run):** 797 com `lvl1=0x805de05c` (o site
+  `0x805de058`), 40 no mesmo site com `lvl2=0x8067cf50` e variantes
+  `lvl3` (0x8067caa0/0x8067caf4/0x8067cb7c/0x8076adf8, 10 cada), e
+  **12 com `lvl1=0x8000de4c`** (o site `0x8000de48`). A função-enceradora do site
+  vivo trava `dono+0x124` (PLT 0x805cf8e0) e escolhe entre
+  `[dono+0x138]` e `[dono+0x140]` pelo contador — **o dono tem duas
+  filas**; o ramo medido posta sempre em `[dono+0x140]` = 0x10a509364
+  (a bomba).
+- **a família 0x805e6ee0 não está morta:** 43 sinais na cv `0x10a52c314`
+  e 2 na cv `0x10a59b284` com `lvl1=0x805e70b0`, `lvl2=0x805d1058`,
+  `lvl3=0x83ab6e88` (o portal interno do `sdk`). A chamada ao submitter
+  no `lvl1` é **indirecta (blr)** — por isso a varredura por `bl` não a
+  mostrava. O poster `0x805e7138` (família `+0x380`) vive nesta função.
+- **as criacões (LOG10, `G610_SVC_CREATE_TRACE`):** as seis threads
+  (entry 0x83abb240, prio 44) saem todas do mesmo pc do `sdk`,
+  **x30=0x83abb0e8** — o spawner do SDK cria a meia-dúzia.
+- **os notify de arranque:** um sinal por run em `arg+0x1AC` de cada
+  objecto (0x13f20fe0c no 0x8000 por `0x805d3b60`; 0x13f31035c no
+  0x10001 por `0x805d3e4c`; 0xe20280e4 no 0x18002 por `0x805e00ec`;
+  mais `0x13f310098`/`0x13f3104d8` por `0x805d6cbc`) — o mesmo padrão do
+  arranque da parede (`0xd9c2c194`, x30=0x83ab6f60). São clones
+  inlinados do `Event::Set` vivos no `main`.
+- **as cinco cv de espera** (0x13f20febc, 0x13f31040c, 0xe2028194,
+  0x10a509a8c, 0xd9c2c22c) **continuam sem receber post nenhum** em toda
+  a corrida — os ponteiros que as postariam vivem em ramos de
+  despacho que não correm no estado de boot capturado.
+
 ### O que decidir no passo seguinte
 
-1. **cv (Parede 2, fechado com medida)**: a produtora da cv 0xd9c2c22c **não
-   existe no guest** — enumerados todos os sinais com o `x30` do produtor,
-   o único toque é o do criador, uma vez por run, antes de o `Waiter`
-   existir. Cinco das seis workers do portal 0x83abb240 estão paradas sem
-   que ninguém despache trabalho para elas (a medida: o objecto
-   congelado, `timeout=-1` eterno nas quatro). O passo seguinte mede o
-   **poster de jobs do jogo**: desmontar `main+0x5E6EB8` (o único
-   produtor activo — o da bomba — vem desse pc no módulo `main`) e achar
-   o ramo que devia alimentar as cinco paradas, ou medir o que ficou
-   pendurado no fim de `hid ActivateNpadWithRevision` que devia ter
-   corrido a seguir.
+1. **cv (Parede 2, medida e desmentida como *poster morto*)**: a produtora
+   da cv 0xd9c2c22c não existe no guest — e a caça ao poster de jobs
+   (secção "O desmonte de main+0x5E6EB8") fechou o lado do produtor: o
+   submitter `0x805e6970` desmontado, os 15 posters direccionais
+   inventorados, a família `0x805e6ee0` medida viva por chamada
+   indirecta, e as cinco cv de espera continuam **sem post nenhum por
+   run** — os ramos que as postariam não correm no estado capturado.
+   A parede é o caso dos cinco com o único sinal do criador consumido.
+   **Pendente a decidir**: se é inactividade correcta do jogo nesta fase
+   de boot (workers de subsistemas que o jogo ainda não alimenta) ou um
+   estado que faria o guest progredir — medir de novo num run em que o
+   guest passe da fase actual.
 2. **GPU**: o desenho em si — a macro do desenho corre e mede desde
    a36ec92; o disparo do desenho vive dentro do blob da chamada de
    firmware 4 (`falcon[4]`), que o upstream também não executa (o
