@@ -4327,3 +4327,110 @@ consome os comandos traduzidos e apresenta o frame.
 | | |
 |---|---|
 | `wip/passo-4-thread` | passo 6: o `nn::time`, o `fsp-srv` e o `nvdrv` (fino) registados; os SVCs `CreateTransferMemory` e `SetMemoryAttribute` implementados; os `Result` com os valores do Eden; o `notify` do `WaitProcessWideKeyAtomic` corrigido. O guest chega ao fim da init do driver da GPU (31 ioctls) e pára num fault **dentro do SDK** — a próxima parede é ligar o tradutor Maxwell → Vulkan ao IPC |
+
+## O abort: identificado (medido, 2026-10-21)
+
+### O `sp` no trace do SVC — quem fez o quê
+
+O trace de `src/svc_dispatcher.cpp` ganhou o `sp` do guest. As pilhas do
+guest são disjuntas, logo o `sp` identifica a thread **sem ambiguidade**
+(agrupando por `sp >> 20`).
+
+Medido (`/tmp/boot_sp.log`, 12 438 linhas): o guest tem **6 threads**, com
+as pilhas em `0x296d4f000`, `0x2a1692000`, `0x2ae4f1000`, `0x2d4c4e000`,
+`0x2dd15c000` e `0x30fff0000` (a principal).
+
+O mapa das futexes, com o `sp` (a inferencia anterior virou medicao):
+
+| thread | pilha | espera | acordada? |
+|---|---|---|---|
+| principal | `0x30fffe000` | cv `0x10a2c7d64` tag `0x81ff` | nunca |
+| worker A | `0x2dd15c000` | cv `0x10a2c7844` tag `0x20003` | sim |
+| worker B | `0x2d4c4e000` | cv `0x10a2c7b0c` tag `0x28004` | sim |
+
+**O `sp` muda entre execuções** (o guest aloca as pilhas): na execucao com
+o observador, a thread que abortou tinha a pilha em `0x2f0bb3c90`. O que
+identifica a thread e' a *pilha*, nao o valor exacto.
+
+### O abort e' do `nn::fs` — e o SDK tem simbolos
+
+O `Break` (SVC 0x26) e' o caminho de abort do SDK. Medido
+(`/tmp/boot_pilha2.log`): o `pc` do abort e' `0x83b0bba4` e o regresso
+(`x30`) e' `0x8390bd3c`.
+
+O SDK **nao esta' sem simbolos**: o `dynsym` do NSO (`dynsym`/`dynstr` no
+cabecalho) da 30 893 nomes. Com eles, o endereco de regresso resolve:
+
+    0x8390bd3c  nn::diag::detail::VAbortImpl(char const*, char const*, char
+                const*, int, nn::Result const*, nn::os::UserExceptionInfo
+                const*, nn::diag::detail::MetaLogContext const&, char
+                const*, __va_list)
+
+E a cadeia de chamadas, seguindo o `x29` da pilha do guest (o `boot_trace`
+agora despeja 0x2000 bytes da pilha no abort):
+
+    #0 x29=0x2f0bb3d70  x30=0x8390be08   (nn::diag::detail::AbortImpl)
+    #1 x29=0x2f0bb3e40  x30=0x8397f920   (nn::fs::OpenFile)
+    #2 x29=0x2f0bb3ea0  x30=0x805e605c   (o jogo)
+    #3 x29=0x2f0bb3ec0  x30=0x805e27f8   (o jogo)
+    ...
+    #7 x29=0x2f0bb3f80  x30=0x83ab6e88   (nn::os::detail::ThreadManager::
+                                          CreateThread)
+
+**O jogo aborta dentro de `nn::fs::OpenFile`** — o SDK aborta quando o
+`OpenFile` nao da o que se espera. O `Result` do abort e' `0x00177A02`
+(moduleo 2, desc 3005) — o mesmo de sempre, e desta vez **nao** por causa
+de um `Result` de erro do motor (zero SVC com erro, zero respostas IPC com
+erro).
+
+### A causa: o armazenamento de dados esta' vazio
+
+O `fsp-srv` da casa responde ao `OpenDataStorageByCurrentProcess` (comando
+200) com um `IStorage` **vazio**. Medido, com o `offset` e o `length` no
+log (`src/services/fsp_srv.cpp`):
+
+    IStorage::Read: offset=0x0 length=80  -> vazio (sem romfs)
+    IStorage::Read: offset=0x0 length=0   -> vazio (sem romfs)
+    (×4)
+
+**80 bytes = o tamanho do cabecalho do RomFS.** E' o `nn::fs` do SDK a
+pedir a imagem do RomFS do processo para a ler; as leituras seguintes vem
+com `length=0` porque o `GetSize` devolve 0. Sem RomFS, o SDK nao encontra
+o ficheiro e aborta.
+
+Ou seja: **a proxima parede nao e' o IPC nem a GPU — e' servir o RomFS do
+jogo.**
+
+### O RomFS: onde esta e quanto mede
+
+Medido (cifra do NCA resolvida em Python, ver abaixo):
+
+- o NSP (`Pokemon Shield [01008DB008C2C000][v0] (9.53 GB).nsp`) e' um
+  `PFS0` com 6 entradas; a primeira e' o NCA do jogo (9.53 GiB);
+- o **cabecalho do NCA esta' cifrado** com AES-XTS (*standard crypto*),
+  chave `header_key` (`header_key[0:16]` e `header_key[16:32]`), com o
+  *tweak* = o numero do sector (0x200) em big-endian nas posicoes 8..15;
+  decifrado, a magica e' `NCA3` e o `program_id` e'
+  `0x1008db008c2c000`;
+- a *key area* (0x100 bytes do cabecalho) decifra-se com AES-ECB, chave
+  `key_area_key_application_00`; a chave AES-CTR do sector e'
+  `7919170a032a1af39484db0e86864d3d`;
+- os quatro `NcaFsHeader` (0x400..0xC00 do ficheiro) dizem: `fs[1]` e' o
+  **RomFS** (`fs_type=0`), com `encryption_type=3` (AES-CTR);
+- o `fs[1]` ocupa os sectores `0xe0..0x1300a20`, ou seja os bytes
+  `0x1C000..0x260144000` do ficheiro: **10 201 759 744 bytes (9.5 GiB)**.
+
+**O RomFS e' maior do que o espaco livre do Pi** (11 GB), e o NSP esta' la.
+Logo o RomFS **nao pode ser extraido para um ficheiro**: tem de ser
+decifrado no sitio, a partir do NSP, a cada leitura.
+
+### O que a casa ja' tem para isso
+
+O build da casa ja' compila **a cripto do Eden**
+(`vendor/eden/src/core/crypto/aes_util.cpp`, `ctr_encryption_layer.cpp`,
+`xts_encryption_layer.cpp`, `key_manager.cpp`) e **todo o `file_sys`**
+(`vfs/`, `fssystem/fssystem_nca_*.cpp`, `fssystem_aes_ctr_storage.cpp`,
+`romfs.cpp`). Falta a ligacao: abrir o NSP, decifrar o RomFS e servir.
+
+**As chaves nao vao para o repositorio** (que e' publico): vao para o
+directorio de chaves do Eden no Pi, que e' de fora do repositorio.

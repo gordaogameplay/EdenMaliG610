@@ -546,6 +546,15 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
                         (unsigned long long)ctx.gpr[arg]);
         }
         std::printf("  pc=0x%llx\n", (unsigned long long)ctx.pc);
+        // **Todos os registos.** A cadeia de chamadas do abort passa pelo
+        // `x29` (o frame pointer); sem os registos todos, o `x22` — que no
+        // `nn::fs` e' o caminho do ficheiro — fica a ser uma adivinhaca.
+        std::printf("[brk] gpr:");
+        for (int arg = 0; arg <= 30; ++arg) {
+            std::printf(" x%d=0x%llx", arg,
+                        (unsigned long long)ctx.gpr[arg]);
+        }
+        std::printf("\n");
         for (int arg = 1; arg <= 6; ++arg) {
             const std::uint64_t p = ctx.gpr[arg];
             if (p == 0 || p >= 0x98000000ull)
@@ -565,6 +574,47 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
                 continue;
             std::printf("[ass] x%d = 0x%llx -> \"%s\"\n", arg,
                         (unsigned long long)p, buf);
+        }
+    }
+
+    // **A pilha inteira da thread que aborta.** O `[quem]` abaixo le 4
+    // palavras e salta as que nao sao enderecos de codigo — o que esconde
+    // a cadeia de chamadas. O abort do SDK (`nn::diag::detail::AbortImpl`)
+    // tem uma frame de 0x190 bytes, logo o chamador esta' muito acima do
+    // `sp`: sem a pilha toda nao se chega ao chamador.
+    if (number == 0x26 && sp != 0 && g_mem != nullptr) {
+        std::uint64_t palavras[128] = {0};
+        std::string e;
+        if (g_mem->read(sp, palavras, sizeof palavras, e)) {
+            std::printf("[pilha] sp=0x%llx\n", (unsigned long long)sp);
+            for (int k = 0; k < 128; ++k) {
+                const std::uint64_t v = palavras[k];
+                const char* marca = (v >= 0x80000000ull && v < 0x98000000ull) ? " <- codigo"
+                                                                           : "";
+                if (v == 0 && k > 8)
+                    continue;
+                std::printf("[pilha] +0x%03x = 0x%016llx%s\n", k * 8,
+                            (unsigned long long)v, marca);
+            }
+            // **A pilha toda, em binario.** A cadeia de chamadas passa por
+            // varias frames (o `AbortImpl` do SDK tem uma frame de 0x190
+            // bytes), e a cadeia so' se ve seguindo o `x29`. O ficheiro
+            // permite analyses locais sem voltar a correr o guest.
+            {
+                const std::uint64_t inicio = sp - 0x100;
+                std::vector<unsigned char> janela(0x2000);
+                if (g_mem->read(inicio, janela.data(), janela.size(), e)) {
+                    char caminho[64];
+                    std::snprintf(caminho, sizeof caminho, "/tmp/g610_pilha.bin");
+                    std::FILE* f = std::fopen(caminho, "wb");
+                    if (f != nullptr) {
+                        std::fwrite(janela.data(), 1, janela.size(), f);
+                        std::fclose(f);
+                        std::printf("[pilha] despejada: %s (base 0x%llx, %zu bytes)\n",
+                                    caminho, (unsigned long long)inicio, janela.size());
+                    }
+                }
+            }
         }
     }
 

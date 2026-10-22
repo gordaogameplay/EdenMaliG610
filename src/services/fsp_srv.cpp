@@ -356,14 +356,24 @@ public:
 private:
     // 0: ler do armazenamento. Sem romfs, zero bytes. O `Result` é
     // sucesso — o Eden também não falha aqui, devolve a leitura vazia.
+    //
+    // **O `offset` e o `length` que o guest pede são o instrumento.** São
+    // eles que dizem se o guest está a ler uma imagem de RomFS (cabeçalho
+    // em 0, depois as tabelas) ou outra coisa. Sem o log, "vazio" não diz
+    // nada.
     void Read(HLERequestContext& ctx) {
-        LOG_DEBUG(Service_FS, "IStorage::Read: vazio (sem romfs)");
+        RequestParser rp{ctx};
+        const auto offset = rp.PopRaw<std::int64_t>();
+        const auto length = rp.PopRaw<std::int64_t>();
+        LOG_DEBUG(Service_FS, "IStorage::Read: offset={:#X} length={} -> vazio (sem romfs)",
+                  static_cast<std::uint64_t>(offset), static_cast<std::int64_t>(length));
         ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
     // 4: o tamanho do armazenamento. Zero.
     void GetSize(HLERequestContext& ctx) {
+        LOG_DEBUG(Service_FS, "IStorage::GetSize: 0 (sem romfs)");
         ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
         rb.Push<std::uint64_t>(0);

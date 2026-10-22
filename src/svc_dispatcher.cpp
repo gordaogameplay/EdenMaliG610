@@ -251,9 +251,16 @@ void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
     // **Todos os SVCs, em ordem.** Sem isto, "o guest esta' em ciclo" nao
     // diz *onde*: com a lista, diz qual e' o ultimo SVC antes do ciclo —
     // e o nome do SVC que falta e' a pista.
+    //
+    // **O `sp` diz de que thread o SVC veio.** O `sp` do guest e' a pilha
+    // real da thread; as pilhas do guest sao disjuntas, logo o `sp`
+    // identifica a thread sem ambiguidade (agrupando por `sp >> 24`).
+    // Sem isto, "quem fez o que" era inferencia a partir das linhas do
+    // log — e a inferencia deu wrong answers.
     if (std::getenv("IA_SVC_TRACE") != nullptr) {
-        std::fprintf(stderr, "[svc] #0x%02x %s x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx\n",
+        std::fprintf(stderr, "[svc] #0x%02x %s sp=0x%llx x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx\n",
                      number, to_string(static_cast<Svc>(number)).c_str(),
+                     (unsigned long long)ctx.sp,
                      (unsigned long long)ctx.x[0], (unsigned long long)ctx.x[1],
                      (unsigned long long)ctx.x[2], (unsigned long long)ctx.x[3]);
     }
