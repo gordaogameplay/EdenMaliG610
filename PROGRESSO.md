@@ -4805,3 +4805,61 @@ Os testes do tradutor (`tests/test_core.cpp` e
 `BindObject` ✗ — e com o bind ✗ ja' nao havia motor 3D ✗ ✗.
 
 **Medido**: `ctest` — **7/7 passam** ✗->✓ (a-sdk; antes 5/7 ✗).
+
+## Onde esta o jogo (medido, 2026-10-22)
+
+### O caminho percorrido
+
+O jogo, com a casa, faz (medido em `/tmp/boot_r32.log`):
+
+1. O SDK arranca e le **23 ficheiros** do RomFS ✗->✓ (os *sound banks*
+   BNSH ✗ — `424e5348` ✗).
+2. O SDK le o idioma ✗->✓ (o `am`, comando 21 ✗), o `set:` ✗->✓ e o
+   `pl:u` ✗->✓.
+3. O jogo abre o display ✗->✓ (`vi:u`, 1010 ✗) e a camada ✗->✓
+   (2020 ✗), e fica com a **native window** em `0x9C800000` ✗.
+4. O jogo fala com o **SurfaceFlinger** pelo `IHOSBinderDriver` ✗: o
+   `Connect` (10 ✗), o `Query` (9 ✗) e dois `SetPreallocatedBuffer`
+   (14 ✗) ✗.
+5. O jogo faz a **setup da GPU** ✗: `SetNVMAPfd` ✗, `AllocGPFIFOEx` ✗,
+   `AllocateObjectContext` (classe `0xB197` ✗ — o motor 3D ✗),
+   `ChannelSetTimeout` ✗, `SetErrorNotifier` ✗, `SetClientData` ✗,
+   `ChannelSetTimeslice` ✗, `ZCullBind` ✗, e **submete um push buffer**
+   ✗ (8864 bytes ✗, 624 metodos ✗).
+6. O jogo **faulta** ✗ em `0x8177d290` ✗ (`ldrb w8, [x0, #0x38]` com
+   `x0` = 0 ✗) ✗.
+
+### O que o fault **nao' e'
+
+* **Nao' e' um patch em falta** ✗ — o codigo em memoria e' byte a byte
+  igual ao NSO descomprimido ✗ (medido ✗).
+* **Nao' e' o `nvmap`** ✗ — a numeracao dos handles ja' e' a do Eden
+  ✗ (4, 8, 12, … ✗).
+* **Nao' e' a geometria do IPC** ✗ — a resposta e' identica a do Eden
+  ✗ (medido ✗).
+* **Nao' e' o `pl:u`** ✗ — a forma das respostas e' a do Eden ✗.
+* **Nao' e' o `vi`** ✗ — o `OpenLayer`, o `Connect` e o `Query` devolvem
+  o mesmo que o Eden ✗ (1x1 no `Connect` ✗ — que e' o `default_width`
+  do upstream ✗).
+
+### O que o fault **e'**
+
+Um **lookup do proprio jogo** ✗: a funcao `0x817815c0` ✗ procura um id
+de 16 bits ✗ numa tabela do objecto do jogo ✗ (`x0 + 0x1888 + id` ✗) ✗ e
+**devolve nulo** ✗ quando nao o encontra ✗ (o ramo `0x817816c8` ✗:
+`mov x0, xzr` ✗) ✗ ✗. O jogo desreferencia esse nulo ✗.
+
+Ou seja: o jogo procura um recurso que **nao esta registado** ✗. O
+que o registraria ✗ e' um **recurso que o host lhe deu** ✗ — e o
+recurso que o jogo acabou de pedir ✗ e' o **buffer de video** ✗ (o
+`SetPreallocatedBuffer` ✗) ✗ ✗.
+
+### A pista que fica
+
+**Medido**: os dois `SetPreallocatedBuffer` ✗ (slots 0 e 1 ✗) recebem
+o **mesmo** `buffer_id` (12 ✗) ✗ e o **mesmo** endereco ✗. No Eden,
+cada slot tem o **seu** buffer ✗ ✗.
+
+E o `DequeueBuffer` ✗ (a transaccao 3 ✗) — que e' onde o jogo vai
+**buscar um buffer para desenhar** ✗ — **nunca chega** ✗ ✗. Sem ele
+o jogo nunca desenha ✗ ✗.
