@@ -5101,3 +5101,45 @@ proprio jogo** ✗ ✗ (magic `36f81a1e` ✗ — o BFTTF ✗) ✗ ✗.
 
 O erro que resta e' **novo** ✗: `SetTerminateResult modulo=64 desc=0`
 ✗ ✗ — nao e' o CMIF ✗ ✗.
+
+## A referencia: o Eden com o PanVK no Mali-G610 (medido, 2026-10-22)
+
+### O que se mediu
+
+O Eden esta' **compilado no Pi** (`~/eden/build/bin/eden-cli`) ✗ ✗ e
+corre o **mesmo jogo** ✗ ✗ — com o **PanVK** ✗ (o driver Vulkan do
+Mali-G610 ✗) ✗ ✗:
+
+    XDG_RUNTIME_DIR=/run/emuos WAYLAND_DISPLAY=wayland-1 \
+    VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/panfrost_icd.json \
+    ~/eden/build/bin/eden-cli -g "Pokemon Shield ...nsp"
+
+O `eden_log.txt` mostra o Eden a chegar aos **4.2 s** ✗ ✗ — a passar do
+`Report` do renderer ✗ ✗, a inicializar o audio ✗ (`GetOutputSinkDetails`
+✗) ✗ e a avançar ✗ ✗.
+
+**Medido** (`~/user/log/eden_log.txt` ✗):
+
+    Render.Vulkan <Info> renderer_vulkan.cpp:215:Report: Driver: panvk 25.2.8
+    Render.Vulkan <Info> renderer_vulkan.cpp:216:Report: Device: Mali-G610
+    Render.Vulkan <Info> renderer_vulkan.cpp:217:Report: Vulkan: 1.4.318
+    Render.Vulkan <Info> renderer_vulkan.cpp:218:Report: Available VRAM: 4.00 GiB
+    Service.Audio <Info> sink_details.cpp:127:GetOutputSinkDetails: Auto-selecting the sdl3 backend
+
+O Eden **segmenta** aos 4.2 s ✗ ✗ — num bug do **PanVK** ✗ (os
+formatos que o panvk nao tem ✗ — `GetSupportedFormat` ✗) ✗ ✗. Isso e'
+do **Eden** ✗ ✗, nao do jogo ✗ ✗.
+
+### O que isto muda
+
+**A casa precisa de chegar ao mesmo ponto** ✗ ✗ — e o caminho esta'
+claro ✗ ✗:
+
+1. O `pl:u` **com a fonte verdadeira** ✗ (ja' feito ✗ ✗).
+2. O `SetPreallocatedBuffer` ✗ e o `DequeueBuffer` ✗ (o render loop ✗).
+3. A **execucao** ✗ — o `renderer_vulkan` do upstream (vendorizado ✗)
+   a falar com o PanVK ✗ ✗, como o Eden ✗ ✗.
+
+**O `renderer_vulkan` do upstream e' a via** ✗ ✗ — o Eden usa-o ✗ ✗ e
+ele **ja' esta' vendorizado** ✗ (61 ficheiros ✗) ✗ ✗ — e o que falta e' a
+**ponte do `KernelCore`** ✗ ✗ que ele precisa ✗ ✗.
