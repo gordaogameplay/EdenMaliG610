@@ -153,6 +153,19 @@ struct KObject {
     std::uint64_t tamanho  = 0;
     std::uint64_t perm     = 0;
 
+    // Para uma `Thread`: o que o `StartThread` precisa para a lançar.
+    //
+    // O `CreateThread` do Horizon **não** põe a thread a correr; só a
+    // cria e devolve o handle (`svc_thread.cpp:26-83`). Quem a põe a
+    // correr é o `StartThread` (`:86-98`, `thread->Run()`). A casa guarda
+    // aqui os argumentos e lança a thread de host no `StartThread` — ver
+    // a medição em `src/svc_dispatcher.cpp`.
+    std::uint64_t thread_entry = 0;
+    std::uint64_t thread_arg   = 0;
+    std::uint64_t thread_stack = 0;
+    std::uint64_t thread_tls   = 0;
+    bool thread_started = false;
+
     // Contador de referências, no sentido mínimo: quantos handles apontam
     // para aqui. Não é a contagem do Eden (`KAutoObject::Open/Close` com
     // spinlock e dispatch), é o suficiente para não haver um dangling, e
@@ -222,6 +235,34 @@ public:
         if (m_linear[idx] != h.linear_id())
             return nullptr;      // geração velha: o handle já foi fechado
         return m_objs[idx];
+    }
+
+    // `Remove` do Eden (`k_handle_table.cpp:29-60`): valida forma, índice e
+    // geração; liberta a entrada e repõe o índice nos livres. Fecha também
+    // uma referência do objecto (o `obj->Close(kernel)` do Eden).
+    //
+    // Medição anterior: sem isto nenhum `CloseHandle` do guest fazia
+    // coisa nenhuma — o mapa que o fecho consultava nunca era preenchido, e
+    // as sessões dos serviços (`GetService` seguido de
+    // `KClientPort::CreateSession`) acumulavam até a porta devolver
+    // `ResultOutOfSessions` (0x0CE01) e o jogo abortar.
+    //
+    // Nota deliberada: NÃO destrói o `KObject` quando as referências chegam
+    // a zero. Portas do caminho antigo sem Eden são partilhadas pelos
+    // registos de nomes, e destruir aqui criava pointers pendurados. Durante
+    // a montagem aceita-se esse pequeno vazamento por fecho.
+    bool remover(Handle h) {
+        if (!h.shape_valido())
+            return false;
+        const std::size_t idx = h.index();
+        if (idx >= m_capacidade || m_objs[idx] == nullptr ||
+            m_linear[idx] != h.linear_id())
+            return false;
+        if (m_objs[idx]->refs > 0)
+            --m_objs[idx]->refs;
+        m_objs[idx] = nullptr;
+        m_livres.push_back(static_cast<std::uint16_t>(idx));
+        return true;
     }
 
     // ── contabilidade ────────────────────────────────────────────────────

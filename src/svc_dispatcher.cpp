@@ -5,6 +5,11 @@
 
 #include "g610/eden_bridge.hpp"
 #include "g610/native_engine.hpp"
+#include "g610/services/shared_font.hpp"
+
+#include "vendor/eden/core/hle/kernel/k_handle_table.h"
+#include "vendor/eden/core/hle/kernel/k_process_bridge.h"
+#include "vendor/eden/core/hle/kernel/k_readable_event.h"
 
 #include <chrono>
 #include <cstdio>
@@ -23,37 +28,37 @@
 
 namespace g610 {
 
-// A pagina do watchpoint ✗ — o motor usa-a para distinguir "o guest
-// escreveu aqui" ✗ de "o guest leu fora do mapa" ✗ ✗.
+// A pagina do watchpoint — o motor usa-a para distinguir "o guest
+// escreveu aqui" de "o guest leu fora do mapa".
 volatile std::uint64_t g_watch_pagina = 0;
 
-// **O watchpoint ainda nao foi armado** ✗ ✗ — porque o rtld ✗ ✗
-// escreve na pagina ✗ ✗ (as relocacoes ✗) ✗ ✗.
+// **O watchpoint ainda nao foi armado** — porque o rtld
+// escreve na pagina (as relocacoes).
 volatile bool g_esperar_pelo_rtld = false;
 
-// O endereco a vigiar ✗ ✗.
+// O endereco a vigiar.
 std::uint64_t g_endereco_do_watchpoint = 0;
 
-// **Ler o global do jogo** ✗ ✗ — o handler de sinais e' estatico ✗ ✗
-// e nao alcanca o dispatcher ✗ ✗.
+// **Ler o global do jogo** — o handler de sinais e' estatico
+// e nao alcanca o dispatcher.
 bool LerGlobalDoJogo(std::uint64_t* valor) {
     if (g_endereco_do_watchpoint == 0)
         return false;
-    // A memoria do guest e' do proprio processo ✗ ✗ (o `mmap` com
-    // `MAP_FIXED_NOREPLACE` ✗) ✗ — e o handler e' estatico ✗ ✗.
+    // A memoria do guest e' do proprio processo (o `mmap` com
+    // `MAP_FIXED_NOREPLACE`) — e o handler e' estatico.
     std::memcpy(valor, reinterpret_cast<const void*>(g_endereco_do_watchpoint),
                 sizeof(std::uint64_t));
     return true;
 }
 
-// **Repor a pagina do watchpoint** ✗ — o handler de sinais e' estatico
-// ✗ ✗, e por isso nao alcanca o dispatcher ✗ ✗. O `mprotect` e' feito
-// aqui mesmo ✗ — a pagina e' do guest e o motor sabe onde ela esta' ✗.
+// **Repor a pagina do watchpoint** — o handler de sinais e' estatico
+//, e por isso nao alcanca o dispatcher. O `mprotect` e' feito
+// aqui mesmo — a pagina e' do guest e o motor sabe onde ela esta'.
 
-// **Voltar a armar depois da escrita** ✗ — o `mprotect` para so' leitura ✗
-// trava a escrita ✗ ✗; o guest repete a instrucao ✗ ✗ e a pagina tem de
-// ficar gravavel ✗ ✗. Re-armar no proximo trap ✗ ✗ e' o que apanha a
-// escrita **seguinte** ✗ ✗.
+// **Voltar a armar depois da escrita** — o `mprotect` para so' leitura
+// trava a escrita; o guest repete a instrucao e a pagina tem de
+// ficar gravavel. Re-armar no proximo trap e' o que apanha a
+// escrita **seguinte**.
 volatile bool g_rearmar_watchpoint = false;
 void ReporWatchpoint() {
     if (g_watch_pagina == 0)
@@ -62,15 +67,15 @@ void ReporWatchpoint() {
                PROT_READ | PROT_WRITE);
 }
 
-// **Voltar a armar** ✗ — a pagina fica em so' leitura ✗ ✗, para a
-// escrita seguinte ser apanhada ✗ ✗.
+// **Voltar a armar** — a pagina fica em so' leitura, para a
+// escrita seguinte ser apanhada.
 void ReArmarWatchpoint() {
     if (g_watch_pagina == 0)
         return;
     ::mprotect(reinterpret_cast<void*>(g_watch_pagina), 0x1000, PROT_READ);
 }
 
-// **Armar no proximo trap** ✗ — e' aqui que a escrita ja' passou ✗ ✗.
+// **Armar no proximo trap** — e' aqui que a escrita ja' passou.
 void ArmarWatchpointNoProximoTrap() {
     if (g_watch_pagina != 0)
         g_rearmar_watchpoint = true;
@@ -101,12 +106,12 @@ bool SvcDispatcher::read_guest(std::uint64_t addr, void* dst, std::size_t size) 
     return false;
 }
 
-// **O watchpoint** ✗ — ver a nota em `svc_dispatcher.hpp` ✗ ✗.
+// **O watchpoint** — ver a nota em `svc_dispatcher.hpp`.
 //
-// A pagina fica em so' leitura ✗ ✗; a escrita do guest nela levanta um
-// SIGSEGV ✗ ✗, que o motor reconhece (o endereco esta' dentro do espaco
-// do guest ✗) ✗ e reporta ✗ ✗.
-// **Armar o watchpoint depois do rtld** ✗ ✗.
+// A pagina fica em so' leitura; a escrita do guest nela levanta um
+// SIGSEGV, que o motor reconhece (o endereco esta' dentro do espaco
+// do guest) e reporta.
+// **Armar o watchpoint depois do rtld**.
 void SvcDispatcher::ArmarWatchpointSePedir(std::uint64_t endereco, std::uint64_t tamanho) {
     g_endereco_do_watchpoint = endereco;
     g_esperar_pelo_rtld = true;
@@ -115,7 +120,7 @@ void SvcDispatcher::ArmarWatchpointSePedir(std::uint64_t endereco, std::uint64_t
 void SvcDispatcher::ArmarWatchpoint(std::uint64_t endereco, std::uint64_t tamanho) {
     if (mem_ == nullptr || tamanho == 0)
         return;
-    // A pagina que contem o endereco ✗.
+    // A pagina que contem o endereco.
     const std::uint64_t pagina = endereco & ~static_cast<std::uint64_t>(0xFFF);
     std::string erro;
     if (!mem_->protect(pagina, 0x1000, Prot::Read, erro)) {
@@ -311,12 +316,60 @@ std::uint32_t SvcDispatcher::connect_named_port(const std::string& name) {
     return h.raw;
 }
 
-void SvcDispatcher::close_handle(std::uint32_t handle) {
-    auto it = name_by_handle_.find(handle);
-    if (it == name_by_handle_.end())
+void SvcDispatcher::close_handle(std::uint32_t raw_handle) {
+    // `svc_close_handle` — é o `CloseHandle` do Eden
+    // (`svc_synchronization.cpp:19-28`): `Remove` na mesa do processo e
+    // falha com `ResultInvalidHandle` quando o handle não existe.
+    //
+    // **A medição que mandou escrever isto** (`/tmp/boot_long.log`): o
+    // guest abriu o `pl:u` e nunca conseguiu fechar nada — o fecho antigo
+    // consultava um mapa que ninguém preenche, e as sessões de
+    // `KClientPort::CreateSession` aglomeraram-se até à porta esgotar e
+    // devolver `ResultOutOfSessions` (0x0CE01), com o jogo a abortar no
+    // `SetTerminateResult` (modulo 1, desc 103). O fecho em duas tabelas
+    // (a da casa para as suas threads/memórias, a do Eden para as sessões
+    // de serviço) é o que mantém as portas com sessões livres.
+
+    // Handles com forma inválida (0, pseudo-handles) não têm entrada em
+    // nenhuma das duas mesas — o `Remove` do Eden também os rejeita
+    // (`k_handle_table.cpp:31`).
+    const Handle h{raw_handle};
+    if (!h.shape_valido())
         return;
-    port_by_name_.erase(it->second);
-    name_by_handle_.erase(it);
+
+    // 1. A mesa da casa. Threads do `CreateThread` e memórias de
+    //    transferência vivem aqui; livrar a entrada e largar a referência
+    //    é o paralelo do `FreeEntry` + `obj->Close()` do Eden.
+    if (handles_.remover(h)) {
+        if (std::getenv("IA_IPC_TRACE") != nullptr) {
+            std::fprintf(stderr, "[svc] CloseHandle 0x%x: remover da mesa casa\n",
+                         raw_handle);
+        }
+        return;
+    }
+
+    // 2. A mesa do Eden. As sessões de serviço (o `GetService` do `sm:`),
+    //    os eventos e as memórias partilhadas dos serviços — tudo o que
+    //    dois `svc_*` handlers entregaram ao guest por handle. `Remove`
+    //    fecha o objecto e, quando a última referência da sessão se vai,
+    //    `KClientPort::OnSessionFinalized` decrementa `m_num_sessions` —
+    //    a porta volta a aceitar.
+    if (eden_ != nullptr) {
+        auto& kernel = eden_->Kernel();
+        if (Kernel::GetCurrentProcess(kernel).GetHandleTable()
+                .Remove(kernel, Kernel::Handle{raw_handle})) {
+            if (std::getenv("IA_IPC_TRACE") != nullptr) {
+                std::fprintf(stderr,
+                             "[svc] CloseHandle 0x%x: remover da mesa Eden\n",
+                             raw_handle);
+            }
+            return;
+        }
+        // O handle pode existir nas DUAS mesas (valores independentes).
+        // Casa primeiro, Eden depois — e se nenhum o conhece, é um fecho
+        // de handle inexistente: o Eden devia devolver erro, mas os
+        // SDKs chamam sem verificar e o wrapper não escreve x0; ignorar.
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -324,24 +377,24 @@ void SvcDispatcher::close_handle(std::uint32_t handle) {
 // ---------------------------------------------------------------------------
 
 void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
-    // **O watchpoint** ✗ — armado no **primeiro SVC** ✗ ✗, que e'
-    // depois do rtld ✗ ✗ (o rtld nao faz SVC ✗ ✗) ✗ ✗.
+    // **O watchpoint** — armado no **primeiro SVC**, que e'
+    // depois do rtld (o rtld nao faz SVC).
     if (g_esperar_pelo_rtld) {
-        // **O rtld ja' passou?** ✗ — o rtld vive em `0x8446xxxx` ✗ ✗ e
-        // o jogo em `0x80xxxxxx` ✗ ✗. armar antes disso ✗ ✗ apanhava as
-        // **relocacoes** ✗ (que escrevem na mesma pagina ✗ ✗) ✗ ✗ — e a
-        // pagina em so' leitura ✗ travaria o jogo ✗ ✗.
+        // **O rtld ja' passou?** — o rtld vive em `0x8446xxxx` e
+        // o jogo em `0x80xxxxxx`. armar antes disso apanhava as
+        // **relocacoes** (que escrevem na mesma pagina) — e a
+        // pagina em so' leitura travaria o jogo.
         //
-        // Medido ✗ ✗: sem este cuidado ✗, as relocacoes do rtld ✗
-        // (`str x11, [x12, x8]` ✗, em `0x84461980` ✗) levantavam
-        // `SIGSEGV` ✗ ✗ em loop ✗ ✗.
-        // **Arma ja'** ✗ — o valor estragado aparece **durante o rtld**
-        // ✗ ✗ (medido ✗ ✗: no momento em que o watchpoint arma ✗, o
-        // global ja' valia `0xcb9000000000808e` ✗ ✗) ✗ ✗.
+        // Medido: sem este cuidado, as relocacoes do rtld
+        // (`str x11, [x12, x8]`, em `0x84461980`) levantavam
+        // `SIGSEGV` em loop.
+        // **Arma ja'** — o valor estragado aparece **durante o rtld**
+        // (medido: no momento em que o watchpoint arma, o
+        // global ja' valia `0xcb9000000000808e`).
         //
-        // A pagina volta a ser gravavel no handler ✗ ✗ (o `ReporWatchpoint`
-        // ✗), por isso o rtld consegue escrever ✗ ✗ — e a escrita e'
-        // apanhada ✗ ✗.
+        // A pagina volta a ser gravavel no handler (o `ReporWatchpoint`
+        //), por isso o rtld consegue escrever — e a escrita e'
+        // apanhada.
         g_esperar_pelo_rtld = false;
         ArmarWatchpoint(g_endereco_do_watchpoint, 8);
     }
@@ -416,7 +469,7 @@ void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
                      static_cast<unsigned>(r), static_cast<unsigned>(r));
     }
 
-    // **O x0 que o guest recebe** ✗ — o SDK le-o ✗ ✗.
+    // **O x0 que o guest recebe** — o SDK le-o.
 
     // **Um SVC que devolve erro mata o jogo.** O SDK trata um Result
     // inesperado como fatal: chama `SetTerminateResult` ao `am` e aborta.
@@ -1030,6 +1083,35 @@ Result SvcDispatcher::svc_map_shared_memory(SvcContext& ctx) {
     if (!mem_->owns(addr) || !mem_->owns(addr + size - 1))
         return Result::InvalidCurrentMemory;
 
+    // **A fonte do sistema**: o handle do `pl:u` e' o `KEvent` que o
+    // `GetSharedMemoryNativeHandle` devolveu. O guest mapeia-o e le o TTF em
+    // `regiao.offset` — por isso o blob tem de estar **na memoria do guest**
+    // antes da leitura, nao num no-op.
+    //
+    // **Medido** (`/tmp/boot_watch.log`): o `GetSize` devolvia 0 a todos os
+    // tipos e o jogo morria no glifo `?` da fonte de indice 2. Com as 7
+    // regioes e esta copia, o guest tem o TTF onde o procura.
+    if (eden_attached()) {
+        auto& kernel = eden_->Kernel();
+        Kernel::KScopedAutoObject<Kernel::KReadableEvent> evento =
+            Kernel::GetCurrentProcess(kernel).GetHandleTable()
+                .GetObject<Kernel::KReadableEvent>(
+                    kernel, Kernel::Handle{static_cast<std::uint32_t>(ctx.x[0])});
+        if (evento.IsNotNull() && services::EventoDaFonte(evento->GetParent())) {
+            const auto& dados = services::DadosDaFontePartilhados();
+            const std::size_t copiar = std::min<std::size_t>(
+                dados.size(), static_cast<std::size_t>(size));
+            std::memcpy(reinterpret_cast<void*>(addr), dados.data(), copiar);
+            if (std::getenv("IA_IPC_TRACE") != nullptr) {
+                std::fprintf(stderr,
+                             "[svc] MapSharedMemory: fonte do sistema, %zu bytes "
+                             "copiados para 0x%llx (pedido=0x%llx)\n",
+                             copiar, static_cast<unsigned long long>(addr),
+                             static_cast<unsigned long long>(size));
+            }
+        }
+    }
+
     ++map_memory_calls_;
     return Result::Success;
 }
@@ -1088,8 +1170,8 @@ Result SvcDispatcher::svc_query_memory(SvcContext& ctx) {
     info.size         = 0;
     info.state        = 0;   // Free
 
-    // **O que a casa responde** ✗ — o rtld percorre o espaco do processo
-    // a perguntar ✗ ✗, e o que ele aceita como modulo e' o que decide ✗ ✗.
+    // **O que a casa responde** — o rtld percorre o espaco do processo
+    // a perguntar, e o que ele aceita como modulo e' o que decide.
     if (std::getenv("IA_IPC_TRACE") != nullptr) {
         std::fprintf(stderr, "[qm] query=0x%llx regioes=%zu\n",
                      (unsigned long long)query, regions_.size());
@@ -1380,9 +1462,9 @@ Result SvcDispatcher::svc_get_info(SvcContext& ctx) {
     // O valor vai em x1. `ctx.ret` fica para o Result, que o motor escreve
     // em x0 — são coisas diferentes, e é por aqui que esta SVC custa mais
     // uma vez às outras: o mesmo erro que o `x0` nunca receber o Result.
-    // **O dump** ✗ — os valores que a casa da ao guest ✗ ✗. O
-    // `AslrRegion` (caso 12 ✗) e' o que o SDK usa ✗ ✗ — e se for errado
-    // ✗, o SDK guarda-o num global ✗ ✗ e o jogo desreferencia-o ✗ ✗ ✗.
+    // **O dump** — os valores que a casa da ao guest. O
+    // `AslrRegion` (caso 12) e' o que o SDK usa — e se for errado
+    // o SDK guarda-o num global e o jogo desreferencia-o.
     if (std::getenv("IA_WATCH") != nullptr) {
         std::fprintf(stderr, "[info] tipo=%u -> 0x%llx\n", type,
                      (unsigned long long)value);
@@ -1604,14 +1686,17 @@ Result SvcDispatcher::svc_create_thread(SvcContext& ctx) {
     ctx.ret      = 0;
     ctx.has_ret  = true;
 
-    // **A thread corre.** O codigo do guest e' nativo, logo uma thread de
-    // guest e' uma thread do host a correr o entry point, com o `sp` que o
-    // guest deu (o Eden chama-lhe `user_stack_top`, `k_thread.h:737`) e com
-    // o `TPIDR_EL0` apontado para o TLS *dela*.
+    // O `CreateThread` do Horizon **nao** poe a thread a correr: so' a cria
+    // e devolve o handle (`svc_thread.cpp:26-83`). Quem a poe a correr e' o
+    // `StartThread` (`:86-98`, `thread->Run()`). Medido (`/tmp/boot_csrng.log`):
+    // o guest cria uma thread, esta' a correr o entry point do SDK antes do
+    // `StartThread`, e o `Run` dela espera num `ConditionVariable` que o
+    // `StartThread` devia acordar; o `StartThread` era um stub, logo a
+    // thread ficava presa e a principal tambem. Aqui so' se prepara o TLS;
+    // o lancamento fica no `svc_start_thread`.
     //
     // O TLS e' uma copia do da thread principal, com o handle novo em
-    // TLS+0x110 — que e' exactamente o que o Eden escreve
-    // (`Write32(tls + 0x110, *out_handle)`, `svc_thread.cpp:79`).
+    // TLS+0x110 — o SDK le-o de la' para saber qual e' a thread corrente.
     if (mem_ != nullptr && tls_base_ != 0) {
         const std::uint64_t tls = tls_base_ + 0x1000ull * (++tls_threads_);
         std::vector<std::uint8_t> bloco(0x1000, 0);
@@ -1621,9 +1706,10 @@ Result SvcDispatcher::svc_create_thread(SvcContext& ctx) {
             if (!write_guest(tls, bloco.data(), bloco.size())) {
                 last_ipc_ = "CreateThread: nao escrevi o TLS da thread";
             } else {
-                std::thread([entry, arg, stack_bottom, tls]() {
-                    NativeEngine::run_guest_thread(entry, arg, stack_bottom, tls);
-                }).detach();
+                to->thread_entry = entry;
+                to->thread_arg   = arg;
+                to->thread_stack = stack_bottom;
+                to->thread_tls   = tls;
             }
         }
     }
@@ -1631,7 +1717,7 @@ Result SvcDispatcher::svc_create_thread(SvcContext& ctx) {
     if (std::getenv("IA_IPC_TRACE") != nullptr) {
         std::fprintf(stderr,
                      "[svc] CreateThread handle=0x%x entry=0x%llx arg=0x%llx "
-                     "stack=0x%llx prio=%d core=%d  (STUB: a thread nao corre)\n",
+                     "stack=0x%llx prio=%d core=%d  (criada; o StartThread lanca)\n",
                      static_cast<unsigned>(h.raw), (unsigned long long)entry,
                      (unsigned long long)arg, (unsigned long long)stack_bottom,
                      priority, core_id);
@@ -1644,20 +1730,48 @@ Result SvcDispatcher::svc_create_thread(SvcContext& ctx) {
 //     x0 = handle da thread
 //     x0 = Result
 //
-// **STUB**, pela mesma razao do `CreateThread`: a thread existe na nossa
-// tabela de handles, mas **nao corre** — este motor corre o guest
-// nativamente, numa thread do host. Devolver `Success` e' o que o guest
-// precisa para nao morrer: um erro aqui e' fatal para o SDK (medido: o
-// `svc #183` foi o `0x09` a devolver `Unsupported` (0x40), e o SDK foi
-// logo a `SetTerminateResult` e ao `Break`).
+// E' AQUI que a thread comeca a correr. O `CreateThread` do Horizon so'
+// cria o objecto e devolve o handle (`svc_thread.cpp:26-83`); o
+// `StartThread` e' que chama `thread->Run()` (`:86-98`). A casa faz o
+// mesmo: os argumentos ficaram guardados no `KObject` e a thread de host
+// nasce agora. Lancar no `CreateThread` (o que a casa fazia) punha o
+// entry point do SDK a correr antes do `Run` do proprio SDK, e o
+// `ConditionVariable` do arranque da thread ficava sem quem o acordasse.
 Result SvcDispatcher::svc_start_thread(SvcContext& ctx) {
     const std::uint64_t handle = ctx.x[0];
     const Handle h{static_cast<std::uint32_t>(handle)};
     const std::uint32_t principal = main_thread_handle();
     const bool pseudo = (handle == kCurrentThreadHandle);
-    const bool nossa = handles_.obter(h) != nullptr;
+    KObject* object = handles_.obter(h);
+    const bool nossa = object != nullptr;
     if (eden_attached() && principal != 0 && handle != principal && !pseudo && !nossa)
         return Result::InvalidHandle;
+
+    if (object != nullptr && object->kind == KObject::Kind::Thread &&
+        !object->thread_started) {
+        if (object->thread_tls != 0) {
+            object->thread_started = true;
+            const std::uint64_t entry = object->thread_entry;
+            const std::uint64_t arg   = object->thread_arg;
+            const std::uint64_t stack = object->thread_stack;
+            const std::uint64_t tls   = object->thread_tls;
+            std::thread([entry, arg, stack, tls]() {
+                NativeEngine::run_guest_thread(entry, arg, stack, tls);
+            }).detach();
+            if (std::getenv("IA_IPC_TRACE") != nullptr) {
+                std::fprintf(stderr,
+                             "[svc] StartThread handle=0x%x entry=0x%llx arg=0x%llx "
+                             "stack=0x%llx tls=0x%llx  (a thread corre)\n",
+                             static_cast<unsigned>(h.raw),
+                             (unsigned long long)entry, (unsigned long long)arg,
+                             (unsigned long long)stack, (unsigned long long)tls);
+            }
+        } else if (std::getenv("IA_IPC_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[svc] StartThread handle=0x%x sem TLS — a thread nao corre\n",
+                         static_cast<unsigned>(h.raw));
+        }
+    }
 
     ctx.ret      = 0;
     ctx.has_ret  = true;
@@ -2268,32 +2382,32 @@ Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
                 ++acordados;
                 wakers.push_back(w.token);
             } else {
-                // ── Existe dono ✗ — o upstream NAO acorda ✗ ───────────────
+                // ── Existe dono — o upstream NAO acorda ───────────────
                 //
-                // O upstream (`k_condition_variable.cpp:222-236` ✗) e'
-                // o `SignalImpl` ✗: com o mutex ocupado ✗, o `prev_tag`
-                // nao e' `InvalidHandle` ✗ — e o `EndWait` **nao** e'
-                // chamado ✗ ✗. O waiter fica a espera ✗ e passa a fila
-                // do **dono** ✗ (`owner_thread->AddWaiter(thread)` ✗) ✗.
+                // O upstream (`k_condition_variable.cpp:222-236`) e'
+                // o `SignalImpl`: com o mutex ocupado, o `prev_tag`
+                // nao e' `InvalidHandle` — e o `EndWait` **nao** e'
+                // chamado. O waiter fica a espera e passa a fila
+                // do **dono** (`owner_thread->AddWaiter(thread)`).
                 //
-                // **O `ArbitrateUnlock`** ✗ — o `SignalToAddress`
-                // (`k_condition_variable.cpp:113-151` ✗) — e' o que passa
-                // o mutex ao proximo ✗ e o **acorda** ✗ ✗.
+                // **O `ArbitrateUnlock`** — o `SignalToAddress`
+                // (`k_condition_variable.cpp:113-151`) — e' o que passa
+                // o mutex ao proximo e o **acorda**.
                 //
-                // **A casa acordava na mesma** ✗ ✗ e **dava-lhe o
-                // mutex** ✗ ✗ — o que **roubava o mutex ao dono** ✗ ✗.
-                // O log mostra ✗: `[arb] signal cv=0x10a2c7844 mutex=0x10a2c7838
+                // **A casa acordava na mesma** e **dava-lhe o
+                // mutex** — o que **roubava o mutex ao dono**.
+                // O log mostra: `[arb] signal cv=0x10a2c7844 mutex=0x10a2c7838
                 // palavra=0x81ff tag=0x20003 -> mexe para a fila do mutex`
-                // ✗ ✗ — o mutex estava ocupado ✗ (`0x81ff` ✗) ✗ e o
-                // waiter foi **acordado na mesma** ✗.
+                // — o mutex estava ocupado (`0x81ff`) e o
+                // waiter foi **acordado na mesma**.
                 //
-                // A consequencia ✗: o dono do mutex ✗ (a thread de render
-                // ✗) perde-o ✗ ✗ — e a cadeia de cv's do jogo ✗ nunca
-                // mais avanca ✗ ✗. O jogo trava ✗ ✗ e o watchdog aborta
-                // ✗ (`SetTerminateResult modulo=2 desc=3005` ✗) ✗ ✗.
+                // A consequencia: o dono do mutex (a thread de render)
+                // perde-o — e a cadeia de cv's do jogo nunca
+                // mais avanca. O jogo trava e o watchdog aborta
+                // (`SetTerminateResult modulo=2 desc=3005`).
                 //
-                // **O que se escreve** ✗ — o upstream ✗
-                // (`k_condition_variable.cpp:217-220` ✗) ✗:
+                // **O que se escreve** — o upstream
+                // (`k_condition_variable.cpp:217-220`):
                 //
                 //     if (prev_tag == Svc::InvalidHandle) {
                 //         thread->EndWait(ResultSuccess);   // <- so' aqui
@@ -2301,21 +2415,21 @@ Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
                 //         owner_thread->AddWaiter(thread);   // <- espera
                 //     }
                 //
-                // A palavra do mutex fica ✗ — o upstream ✗
-                // (`UpdateLockAtomic` ✗) ✗ faz `value = expected |
-                // HandleWaitMask` ✗ — ou seja ✗, o valor antigo **com o
-                // bit de "ha waiters"** ✗ ✗.
+                // A palavra do mutex fica — o upstream
+                // (`UpdateLockAtomic`) faz `value = expected |
+                // HandleWaitMask` — ou seja, o valor antigo **com o
+                // bit de "ha waiters"**.
                 const std::uint32_t novo = prev | kArbWaitMask;
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 if (write_guest(w.addr, &novo, sizeof novo)) {
-                    // **O waiter NAO acorda** ✗ ✗ — vai para a fila do
-                    // mutex ✗, e so' o `ArbitrateUnlock` do dono o acorda
-                    // ✗ ✗ (o upstream ✗).
+                    // **O waiter NAO acorda** — vai para a fila do
+                    // mutex, e so' o `ArbitrateUnlock` do dono o acorda
+                    // (o upstream).
                     g_arbiter.fila[w.addr].push_back({w.tag, w.token});
                 } else {
-                    // Sem acesso a memoria ✗ — o upstream ✗
-                    // (`k_condition_variable.cpp:243` ✗) ✗:
-                    // `thread->EndWait(ResultInvalidCurrentMemory)` ✗.
+                    // Sem acesso a memoria — o upstream
+                    // (`k_condition_variable.cpp:243`):
+                    // `thread->EndWait(ResultInvalidCurrentMemory)`.
                     g_arbiter.desperta[w.token] =
                         ArbitrationBoard::DespertaInvalido;
                     ++acordados;
@@ -2392,27 +2506,27 @@ Result SvcDispatcher::svc_unsupported(SvcContext&) {
 // e o `SignalProcessWideKey` do próprio jogo não ajuda, porque o que o
 // jogo está a esperar é o driver.
 //
-// **O mecanismo actual** ✗: o `KEvent` do evento NV ✗ — o mesmo
-// objecto que o upstream sinaliza ✗ (`nvhost_ctrl.cpp` ✗,
-// `event.kevent->Signal()` ✗) ✗. O `WaitSynchronization` do guest
-// consulta-o e prossegue ✗ ✗.
+// **O mecanismo actual**: o `KEvent` do evento NV — o mesmo
+// objecto que o upstream sinaliza (`nvhost_ctrl.cpp`,
+// `event.kevent->Signal()`). O `WaitSynchronization` do guest
+// consulta-o e prossegue.
 //
-// A flag `g_gpu_trabalho_pronto` que existia aqui ✗ era **estado
-// morto** ✗: era escrita ✗ e nunca lida ✗ ✗. O sinal agora vem do
-// syncpoint ✗ (`g610/gpu/syncpoint.hpp` ✗) ✗ — que dispara a accao
-// registada pelo `EventWait` ✗ ✗.
+// A flag `g_gpu_trabalho_pronto` que existia aqui era **estado
+// morto**: era escrita e nunca lida. O sinal agora vem do
+// syncpoint (`g610/gpu/syncpoint.hpp`) — que dispara a accao
+// registada pelo `EventWait`.
 //
 // O mecanismo é o do Eden (`SignalImpl`,
 // `k_condition_variable.cpp:209-220`): a palavra do mutex passa a zero
 // (liberta) e o *waiter* acorda **já dono** — por isso é preciso
 // escrever na memória do guest, e não só tocar no token.
 void g610::SvcDispatcher::RegistarTrabalhoGpu() {
-    // **Sem sinal proprio** ✗ — o sinal e' o do `KEvent` ✗ ✗.
+    // **Sem sinal proprio** — o sinal e' o do `KEvent`.
     //
-    // Esta funcao fica porque o `nvdrv` a chama no `FenceAction` ✗ (o
-    // metodo de canal que incrementa a fence ✗) ✗. Mas ja' nao ha flag
-    // para ler ✗ ✗: o `KEvent` ja' foi sinalizado ✗ ✗, e o
-    // `WaitSynchronization` do guest ve-o ✗ ✗.
+    // Esta funcao fica porque o `nvdrv` a chama no `FenceAction` (o
+    // metodo de canal que incrementa a fence). Mas ja' nao ha flag
+    // para ler: o `KEvent` ja' foi sinalizado, e o
+    // `WaitSynchronization` do guest ve-o.
 }
 
 void g610::SvcDispatcher::AcordarFutexNoEndereco(std::uint64_t endereco) {
@@ -2426,7 +2540,7 @@ void g610::SvcDispatcher::AcordarFutexNoEndereco(std::uint64_t endereco) {
     cv->second.erase(cv->second.begin());
     if (cv->second.empty())
         g_arbiter.cv_fila.erase(cv);
-    // A palavra do mutex passa a zero (liberta) e o waiter acorda
+                // A palavra do mutex passa a zero (liberta) e o waiter acorda
     // **dono** — o Eden, `SignalImpl` (`k_condition_variable.cpp:209-220`).
     const std::uint32_t zero = 0;
     (void)g_dispatcher_atual->write_guest(w.addr, &zero, sizeof zero);

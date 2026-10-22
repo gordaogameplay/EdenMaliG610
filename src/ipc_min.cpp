@@ -645,9 +645,9 @@ Result SvcDispatcher::svc_send_sync_request(SvcContext& ctx) {
     if (eden_) {
         const std::uint32_t handle = static_cast<std::uint32_t>(ctx.x[0]);
         ++sync_request_calls_;
-        // O endereco do buffer do pedido ✗ — e' o x1 ✗ (ver
-        // `eden_bridge.cpp` ✗: sem isto ✗, o upstream ia ler o pedido do
-        // TLS ✗ e encontrava a resposta anterior ✗).
+        // O endereco do buffer do pedido — e' o x1 (ver
+        // `eden_bridge.cpp`: sem isto, o upstream ia ler o pedido do
+        // TLS e encontrava a resposta anterior).
         if (eden_send_sync_request(eden_->Kernel(), handle, ctx.x[1])) {
             ctx.ret     = 0;
             ctx.has_ret = true;
@@ -922,8 +922,10 @@ void SvcDispatcher::write_empty_reply(std::uint64_t buffer, std::size_t size,
 
 std::string SvcDispatcher::service_name_for_handle(std::uint32_t handle) const {
     // Primeiro a tabela de objectos, que é a fonte de verdade: tem geração e
-    // valida. O mapa antigo fica como recurso, porque `sm: GetService` também
-    // fabrica handles e nesse caminho ainda não há sessão.
+    // valida. O mapa antigo (`name_by_handle_`) morreu — nunca foi preenchido
+    // (verificação do código), o que fez o `CloseHandle` da casa ser um
+    // no-op e as sessões de serviço acumularem até `ResultOutOfSessions`.
+    // Na via com Eden, o nome do serviço vem da sessão e da porta-mãe.
     if (const KObject* o = object_for_handle(handle)) {
         if (o->kind == KObject::Kind::Session && o->parent.raw != 0) {
             if (const KObject* p = object_for_handle(o->parent.raw))
@@ -931,8 +933,7 @@ std::string SvcDispatcher::service_name_for_handle(std::uint32_t handle) const {
         }
         return o->name;
     }
-    auto it = name_by_handle_.find(handle);
-    return it == name_by_handle_.end() ? std::string() : it->second;
+    return std::string();
 }
 
 KObject* SvcDispatcher::object_for_handle(std::uint32_t handle) const {

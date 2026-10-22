@@ -588,17 +588,17 @@ public:
         query_memory_calls_ = 0;
     }
 
-    // **Um watchpoint** ✗ — pôr uma página do guest em so' leitura ✗,
-    // para que a escrita do guest nela levante um SIGSEGV ✗ ✗ — e o
-    // motor reporte **quem** escreveu ✗ ✗ (o PC ✗ e os registos ✗) ✗ ✗.
+    // **Um watchpoint** — pôr uma página do guest em so' leitura,
+    // para que a escrita do guest nela levante um SIGSEGV — e o
+    // motor reporte **quem** escreveu (o PC e os registos).
     //
     // E' a unica forma de descobrir **qual** das respostas do host
-    // encheu um campo do jogo ✗ ✗ (e no Eden nao encheria ✗ ✗) ✗ ✗.
+    // encheu um campo do jogo (e no Eden nao encheria).
     void ArmarWatchpoint(std::uint64_t endereco, std::uint64_t tamanho);
 
-    // **Armar o watchpoint depois do rtld** ✗ ✗ — o rtld escreve na
-    // pagina ✗ ✗ (as relocacoes ✗) ✗, e o watchpoint dispararia nessa
-    // altura ✗ ✗ ✗. O primeiro SVC e' do jogo ✗ ✗ — logo depois ✗ ✗.
+    // **Armar o watchpoint depois do rtld** — o rtld escreve na
+    // pagina (as relocacoes), e o watchpoint dispararia nessa
+    // altura. O primeiro SVC e' do jogo — logo depois.
     void ArmarWatchpointSePedir(std::uint64_t endereco, std::uint64_t tamanho);
 
     // Chamadas de mapeamento desde o último reset.
@@ -723,16 +723,14 @@ private:
     // const, e read_guest() é const porque é uma consulta.
     mutable std::string g_err_scratch;
     std::unordered_map<std::string, Handle> port_by_name_;
-    std::unordered_map<std::uint32_t, std::string> name_by_handle_;
     std::uint32_t    next_handle_ = 0x1000;
     std::uint64_t    entropy_counter_ = 0x9E3779B97F4A7C15ull;
     // A última porta a que o guest se ligou, para o relatório. STUB: não há
     // IPC por trás do handle.
     std::string       last_port_;
 
-    // `ConnectToNamedPort` fabrica handles a partir de 0x1000. `name_by_handle_`
-    // é o que permite responder a um `SendSyncRequest` sabendo a que serviço
-    // ele é dirigido.
+    // `ConnectToNamedPort` fabrica handles a partir de 0x1000, só no caminho
+    // sem Eden. Com o Eden ligado os handles de sessão vêm da mesa dele.
 
     std::uint64_t    mem_total_   = 0;
     std::uint64_t    mem_used_    = 0;
