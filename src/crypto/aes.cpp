@@ -11,6 +11,7 @@
 #include <openssl/evp.h>
 
 #include <cstring>
+#include <vector>
 
 namespace g610::crypto {
 
@@ -42,17 +43,7 @@ void MultiplicarPorAlpha(std::array<std::uint8_t, 16>& t) {
     }
 }
 
-// Incrementa o contador de 128 bits, big-endian.
-void Incrementar(std::array<std::uint8_t, 16>& c) {
-    for (int i = 15; i >= 0; --i) {
-        if (++c[i] != 0) {
-            break;
-        }
-    }
-}
-
 } // namespace
-
 Bloco::Bloco(const Chave128& chave) {
     // **Dois contextos.** O `EVP_CIPHER_CTX` guarda a chave da direccao com
     // que foi inicializado: um contexto inicializado para cifrar e'
@@ -107,20 +98,44 @@ void Bloco::Decifrar(std::span<const std::uint8_t> entrada, std::span<std::uint8
     EVP_DecryptUpdate(ctx, saida.data(), &out, entrada.data(), static_cast<int>(entrada.size()));
 }
 
-void CtrDecifrar(Bloco& bloco, std::span<const std::uint8_t> entrada,
-                 std::span<std::uint8_t> saida, std::array<std::uint8_t, 16> contador) {
-    const std::size_t n = entrada.size() & ~static_cast<std::size_t>(0xF);
-    std::array<std::uint8_t, 16> fluxo{};
-    for (std::size_t i = 0; i < n; i += 16) {
-        bloco.Cifrar(std::span<const std::uint8_t>(contador), std::span<std::uint8_t>(fluxo));
-        for (std::size_t k = 0; k < 16; ++k) {
-            saida[i + k] = static_cast<std::uint8_t>(entrada[i + k] ^ fluxo[k]);
-        }
-        Incrementar(contador);
+Ctr::Ctr(const Chave128& chave) : bloco_{chave} {}
+
+void Ctr::Iv(std::span<const std::uint8_t> iv) {
+    if (iv.size() != 16) {
+        return;
     }
-    // O resto (que nao e' multiplo de 16) fica como esta.
-    for (std::size_t i = n; i < entrada.size() && i < saida.size(); ++i) {
-        saida[i] = entrada[i];
+    std::memcpy(contador_.data(), iv.data(), 16);
+}
+
+void Ctr::Decifrar(std::span<const std::uint8_t> entrada, std::span<std::uint8_t> saida) {
+    const std::size_t n = entrada.size();
+    if (n == 0) {
+        return;
+    }
+    // O fluxo de chaves: um contador por bloco, em big-endian de 128 bits.
+    // O bloco e' cifrado **todo de uma vez** com o ECB — que e'
+    // independente por bloco.
+    //
+    // **O ultimo bloco pode ser parcial** — e tem de ser cifrado na mesma:
+    // o keystream de um bloco comeca' no principio do bloco, e o que
+    // interessa sao os primeiros bytes. Sem isto, os ultimos bytes de uma
+    // leitura de tamanho nao multiplo de 16 ficavam *cifrados* — e o guest
+    // lia-os como dados, sem eu dar por isso.
+    const std::size_t total = ((n + 15) / 16) * 16;
+    std::vector<std::uint8_t> fluxo(total);
+    auto contador = contador_;
+    for (std::size_t i = 0; i < total; i += 16) {
+        std::memcpy(fluxo.data() + i, contador.data(), 16);
+        for (int k = 15; k >= 0; --k) {
+            if (++contador[k] != 0) {
+                break;
+            }
+        }
+    }
+    bloco_.Cifrar(std::span<const std::uint8_t>(fluxo.data(), total),
+                  std::span<std::uint8_t>(fluxo.data(), total));
+    for (std::size_t i = 0; i < n; ++i) {
+        saida[i] = static_cast<std::uint8_t>(entrada[i] ^ fluxo[i]);
     }
 }
 

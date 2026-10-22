@@ -74,8 +74,28 @@ private:
 //
 // `contador[0..8]` = o "upper" (vem do cabecalho da seccao), e
 // `contador[8..16]` = o numero do bloco. O Eden: `AesCtrStorage::MakeIv`.
-void CtrDecifrar(Bloco& bloco, std::span<const std::uint8_t> entrada,
-                 std::span<std::uint8_t> saida, std::array<std::uint8_t, 16> contador);
+//
+// **Feito sobre o bloco, e nao com o modo CTR do OpenSSL.** O mbedtls e' o
+// OpenSSL trampam o contador de 128 bits big-endian como um numero — mas o
+// modo CTR do OpenSSL nao da' o mesmo resultado (medido: a leitura do
+// RomFS dava bytes diferentes). Por isso o fluxo de chaves e' gerado aqui:
+// monta-se um bloco de contadores e cifra-se **tudo de uma vez** com o ECB
+// (que e' independente por bloco), e faz-se o XOR. Uma chamada do EVP
+// para o pacote inteiro — e exactamente o que o Eden faz.
+class Ctr {
+public:
+    explicit Ctr(const Chave128& chave);
+
+    // O contador inicial.
+    void Iv(std::span<const std::uint8_t> iv);
+
+    // Decifra (ou cifra) `n` bytes. `n` tem de ser multiplo de 16.
+    void Decifrar(std::span<const std::uint8_t> entrada, std::span<std::uint8_t> saida);
+
+private:
+    Bloco bloco_;
+    std::array<std::uint8_t, 16> contador_{};
+};
 
 // AES-XTS, **a variante do Switch**.
 //

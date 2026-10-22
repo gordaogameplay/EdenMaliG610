@@ -61,6 +61,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -473,8 +474,16 @@ private:
             const std::size_t n = static_cast<std::size_t>(
                 std::min<std::int64_t>(static_cast<std::int64_t>(saida), length));
             std::vector<std::uint8_t> buffer(n);
+            // **O tempo da leitura.** O SDK tem um tempo limite para a
+            // resposta do IPC: se a leitura demora, o leitor CMIF da um
+            // erro em vez de um resultado. O tempo e' o que diz.
+            const auto inicio = std::chrono::steady_clock::now();
             if (O_Romfs().Ler(static_cast<std::uint64_t>(offset), n, buffer.data())) {
-                ctx.WriteBuffer(buffer.data(), n, 0);
+                // **Quantos bytes foram mesmo escritos.** O
+                // `WriteBuffer` do Eden devolve 0 quando o descritor nao
+                // serve — e o guest fica sem os dados, sem nenhuma
+                // complainca no host.
+                const std::size_t escritos = ctx.WriteBuffer(buffer.data(), n, 0);
                 // **Os primeiros bytes da leitura.** Sao o que permite
                 // comparar com uma decifracao de referencia (o Python) sem
                 // despejar o ficheiro todo.
@@ -484,7 +493,13 @@ private:
                     std::snprintf(b, sizeof b, "%02x", buffer[i]);
                     hex += b;
                 }
-                LOG_DEBUG(Service_FS, "IStorage::Read: primeiros bytes: {}", hex);
+                const auto ms = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - inicio)
+                                    .count() /
+                                1000;
+                LOG_DEBUG(Service_FS,
+                          "IStorage::Read: primeiros bytes: {} ({} bytes em {} us, {} escritos)", hex,
+                          n, ms, escritos);
             } else {
                 LOG_WARNING(Service_FS, "IStorage::Read: a leitura de {:#X} falhou",
                             static_cast<std::uint64_t>(offset));

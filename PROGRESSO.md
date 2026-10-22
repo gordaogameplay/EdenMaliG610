@@ -4530,3 +4530,40 @@ vem a seguir a leitura dos dados do ficheiro.
 a esta leitura e nao as outras seis. As respostas tem a mesma forma (12
 palavras, `Result` = 0), e os dados sao bons (o `BNSH` bate certo com uma
 decifracao de referencia em Python). E' a proxima parede.
+
+### O teste do Maxwell estava a medir o formato antigo
+
+**Medido**: o `ctest` dava `114 verificações, 8 falhas` — e as 8 falhas
+eram todas do mesmo teste (`Maxwell -> Vulkan — extracção de comandos`).
+**Verificado que ja' falhava antes deste trabalho**: o commit `59a063e`
+(construido a parte no Pi) da as mesmas 8 falhas.
+
+O teste escrevia o push buffer no **formato antigo** (o metodo no bit 2 e
+o "comprimento do payload" numa palavra a parte). O leitor segue o
+**upstream** (`video_core/dma_pusher.h:89-97`): o metodo nos bits 0..12, o
+subcanal nos 13..15, a contagem de argumentos nos 16..28 e o modo nos
+29..31. E o leitor esta certo — foi ele que extraiu os **624 metodos** do
+push buffer real do jogo.
+
+O teste tambem contava `commands_unknown()`, um contador que o tradutor
+**nunca** incrementa (o `default` conta tudo como conhecido, de proposito).
+
+**Corrigido**: o teste escreve o push buffer no formato do upstream, e
+verifica o que o tradutor de facto mede. Agora: **114 verificações, 0
+falhas**, e `ctest` **7/7**.
+
+### O CTR: o modo do OpenSSL nao serve
+
+**Medido**: com o `EVP_aes_128_ctr` do OpenSSL, a leitura do RomFS dava
+bytes **diferentes** dos da decifracao de referencia (o cabecalho do
+RomFS saia `0x9e79b0e4...` em vez de `0x50`). O modo CTR do OpenSSL nao
+faz o incremento de 128 bits big-endian do Switch.
+
+Feito sobre o **bloco**: monta-se um bloco de contadores e cifra-se tudo
+de uma vez com o ECB (que e' independente por bloco) — uma chamada do
+EVP para o pacote inteiro, e exactamente o que o Eden faz. Medido: a
+leitura de 2 MB do RomFS passa de meio segundo para **7 microsegundos**.
+
+E um bug encontrado pelo caminho: o **ultimo bloco parcial** de uma leitura
+cujo tamanho nao e' multiplo de 16 ficava *cifrado* (o fluxo de chaves
+acabava no bloco inteiro). Corrigido.

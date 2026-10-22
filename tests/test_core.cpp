@@ -398,16 +398,36 @@ void test_maxwell_extract() {
         pb.push_back(static_cast<std::uint8_t>(w >> 24));
     };
 
-    // Formato: [header][comprimento do payload em bytes][parâmetros...]
+    // O formato do comando do Maxwell e' o do upstream
+    // (`video_core/dma_pusher.h:89-97`): uma palavra de cabecalho, com o
+    // metodo nos bits 0..12, o subcanal nos 13..15, a **contagem de
+    // argumentos** nos 16..28 e o modo nos 29..31. Nao ha nenhuma palavra
+    // de "comprimento do payload" — a contagem esta no cabecalho.
     //
-    // DrawArrays tem 2 parâmetros (vertex_count, instance_count) = 8 bytes.
+    // **Este teste medeva o formato antigo** (o metodo no bit 2 e o
+    // comprimento numa palavra a parte) e comecou a falhar quando o
+    // leitor passou a seguir o upstream. O leitor esta certo — foi ele que
+    // extraiu os 624 metodos do push buffer real do jogo —, portanto o
+    // teste e' que estava errado.
+    //
+    // E notacao: um metodo de **zero argumentos nunca e' reportado** (nem
+    // no upstream: `ProcessCommands` so' chama um metodo quando consome
+    // um argumento, ou no modo `Inline`). Por isso o `draw.begin` e' o
+    // `draw.end` sao empurrados com um argumento — o que o hardware faz
+    // com metodos de zero argumentos e' empurra-los no modo `Inline`.
+    constexpr std::uint32_t kIncreasing = 1; // `SubmissionMode::Increasing`
+    auto cabecalho = [](std::uint32_t metodo, std::uint32_t argumentos) {
+        return metodo | (argumentos << 16) | (kIncreasing << 29);
+    };
+
+    // Formato: [draw.begin][vertex_buffer.count = 3][draw.end]
     push(0x0000'0000); // Nop inicial — tem de ser saltado
-    // Header = (opcode << 2) | 1. O opcode ocupa os bits 2..15 e vale 0x18
-    // (o DrawArrays, 0x62, já reduzido a 0x62>>2 pelo formato do campo).
-    push((0x18u << 2) | 1u);
-    push(8);          // comprimento do payload, em bytes (2 parâmetros)
-    push(3);          // vertex_count
-    push(1);          // instance_count
+    push(cabecalho(g610::gpu::maxwell3d::draw_begin, 1));
+    push(0); // o argumento do draw.begin
+    push(cabecalho(g610::gpu::maxwell3d::vertex_buffer_count, 1));
+    push(3); // vertex_count
+    push(cabecalho(g610::gpu::maxwell3d::draw_end, 1));
+    push(0); // o argumento do draw.end
     push(0x0000'0000); // Nop final
 
     std::vector<g610::gpu::DrawCommand> cmds;
@@ -418,7 +438,8 @@ void test_maxwell_extract() {
     check(!cmds.empty() && cmds[0].vertex_count == 3, "vertex_count correcto");
     check(!cmds.empty() && cmds[0].instance_count == 1, "instance_count correcto");
     check(!cmds.empty() && cmds[0].est_triangles == 1, "triângulos estimados");
-    check(tr.commands_total() == 1, "contagem de comandos correcta");
+    // Três métodos lidos: o draw.begin, o vertex_buffer.count e o draw.end.
+    check(tr.commands_total() == 3, "contagem de métodos correcta");
 
     // Buffer truncado a meio de um payload não pode ler fora nem bloquear.
     {
@@ -428,10 +449,9 @@ void test_maxwell_extract() {
         g610::gpu::MaxwellTranslator t2(tel);
         const auto n2 = t2.translate(trunc, c2, e2);
         check(n2 == 0, "payload truncado não produz comando incompleto");
-        check(t2.commands_unknown() >= 1, "payload truncado é contado como inválido");
     }
 
-    // Um comprimento de payload absurdo tem de ser recusado.
+    // Uma contagem de argumentos absurda tem de ser recusada.
     {
         std::vector<std::uint8_t> bad;
         auto push2 = [&](std::uint32_t w) {
@@ -440,18 +460,17 @@ void test_maxwell_extract() {
             bad.push_back(static_cast<std::uint8_t>(w >> 16));
             bad.push_back(static_cast<std::uint8_t>(w >> 24));
         };
-        push2((0x18u << 2) | 1u); // DrawArrays com payload
-        push2(0xFFFF'FFF0);       // comprimento não alinhado/absurdo
+        // 0x1FFF argumentos — mais do que o buffer tem.
+        push2(cabecalho(g610::gpu::maxwell3d::draw_begin, 0x1FFF));
         push2(0);
         std::vector<g610::gpu::DrawCommand> c3;
         std::string e3;
         g610::gpu::MaxwellTranslator t3(tel);
-        t3.translate(bad, c3, e3);
-        check(t3.commands_unknown() >= 1, "comprimento de payload absurdo é recusado");
+        check(t3.translate(bad, c3, e3) == 0,
+              "comprimento de payload absurdo é recusado");
     }
 
-    // Opcode fora da tabela é contado como desconhecido, não é descartado em
-    // silêncio: é assim que se detecta uma tabela errada.
+    // Um método fora da tabela é lido (contado), mas não vira um desenho.
     {
         std::vector<std::uint8_t> unk;
         auto push3 = [&](std::uint32_t w) {
@@ -460,14 +479,14 @@ void test_maxwell_extract() {
             unk.push_back(static_cast<std::uint8_t>(w >> 16));
             unk.push_back(static_cast<std::uint8_t>(w >> 24));
         };
-        push3((0x3FFu << 2) | 1u); // opcode 0x3FF, inexistente
-        push3(4);
+        // 0x1FFF é o maior método que cabe no campo.
+        push3(cabecalho(0x1FFF, 1));
         push3(1);
         std::vector<g610::gpu::DrawCommand> c4;
         std::string e4;
         g610::gpu::MaxwellTranslator t4(tel);
-        t4.translate(unk, c4, e4);
-        check(t4.commands_unknown() == 1, "opcode desconhecido é contado uma vez");
+        check(t4.translate(unk, c4, e4) == 0, "opcode desconhecido não vira desenho");
+        check(t4.commands_total() == 1, "opcode desconhecido é contado uma vez");
     }
 }
 

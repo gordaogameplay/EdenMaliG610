@@ -453,7 +453,7 @@ bool RomfsJogo::Ler(std::uint64_t offset, std::size_t size, std::uint8_t* destin
         return false;
     }
 
-    crypto::Bloco bloco_ctr{chave_ctr_};
+    crypto::Ctr ctr{chave_ctr_};
     // O contador: os 8 primeiros bytes sao o "upper" (fixo) e os 8
     // seguintes sao o numero do bloco.
     //
@@ -466,8 +466,9 @@ bool RomfsJogo::Ler(std::uint64_t offset, std::size_t size, std::uint8_t* destin
     for (int k = 0; k < 8; ++k) {
         contador[8 + k] = static_cast<std::uint8_t>((bloco >> (8 * (7 - k))) & 0xFF);
     }
-    crypto::CtrDecifrar(bloco_ctr, std::span<const std::uint8_t>(buffer.data(), buffer.size()),
-                        std::span<std::uint8_t>(buffer.data(), buffer.size()), contador);
+    ctr.Iv(std::span<const std::uint8_t>(contador));
+    ctr.Decifrar(std::span<const std::uint8_t>(buffer.data(), buffer.size()),
+                  std::span<std::uint8_t>(buffer.data(), buffer.size()));
     std::memcpy(destino, buffer.data() + resto, n);
     return true;
 }
