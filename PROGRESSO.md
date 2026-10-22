@@ -4678,3 +4678,20 @@ chamador: o codigo do jogo (0x8177d280 e' do `main`).
 forte e' a **fonte**: o `pl:u` foi o ultimo servico novo, e o Eden sem
 uma NAND daria a mesma resposta (fonte vazia) — logo a fonte **nao
 explica** o fault, a nao ser que o SDK *exija* uma fonte nao vazia.
+
+### A hipótese das "ips patches" — REFUTADA (medido, 2026-10-21)
+
+A pista de que o código do guest estava *patched* vinha de comparar os
+bytes do NSO (`g610_main.nso`) com os da memória. **O NSO tem o `.text`
+comprimido** — a comparação era entre coisas diferentes.
+
+**Medido**: o dump do texto descomprimido (`IA_DUMP_TEXT=main`,
+25 084 672 bytes, base 0x80000000) é **byte a byte igual** ao código em
+memória no endereço do fault:
+
+    NSO descomprimido == codigo em memoria: True
+    (0x8177d250, 64 bytes, a partir do dump `IA_DUMP_TEXT`)
+
+**Conclusão**: o guest corre o código **tal como está no NSO**. Não há
+patches por aplicar, e o ficheiro exefs é o que o jogo espera. A causa do
+fault é outra.

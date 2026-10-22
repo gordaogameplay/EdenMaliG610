@@ -61,6 +61,7 @@
 #include <string>
 #include <vector>
 
+#include "g610/services/vi.hpp"
 #include "vendor/eden/common/logging.h"
 #include "vendor/eden/core/system_ref.h"  // o `Core::System` nosso
 #include "vendor/eden/core/hle/kernel/k_event.h"
@@ -771,14 +772,22 @@ private:
         rb.Push(ResultSuccess);
     }
 
-    // As camadas de display são do subsistema de vídeo. Sem ele, não há
-    // layer para dar — e diz-se.
-    void CreateManagedDisplayLayer(HLERequestContext& ctx) {
-        LOG_WARNING(Service_AM, "CreateManagedDisplayLayer: sem subsistema de video");
-        ResponseBuilder rb{ctx, 4};
-        rb.Push(ResultSuccess);
-        rb.Push(static_cast<u64>(0));
-    }
+    // 40: criar uma camada gerida para o jogo.
+//
+// **Medido** (`/tmp/boot_r25.log`): com o id a ser **zero**, o jogo
+// usou-o como se fosse um ponteiro e faultou (`ldr w8, [x0, #0x38]` com
+// `x0` = 0, em 0x8177d290). O id tem de ser um id **de verdade**.
+//
+// O Eden (`core/hle/service/am/display_layer_manager.cpp:64`) abre o
+// display "Default" e cria a camada no `vi:m`. Na casa o `am` nao tem o
+// `vi`, por isso o id vem do `vi` (ver `criar_camada_gerida`).
+void CreateManagedDisplayLayer(HLERequestContext& ctx) {
+    const std::uint64_t camada = services::criar_camada_gerida();
+    LOG_DEBUG(Service_AM, "CreateManagedDisplayLayer: camada={}", camada);
+    ResponseBuilder rb{ctx, 4};
+    rb.Push(ResultSuccess);
+    rb.Push(camada);
+}
 
     void IsSystemBufferSharingEnabled(HLERequestContext& ctx) {
         ResponseBuilder rb{ctx, 3};

@@ -825,4 +825,22 @@ void registar_vi(Core::System& system) {
     Service::ServerManager::RunServer(std::move(server_manager));
 }
 
+// Cria uma camada gerida e devolve o id.
+//
+// O Eden (`core/hle/service/am/display_layer_manager.cpp:64`):
+//
+//     m_display_service->OpenDisplay(&display_id, "Default");
+//     m_manager_display_service->CreateManagedLayer(out_layer_id, 0, display_id, user_id);
+//     m_manager_display_service->SetLayerVisibility(m_visible, *out_layer_id);
+//
+// Na casa não há displays nem pilhas de camadas — o `vi` dá ao jogo a
+// **janela** pelo `OpenLayer` (o `vi:u`) e o `am` só precisa de um id de
+// camada que não colida com o do `vi:m`.
+//
+// **O id sai do mesmo contador** que o `vi:m` usa (`Estado().proxima_camada`),
+// para que um id de camada do `am` e um do `vi:m` nunca sejam o mesmo.
+std::uint64_t criar_camada_gerida() {
+    return Estado().proxima_camada++;
+}
+
 } // namespace g610::services

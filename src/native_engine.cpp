@@ -792,13 +792,18 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
         {
             // A leitura e' a segura do dispatcher: o acesso do host nao
             // pode faultar (o `read` do guest usa um processo filho).
-            std::uint8_t codigo[64] = {0};
-            if (svc_.read_guest(g_hooks.fault_pc - 16, codigo, sizeof codigo)) {
-                char linha[320];
+            //
+            // **64 bytes antes e 64 depois do PC**: o codigo do guest esta
+            // *patched* (as "ips patches" do NCA), por isso o NSO
+            // descomprimido **nao serve** para o desassemblar — e' o
+            // codigo em memoria que diz o que a instrucao faz.
+            std::uint8_t codigo[128] = {0};
+            if (svc_.read_guest(g_hooks.fault_pc - 64, codigo, sizeof codigo)) {
+                char linha[700];
                 std::size_t n = 0;
                 n += static_cast<std::size_t>(
-                    std::snprintf(linha + n, sizeof(linha) - n, "[fault] cod (pc-16) 0x%llx:",
-                                   (unsigned long long)g_hooks.fault_pc));
+                    std::snprintf(linha + n, sizeof(linha) - n, "[fault] cod (pc-64) 0x%llx:",
+                                   (unsigned long long)(g_hooks.fault_pc - 64)));
                 for (std::size_t i = 0; i < sizeof codigo && n + 4 < sizeof(linha); ++i)
                     n += static_cast<std::size_t>(
                         std::snprintf(linha + n, sizeof(linha) - n, " %02x", codigo[i]));
