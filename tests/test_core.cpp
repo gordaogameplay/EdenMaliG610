@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "g610/gpu/maxwell_translator.hpp"
+#include "g610/gpu/pushbuffer.hpp"
 #include "g610/guest_context.hpp"
 #include "g610/instructions.hpp"
 #include "g610/patcher.hpp"
@@ -420,7 +421,14 @@ void test_maxwell_extract() {
         return metodo | (argumentos << 16) | (kIncreasing << 29);
     };
 
-    // Formato: [draw.begin][vertex_buffer.count = 3][draw.end]
+    // Formato: [bind][draw.begin][vertex_buffer.count = 3][draw.end]
+    //
+    // **O bind** ✗ — o metodo `BindObject` (o 0x00 do canal ✗) liga o
+    // subcanal 0 ao motor 3D ✗ (o upstream,
+    // `src/video_core/engines/puller.cpp:29-58` ✗) ✗. Sem ele ✗ o
+    // tradutor nao sabe que o subcanal 0 e' o motor 3D ✗ ✗.
+    push(cabecalho(g610::gpu::canal::BindObject, 1));
+    push(g610::gpu::motor::Maxwell3D); // o `EngineID` do motor 3D
     push(0x0000'0000); // Nop inicial — tem de ser saltado
     push(cabecalho(g610::gpu::maxwell3d::draw_begin, 1));
     push(0); // o argumento do draw.begin
@@ -438,8 +446,9 @@ void test_maxwell_extract() {
     check(!cmds.empty() && cmds[0].vertex_count == 3, "vertex_count correcto");
     check(!cmds.empty() && cmds[0].instance_count == 1, "instance_count correcto");
     check(!cmds.empty() && cmds[0].est_triangles == 1, "triângulos estimados");
-    // Três métodos lidos: o draw.begin, o vertex_buffer.count e o draw.end.
-    check(tr.commands_total() == 3, "contagem de métodos correcta");
+    // Quatro métodos lidos: o `BindObject`, o `draw.begin`, o
+    // `vertex_buffer.count` e o `draw.end`.
+    check(tr.commands_total() == 4, "contagem de métodos correcta");
 
     // Buffer truncado a meio de um payload não pode ler fora nem bloquear.
     {

@@ -4797,3 +4797,11 @@ buffer **nao tem** `draw.begin`/`draw.end` ✗ (e' um push buffer de
 **O que fica por fazer**: o push buffer de *desenho* — que vem depois ✗ —
 e' que tem os `draw_begin`/`draw_end` ✗, e o que o tradutor tem de
 traduzir ✗.
+
+### Os testes: o bind passa a fazer parte do push buffer
+
+Os testes do tradutor (`tests/test_core.cpp` e
+`tests/test_pushbuffer.cpp`) empurravam um push buffer **sem** o
+`BindObject` ✗ — e com o bind ✗ ja' nao havia motor 3D ✗ ✗.
+
+**Medido**: `ctest` — **7/7 passam** ✗->✓ (a-sdk; antes 5/7 ✗).

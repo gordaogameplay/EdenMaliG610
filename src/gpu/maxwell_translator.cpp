@@ -152,7 +152,7 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
     //
     // O mapa e' `subcanal -> motor` ✗ — e vale so' para o subcanal ligado
     // ao 3D ✗ ✗.
-    std::uint8_t motores_por_subcanal[8] = {0};
+    std::uint32_t motores_por_subcanal[8] = {0};
 
     leitor.for_each(pushbuffer, [&](const gpu::MethodCall& m) {
         ++cmds_total_;
@@ -161,7 +161,7 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
         // (`puller.cpp:145-148` ✗) trata-o antes de tudo ✗.
         if (m.method == gpu::canal::BindObject) {
             if (m.subchannel < 8) {
-                motores_por_subcanal[m.subchannel] = static_cast<std::uint8_t>(m.argument);
+                motores_por_subcanal[m.subchannel] = m.argument;
             }
             return;
         }
