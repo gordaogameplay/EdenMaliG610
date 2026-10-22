@@ -98,6 +98,7 @@ add_library(g610_core STATIC
   src/gpu/maxwell_frontend.cpp
   src/gpu/glsl_backend.cpp
   src/gpu/maxwell_translator.cpp
+  src/gpu/macro_mme.cpp
   src/gpu/pushbuffer.cpp
   src/gpu/rasterizer_g610.cpp
   src/patcher.cpp

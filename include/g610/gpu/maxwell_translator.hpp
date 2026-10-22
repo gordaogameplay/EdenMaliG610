@@ -169,6 +169,12 @@ public:
     std::uint64_t commands_unknown() const { return cmds_unknown_; }
     std::uint64_t commands_dropped_feature() const { return cmds_dropped_; }
 
+    // O acumulado do microcode: os passos e os envios de todas as
+    // macros executadas (`mme::Interpretador::passos`/`envios` — cada
+    // `executar` reinicia a sua contagem; o tradutor soma os totais).
+    std::uint64_t macro_passos() const { return macro_passos_; }
+    std::uint64_t macro_envios() const { return macro_envios_; }
+
     // Traduz o limite do PushBuffer. Se devolve false, o buffer não coube e o
     // erro é reportado — um runaway de writes é um sintoma, não um detalhe.
     bool drain_pushbuffer(std::vector<std::uint8_t>& buffer,
@@ -180,6 +186,10 @@ private:
     std::uint64_t    cmds_total_ = 0;
     std::uint64_t    cmds_unknown_ = 0;
     std::uint64_t    cmds_dropped_ = 0;
+    // O acumulado do microcode (o mesmo produtor de sintomas do
+    // `mme::Interpretador`; aquí somado entre execuções).
+    std::uint64_t    macro_passos_ = 0;
+    std::uint64_t    macro_envios_ = 0;
 };
 
 } // namespace g610::gpu

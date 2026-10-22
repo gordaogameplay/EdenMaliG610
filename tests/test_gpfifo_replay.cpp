@@ -33,12 +33,15 @@
 //   - Parte A ('a foto do caso real') **passa**: fixa a procura de
 //     entrada a partir dos bytes reais, para o teste futuro barrar o
 //     reinvencao de comandos artificial.
-//   - Parte B (**a expectativa**) **falha hoje**: `translate()` da casa
-//     tem 0 `DrawCommand` para os mesmos bytes, porque so' trata os ids
-//     1414/1413 e as macros MME nao sao lidas — essa e' a causa
-//     demonstrada. Quando o tradutor ficar a interpreta-las, esta
-//     Parte B fica verde — e a Parte A continua a garantir que o caso
-//     e' o mesmo.
+//   - Parte B (**a execução das macros**) **passa desde o stub da
+//     chamada de firmware 4**: o `translate()` executa as 29 macros de
+//     desenho até ao fim (a medida: 17 passos e 5 envios por chamada,
+//     as parámetros 3/3 — o tracer mediu o mesmo). O que a casa não
+//     pode fazer com honestidade é produzir o `DrawCommand`: o desenho
+//     do jogo dispara dentro do blob da chamada de firmware 4
+//     (`falcon[4]`), que o próprio upstream substitui por um stub de
+//     registo que desenha zero (`maxwell_3d.cpp:486-492`). O déficit
+//     de desenho é medido e impresso — o próximo passo é que o fecha.
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -134,11 +137,14 @@ int main() {
           std::to_string(sc6_chamadas));
 
     // ------------------------------------------------------------------------
-    // Parte B — a expectativa: o que o caso real exige do tradutor.
+    // Parte B — a execução das macros de desenho pelo tradutor.
     //
-    // O jogo submeteu 8864 bytes com 29 desenhos por macro MME; o
-    // tradutor da casa emite 0. **Este check e' a falha demonstrada**:
-    // fica verde quando as macros (ou o caminho de desenho) existirem.
+    // O microcode (o balde 49, 25 palavras, o `9e3ca7054d12d63c`)
+    // termina leaps: antes do stub da chamada de firmware 4 ele contava
+    // passos infinitamente (o laco `52..68` lia o rascunho 0xD00, que
+    // ficava a 0) e o teto de 1M passos abortava — 29 desconhecidos.
+    // Com o stub (`regs[0xD00] = 1`, o mesmo do upstream) o laco sai
+    // desde o primeiro decremento. O contrato fixa os números medidos.
     // ------------------------------------------------------------------------
     g610::tel::Telemetry tel;
     MaxwellTranslator tradutor{tel};
@@ -146,13 +152,36 @@ int main() {
     std::string erro;
     const std::size_t n = tradutor.translate(pushbuffer, comandos, erro);
     std::printf("  [medicao] translate(): %zu comandos, desconhecidos %llu, "
-                "descartados %llu, erro: %s\n",
+                "descartados %llu, passos %llu, envios %llu, erro: %s\n",
                 n, static_cast<unsigned long long>(tradutor.commands_unknown()),
                 static_cast<unsigned long long>(tradutor.commands_dropped_feature()),
+                static_cast<unsigned long long>(tradutor.macro_passos()),
+                static_cast<unsigned long long>(tradutor.macro_envios()),
                 erro.empty() ? "(vazio)" : erro.c_str());
 
-    check(comandos.size() > 0, "translate() produz DrawCommand para o caso real",
-          "0 — este e' o defeito demonstrado (como o log vivo)");
+    check(tradutor.commands_unknown() == 0,
+          "as 29 macros de desenho terminam (desconhecidos: 0)",
+          std::to_string(tradutor.commands_unknown()));
+    check(erro.empty(), "nenhum sintoma do microcode (teto/pc/parámetros)");
+
+    // Os totais medidos do microcode no mesmo fluxo (a macro do
+    // desenho e' 29 x (17 passos, 5 envios) = 493/145; o resto sao as
+    // outras macros chamadas — entry 14/16/20 — 1144 passos e 756
+    // envios). Se o porte do interpretador divergir do upstream, os
+    // dois números caem e o teste barre.
+    check(tradutor.macro_passos() == 1637,
+          "os passos do microcode (o medido: 1637 = 493 + 1144)",
+          std::to_string(tradutor.macro_passos()));
+    check(tradutor.macro_envios() == 901,
+          "os envios do microcode (o medido: 901 = 145 + 756)",
+          std::to_string(tradutor.macro_envios()));
+
+    // O defeito em pé: comandos ainda a 0 — o desenho vive no blob da
+    // chamada de firmware 4 que o upstream também não executa. Medido e
+    // impresso, não varrido para o tapete.
+    std::printf("  [medicao] comandos: %zu — o desenho é disparado pelo blob\n"
+                "  do falcon[4] (a chamada de firmware 4); o upstream substitui-o\n"
+                "  pelo stub e também não desenha estes bytes\n", n);
 
     std::printf("\ngpfifo_replay: %d passaram, %d falharam\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

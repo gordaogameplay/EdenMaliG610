@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // EdenMaliG610 — implementação da tradução Maxwell -> Vulkan.
 #include "g610/gpu/maxwell_translator.hpp"
+#include "g610/gpu/macro_mme.hpp"
 #include "g610/gpu/pushbuffer.hpp"
 
+#include <algorithm>
 #include <cstring>
+#include <functional>
+#include <unordered_map>
 
 namespace g610::gpu {
 
@@ -13,11 +17,22 @@ namespace g610::gpu {
 // Cada método escreve o seu argumento no registo correspondente — e é
 // assim que os comandos empacotados (a topologia, o início, a
 // contagem) se lêem ✓.
+//
+// O mesmo número é o `MacroRegistersStart` do upstream ✓: os métodos
+// >= 0xE00 não são registos — são os gatilhos das macros MME.
 namespace {
 constexpr std::size_t kMaxRegistos = 0xE00;
 // O alinhamento do push buffer: o fluxo de métodos são palavras de 32
 // bits ✓ (o upstream: `Tegra::CommandHeader` ✓).
 constexpr std::size_t kWord = 4;
+// O `macro_positions` do upstream (`maxwell_3d.h`: `std::array<u32, 0x80>` ✓).
+constexpr std::size_t kNumMacroPositions = 0x80;
+// O limiar dos métodos do canal (o `non_puller_methods` do upstream
+// `dma_pusher.cpp` ✓): m < 0x40 é do *puller*, não do motor.
+constexpr std::uint32_t kPullerMetodos = 0x40;
+// O registo que falta nome na casa (o `load_mme.start_address_ptr` = 71:
+// fica entre o `instruction_ptr` (69) e o `start_address` (72) ✓).
+constexpr std::uint32_t load_mme_start_address_ptr = 71;
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -113,84 +128,134 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
     out.clear();
     error.clear();
 
-    gpu::PushBufferReader leitor;
+    // A leitura de palavra — a mesma da `palavra` da `pushbuffer.cpp`,
+    // porque o buffer pode não estar alinhado (vindo de um vector do
+    // host): por `memcpy`.
+    auto palavra = [&pushbuffer](std::size_t i, std::uint32_t& v) {
+        std::memcpy(&v, pushbuffer.data() + i * 4, 4);
+    };
+
+    // ============================================================
+    // O estado do motor — local por chamada.
+    //
+    // **Medido** (`tools/simular_mme.py` nos 3 caps reais): o jogo
+    // re-carrega o mesmo bloco MME inteiro em cada submissão (623
+    // instruções nos mesmos buckets, os mesmos binds, os mesmos
+    // hashes) — o reset por `translate()` é seguro e é o que o modelo
+    // pede.
+    // ============================================================
 
     // O ficheiro de registos — no upstream, cada método escreve o seu
-    // argumento no registo correspondente (`Regs::reg_array`) ✓.
+    // argumento no registo correspondente (`Regs::reg_array`). É daqui
+    // que as macros leem o estado (`GetRegisterValue`) e o `draw.end`
+    // lê as contagens.
     std::vector<std::uint32_t> regs(kMaxRegistos, 0);
 
-    // O estado do desenho (o `draw_state` do upstream, `draw_manager.cpp` ✓).
+    // O estado do desenho (o `draw_state` do upstream, `draw_manager.cpp`).
     //
-    // **Os contadores vivem nos registos** ✓ — como no upstream ✓, onde
-    // o `draw.end` lê `regs.vertex_buffer.count` e `regs.index_buffer`.
-    // Por isso não se reiniciam no `draw.begin` ✓: quem os escreve é o
-    // método correspondente ✓, e valem até ao próximo desenho ✓.
+    // Os contadores vivem nos registos: quem os escreve é o método
+    // correspondente, e valem até ao próximo desenho.
     std::uint32_t index_first = 0;
     std::uint32_t instance_count = 0;
     bool indexado = false;
     bool dentro = false;
 
-    // **O bind dos subcanais** — o upstream
-    // (`src/video_core/engines/puller.cpp:29-58`) liga cada subcanal a
-    // um motor, pelo método `BindObject` (o 0x00 do canal):
-    //
-    //     void Puller::ProcessBindMethod(const MethodCall& method_call) {
-    //         const auto engine_id = static_cast<EngineID>(method_call.argument);
-    //         bound_engines[method_call.subchannel] = engine_id;
-    //         ...
-    //     }
-    //
-    // **Só os métodos do subcanal ligado ao motor 3D** sao do motor 3D
-    // — os dos outros subcanais sao de outros motores (o de copia,
-    // o de computacao).
-    //
-    // **Medido** (`/tmp/boot_r27.log`): sem este bind, a casa traduz
-    // os métodos **de todos** os subcanais — e os ids que ela via
-    // (`1410`, `1411`) **nao** sao o `draw.begin`/`draw.end` (que sao
-    // `1414`/`1413`) — o que explica os **0 comandos traduzidos**
-    //.
-    //
-    // O mapa e' `subcanal -> motor` — e vale so' para o subcanal ligado
-    // ao 3D.
+    // **O bind dos subcanais** (o `puller.cpp:29-58` — o mesmo filtro
+    // da versão anterior). **Medido** (`/tmp/boot_r27.log`): sem este
+    // bind, a casa traduz métodos de outros motores.
     std::uint32_t motores_por_subcanal[8] = {0};
 
-    leitor.for_each(pushbuffer, [&](const gpu::MethodCall& m) {
-        ++cmds_total_;
+    // ============================================================
+    // O MME — o código em buckets por chave (o `uploaded_macro_code`
+    // do upstream, `macro.cpp:62-69`: `AddCode` faz `push_back` no
+    // vetor da chave) e as posições por slot (`macro_positions`,
+    // `maxwell_3d.h:3198`).
+    // ============================================================
+    std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> mme_buckets;
+    std::vector<std::uint32_t> macro_positions(kNumMacroPositions, 0);
 
-        // O `BindObject` (o 0x00 do canal) — o upstream
-        // (`puller.cpp:145-148`) trata-o antes de tudo.
-        if (m.method == gpu::canal::BindObject) {
-            if (m.subchannel < 8) {
-                motores_por_subcanal[m.subchannel] = m.argument;
+    // O ciclo `ProcessMacro` (o `maxwell_3d.cpp:199-224`).
+    std::uint32_t executando_macro = 0;
+    std::vector<std::uint32_t> macro_params;
+
+    // O sintoma do microcode (a contagem honesta; sai no `error` uma vez).
+    std::string anomalias_microcode;
+    std::uint32_t profundidade_macro = 0;
+
+    // (A recursão tem definição atrasada: o `Send` das macros volta a
+    // entrar neste mesmo caminho — o `maxwell3d.CallMethod` do upstream.)
+    std::function<void(std::uint32_t metodo, const std::uint32_t* base,
+                       std::uint32_t quantidade, bool e_ultimo)>
+        chamada_metodo;
+
+    // ============================================================
+    // A palavra do motor: a escrita no registo + os casos do MME +
+    // o desenho (o `Maxwell3D::CallMethod` para depois passar pelo
+    // `ProcessMethodCall`).
+    // ============================================================
+    auto palavra_engine = [&](std::uint32_t metodo, std::uint32_t valor) {
+        // A escrita no registo vem antes dos casos: o upstream escreve
+        // o reg (via `ProcessDirtyRegisters`) e só depois o
+        // `ProcessMethodCall` trata o método — os casos do MME leem o
+        // valor NOVO dos registos-ponteiro.
+        if (metodo < regs.size()) regs[metodo] = valor;
+
+        switch (metodo) {
+        case gpu::maxwell3d::load_mme_instruction_ptr:  // 69
+            // O `ClearCode(regs.load_mme.instruction_ptr)` (o
+            // `maxwell_3d.cpp:332-343`): apaga o bucket na chave nova.
+            mme_buckets.erase(regs[metodo]);
+            return;
+
+        case gpu::maxwell3d::load_mme_instruction:  // 70
+            // O `AddCode(regs.load_mme.instruction_ptr, argumento)`:
+            // anexa ao BUCKET da chave. O ponteiro não auto-incrementa
+            // no upstream — é isto que os 623 instruídos medidos nos
+            // buckets provam.
+            mme_buckets[regs[static_cast<std::size_t>(
+                            gpu::maxwell3d::load_mme_instruction_ptr)]]
+                .push_back(valor);
+            return;
+
+        case gpu::maxwell3d::load_mme_start_address:  // 72
+            // O `ProcessMacroBind`: `macro_positions[start_ptr++] = data`
+            // (o `maxwell_3d.cpp:482-484` — o ponteiro incrementa aqui).
+            {
+                const std::size_t ptr =
+                    static_cast<std::size_t>(load_mme_start_address_ptr);
+                macro_positions[regs[ptr] % kNumMacroPositions] = valor;
+                ++regs[ptr];
             }
             return;
-        }
 
-        // **Só o subcanal do motor 3D** tem métodos de motor — os
-        // outros (o `maxwell_dma`, o `kepler_compute`) tem
-        // *outros* ids, e traduzi-los como se fossem do 3D dava
-        // desenhos errados.
-        if (m.subchannel < 8 && motores_por_subcanal[m.subchannel] != gpu::motor::Maxwell3D) {
+        case gpu::maxwell3d::falcon + 4:  // 2244
+            // A chamada de firmware 4 (o `ProcessMethodCall`,
+            // `maxwell_3d.cpp:346-347`): no hardware é um blob que
+            // escreve registos conforme os parámetros; o upstream
+            // substitui por `regs.shadow_scratch[0] = 1`
+            // (`ProcessFirmwareCall4`, `maxwell_3d.cpp:486-492`), porque
+            // os registos tocados pelo blob não afetam os jogos que ele
+            // mediu. A escrita simples 2244 continua (a escrita acima
+            // acontece antes do switch, como o `ProcessDirtyRegisters`
+            // do upstream); o stub abre o laço da macro de desenho do
+            // jogo (ela lê o rascunho 0xD00 e sai quando vale 0 no r1
+            // decrementado).
+            regs[0xD00] = 1;
             return;
-        }
 
-        if (m.method < regs.size())
-            regs[m.method] = m.argument;
-
-        switch (m.method) {
         case gpu::maxwell3d::vertex_buffer_count:
-            // O valor fica no registo ✓ (é de lá que o `draw.end` o
-            // lê ✓, como no upstream ✓).
+            // O valor fica no registo (é de lá que o `draw.end` o lê,
+            // como no upstream).
             break;
 
         case gpu::maxwell3d::index_buffer_count:
             // O upstream: `index_buffer.count` marca o desenho como
-            // indexado (`draw_state.draw_indexed = true`) ✓.
+            // indexado (`draw_state.draw_indexed = true`).
             indexado = true;
             break;
 
         case gpu::maxwell3d::index_buffer_first:
-            index_first = m.argument;
+            index_first = valor;
             break;
 
         case gpu::maxwell3d::global_base_vertex_index:
@@ -198,23 +263,23 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
 
         case gpu::maxwell3d::draw_begin:
             // O `draw.begin` é o início de um desenho (`DrawBegin` no
-            // upstream ✓): reinicia a contagem de instâncias e o modo.
+            // upstream): reinicia a contagem de instâncias e o modo.
             dentro = true;
             instance_count = 0;
             break;
 
         case gpu::maxwell3d::draw_end: {
-            // O `draw.end` é o desenho (`DrawEnd` no upstream ✓).
+            // O `draw.end` é o desenho (`DrawEnd` no upstream).
             if (!dentro)
                 break;
             dentro = false;
 
-            // Os contagens vêm dos registos ✓ — como no upstream ✓.
+            // Os contagens vêm dos registos — como no upstream.
             const std::uint32_t vertex_count = regs[gpu::maxwell3d::vertex_buffer_count];
             const std::uint32_t index_count = regs[gpu::maxwell3d::index_buffer_count];
 
             DrawCommand c;
-            c.method = m.method;
+            c.method = metodo;
             c.indexado = indexado;
             c.index_count = indexado ? index_count : 0;
             c.index_first = index_first;
@@ -222,31 +287,274 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
             c.base_vertex = regs[gpu::maxwell3d::global_base_vertex_index];
             c.instance_count = instance_count != 0 ? instance_count : 1;
             c.est_triangles = static_cast<std::uint64_t>(
-                                 indexado ? c.index_count : c.vertex_count) / 3;
+                                  indexado ? c.index_count : c.vertex_count) / 3;
             out.push_back(c);
             tel_.frame_draw(static_cast<std::uint32_t>(c.est_triangles));
-            // O upstream limpa a marca de "indexado" no fim do desenho ✓.
+            // O upstream limpa a marca de "indexado" no fim do desenho.
             indexado = false;
             break;
         }
 
         case gpu::maxwell3d::vertex_array_instance_first:
         case gpu::maxwell3d::vertex_array_instance_subsequent:
-            // **Um desenho instanciado** (o upstream: `DrawArrayInstanced` ✓).
-            // A topologia, o início e a contagem vivem num registo
-            // *empacotado* — o upstream tira-os bit a bit. Fica a
-            // contagem e conta-se como degradado ✓ (é honesto: um
-            // desenho instanciado sem a contagem exacta não é o desenho).
+            // **Um desenho instanciado** (`DrawArrayInstanced`): os
+            // valores vivem num registo empacotado; fica a contagem e
+            // conta-se como degradado (honesto: sem a contagem
+            // exacta não é o desenho).
             ++cmds_dropped_;
             ++instance_count;
             break;
 
         default:
             // Estados, máscaras, fences e o resto são legítimos e não
-            // são erro: contam-se como conhecidos ✓.
+            // são erro: contam-se como conhecidos.
             break;
         }
-    });
+    };
+
+    // ============================================================
+    // O interpretador das macros — o caminho LE do upstream (a macro
+    // de desenho do jogo NÃO é HLE: hash `9e3ca7054d12d63c`, fora dos
+    // 15 builders de `macro_hle.cpp`).
+    // ============================================================
+    mme::Interpretador interprete{
+        [&](std::uint32_t endereco, std::uint32_t valor) {
+            // O `Send` — o `maxwell3d.CallMethod(endereco, valor, true)`:
+            // o método volta ao mesmo caminho do motor (é por aqui que
+            // a macro manda desenhar).
+            std::uint32_t v = valor;
+            chamada_metodo(endereco, &v, 1, true);
+        },
+        [&](std::uint32_t metodo) {
+            // O `Read` — o `maxwell3d.GetRegisterValue(metodo)`.
+            return metodo < regs.size() ? regs[metodo] : 0u;
+        }};
+
+    // ============================================================
+    // O `ProcessMacro` (o `maxwell_3d.cpp:199-224`): colhe os
+    // parámetros e chama a macro quando o burst acaba.
+    // ============================================================
+    auto processar_macro = [&](std::uint32_t metodo, const std::uint32_t* base,
+                               std::uint32_t quantidade, bool e_ultimo) {
+        if (quantidade == 0)
+            return;
+
+        if (executando_macro == 0) {
+            // O ASSERT do upstream `(method % 2) == 0`: a macro começa
+            // pelo método PAR (o registo da macro), nunca pelo de ARGS.
+            // A casa conta o sintoma e não executa.
+            if ((metodo % 2) != 0) {
+                ++cmds_dropped_;
+                return;
+            }
+            executando_macro = metodo;
+        }
+
+        macro_params.insert(macro_params.end(), base, base + quantidade);
+
+        // A chamada no fim do burst (o `is_last_call` do upstream).
+        if (!e_ultimo)
+            return;
+
+        // O `CallMacroMethod` (o `maxwell_3d.cpp:402-414`) — o reset do
+        // estado vem antes da execução (uma macro pode mandar métodos
+        // de macro; o upstream faz exactamente isto).
+        const std::uint32_t metodo_macro = executando_macro;
+        executando_macro = 0;
+
+        const std::uint32_t entry =
+            ((metodo_macro - 0xE00) >> 1) %
+            static_cast<std::uint32_t>(kNumMacroPositions);
+        const std::uint32_t chave = macro_positions[entry];
+
+        // O código: o bucket da chave; se a chave não é um bucket, o
+        // `mid_method` do upstream procura o bucket que a contém e
+        // rebasa (o `macro.cpp:83-110`).
+        const std::vector<std::uint32_t>* codigo = nullptr;
+        auto it = mme_buckets.find(chave);
+        if (it != mme_buckets.end()) {
+            codigo = &it->second;
+        } else {
+            bool de_rebase = false;
+            std::uint32_t base_encontrada = 0;
+            for (const auto& par : mme_buckets) {
+                if (chave >= par.first && (chave - par.first) < par.second.size()) {
+                    base_encontrada = par.first;
+                    de_rebase = true;
+                    break;
+                }
+            }
+            if (de_rebase) {
+                // O rebase — o insert pode rehashar o mapa: as
+                // referências re-resolvem depois.
+                mme_buckets[chave];
+                mme_buckets.at(chave)
+                    .assign(mme_buckets.at(base_encontrada).begin() +
+                                (chave - base_encontrada),
+                            mme_buckets.at(base_encontrada).end());
+                codigo = &mme_buckets.at(chave);
+            } else {
+                // A macro não tem código carregado — sintoma real
+                // (nada inventado: conta e segue).
+                ++cmds_dropped_;
+                macro_params.clear();
+                return;
+            }
+        }
+
+        if (++profundidade_macro > 16) {
+            // A recursão (macro mandando macro) além do razoável:
+            // o motor vivo não deve travar; conta e para.
+            --profundidade_macro;
+            ++cmds_unknown_;
+            macro_params.clear();
+            return;
+        }
+        interprete.executar(*codigo, macro_params);
+        --profundidade_macro;
+
+        // O acumulado do microcode: cada `executar` reinicia a sua
+        // contagem; o tradutor soma os totais (as medições que o
+        // teste fixa: 17 passos e 5 envios por chamada da macro de
+        // desenho — o `tools/trace_macro.py` mediu o mesmo).
+        macro_passos_ += interprete.passos();
+        macro_envios_ += interprete.envios();
+
+        // Os sintomas do microcode (teto de passos, pc fora do código,
+        // parámetros esgotados).
+        if (interprete.saiu_por_teto() || interprete.pc_fora() ||
+            interprete.params_esgotados()) {
+            ++cmds_unknown_;
+            if (anomalias_microcode.empty()) {
+                if (interprete.saiu_por_teto())
+                    anomalias_microcode = "macro MME passou do teto de passos";
+                else if (interprete.pc_fora())
+                    anomalias_microcode = "macro MME saltou fora do código";
+                else
+                    anomalias_microcode = "macro MME exauriu os parámetros";
+            }
+        }
+        macro_params.clear();
+    };
+
+    // O `CallMethod` / `CallMultiMethod` do motor (o `maxwell_3d.cpp`):
+    // macros num só caminho; o resto é palavra a palavra.
+    chamada_metodo = [&](std::uint32_t metodo, const std::uint32_t* base,
+                         std::uint32_t quantidade, bool e_ultimo) {
+        if (metodo >= 0xE00) {
+            processar_macro(metodo, base, quantidade, e_ultimo);
+            return;
+        }
+        for (std::uint32_t i = 0; i < quantidade; ++i)
+            palavra_engine(metodo, base[i]);
+    };
+
+    // A porta do canal: o puller primeiro (o `dma_pusher.cpp`: os
+    // métodos < 0x40 não chegam ao motor), depois o filtro do subcanal
+    // do motor 3D (o mesmo filtro da versão anterior).
+    auto chamada_via_subcanal = [&](std::uint32_t sc, std::uint32_t metodo,
+                                    const std::uint32_t* base,
+                                    std::uint32_t quantidade, bool e_ultimo) {
+        ++cmds_total_;
+        if (quantidade == 0)
+            return;
+        if (metodo == gpu::canal::BindObject) {
+            // O `ProcessBindMethod` (o `puller.cpp:29-58`).
+            if (sc < 8)
+                motores_por_subcanal[sc] = *base;
+            return;
+        }
+        if (metodo < kPullerMetodos)
+            return;  // semáforos/fence: do canal (o nvdrv trata), não do motor
+        if (sc >= 8 || motores_por_subcanal[sc] != gpu::motor::Maxwell3D)
+            return;  // métodos de outros motores: não são do 3D
+        chamada_metodo(metodo, base, quantidade, e_ultimo);
+    };
+
+    // ============================================================
+    // A máquina de palavras — o `ProcessCommands` do upstream com a
+    // semântica POR PALAVRA (a razão desta reescrita: o `for_each` da
+    // casa colapsava os blocos NonIncreasing/IncreaseOnce e engolia os
+    // parámetros das macros — medido nos bytes: `w[975]` é o header
+    // modo 5 m=3594 args=3 seguido de 3 palavras de dados; a versão
+    // anterior entregava só as 2 primeiras, e o burst de 3 params
+    // nunca chegava inteiro ao `ProcessMacro`).
+    // ============================================================
+    const std::size_t n_palavras = pushbuffer.size() / 4;
+
+    std::uint32_t burst_metodo = 0, burst_sc = 0, burst_count = 0;
+    bool burst_uma_vez = false;  // o modo 5 (IncreaseOnce)
+    bool burst_cauda = false;    // o resto do burst vem em bloco (o modo 3; a cauda do 5)
+    std::vector<std::uint32_t> bloco;
+
+    std::size_t i = 0;
+    while (i < n_palavras) {
+        std::uint32_t w = 0;
+        palavra(i, w);
+
+        if (burst_count != 0) {
+            if (burst_cauda) {
+                // O bloco do burst — o `CallMultiMethod` do upstream.
+                // O `e_ultimo` é o `amount == methods_pending` do
+                // upstream: verdadeiro quando o bloco cobre todo o
+                // restante do burst. (O upstream chunka por buffer
+                // intermédio; aqui o bloco corre inteiro — semântica
+                // igual: os parámetros chegam na ordem.)
+                const std::uint64_t restante =
+                    std::min<std::uint64_t>(static_cast<std::uint64_t>(burst_count),
+                                            n_palavras - i);
+                bloco.clear();
+                for (std::uint64_t k = 0; k < restante; ++k) {
+                    std::uint32_t v = 0;
+                    palavra(i + k, v);
+                    bloco.push_back(v);
+                }
+                chamada_via_subcanal(burst_sc, burst_metodo, bloco.data(),
+                                     static_cast<std::uint32_t>(restante),
+                                     restante == burst_count);
+                burst_count -= static_cast<std::uint32_t>(restante);
+                i += static_cast<std::size_t>(restante);
+                continue;
+            }
+
+            // O aumento: uma palavra é uma chamada, o método incrementa.
+            std::uint32_t v = 0;
+            palavra(i, v);
+            chamada_via_subcanal(burst_sc, burst_metodo, &v, 1, burst_count == 1);
+            ++burst_metodo;
+            --burst_count;
+            if (burst_uma_vez)
+                burst_cauda = true;  // o modo 5 incrementa UMA vez
+            ++i;
+            continue;
+        }
+
+        // A palavra é cabeçalho de método novo.
+        const std::uint32_t modo = (w >> 29) & 7;
+        if (modo == gpu::modo::Increasing || modo == gpu::modo::NonIncreasing ||
+            modo == gpu::modo::IncreaseOnce) {
+            burst_metodo = w & 0x1FFFu;
+            burst_sc = (w >> 13) & 7u;
+            burst_count = (w >> 16) & 0x1FFFu;
+            burst_uma_vez = (modo == gpu::modo::IncreaseOnce);
+            burst_cauda = (modo == gpu::modo::NonIncreasing);
+        } else if (modo == gpu::modo::Inline) {
+            // O cabeçalho é a chamada (o valor nos bits 16..28).
+            std::uint32_t valor = (w >> 16) & 0x1FFFu;
+            chamada_via_subcanal((w >> 13) & 7u, w & 0x1FFFu, &valor, 1, true);
+        }
+        // Os modos 0 e 2 (`IncreasingOld`/`NonIncreasingOld`) não
+        // existem no upstream: o `default` ignora a palavra.
+        ++i;
+    }
+
+    // O que ficou pendente (burst truncado no fim do buffer, macro sem
+    // fecho): sintoma contado, nada inventado.
+    if (burst_count != 0 || executando_macro != 0 || !macro_params.empty()) {
+        ++cmds_dropped_;
+    }
+    if (!anomalias_microcode.empty())
+        error = anomalias_microcode;
 
     tel_.frame_translate(tel_.time_now() - t0);
     return out.size();
