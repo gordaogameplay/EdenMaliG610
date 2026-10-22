@@ -4695,3 +4695,35 @@ memória no endereço do fault:
 **Conclusão**: o guest corre o código **tal como está no NSO**. Não há
 patches por aplicar, e o ficheiro exefs é o que o jogo espera. A causa do
 fault é outra.
+
+## Os handles do `nvmap`: a numeracao e' a do Eden (medido, 2026-10-21)
+
+### O que estava diferente
+
+O Eden (`nvmap/core/nvmap.h:165-167`) gera os ids **de 4 em 4** e a
+partir de **4**:
+
+    static constexpr u32 HandleIdIncrement{4};
+    std::atomic<u32> next_handle_id{HandleIdIncrement};
+
+A casa usava **0, 1, 2, …** — e o handle **0** passava a existir. Isso
+importa porque no Eden o handle 0 e' um handle **invalido** por
+definicao:
+
+* o `IocAlloc` **recusa-o** (`devices/nvmap.cpp:103-106`):
+  `if (!params.handle) { ...; return NvResult::BadValue; }`
+* o `GraphicBuffer` so' o usa se for **maior que zero**
+  (`nvnflinger/ui/graphic_buffer.cpp:23`): `if (this->BufferId() > 0)`
+
+**Medido** (`/tmp/boot_r26.log`): o primeiro `IocCreate` da casa devolveu
+**handle=0**, e esse handle passou pelo `RegistoNvmap` como se fosse um
+handle normal.
+
+**A correccao**: `proximo_nvmap_` comeca em 4 e incrementa de 4 em 4 —
+a numeracao do Eden. O handle 0 nunca existe.
+
+**Medido depois** (`/tmp/boot_r27.log`): os handles sao **4, 8, 12, 16,
+20, …** ✓, o `SetPreallocatedBuffer` do compositor recebe o handle **12**
+(em vez de 2) ✓, e o jogo continua a ler 23 ficheiros do RomFS ✓ e a
+fazer a setup da GPU ✓. O fault e' o mesmo (`0x8177d290`) — este
+numero **nao** era a causa.

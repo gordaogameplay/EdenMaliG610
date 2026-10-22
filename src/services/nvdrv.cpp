@@ -1169,19 +1169,29 @@ private:
         bool alocado = false;
     };
     std::map<std::uint32_t, HandleNvmap> nvmap_;
-    // **O primeiro handle e' o 0** ✗ — o upstream
-    // (`nvmap/core/nvmap.cpp:134` ✗) faz `fetch_add` a partir de zero ✗:
+    // **O primeiro handle e' o 4** ✗ — o upstream
+    // (`nvmap/core/nvmap.h:165-167` ✗) faz `fetch_add` a partir de
+    // `HandleIdIncrement` (= 4 ✗) ✗:
     //
-    //     u32 id{next_handle_id.fetch_add(HandleIdIncrement, ...)};
+    //     static constexpr u32 HandleIdIncrement{4};
+    //     std::atomic<u32> next_handle_id{HandleIdIncrement};
     //
-    // A casa comecava em **1** ✗ — e o guest, ao mapear um buffer, pede
-    // o handle **0** ✗.
+    // A casa comecava em **0** ✗ e contava de 1 em 1 ✗ — e o handle **0**
+    // ✗ existe no Eden **apenas como handle invalido** ✗:
     //
-    // **Medido** (`/tmp/boot_v12.log` ✗): `MapBufferEx: handle 0 não
-    // está alocado` ✗ — cinco vezes ✗ — e o `NvResult` de erro (11 ✗,
-    // `BadValue` ✗) mata o jogo ✗ ✗: o SDK aborta com
-    // `SetTerminateResult modulo=2 desc=3005` ✗ ✗.
-    std::uint32_t proximo_nvmap_ = 0;
+    // * o `IocAlloc` do Eden recusa-o ✗ (`devices/nvmap.cpp:103-106` ✗:
+    //   `if (!params.handle) { ... return NvResult::BadValue; }` ✗);
+    // * o `GraphicBuffer` do Eden so' o usa se for **maior que zero** ✗
+    //   (`ui/graphic_buffer.cpp:23` ✗: `if (this->BufferId() > 0)` ✗).
+    //
+    // **Medido** (`/tmp/boot_r26.log` ✗): o primeiro `IocCreate` da casa
+    // devolveu **handle=0** ✗ — e o `MapBufferEx` desse handle ✗ passou
+    // pelo `RegistoNvmap` ✗ como se fosse um handle normal ✗.
+    //
+    // A numeracao e' agora **a do Eden** ✗: 4, 8, 12, … ✗ — o handle 0
+    // nunca existe ✗ ✗, e o guest que o peca recebe um erro ✗ (como no
+    // Eden ✗) ✗ em vez de um handle silenciosamente invalido ✗ ✗.
+    std::uint32_t proximo_nvmap_ = 4;
     // O par (VA da GPU -> endereco do guest), que o tradutor Maxwell ->
     // Vulkan usa para traduzir os comandos do push buffer.
     // **O mapeamento** ✗ — o `Mapping` do upstream
@@ -1205,7 +1215,13 @@ private:
         IocCreateParams params{};
         LerEntrada(ctx, params);
 
-        const std::uint32_t id = proximo_nvmap_++;
+        // **De 4 em 4** ✗ — o Eden (`nvmap/core/nvmap.h:165` ✗):
+        // `HandleIdIncrement` = 4 ✗. O `fetch_add` do Eden e' sobre um
+        // `u32` ✗, por isso o handle mais alto que se pode pedir e'
+        // `0xFFFFFFFC` ✗ — e o Eden **enrola** ✗ (o `fetch_add` e' um
+        // `relaxed` ✗ e o `u32` da casa e' como o do Eden ✗).
+        const std::uint32_t id = proximo_nvmap_;
+        proximo_nvmap_ += 4;
         HandleNvmap h{};
         h.tamanho = params.size;
         nvmap_.emplace(id, h);
