@@ -4743,3 +4743,57 @@ outra coisa). Agora devolve **0**.
 
 **Medido depois** (`/tmp/boot_r28.log`): o fault e' o mesmo
 (`0x8177d290`) — a correccao e' fiel ao Eden mas nao era a causa.
+
+## O bind dos subcanais: o tradutor passa a saber qual e' o motor 3D (medido, 2026-10-21)
+
+### O que estava a acontecer
+
+O upstream (`src/video_core/engines/puller.cpp:29-58`) **liga cada
+subcanal a um motor** pelo método `BindObject` (o **0x00** do canal):
+
+    const auto engine_id = static_cast<EngineID>(method_call.argument);
+    bound_engines[method_call.subchannel] = engine_id;
+
+E **só os métodos do subcanal ligado ao motor 3D** sao do motor 3D — os
+dos outros subcanais (o de cópia, o de computação) são de **outros**
+motores, com **outros** ids.
+
+A casa traduzia os métodos de **todos** os subcanais como se fossem do
+motor 3D.
+
+### O que se mediu
+
+**Medido** (`/tmp/boot_r31.log`): o bind do jogo é
+
+    subcanal 0 -> motor 0xB197   (Maxwell 3D)
+    subcanal 1 -> motor 0xB1C0   (Kepler Compute)
+    subcanal 2 -> motor 0xA140   (Kepler Inline-to-Memory)
+    subcanal 3 -> motor 0x902D   (Fermi 2D)
+    subcanal 4 -> motor 0xB0B5   (Maxwell DMA Copy)
+
+E os ids por subcanal:
+
+    subcanal 0: 0:1 2:2 69:34 70:34 71:38 72:38 73:2 84:1 85:1 131:1 134:1
+                 178:1 187:1 192:1 195:1 196:1 221:1 467:1 479:1 489:1 490:1
+                 640:1 641:1 642:1 ... (muitos)
+    subcanal 1: 0:1 133:1 196:1 479:1 1354:1 1410:1 1411:1 2434:1
+
+**Os ids `1410` e `1411`** — que a casa tomava por `draw.begin`/`draw.end`
+(que sao `1414`/`1413`) — estão no **subcanal 1**, que e' o **Kepler
+Compute** ✗. A casa traduzia-os como se fossem do motor 3D ✗.
+
+### A correccao
+
+O tradutor (`src/gpu/maxwell_translator.cpp`) faz agora o bind: guarda
+o motor de cada subcanal e **so' traduz os métodos do subcanal do
+Maxwell 3D**.
+
+**Medido depois** (`/tmp/boot_r31.log`): o `BindObject` e' lido com o
+subcanal e o motor correctos ✗->✓, e o resultado são **0 comandos
+traduzidos** — o que e' **o mesmo** que antes ✗, porque este push
+buffer **nao tem** `draw.begin`/`draw.end` ✗ (e' um push buffer de
+*setup* ✗, nao de desenho ✗).
+
+**O que fica por fazer**: o push buffer de *desenho* — que vem depois ✗ —
+e' que tem os `draw_begin`/`draw_end` ✗, e o que o tradutor tem de
+traduzir ✗.

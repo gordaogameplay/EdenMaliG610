@@ -55,6 +55,7 @@ struct MethodCall {
 // Os métodos do canal (o *puller*). As posições vêm do upstream
 // (`puller.h`, `ASSERT_REG_POSITION`).
 namespace canal {
+inline constexpr std::uint32_t BindObject = 0x00;
 inline constexpr std::uint32_t SemaphoreAddressHigh = 0x04;
 inline constexpr std::uint32_t SemaphoreAddressLow = 0x05;
 inline constexpr std::uint32_t SemaphoreSequence = 0x06;
@@ -71,6 +72,22 @@ namespace fence_op {
 inline constexpr std::uint32_t Acquire = 0;
 inline constexpr std::uint32_t Increment = 1;
 }  // namespace fence_op
+
+// Os motores (`Tegra::Engines::EngineID` do upstream,
+// `src/video_core/engines/puller.cpp:33-58`).
+//
+// O método `BindObject` (o 0x00 do canal) **liga um subcanal a um
+// motor** — e so' os métodos do subcanal ligado ao motor 3D sao do
+// motor 3D.
+namespace motor {
+// O Maxwell 3D — `EngineID::MAXWELL_B` do upstream
+// (`src/video_core/engines/puller.h:24`): `MAXWELL_B = 0xB197`.
+//
+// **Medido**: e' o mesmo valor que o `AllocateObjectContext` do `nvdrv`
+// recebe (`classe=0xB197`, `/tmp/boot_r27.log`) — o `class_num` do
+// `IoctlAllocObjCtx` e' o `EngineID` (`nvhost_gpu.h:149-151`).
+inline constexpr std::uint32_t Maxwell3D = 0xB197;
+}  // namespace motor
 
 // As operações do semáforo (`Puller::GpuSemaphoreOperation`): os 4 bits
 // baixos da palavra do trigger.

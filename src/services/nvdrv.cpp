@@ -2035,10 +2035,21 @@ private:
             // (semaphore, fence) tem id < 0x40; os do motor 3D tem id
             // >= 0x40 (upstream, dma_pusher.cpp:204).
             std::map<std::uint32_t, std::uint32_t> metodos_vistos;
+            // Os ids **por subcanal** ✗ — sem isto ✗ nao se sabe qual e'
+            // o motor 3D ✗ ✗.
+            std::map<std::uint32_t, std::map<std::uint32_t, std::uint32_t>> por_subcanal;
 
             const std::size_t metodos = leitor.for_each(
                 pushbuffer, [&](const gpu::MethodCall& m) {
                     ++metodos_vistos[m.method];
+                    ++por_subcanal[m.subchannel][m.method];
+                    // **O bind dos subcanais** ✗ — o metodo 0 do canal
+                    // (`BindObject` ✗) liga o subcanal a um motor ✗.
+                    if (m.method == gpu::canal::BindObject) {
+                        LOG_DEBUG(Service_NVDRV,
+                                  "SubmitGPFIFO: BindObject: subcanal={} motor=0x{:X}",
+                                  m.subchannel, m.argument);
+                    }
                     switch (m.method) {
                     case gpu::canal::SemaphoreAddressHigh:
                         sem_endereco = (sem_endereco & 0xFFFFFFFFull) |
@@ -2111,6 +2122,16 @@ private:
                 LOG_DEBUG(Service_NVDRV,
                           "SubmitGPFIFO: max id={} (draw_begin=1414 draw_end=1413) total={}",
                           max_id, metodos_vistos.size());
+                // **Os ids por subcanal** ✗ — o que o motor 3D recebeu ✗.
+                for (const auto& [sc, ids] : por_subcanal) {
+                    std::string l;
+                    char tmp2[32];
+                    for (const auto& [id, n] : ids) {
+                        std::snprintf(tmp2, sizeof tmp2, "%s%u:%u", l.empty() ? "" : " ", id, n);
+                        l += tmp2;
+                    }
+                    LOG_DEBUG(Service_NVDRV, "SubmitGPFIFO: subcanal {}: {}", sc, l);
+                }
             }
         }
 

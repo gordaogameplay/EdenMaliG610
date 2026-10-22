@@ -130,8 +130,49 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
     bool indexado = false;
     bool dentro = false;
 
+    // **O bind dos subcanais** ✗ — o upstream
+    // (`src/video_core/engines/puller.cpp:29-58` ✗) liga cada subcanal a
+    // um motor ✗, pelo método `BindObject` (o 0x00 do canal ✗):
+    //
+    //     void Puller::ProcessBindMethod(const MethodCall& method_call) {
+    //         const auto engine_id = static_cast<EngineID>(method_call.argument);
+    //         bound_engines[method_call.subchannel] = engine_id;
+    //         ...
+    //     }
+    //
+    // **Só os métodos do subcanal ligado ao motor 3D** ✗ sao do motor 3D
+    // ✗ — os dos outros subcanais sao de outros motores ✗ (o de copia ✗,
+    // o de computacao ✗) ✗ ✗.
+    //
+    // **Medido** (`/tmp/boot_r27.log` ✗): sem este bind ✗, a casa traduz
+    // os métodos **de todos** os subcanais ✗ — e os ids que ela via ✗
+    // (`1410`, `1411` ✗) **nao** sao o `draw.begin`/`draw.end` ✗ (que sao
+    // `1414`/`1413` ✗) ✗ ✗ — o que explica os **0 comandos traduzidos**
+    // ✗ ✗.
+    //
+    // O mapa e' `subcanal -> motor` ✗ — e vale so' para o subcanal ligado
+    // ao 3D ✗ ✗.
+    std::uint8_t motores_por_subcanal[8] = {0};
+
     leitor.for_each(pushbuffer, [&](const gpu::MethodCall& m) {
         ++cmds_total_;
+
+        // O `BindObject` (o 0x00 do canal ✗) — o upstream
+        // (`puller.cpp:145-148` ✗) trata-o antes de tudo ✗.
+        if (m.method == gpu::canal::BindObject) {
+            if (m.subchannel < 8) {
+                motores_por_subcanal[m.subchannel] = static_cast<std::uint8_t>(m.argument);
+            }
+            return;
+        }
+
+        // **Só o subcanal do motor 3D** ✗ tem métodos de motor ✗ — os
+        // outros ✗ (o `maxwell_dma` ✗, o `kepler_compute` ✗) tem
+        // *outros* ids ✗ ✗, e traduzi-los como se fossem do 3D ✗ dava
+        // desenhos errados ✗ ✗.
+        if (m.subchannel < 8 && motores_por_subcanal[m.subchannel] != gpu::motor::Maxwell3D) {
+            return;
+        }
 
         if (m.method < regs.size())
             regs[m.method] = m.argument;
