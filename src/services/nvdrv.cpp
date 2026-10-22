@@ -2275,9 +2275,10 @@ private:
         const std::size_t n = tradutor_.translate(pushbuffer, comandos, erro);
         LOG_DEBUG(Service_NVDRV,
                   "canal: SubmitGPFIFO: {} bytes, {} comandos traduzidos "
-                  "(desconhecidos {}, descartados {}){}",
+                  "(desconhecidos {}, descartados {}, passos {} envios {}){}",
                   pushbuffer.size(), n, tradutor_.commands_unknown(),
-                  tradutor_.commands_dropped_feature(), erro.empty() ? "" : (" — " + erro));
+                  tradutor_.commands_dropped_feature(), tradutor_.macro_passos(),
+                  tradutor_.macro_envios(), erro.empty() ? "" : (" — " + erro));
 
         // **A GPU terminou.** O driver tem de acordar o guest: medido, o
         // jogo fica à espera de uma *condition variable* que ninguém
