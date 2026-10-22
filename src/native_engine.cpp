@@ -308,6 +308,7 @@ struct TrapState {
     std::uint64_t* fault_pc;
     std::uint64_t* fault_sp;
     std::uint64_t* fault_addr;
+    std::uint64_t (*fault_regs)[22];
     std::uint64_t* platform_reg;
     TrapKind*      last;
     bool*          limit_hit;
@@ -319,7 +320,8 @@ struct TrapState {
         : svc_calls(&h.svc_calls), traps(&h.traps), faults(&h.faults),
           host_faults(&h.host_faults), svc_time_ns(&h.svc_time_ns),
           fault_pc(&h.fault_pc), fault_sp(&h.fault_sp),
-          fault_addr(&h.fault_addr), platform_reg(&h.platform_reg),
+          fault_addr(&h.fault_addr), fault_regs(&h.fault_regs),
+          platform_reg(&h.platform_reg),
           last(&h.last), limit_hit(&h.limit_hit), faulted(&h.faulted),
           guest_returned(&h.guest_returned), illegal_insn(&h.illegal_insn) {}
 
@@ -327,7 +329,8 @@ struct TrapState {
         : svc_calls(&s.svc_calls), traps(&s.traps), faults(&s.faults),
           host_faults(&s.host_faults), svc_time_ns(&s.svc_time_ns),
           fault_pc(&s.fault_pc), fault_sp(&s.fault_sp),
-          fault_addr(&s.fault_addr), platform_reg(&s.platform_reg),
+          fault_addr(&s.fault_addr), fault_regs(&s.fault_regs),
+          platform_reg(&s.platform_reg),
           last(&s.last), limit_hit(&s.limit_hit), faulted(&s.faulted),
           guest_returned(&s.guest_returned), illegal_insn(&s.illegal_insn) {}
 };
@@ -813,6 +816,42 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
                 const ssize_t w = ::write(2, linha, n);
                 (void)w;
             }
+        }
+
+        // **A tabela que o guest estava a consultar** ✗ — e' o lookup
+        // que devolveu nulo ✗ ✗: a base ✗ (o `x0` ✗), o indice ✗ (o
+        // `w3` ✗) ✗ e o byte de "presente" ✗ ✗.
+        {
+            const std::uint64_t base = hooks_.fault_regs[0];
+            const std::uint64_t w3 = hooks_.fault_regs[3] & 0xFFFF;
+            char linha[400];
+            std::size_t n = 0;
+            n += static_cast<std::size_t>(
+                std::snprintf(linha + n, sizeof(linha) - n, "[fault] tabela: base=0x%llx id=%llu",
+                               (unsigned long long)base, (unsigned long long)w3));
+            std::uint8_t presente = 0;
+            if (svc_.read_guest(base + w3 + 0x1888, &presente, 1)) {
+                n += static_cast<std::size_t>(
+                    std::snprintf(linha + n, sizeof(linha) - n, " presente=%u", presente));
+            }
+            std::uint64_t lista = 0;
+            if (svc_.read_guest(base + w3 * 8 + 0x18AC, &lista, sizeof lista)) {
+                n += static_cast<std::size_t>(
+                    std::snprintf(linha + n, sizeof(linha) - n, " lista=0x%llx", lista));
+                std::uint8_t ids[16]{};
+                if (lista != 0 && svc_.read_guest(lista, ids, sizeof ids)) {
+                    n += static_cast<std::size_t>(
+                        std::snprintf(linha + n, sizeof(linha) - n, " ids="));
+                    for (std::size_t i = 0; i < sizeof ids; ++i)
+                        n += static_cast<std::size_t>(
+                            std::snprintf(linha + n, sizeof(linha) - n, " %u", ids[i]));
+                }
+            }
+            if (n + 2 < sizeof(linha))
+                n += static_cast<std::size_t>(
+                    std::snprintf(linha + n, sizeof(linha) - n, "\n"));
+            const ssize_t w = ::write(2, linha, n);
+            (void)w;
         }
     }
 
@@ -1340,7 +1379,34 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         *ts.fault_pc = pc;
         *ts.fault_sp = static_cast<std::uint64_t>(uc->uc_mcontext.sp);
         *ts.fault_addr = reinterpret_cast<std::uint64_t>(info->si_addr);
+        for (int i = 0; i < 22; ++i) {
+            (*ts.fault_regs)[i] = uc->uc_mcontext.regs[i];
+        }
         *ts.faulted  = true;
+
+        // **Os registos** ✗ — sem eles ✗ nao se sabe o que o guest
+        // procurava ✗ ✗ (o id ✗, o ponteiro ✗) ✗ ✗.
+        {
+            char linha[400];
+            std::size_t n = 0;
+            n += static_cast<std::size_t>(
+                std::snprintf(linha + n, sizeof(linha) - n, "[fault] registos:"));
+            for (int i = 0; i < 8; ++i) {
+                n += static_cast<std::size_t>(
+                    std::snprintf(linha + n, sizeof(linha) - n, " x%d=0x%llx", i,
+                                   (unsigned long long)uc->uc_mcontext.regs[i]));
+            }
+            n += static_cast<std::size_t>(
+                std::snprintf(linha + n, sizeof(linha) - n, " x19=0x%llx x20=0x%llx x21=0x%llx",
+                               (unsigned long long)uc->uc_mcontext.regs[19],
+                               (unsigned long long)uc->uc_mcontext.regs[20],
+                               (unsigned long long)uc->uc_mcontext.regs[21]));
+            if (n + 2 < sizeof(linha))
+                n += static_cast<std::size_t>(
+                    std::snprintf(linha + n, sizeof(linha) - n, "\n"));
+            const ssize_t w = ::write(2, linha, n);
+            (void)w;
+        }
 
         uc->uc_mcontext.sp = rec_sp;
         uc->uc_mcontext.pc = g_hooks.recovery_pc;

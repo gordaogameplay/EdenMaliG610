@@ -123,6 +123,10 @@ struct GuestThreadState {
     std::uint64_t fault_sp         = 0;
     std::uint64_t fault_addr       = 0;
 
+    // **Os registos no momento do fault** ✗ — sem eles ✗ nao se sabe o
+    // que o guest procurava ✗ ✗ (o id ✗, o ponteiro ✗) ✗ ✗.
+    std::uint64_t fault_regs[22]   = {0};
+
     // O `x18` DESTA thread — o "platform register" (stack canary).
     //
     // O Eden gera um valor POR THREAD: `ctx.r[18] = Random64(0) | 1` em cada
@@ -246,6 +250,10 @@ struct EngineHooks {
     // sítio certo com a permissão errada, ou ao sítio errado.
     std::uint64_t   fault_addr    = 0;
     bool            faulted       = false;
+
+    // **Os registos no momento do fault** ✗ — sem eles ✗ nao se sabe o
+    // que o guest procurava ✗ ✗ (o id ✗, o ponteiro ✗) ✗ ✗.
+    std::uint64_t   fault_regs[22] = {0};
 
     // O guest fez `ret` sem ter chamado ExitProcess. Distingue esse bug de
     // uma saída limpa e de um fault, para o relatório não mentir.
