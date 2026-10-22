@@ -72,6 +72,11 @@ add_library(g610_core STATIC
   src/services/fsp_srv.cpp
   src/services/pl_u.cpp
   src/services/set.cpp
+  src/services/shared_font.cpp
+  # A fonte do sistema — os **dados** vem do upstream (embutidos em
+  # codigo ✗) ✗ e a **cifragem** e' a nossa ✗ (`src/services/
+  # shared_font.cpp` ✗) ✗.
+  vendor/eden/core/file_sys/system_archive/data/font_standard.cpp
   src/services/nvdrv.cpp
   src/services/time_u.cpp
   src/services/vi.cpp

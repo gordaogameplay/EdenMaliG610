@@ -40,12 +40,14 @@
 // **Medido**: o jogo arranca e continua (le os seus ficheiros do RomFS e
 // desenha) com a fonte vazia. O que nao ha e' texto do sistema — o jogo
 // traz as suas proprias fontes.
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
 #include <vector>
 
 #include "g610/services/pl_u.hpp"
+#include "g610/services/shared_font.hpp"
 #include "vendor/eden/common/logging.h"
 #include "vendor/eden/core/system_ref.h"  // o `Core::System` nosso
 #include "vendor/eden/core/hle/kernel/k_event.h"
@@ -147,25 +149,32 @@ private:
         rb.Push(static_cast<std::uint32_t>(LoadState::Loaded));
     }
 
-    // 2: o tamanho da regiao da fonte. **Zero** — a casa nao tem a fonte
-    // do sistema (ela vem do firmware).
+    // 2: o tamanho da regiao da fonte.
+    //
+    // **Com a fonte** ✗ — o tamanho da regiao ✗ (o Eden,
+    // `platform_service_manager.cpp:221-225` ✗) ✗.
     void GetSize(HLERequestContext& ctx) {
         RequestParser rp{ctx};
         const auto tipo = rp.PopRaw<std::uint32_t>();
-        LOG_DEBUG(Service_NS, "GetSize: tipo={} (sem fonte do sistema)", tipo);
+        const auto& regioes = RegioesDaFonte();
+        const std::uint32_t tamanho =
+            tipo < regioes.size() ? regioes[tipo].tamanho : 0u;
+        LOG_DEBUG(Service_NS, "GetSize: tipo={} -> {}", tipo, tamanho);
         ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
-        rb.Push(static_cast<std::uint32_t>(0));
+        rb.Push(tamanho);
     }
 
     // 3: o offset da regiao da fonte dentro da memoria partilhada.
     void GetSharedMemoryAddressOffset(HLERequestContext& ctx) {
         RequestParser rp{ctx};
         const auto tipo = rp.PopRaw<std::uint32_t>();
-        LOG_DEBUG(Service_NS, "GetSharedMemoryAddressOffset: tipo={}", tipo);
+        const auto& regioes = RegioesDaFonte();
+        const std::uint32_t offset = tipo < regioes.size() ? regioes[tipo].offset : 0u;
+        LOG_DEBUG(Service_NS, "GetSharedMemoryAddressOffset: tipo={} -> {}", tipo, offset);
         ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
-        rb.Push(static_cast<std::uint32_t>(0));
+        rb.Push(offset);
     }
 
     // 4: o handle da memoria partilhada da fonte.
@@ -176,19 +185,51 @@ private:
         rb.PushCopyObjects(ctx, &shm_->GetReadableEvent());
     }
 
-    // 5 e 6: as fontes por ordem de prioridade. Sem fonte do sistema, a
-    // lista e' **vazia** (o Eden tambem devolve uma lista vazia quando nao
-    // ha fontes).
+    // 5 e 6: as fontes por ordem de prioridade.
+    //
+    // **O Eden** (`platform_service_manager.cpp:248-277` ✗) ✗: as tres
+    // listas (os codigos ✗, os offsets ✗ e os tamanhos ✗) vao para tres
+    // **buffers de saida** ✗ ✗, e o `out_font_count` ✗ e' o numero de
+    // fontes ✗ ✗.
+    //
+    // **O maximo e' 6** ✗ (`MaxElementCount` ✗, a linha 257 ✗) ✗ ✗.
     void GetSharedFontInOrderOfPriority(HLERequestContext& ctx) {
         RequestParser rp{ctx};
         const auto linguagem = rp.PopRaw<std::uint64_t>();
         LOG_DEBUG(Service_NS, "GetSharedFontInOrderOfPriority: linguagem={:#x}", linguagem);
-        // As tres listas (os codigos, os offsets e os tamanhos) sao tres
-        // buffers de saida, e vao vazios.
+
+        const auto& regioes = RegioesDaFonte();
+
+        // As tres listas — cada uma num buffer de saida ✗ ✗.
+        //
+        // **O Eden** (`platform_service_manager.cpp:260-270` ✗) ✗: o
+        // maximo e' o menor ✗ entre 6 ✗, os tamanhos dos tres buffers ✗
+        // e o numero de regioes ✗ ✗.
+        constexpr std::size_t kMaximo = 6;
+
+        const std::size_t capacidade =
+            std::min({kMaximo, ctx.GetWriteBufferSize(0) / sizeof(std::uint32_t),
+                      ctx.GetWriteBufferSize(1) / sizeof(std::uint32_t),
+                      ctx.GetWriteBufferSize(2) / sizeof(std::uint32_t), regioes.size()});
+
+        std::vector<std::uint32_t> codigos(capacidade);
+        std::vector<std::uint32_t> offsets(capacidade);
+        std::vector<std::uint32_t> tamanhos(capacidade);
+        for (std::size_t i = 0; i < capacidade; ++i) {
+            codigos[i] = static_cast<std::uint32_t>(i);
+            offsets[i] = regioes[i].offset;
+            tamanhos[i] = regioes[i].tamanho;
+        }
+        if (capacidade > 0) {
+            ctx.WriteBuffer(codigos.data(), codigos.size() * sizeof(std::uint32_t), 0);
+            ctx.WriteBuffer(offsets.data(), offsets.size() * sizeof(std::uint32_t), 1);
+            ctx.WriteBuffer(tamanhos.data(), tamanhos.size() * sizeof(std::uint32_t), 2);
+        }
+
         ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
-        rb.Push(static_cast<std::uint8_t>(1)); // as fontes estao' "carregadas"
-        rb.Push(static_cast<std::uint32_t>(0)); // zero fontes
+        rb.Push(static_cast<std::uint8_t>(1));  // as fontes estao' "carregadas"
+        rb.Push(static_cast<std::uint32_t>(capacidade));
     }
 
     void GetSharedFontInOrderOfPriorityForSystem(HLERequestContext& ctx) {

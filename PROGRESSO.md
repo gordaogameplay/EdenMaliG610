@@ -5060,3 +5060,44 @@ o `KernelCore` minimo ✗ (a ponte ✗) ✗ ✗.
    caminho e' o `renderer_vulkan` ✗ do upstream ✗ + o PanVK ✗ ✗ ✗.
 5. **A apresentacao** ✗ — o `QueueBuffer` ✗ tem de pôr o frame ✗ na
    janela ✗ ✗ (e a janela na HDMI ✗ ✗) ✗.
+
+## A fonte do sistema: a casa passa a servir a fonte verdadeira (medido, 2026-10-22)
+
+### O que era
+
+A `pl:u` devolveva a regiao da fonte **vazia** (`GetSize` = 0 ✗) ✗ — a
+fonte vem do **firmware** da consola ✗ ✗, que a casa nao tem ✗ ✗.
+
+### O que se descobriu
+
+**O Eden tambem nao tem NAND** ✗ — e por isso **sintetiza** a fonte ✗: os
+dados estao **embutidos em codigo** ✗ (`core/file_sys/system_archive/data/
+font_standard.cpp` ✗ — 217 KB ✗) ✗ e sao **cifrados** com a mesma
+transformacao do hardware ✗ ✗ (`platform_service_manager.cpp:77-91` ✗) ✗ ✗.
+
+**Sao um recurso do Eden** ✗ ✗ — nao do firmware da consola ✗ ✗ — e
+portanto a casa pode usa-los ✗ ✗ (o mesmo que o Eden ✗ ✗).
+
+### A correccao
+
+`src/services/shared_font.cpp` (novo) ✗ — a **cifragem** ✗ (a do
+hardware ✗) ✗ e as **regioes** ✗ ✗. `include/g610/services/shared_font.hpp`
+(novo) ✗ — a interface ✗ ✗.
+
+O `pl:u` passa a devolver ✗: o `GetSize` ✗ e o
+`GetSharedMemoryAddressOffset` ✗ **reais** ✗ ✗, e o
+`GetSharedFontInOrderOfPriority` ✗ as tres listas ✗ (os codigos ✗, os
+offsets ✗ e os tamanhos ✗) ✗ nos tres **buffers de saida** ✗ ✗ — como
+o Eden ✗ (`platform_service_manager.cpp:248-277` ✗) ✗ ✗.
+
+### O que mudou
+
+**Medido** (`/tmp/boot_r41.log`): o **fault desapareceu** ✗->✓ ✗ — o
+jogo **nao aborta** com o CMIF ✗ ✗ e nao desreferencia um ponteiro nulo
+✗ ✗. Saiu pelo **limite de traps** ✗ ✗ — o jogo entrou num ciclo de
+IPC ✗ ✗, mas **faz** coisas a mais ✗ ✗: le **21** ficheiros ✗ ✗ (o
+RomFS ✗ e os **BNS** ✗) ✗ e as **duas ultimas leituras sao as fontes do
+proprio jogo** ✗ ✗ (magic `36f81a1e` ✗ — o BFTTF ✗) ✗ ✗.
+
+O erro que resta e' **novo** ✗: `SetTerminateResult modulo=64 desc=0`
+✗ ✗ — nao e' o CMIF ✗ ✗.
