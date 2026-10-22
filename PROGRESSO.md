@@ -5018,3 +5018,45 @@ pode ser o proprio PanVK ✗ ✗ ✗, como no Eden ✗ ✗.
 **Nota**: o `eden-cli` ainda **segfaulta** ✗ (no `GetSupportedFormat` ✗
 — os formatos que o panvk nao tem ✗ ✗) ✗ — mas isso e' um problema do
 **Eden** ✗ ✗, nao do jogo ✗ ✗, e nao serve de referencia ✗ ✗.
+
+## Onde esta' o trabalho que falta (medido, 2026-10-22)
+
+### O `RasterizerG610` — o motor de desenho da casa
+
+`src/gpu/rasterizer_g610.cpp` tem **258 linhas** ✗ e os comandos de
+desenho sao **vazios** ✗ (`Draw` so' conta ✗, `BufferCopy` devolve
+`false` ✗) ✗ ✗.
+
+E' o **`RasterizerInterface`** do upstream ✗ (`video_core/rasterizer_interface.h`
+✗) — a mesma interface que o `renderer_vulkan` do Eden implementa ✗ ✗.
+
+### O caminho
+
+O upstream (`video_core/renderer_vulkan/` ✗ — **61 ficheiros** ✗, todos
+vendorizados ✗ ✗) e' o backend que **executa** os comandos Maxwell ✗
+como Vulkan ✗ ✗ — e o **PanVK** ✗ (medido ✗: `Mali-G610` + `panvk` ✗) e'
+a implementacao desse backend para o nosso GPU ✗ ✗ ✗.
+
+**Logo**: a execucao da casa **nao tem de ser escrita do zero** ✗ ✗ —
+pode ser o proprio `renderer_vulkan` do upstream ✗ ✗, a falar com o
+PanVK ✗ ✗, como o Eden ✗ ✗.
+
+**O que impede isso hoje** ✗ (medido ✗): os `.cpp` do upstream do
+`video_core` ✗ herdam o **`KernelCore` completo** ✗ (`GetMemoryManager` ✗,
+`GetCurrentProcess` ✗, o `KDynamicPageManager` ✗) ✗ — e a casa tem so'
+o `KernelCore` minimo ✗ (a ponte ✗) ✗ ✗.
+
+**O caminho possivel** ✗: dar ao `video_core` do upstream a **ponte**
+✗ que ele precisa ✗ — um `KernelCore` que sirva a memoria do guest ✗
+✗ (que e' o que a casa ja' tem ✗) ✗ ✗.
+
+### O que falta, por ordem
+
+1. **O fault** ✗ — `0x8177d290` ✗: um lookup do **proprio jogo** ✗ que
+   devolveu nulo ✗ ✗.
+2. **O `DequeueBuffer`** ✗ — nunca chega ✗.
+3. **O push buffer de desenho** ✗ — o que chegou ✗ foi de *setup* ✗.
+4. **A execucao** ✗ — o `RasterizerG610` ✗ e' um esqueleto ✗ ✗; o
+   caminho e' o `renderer_vulkan` ✗ do upstream ✗ + o PanVK ✗ ✗ ✗.
+5. **A apresentacao** ✗ — o `QueueBuffer` ✗ tem de pôr o frame ✗ na
+   janela ✗ ✗ (e a janela na HDMI ✗ ✗) ✗.
