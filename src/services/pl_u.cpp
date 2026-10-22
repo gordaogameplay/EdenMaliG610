@@ -31,15 +31,20 @@
 // 16 comandos) e o `ns.cpp` (o registo do `pl:u` e do `pl:s`). Os **IDs**
 // e os **nomes** sao copiados a mao — as tabelas **nao se inventam**.
 //
-// ## O que a casa **nao** tem: a fonte
+// ## A fonte: sete regioes, nao uma
 //
-// A fonte do sistema vem do **firmware** da consola (os ficheiros
-// `.bfttf` dos arquivos do sistema). A casa nao os tem, e o `GetSize`
-// devolve **zero** — a regiao da fonte e' **vazia**.
+// **Medido** (`/tmp/boot_watch.log`): o jogo pede `GetSize` e
+// `GetSharedMemoryAddressOffset` para os tipos 4, 2, 1 e 3. A casa so'
+// tinha a regiao 0 e devolvia **0** a todos — e morria a seguir no indice
+// 2 do ciclo das 5 fontes (`0x8177d290`, o glifo `?` de uma fonte vazia).
 //
-// **Medido**: o jogo arranca e continua (le os seus ficheiros do RomFS e
-// desenha) com a fonte vazia. O que nao ha e' texto do sistema — o jogo
-// traz as suas proprias fontes.
+// O Eden tem **7** entradas em `SHARED_FONTS`
+// (`platform_service_manager.h:42-50`) e o tipo do `SharedFontType` e' o
+// indice directo. A casa serve as mesmas 7 (`shared_font.cpp`).
+//
+// O handle do comando 4 e' um `KEvent` (o kernel vendorizado nao tem
+// `KSharedMemory`); o `svcMapSharedMemory` reconhece-o e copia o blob para
+// o endereco escolhido pelo guest.
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -119,10 +124,12 @@ public:
         shm_ = new Kernel::KEvent(kernel);
         auto& processo = Kernel::GetCurrentProcess(kernel);
         shm_->Initialize(kernel, &processo);
+        RegistarEventoDaFonte(shm_);
     }
 
     ~PlU() override {
         if (shm_ != nullptr) {
+            RegistarEventoDaFonte(nullptr);
             shm_->Close(kernel);
             delete shm_;
         }
@@ -151,8 +158,8 @@ private:
 
     // 2: o tamanho da regiao da fonte.
     //
-    // **Com a fonte** ✗ — o tamanho da regiao ✗ (o Eden,
-    // `platform_service_manager.cpp:221-225` ✗) ✗.
+    // **Com a fonte** — o tamanho da regiao (o Eden,
+    // `platform_service_manager.cpp:221-225`).
     void GetSize(HLERequestContext& ctx) {
         RequestParser rp{ctx};
         const auto tipo = rp.PopRaw<std::uint32_t>();
@@ -187,12 +194,12 @@ private:
 
     // 5 e 6: as fontes por ordem de prioridade.
     //
-    // **O Eden** (`platform_service_manager.cpp:248-277` ✗) ✗: as tres
-    // listas (os codigos ✗, os offsets ✗ e os tamanhos ✗) vao para tres
-    // **buffers de saida** ✗ ✗, e o `out_font_count` ✗ e' o numero de
-    // fontes ✗ ✗.
+    // **O Eden** (`platform_service_manager.cpp:248-277`): as tres
+    // listas (os codigos, os offsets e os tamanhos) vao para tres
+    // **buffers de saida**, e o `out_font_count` e' o numero de
+    // fontes.
     //
-    // **O maximo e' 6** ✗ (`MaxElementCount` ✗, a linha 257 ✗) ✗ ✗.
+    // **O maximo e' 6** (`MaxElementCount`, a linha 257).
     void GetSharedFontInOrderOfPriority(HLERequestContext& ctx) {
         RequestParser rp{ctx};
         const auto linguagem = rp.PopRaw<std::uint64_t>();
@@ -200,11 +207,11 @@ private:
 
         const auto& regioes = RegioesDaFonte();
 
-        // As tres listas — cada uma num buffer de saida ✗ ✗.
+        // As tres listas — cada uma num buffer de saida.
         //
-        // **O Eden** (`platform_service_manager.cpp:260-270` ✗) ✗: o
-        // maximo e' o menor ✗ entre 6 ✗, os tamanhos dos tres buffers ✗
-        // e o numero de regioes ✗ ✗.
+        // **O Eden** (`platform_service_manager.cpp:260-270`): o
+        // maximo e' o menor entre 6, os tamanhos dos tres buffers
+        // e o numero de regioes.
         constexpr std::size_t kMaximo = 6;
 
         const std::size_t capacidade =

@@ -9,43 +9,49 @@
 // `.bfttf` (uma fonte BFTTF **cifrada**) que vive nos **arquivos do
 // sistema** da consola (o `NAND`).
 //
-// **O Eden nao tem NAND** ✗ — e por isso **sintetiza** a fonte ✗: os
-// dados estao **embutidos em codigo** ✗ (`core/file_sys/system_archive/data/
-// font_standard.h` ✗) ✗ e sao **cifrados** com a mesma transformacao do
-// hardware ✗ ✗.
+// **O Eden nao tem NAND** — e por isso **sintetiza** a fonte: os dados
+// estao **embutidos em codigo** (`core/file_sys/system_archive/data/
+// font_*.h`) e sao cifrados com a mesma transformacao do hardware.
 //
-// **A casa faz exactamente o mesmo** ✗ ✗ — e com os **mesmos dados** ✗
-// (os do upstream ✗ ✗, que sao um recurso **do Eden** ✗ ✗ e nao do
-// firmware da consola ✗ ✗) ✗ ✗.
+// **A casa faz exactamente o mesmo** — e com os **mesmos dados** (os do
+// upstream, que sao um recurso **do Eden** e nao do firmware da consola).
 //
-// ## A cifragem
+// ## Porque sao **sete** regioes e nao uma
 //
-// O Eden (`core/hle/service/ns/platform_service_manager.cpp:77-91` ✗):
+// **Medido** (`/tmp/boot_watch.log`): o jogo pede `GetSize`/`GetSharedMemory-
+// AddressOffset` para os tipos 4, 2, 1 e 3, e a casa so' tinha a regiao 0.
+// Todos os pedidos devolviam **0**, e o jogo morria a seguir no indice 2 do
+// ciclo das 5 fontes (`0x8177d290`, o glifo `?` de uma fonte vazia).
 //
-//     const auto key = Common::swap32(EXPECTED_RESULT ^ EXPECTED_MAGIC);
-//     std::vector<u32> transformed_font(input.size() + 2);
-//     transformed_font[0] = Common::swap32(EXPECTED_MAGIC);
-//     transformed_font[1] = Common::swap32(input.size() * 4) ^ key;
-//     std::transform(input.begin(), input.end(), transformed_font.begin() + 2,
-//                    [key](u32 in) { return in ^ key; });
+// O Eden tem **7** entradas em `SHARED_FONTS`
+// (`platform_service_manager.h:42-50`): a standard, duas chinesas
+// simplificadas, a chinesa tradicional, a coreana, e a `ext` **duas vezes**
+// (`nintendo_ext_003.bfttf` e `nintendo_ext2_003.bfttf`, com os mesmos
+// dados). As regioes seguem essa ordem, e o tipo do `SharedFontType` e' o
+// indice directo — como no upstream.
 //
-// E o `DecryptSharedFont` (a linha 43 ✗) e' o inverso ✗:
+// ## A cifragem e a memoria partilhada
 //
-//     const u32 KEY = input[0] ^ EXPECTED_RESULT;
-//     std::transform(input.begin(), input.end(), transformed_font.begin(),
-//                    [&KEY](u32 f) { return Common::swap32(f ^ KEY); });
-//     transformed_font[1] = Common::swap32(transformed_font[1]) ^ KEY;
+// O Eden (`core/hle/service/ns/platform_service_manager.cpp:77-91`)
+// cifra a fonte e o `DecryptSharedFont` (a linha 43) escreve-a **ja'
+// decifrada** na memoria partilhada. A regiao comeca **8 bytes depois**
+// do inicio de cada fonte: os primeiros 8 bytes sao o cabecalho
+// (`swap32(EXPECTED_RESULT)` e o tamanho com a chave), e o TTF comeca no
+// offset da regiao.
 //
-// **A regiao da fonte** (`FontRegion` ✗) e' o par (offset, tamanho) ✗
-// **dentro da memoria partilhada** ✗ — e o offset comeca em 8 ✗ (o
-// cabecalho) ✗ ✗.
+// **A casa escreve o mesmo layout directamente** — nao ha' round-trip
+// cifrar/decifrar. O que o guest le em `regiao.offset` e' o TTF.
 //
-// O `SHARED_FONT_MEM_SIZE` do upstream e' **17 MB** ✗ (`0x1100000` ✗) ✗.
+// O `SHARED_FONT_MEM_SIZE` do upstream e' **17 MB** (`0x1100000`).
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+
+namespace Kernel {
+class KEvent;
+} // namespace Kernel
 
 namespace g610::services {
 
@@ -60,14 +66,23 @@ struct RegiaoDaFonte {
 // upstream, `platform_service_manager.cpp:40`).
 inline constexpr std::size_t kTamanhoDaMemoriaDaFonte = 0x1100000;
 
-// Os dados da fonte **cifrados** (a forma em que o SDK os recebe) e as
-// regoes que ocupam.
-//
-// **Um vector vazio** ✗ significa "sem fonte" ✗ — e e' o que a casa
-// devolvia ✗ ✗ (e o que o Eden devolve sem NAND ✗ ✗).
-const std::vector<std::uint8_t>& DadosDaFonteCifrados();
+// O que vai para a memoria partilhada: para cada fonte, o cabecalho de 8
+// bytes e o TTF. E' o layout **ja' decifrado** — o mesmo que o
+// `DecryptSharedFont` do Eden escreve.
+const std::vector<std::uint8_t>& DadosDaFontePartilhados();
 
-// As regoes das fontes, por ordem de prioridade. Vazio = sem fonte.
+// As regioes das fontes, por ordem de prioridade (a ordem do `SHARED_FONTS`
+// do Eden). Vazio = sem fonte.
 const std::vector<RegiaoDaFonte>& RegioesDaFonte();
+
+// O evento do `pl:u` que representa a memoria partilhada. O kernel
+// vendorizado nao tem `KSharedMemory`; o guest recebe um handle para este
+// evento, e o `svcMapSharedMemory` reconhece-o para copiar o blob para o
+// endereco que o guest escolheu.
+//
+// **Medido**: sem esta copia, o `svcMapSharedMemory` da casa era um no-op e
+// o guest lia zeros onde devia estar o TTF.
+void RegistarEventoDaFonte(Kernel::KEvent* evento);
+bool EventoDaFonte(const Kernel::KEvent* evento);
 
 } // namespace g610::services
