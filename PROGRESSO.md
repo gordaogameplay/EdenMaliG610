@@ -5289,10 +5289,12 @@ fixture `tests/fixtures/gpfifo_submit0.bin`):
     parte A (10 checks, todos verdes): 2216 palavras; 624 chamadas;
     6 descartados; 5 BindObject; sc0=0xB197; 1413/1414 ausentes;
     0xE0A×29; 0xE0B×29; 2 chamadas de canal no subcanal 6.
-    parte B (a expectativa): translate() → 0 comandos — FALHA
-    deliberada hoje; fica verde quando as macros forem interpretadas.
+    parte B (as macros): 0 desconhecidos, erro vazio, passos 1637,
+    envios 901 — verde desde o stub da chamada de firmware 4
+    (commit a36ec92); 0 comandos segue medido e impresso, não
+    escondido.
 
-    ctest: 7 de 8 passam; o `gpfifo_replay` é o 1 falho esperado.
+    ctest no Pi: 8 de 8 passam (22/10, fim de tarde).
 
 **Comparação de builds (item 4)**: o build do run (LOG/LOG2) e o
 atual são funcionalmente idênticos no caminho — `git diff
@@ -5300,10 +5302,55 @@ a2a17a9..HEAD` nos 6 ficheiros do caminho dá 6 linhas fora de
 comentários, todas a retirar o glifo de cruz de comentários inline;
 o `pushbuffer.cpp` (o decoder) não mudou.
 
-Falta o passo que dá nome ao projecto: **interpretar as macros MME
-no tradutor** (a MESMA máquina do upstream é a Fonte). Por isso
+Falta o passo que dá nome ao projecto: **emitir o desenho do jogo** —
+o interpretador da macro já corre as 29 chamadas e mede (a36ec92);
+o disparo do desenho vive dentro do blob da chamada de firmware 4
+(`falcon[4]`), que o próprio upstream substitui por um stub que
+desenha zero — vê a subsecção a seguir. Por isso
 `DequeueBuffer`/`QueueBuffer` do compositor nunca foram alcançados,
 e nada chega ao ecrã.
+
+#### As macros correm e medem; o desenho fica no blob (22/10 noite,
+commit a36ec92)
+
+A primeira execução do porte fiel (`src/gpu/macro_mme.cpp`,
+verificado instrução a instrução contra `macro_interpreter.cpp`
+do upstream) travou no teto de 1M passos com **29 desconhecidos**:
+a macro de desenho translada porque lê o rascunho `0xD00` e a casa
+nunca o acende. A fonte demonstrada: o upstream, ao receber a escrita
+em `falcon[4]` (o reg 2244), roda `ProcessFirmwareCall4` e substitui o
+blob de hardware por `0xd00 = 1` (`maxwell_3d.cpp:346-347` e
+`486-492`); a casa só tinha a escrita simples do registo. Com a
+mesma substituição (o caso novo no `palavra_engine`, via
+`gpu::maxwell3d::falcon + 4`), as macros terminam:
+
+- o tracer fiel (`tools/trace_macro.py`, reescrito com o slot de
+  atraso recursivo, o r0 fio a zero e o alvo do ramo em bytes) mede
+  por chamada da macro de desenho: **17 passos, 5 envios, 3/3
+  parámetros** (exit na palavra 23); os envios: `wait_for_idle (68)←0`,
+  `0xD00←0`, `0xD01←1`, `0xD02←1`, `falcon[4]←VA` — os VAs medidos nos
+  29 chamados: 0x418800, 0x419a08, 0x419f78, 0x404468, 0x419a04 …
+- o `translate()` no Pi mede **1637 passos / 901 envios por submit**
+  (o 493/145 da macro de desenho = 29×17/29×5; o resto, 1144/756,
+  são as macros de estado — entry 14/16/20);
+- o erro da Parte B, antes: "macro MME passou do teto de passos";
+  depois: `(vazio)`.
+
+No run vivo (`/tmp/LOG4`, a mesma máquina): 4 submits de canal
+(3×8864 + 1×300) com os cumulativos **1637 → 3274 → 4911 passos** e
+**901 → 1802 → 2703 envios** (o determinismo do porte), zero sintomas
+de microcode (`passou do teto`/`saltou fora`/`exauriu` = 0) e a forma
+da corrida igual à de LOG3 (`trap #28` ×1592 → ×1593): a única
+mudança é a execução e a medição das macros.
+
+**O defeito em pé (medido, não varrido)**: 0 `DrawCommand` — o jogo
+entrega ao `falcon[4]` o VA dos parámetros do desenho; o blob de
+hardware é quem dispara o desenho a partir desses parámetros, e o
+próprio upstream o stubiza sem desenhar. Para ESTES bytes também o
+upstream não produz desenho. O passo seguinte depende de uma decisão
+de fonte (não de mais código): ler o que vive no VA dos parámetros no
+run vivo (a evidência do conteúdo) e decidir com isso — ou documentar
+a parede aqui.
 
 ### Parede 2 — thread de cv (medida, em discussão)
 
@@ -5344,13 +5391,15 @@ Distribuição de wrappers `brk` do SDK no log de 240 s (contagem por pc):
 1. **cv**: medir o lado do produtor — que thread devia sinalizar 0xd9c2c22c e
    por que não corre — ou alargar o limiar do watchdog para não abortar
    repetições legítimas de `TimedWait`.
-2. **GPU**: interpretar as macros MME no tradutor (`MacroRegistersStart
-   = 0xE00` do upstream é a Fonte; a macro `(0xE0A)>>1` é a de
-   desenho, chamada 29 vezes no caso capturado). O teste
-   `gpfifo_replay` é o contrato: a Parte B fica verde quando o
-   `translate()` emitir ≥ 1 `DrawCommand` para os mesmos 8864 bytes.
-   **Nesta etapa** a expectativa foi deixada em falha deliberada —
-   foi a marca da causa, e o `ctest` mostra 7/8.
+2. **GPU**: o desenho em si — a macro do desenho corre e mede desde
+   a36ec92; o disparo do desenho vive dentro do blob da chamada de
+   firmware 4 (`falcon[4]`), que o upstream também não executa (o
+   stub dele só gravar 0xd00=1). Antes de escrever mais código:
+   medir o que vive no VA que as 29 chamadas entregam (o run vivo
+   é quem tem a memória) e decidir a fonte com essa evidência. O
+   teste `gpfifo_replay` é o contrato: Parte B verde com os totais
+   fixados (1637 passos / 901 envios) e os 0 comandos medidos e
+   impressos.
 3. **Apresentar**: ligar o `renderer_vulkan` do upstream ao PanVK (valida o
    patch SNORM) e mostrar a janela nativa 0x9C800000, depois hdmi.
 
