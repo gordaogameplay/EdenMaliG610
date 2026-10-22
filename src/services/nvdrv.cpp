@@ -1472,37 +1472,13 @@ private:
         IoctlMapBufferEx params{};
         LerEntrada(ctx, params);
 
-        const auto it = nvmap_.find(params.handle);
-        if (it == nvmap_.end() || !it->second.alocado) {
-            LOG_WARNING(Service_NVDRV, "MapBufferEx: handle {} não está alocado", params.handle);
-            RespostaErro(ctx, NvResult::BadValue, "ioctl");
-            return;
+        if (std::getenv("IA_IPC_TRACE") != nullptr) {
+            const auto entrada = ctx.ReadBufferCopy(0);
+            std::fprintf(stderr, "[nvdrv] MapBufferEx: entrada=%zu bytes:", entrada.size());
+            for (std::size_t i = 0; i < entrada.size() && i < 40; ++i)
+                std::fprintf(stderr, " %02x", entrada[i]);
+            std::fprintf(stderr, "\n");
         }
-
-        // **O tamanho** ✗ — o upstream (`nvhost_as_gpu.cpp:369` ✗):
-        //
-        //     u64 size{params.mapping_size ? params.mapping_size : handle->orig_size};
-        //
-        // **O tamanho zero significa "o handle inteiro"** ✗ — e a casa
-        // usava o zero ✗, o que mapeava **nada** ✗ ✗.
-        //
-        // **Medido**: o guest pede `MapBufferEx` com `mapping_size = 0` ✗
-        // (`fd=2 grupo=0x41 cmd=0x06 tamanho=40` ✗, `va=0x0 -> ... tamanho=0x0`
-        // ✗) ✗ — e a casa registava `tamanho=0x0` ✗.
-        const std::uint64_t tamanho =
-            params.mapping_size != 0 ? params.mapping_size : it->second.tamanho;
-
-        // **O endereco base** ✗ — o `nvmap` do handle ✗, **mais** o
-        // `buffer_offset` ✗ ✗.
-        //
-        // **O `buffer_offset` conta a partir do handle** ✗ — e o upstream
-        // (`nvhost_as_gpu.cpp:369-375` ✗) faz `device_address = ptr +
-        // buffer_offset` ✗, onde o `ptr` e' o do **mapeamento** ✗ ✗.
-        const std::uint64_t endereco = it->second.endereco + params.buffer_offset;
-        LOG_DEBUG(Service_NVDRV,
-                  "MapBufferEx: handle={} va=0x{:X} -> 0x{:X} tamanho=0x{:X} flags=0x{:X}",
-                  params.handle, static_cast<std::uint64_t>(params.offset), endereco, tamanho,
-                  params.flags);
 
         // O VA devolvido.
         //
@@ -1581,6 +1557,50 @@ private:
             RespostaOk(ctx);
             return;
         }
+
+        // **A validacao do handle** ✗ — so' **depois** do `Remap` ✗ ✗,
+        // como no upstream ✗ (`nvhost_as_gpu.cpp:353` ✗: o `GetHandle`
+        // so' e' chamado depois ✗) ✗ ✗.
+        //
+        // **Medido** (`/tmp/boot_r38.log` ✗): o guest pede
+        //
+        //     MapBufferEx: flags=0x100 handle=0 ...
+        //
+        // — o `handle` e' **zero** ✗ ✗ porque o `Remap` nao' o usa ✗ ✗.
+        // A casa validava o handle **antes** ✗ ✗ e respondia `BadValue`
+        // ✗ ✗ — e o guest ficava sem o remapeamento ✗ ✗.
+
+        const auto it = nvmap_.find(params.handle);
+        if (it == nvmap_.end() || !it->second.alocado) {
+            LOG_WARNING(Service_NVDRV, "MapBufferEx: handle {} não está alocado", params.handle);
+            RespostaErro(ctx, NvResult::BadValue, "ioctl");
+            return;
+        }
+
+        // **O tamanho** ✗ — o upstream (`nvhost_as_gpu.cpp:369` ✗):
+        //
+        //     u64 size{params.mapping_size ? params.mapping_size : handle->orig_size};
+        //
+        // **O tamanho zero significa "o handle inteiro"** ✗ — e a casa
+        // usava o zero ✗, o que mapeava **nada** ✗ ✗.
+        //
+        // **Medido**: o guest pede `MapBufferEx` com `mapping_size = 0` ✗
+        // (`fd=2 grupo=0x41 cmd=0x06 tamanho=40` ✗, `va=0x0 -> ... tamanho=0x0`
+        // ✗) ✗ — e a casa registava `tamanho=0x0` ✗.
+        const std::uint64_t tamanho =
+            params.mapping_size != 0 ? params.mapping_size : it->second.tamanho;
+
+        // **O endereco base** ✗ — o `nvmap` do handle ✗, **mais** o
+        // `buffer_offset` ✗ ✗.
+        //
+        // **O `buffer_offset` conta a partir do handle** ✗ — e o upstream
+        // (`nvhost_as_gpu.cpp:369-375` ✗) faz `device_address = ptr +
+        // buffer_offset` ✗, onde o `ptr` e' o do **mapeamento** ✗ ✗.
+        const std::uint64_t endereco = it->second.endereco + params.buffer_offset;
+        LOG_DEBUG(Service_NVDRV,
+                  "MapBufferEx: handle={} va=0x{:X} -> 0x{:X} tamanho=0x{:X} flags=0x{:X}",
+                  params.handle, static_cast<std::uint64_t>(params.offset), endereco, tamanho,
+                  params.flags);
 
         if ((params.flags & kMappingFixed) != 0) {
             params.offset = static_cast<std::int64_t>(params.offset);

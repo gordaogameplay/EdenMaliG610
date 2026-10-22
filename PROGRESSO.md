@@ -4920,3 +4920,28 @@ correcta ✗->✓ —
 
 — que e' **a mesma regiao** que o compositor usa ✗ (o
 `SetPreallocatedBuffer` ✗) ✗ ✗.
+
+## O `Remap` do `MapBufferEx` nao' valida o handle (medido, 2026-10-22)
+
+### O bug
+
+**Medido** (`/tmp/boot_r38.log`): o guest pede
+
+    MapBufferEx: flags=0x100 handle=0 va=0xE5D39000 ...
+
+O `0x100` e' o **`Remap`** ✗ (o bit 8 ✗ — `nvhost_as_gpu.h:42-47` ✗) ✗.
+E o `handle` e' **zero** ✗ ✗ — porque o `Remap` **nao' usa o handle**
+✗ ✗: o upstream (`nvhost_as_gpu.cpp:328-352` ✗) faz o remapeamento
+**antes** de qualquer `GetHandle` ✗ ✗ (o `GetHandle` so' e' chamado na
+linha 353 ✗) ✗ ✗.
+
+**A casa validava o handle primeiro** ✗ ✗ e respondia `BadValue` ✗ ✗ —
+e o guest ficava **sem o remapeamento** ✗ ✗.
+
+### A correccao
+
+A validacao do handle foi movida para **depois** do `Remap` ✗ ✗ —
+como no upstream ✗ ✗.
+
+**Medido depois** (`/tmp/boot_r39.log`): o `MapBufferEx: handle 0 nao
+esta' alocado` **desapareceu** ✗->✓ (ya' nao ha ✗) ✗.
