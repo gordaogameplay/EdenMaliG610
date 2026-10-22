@@ -111,7 +111,7 @@ struct CommandHeader {
 
 // Os modos (`Tegra::SubmissionMode` do upstream, `video_core/dma_pusher.h`).
 //
-// **Copia exacta do upstream** ✓ — e a tabela errada custou caro ✗.
+// **Copia exacta do upstream** ✓ — e a tabela errada custou caro.
 //
 // O upstream (`dma_pusher.h:35-42` ✓):
 //
@@ -124,21 +124,21 @@ struct CommandHeader {
 //         IncreaseOnce = 5
 //     };
 //
-// A casa tinha `Increasing = 0` ✗, `NonIncreasing = 1` ✗, `Inline = 2` ✗ e
-// `IncreaseOnce = 3` ✗ — **todos deslocados** ✗.
+// A casa tinha `Increasing = 0`, `NonIncreasing = 1`, `Inline = 2` e
+// `IncreaseOnce = 3` — **todos deslocados**.
 //
-// **Consequencia medida** ✗: o dump do push buffer real (`/tmp/boot_v4.log`
-// ✗) mostra `modo=1` ✗ — que no upstream e' `Increasing` ✓ (o modo normal
-// ✗) ✗, mas a casa tratava-o como `NonIncreasing` ✗. O leitor consumia os
-// argumentos pelo caminho errado ✗ ✗ — o fluxo dessincronizava ✗ — e
-// nunca chegava ao `draw_end` ✗ nem aos metodos do *puller* ✗ (o
-// semaforo ✗ e a fence ✗) ✗.
+// **Consequencia medida**: o dump do push buffer real (`/tmp/boot_v4.log`
+//) mostra `modo=1` — que no upstream e' `Increasing` ✓ (o modo normal
+//), mas a casa tratava-o como `NonIncreasing`. O leitor consumia os
+// argumentos pelo caminho errado — o fluxo dessincronizava — e
+// nunca chegava ao `draw_end` nem aos metodos do *puller* (o
+// semaforo e a fence).
 //
-// **E o mais grave** ✗: os modos `0` ✗ e `2` ✗ (`IncreasingOld` ✗ e
-// `NonIncreasingOld` ✗) **nao existem** no upstream ✗ — o `ProcessCommands`
-// (`dma_pusher.cpp:164-191` ✗) cai no `default` ✗ e **ignora** a palavra
-// ✗. A casa, com a tabela errada ✗, tratava-os como modos validos ✗ e
-// comia o fluxo ✗ ✗.
+// **E o mais grave**: os modos `0` e `2` (`IncreasingOld` e
+// `NonIncreasingOld`) **nao existem** no upstream — o `ProcessCommands`
+// (`dma_pusher.cpp:164-191`) cai no `default` e **ignora** a palavra
+//. A casa, com a tabela errada, tratava-os como modos validos e
+// comia o fluxo.
 namespace modo {
 inline constexpr std::uint32_t IncreasingOld = 0;
 inline constexpr std::uint32_t Increasing = 1;

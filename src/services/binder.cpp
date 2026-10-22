@@ -65,7 +65,7 @@
 
 namespace g610::services {
 
-// **O evento da fila** ✗ — ver a nota em `g_evento_da_fila` ✗ ✗.
+// **O evento da fila** — ver a nota em `g_evento_da_fila`.
 void DefinirEventoDaFila(Kernel::KEvent* evento);
 void SinalizarEventoDaFila(Kernel::KernelCore& kernel);
 
@@ -175,20 +175,20 @@ public:
     // O token: o Eden lê um `u32` (o "0x100" que medimos) e o
     // comprimento, e depois (comprimento + 1) caracteres em UTF‑16.
     //
-    // **Os caracteres NÃO são alinhados** ✗ — o upstream usa
-    // `ReadUnaligned<u16>()` (`parcel.h:96` ✗), que deixa o índice onde
-    // está ✗. A casa alinhava a 4 bytes **depois** de cada caracter ✗ ✗.
+    // **Os caracteres NÃO são alinhados** — o upstream usa
+    // `ReadUnaligned<u16>()` (`parcel.h:96`), que deixa o índice onde
+    // está. A casa alinhava a 4 bytes **depois** de cada caracter.
     //
-    // **Medido** ✗ (`/tmp/boot_v17.log` ✗): o token do `android.gui`
-    // (11 caracteres ✗ + o terminador ✗ = 12 ✗) deixava o índice em
-    // **164** ✗ — quando 16 (o `data_offset` ✗) + 8 (o cabeçalho do token
-    // ✗) + 24 (os 12 caracteres ✗) = **48** ✗ ✗. A diferença ✗ — 116
-    // bytes ✗ — eram os 2 bytes de desperdício por caracter ✗ ✗.
+    // **Medido** (`/tmp/boot_v17.log`): o token do `android.gui`
+    // (11 caracteres + o terminador = 12) deixava o índice em
+    // **164** — quando 16 (o `data_offset`) + 8 (o cabeçalho do token
+    //) + 24 (os 12 caracteres) = **48**. A diferença — 116
+    // bytes — eram os 2 bytes de desperdício por caracter.
     //
-    // **Consequência medida** ✗: o `SetPreallocatedBuffer` (transacção 14
-    // ✗) lia o *slot* ✗ e o *handle* ✗ de sitios errados ✗ — e o
-    // `LeObjecto` falhava ✗, o que fazia o compositor devolver
-    // `StatusBadValue` ✗ ✗. O jogo ficava sem poder desenhar ✗ ✗.
+    // **Consequência medida**: o `SetPreallocatedBuffer` (transacção 14
+    //) lia o *slot* e o *handle* de sitios errados — e o
+    // `LeObjecto` falhava, o que fazia o compositor devolver
+    // `StatusBadValue`. O jogo ficava sem poder desenhar.
     void TokenDaInterface() {
         (void)Le<u32>();
         const std::uint32_t comprimento = Le<u32>();
@@ -209,7 +209,7 @@ public:
     }
 
     // A leitura **sem alinhamento** — o `ReadUnaligned` do upstream
-    // (`parcel.h:89-99` ✗). So o token a usa ✗.
+    // (`parcel.h:89-99`). So o token a usa.
     template <typename T>
     T LeSemAlinhar() {
         T valor{};
@@ -311,16 +311,16 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 struct NvGraphicBuffer {
     std::uint8_t bytes[0x16C]{};
-    // O `buffer_id` (offset 44 ✗) e' o **handle do `nvmap`** ✗ — e e'
-    // ele que o compositor usa para chegar ao endereco ✗ ✗.
+    // O `buffer_id` (offset 44) e' o **handle do `nvmap`** — e e'
+    // ele que o compositor usa para chegar ao endereco.
     //
-    // **O upstream** (`nvnflinger/ui/graphic_buffer.cpp:23-25` ✗) usa
-    // `BufferId()` ✗ — o `nvmap->DuplicateHandle(this->BufferId(), true)` ✗
-    // e o `PinHandle` ✗ ✗. O `Handle()` (offset 116 ✗) e' o handle do
-    // **buffer de video** ✗ — nao do `nvmap` ✗ ✗.
+    // **O upstream** (`nvnflinger/ui/graphic_buffer.cpp:23-25`) usa
+    // `BufferId()` — o `nvmap->DuplicateHandle(this->BufferId(), true)`
+    // e o `PinHandle`. O `Handle()` (offset 116) e' o handle do
+    // **buffer de video** — nao do `nvmap`.
     //
-    // **A casa usava o `Handle()`** ✗ ✗ — o que dava o handle do `nvmap`
-    // errado ✗ (e o endereco errado ✗) ✗.
+    // **A casa usava o `Handle()`** — o que dava o handle do `nvmap`
+    // errado (e o endereco errado).
     static constexpr std::size_t kOffsetBufferId = 44;
     static constexpr std::size_t kOffsetHandle = 116;
 
@@ -336,21 +336,21 @@ struct NvGraphicBuffer {
         return h;
     }
 
-    // A largura ✗ — o offset 4 ✗ (`nvnflinger/ui/graphic_buffer.h` ✗).
+    // A largura — o offset 4 (`nvnflinger/ui/graphic_buffer.h`).
     [[nodiscard]] std::uint32_t Width() const {
         std::int32_t w = 0;
         std::memcpy(&w, bytes + 4, sizeof(w));
         return static_cast<std::uint32_t>(w);
     }
 
-    // A altura ✗ — o offset 8 ✗.
+    // A altura — o offset 8.
     [[nodiscard]] std::uint32_t Height() const {
         std::int32_t h = 0;
         std::memcpy(&h, bytes + 8, sizeof(h));
         return static_cast<std::uint32_t>(h);
     }
 
-    // O formato ✗ — o offset 16 ✗.
+    // O formato — o offset 16.
     [[nodiscard]] std::uint32_t Format() const {
         std::uint32_t f = 0;
         std::memcpy(&f, bytes + 16, sizeof(f));
@@ -378,25 +378,25 @@ struct FilaDeBuffers {
     std::uint64_t tamanho_ultimo = 0;
     std::uint64_t submissoes = 0;
 
-    // **As dimensoes da fila** ✗ — o upstream (`buffer_queue_core.h:89-91`
-    // ✗) tem `default_width` ✗, `default_height` ✗ e
-    // `default_buffer_format` ✗, que o `SetPreallocatedBuffer` define ✗
-    // (`buffer_queue_producer.cpp:814-816` ✗) e que o `Connect` ✗ e o
-    // `Query` ✗ devolvem ✗ ✗.
+    // **As dimensoes da fila** — o upstream (`buffer_queue_core.h:89-91`
+    //) tem `default_width`, `default_height` e
+    // `default_buffer_format`, que o `SetPreallocatedBuffer` define
+    // (`buffer_queue_producer.cpp:814-816`) e que o `Connect` e o
+    // `Query` devolvem.
     //
-    // **Antes do `SetPreallocatedBuffer`** ✗, os valores sao **1** ✗ (o
-    // upstream ✗ — `default_width{1}` ✗) ✗. A casa devolvia 1280×720 ✗
-    // fixos ✗ ✗ — o que era um palpite ✗, nao o upstream ✗ ✗.
-    // **Os valores por omissao** ✗ — o upstream
-    // (`nvnflinger/buffer_queue_core.h:88-91` ✗):
+    // **Antes do `SetPreallocatedBuffer`**, os valores sao **1** (o
+    // upstream — `default_width{1}`). A casa devolvia 1280×720
+    // fixos — o que era um palpite, nao o upstream.
+    // **Os valores por omissao** — o upstream
+    // (`nvnflinger/buffer_queue_core.h:88-91`):
     //
     //     PixelFormat default_buffer_format{PixelFormat::Rgba8888};
     //     u32 default_width{1};
     //     u32 default_height{1};
     //
-    // **O formato por omissao e' `Rgba8888` (=1)** ✗ — e a casa punha
-    // **0** ✗ (`NoFormat` ✗) ✗ ✗. O jogo perguntou o formato ✗
-    // (`Query` com `o_que=2` ✗) e recebeu `0` ✗ ✗.
+    // **O formato por omissao e' `Rgba8888` (=1)** — e a casa punha
+    // **0** (`NoFormat`). O jogo perguntou o formato
+    // (`Query` com `o_que=2`) e recebeu `0`.
     std::uint32_t largura = 1;
     std::uint32_t altura = 1;
     std::uint32_t formato = 1;  // Rgba8888
@@ -482,16 +482,16 @@ FilaDeBuffers& Fila() {
     return f;
 }
 
-// **O `buffer_wait_event`** ✗ — o evento da fila de buffers ✗ (o
-// `buffer_wait_event` do upstream ✗, `nvnflinger/buffer_queue_producer.h:81`
-// ✗) ✗.
+// **O `buffer_wait_event`** — o evento da fila de buffers (o
+// `buffer_wait_event` do upstream, `nvnflinger/buffer_queue_producer.h:81`
+//).
 //
-// E' o que o `GetNativeHandle` do binder devolve ao jogo ✗ ✗ — e o
-// upstream **sinaliza-o** ✗ no `SetPreallocatedBuffer` ✗
-// (`buffer_queue_producer.cpp:820` ✗) ✗, no `QueueBuffer` ✗ e no
-// `CancelBuffer` ✗ ✗ ✗.
+// E' o que o `GetNativeHandle` do binder devolve ao jogo — e o
+// upstream **sinaliza-o** no `SetPreallocatedBuffer`
+// (`buffer_queue_producer.cpp:820`), no `QueueBuffer` e no
+// `CancelBuffer`.
 //
-// **O jogo espera-o** ✗ — e sem o sinal ✗ o guest fica bloqueado ✗ ✗.
+// **O jogo espera-o** — e sem o sinal o guest fica bloqueado.
 Kernel::KEvent* g_evento_da_fila = nullptr;
 
 } // namespace
@@ -595,18 +595,18 @@ std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
             valor = static_cast<std::int32_t>(Fila().formato);
             break;
         case WindowMinUndequeuedBuffers:
-            // **Zero** ✗ — o upstream
-            // (`nvnflinger/buffer_queue_core.cpp:41-52` ✗) so' conta um
-            // buffer extra ✗ quando o `DequeueBuffer` pode **falhar** ✗
-            // (`use_async_buffer` ✗) ✗ — e nao e' o caso ✗ ✗:
+            // **Zero** — o upstream
+            // (`nvnflinger/buffer_queue_core.cpp:41-52`) so' conta um
+            // buffer extra quando o `DequeueBuffer` pode **falhar**
+            // (`use_async_buffer`) — e nao e' o caso:
             //
             //     if (!use_async_buffer) {
             //         return 0;
             //     }
             //
-            // A casa devolvia **2** ✗ — o que e' o `default_max_buffer_count`
-            // ✗ do upstream ✗ (`buffer_queue_core.h:91` ✗) ✗, que e' outra
-            // coisa ✗ ✗.
+            // A casa devolvia **2** — o que e' o `default_max_buffer_count`
+            // do upstream (`buffer_queue_core.h:91`), que e' outra
+            // coisa.
             valor = 0;
             break;
         case WindowQueuesToWindowComposer:
@@ -643,21 +643,21 @@ std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
         const std::int32_t api = leitor.Le<std::int32_t>();  // o api
         (void)leitor.Le<std::uint8_t>();   // o producer_controlled_by_app
 
-        // **A `api` tem de ser uma das quatro** ✗ — o upstream
-        // (`buffer_queue_producer.cpp:716-726` ✗) so' aceita `Egl` ✗,
-        // `Cpu` ✗, `Media` ✗ e `Camera` ✗; o resto e' `Status::BadValue`
-        // ✗ ✗.
+        // **A `api` tem de ser uma das quatro** — o upstream
+        // (`buffer_queue_producer.cpp:716-726`) so' aceita `Egl`,
+        // `Cpu`, `Media` e `Camera`; o resto e' `Status::BadValue`
+        //.
         //
-        // A casa aceitava qualquer uma ✗ ✗ — e devolvia a saida ✗ como
-        // se fosse valida ✗ ✗.
+        // A casa aceitava qualquer uma — e devolvia a saida como
+        // se fosse valida.
         if (api < 1 || api > 4) {
             status = StatusBadValue;
             break;
         }
 
         QueueBufferOutput saida{};
-        // **As dimensoes da fila** ✗ — o upstream (`buffer_queue_producer.cpp:723`
-        // ✗) devolve o `default_width` ✗ e o `default_height` ✗ ✗.
+        // **As dimensoes da fila** — o upstream (`buffer_queue_producer.cpp:723`
+        //) devolve o `default_width` e o `default_height`.
         saida.width = Fila().largura;
         saida.height = Fila().altura;
         saida.transform_hint = 0;
@@ -697,15 +697,15 @@ std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
         s.ocupado = true;
         s.endereco = regiao.endereco;
         s.tamanho = regiao.tamanho;
-        // **As dimensoes** ✗ — o upstream (`buffer_queue_producer.cpp:814-816`
-        // ✗) guarda-as no `BufferQueueCore` ✗, e o `Connect` ✗ e o `Query`
-        // ✗ devolvem-nas ✗ ✗.
+        // **As dimensoes** — o upstream (`buffer_queue_producer.cpp:814-816`
+        //) guarda-as no `BufferQueueCore`, e o `Connect` e o `Query`
+        // devolvem-nas.
         Fila().largura = buffer.Width();
         Fila().altura = buffer.Height();
         Fila().formato = buffer.Format();
-        // **O evento da fila** ✗ — o upstream sinaliza-o aqui ✗
-        // (`buffer_queue_producer.cpp:820` ✗) ✗ ✗: o jogo esta' a
-        // espera dele ✗ ✗.
+        // **O evento da fila** — o upstream sinaliza-o aqui
+        // (`buffer_queue_producer.cpp:820`): o jogo esta' a
+        // espera dele.
         SinalizarEventoDaFila(kernel);
         LOG_DEBUG(Service_NVDRV,
                   "compositor: SetPreallocatedBuffer: slot={} buffer_id={} -> 0x{:X} "
@@ -807,13 +807,13 @@ std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
     return escritor.Serializa();
 }
 
-// **O evento da fila** ✗ — ver a nota em `g_evento_da_fila` ✗ ✗.
+// **O evento da fila** — ver a nota em `g_evento_da_fila`.
 void DefinirEventoDaFila(Kernel::KEvent* evento) {
     g_evento_da_fila = evento;
 }
 
-// O `buffer_wait_event->Signal()` do upstream ✗ — o `Signal` do
-// `KEvent` precisa do `kernel` ✗ (`k_event.h:49` ✗) ✗ ✗.
+// O `buffer_wait_event->Signal()` do upstream — o `Signal` do
+// `KEvent` precisa do `kernel` (`k_event.h:49`).
 void SinalizarEventoDaFila(Kernel::KernelCore& kernel) {
     if (g_evento_da_fila != nullptr) {
         g_evento_da_fila->Signal(kernel);

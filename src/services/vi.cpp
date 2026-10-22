@@ -403,9 +403,9 @@ private:
         const std::vector<std::uint8_t> reply =
             TransactionarParcel(transacao, entrada, kernel);
 
-        // **A resposta, em hexadecimal.** E' o parcel que volta ao jogo ✗
-        // — e nunca foi medido ✗ ✗. O Eden (`parcel.h:155-170` ✗) escreve
-        // o cabecalho ✗, os dados ✗ e os objectos ✗ ✗.
+        // **A resposta, em hexadecimal.** E' o parcel que volta ao jogo
+        // — e nunca foi medido. O Eden (`parcel.h:155-170`) escreve
+        // o cabecalho, os dados e os objectos.
         if (std::getenv("IA_IPC_TRACE") != nullptr) {
             char linha[320];
             std::size_t n = 0;
@@ -458,10 +458,10 @@ private:
             auto& processo = Kernel::GetCurrentProcess(kernel);
             evento_ = new Kernel::KEvent(kernel);
             evento_->Initialize(kernel, &processo);
-            // **O evento da fila** ✗ — e' este ✗ que o upstream devolve
-            // ao jogo (`buffer_queue_producer.cpp:825-827` ✗: o
-            // `buffer_wait_event` ✗) ✗ ✗, e que o compositor sinaliza
-            // quando ha' buffer ✗ ✗.
+            // **O evento da fila** — e' este que o upstream devolve
+            // ao jogo (`buffer_queue_producer.cpp:825-827`: o
+            // `buffer_wait_event`), e que o compositor sinaliza
+            // quando ha' buffer.
             services::DefinirEventoDaFila(evento_);
         }
 

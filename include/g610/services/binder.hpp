@@ -38,18 +38,18 @@ void DespejarJanelaDoCompositor();
 // Varre a regiao do canal da GPU a procura de conteudo escrito.
 void VarrerRegiaoDoCanalDoCompositor();
 
-// **O evento da fila de buffers** ✗ — o `buffer_wait_event` do upstream
-// ✗ (`nvnflinger/buffer_queue_producer.h:81` ✗) ✗.
+// **O evento da fila de buffers** — o `buffer_wait_event` do upstream
+// (`nvnflinger/buffer_queue_producer.h:81`).
 //
-// E' o evento que o `GetNativeHandle` do binder devolve ao jogo ✗
-// (`hos_binder_driver.cpp:49-56` ✗) ✗ — e que o upstream **sinaliza**
-// ✗ no `SetPreallocatedBuffer` ✗ (`buffer_queue_producer.cpp:820` ✗),
-// no `QueueBuffer` ✗ e no `CancelBuffer` ✗ ✗ ✗.
+// E' o evento que o `GetNativeHandle` do binder devolve ao jogo 
+// (`hos_binder_driver.cpp:49-56`) — e que o upstream **sinaliza**
+// no `SetPreallocatedBuffer` (`buffer_queue_producer.cpp:820`),
+// no `QueueBuffer` e no `CancelBuffer`.
 //
-// **O jogo espera-o** ✗ — e sem o sinal ✗ o guest fica bloqueado ✗ ✗.
+// **O jogo espera-o** — e sem o sinal o guest fica bloqueado.
 //
-// A casa nao tinha este evento ✗ ✗: o `GetNativeHandle` devolvia um
-// `KEvent` ✗ que **ninguem sinalizava** ✗ ✗.
+// A casa nao tinha este evento: o `GetNativeHandle` devolvia um
+// `KEvent` que **ninguem sinalizava**.
 void DefinirEventoDaFila(Kernel::KEvent* evento);
 
 // Sinaliza o evento da fila (o `buffer_wait_event->Signal()` do

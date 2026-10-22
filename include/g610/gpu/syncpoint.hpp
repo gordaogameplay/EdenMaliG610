@@ -32,13 +32,13 @@
 // esperado.
 //
 // **A casa nao tem thread de GPU** — o trabalho e' feito de seguida, no
-// `SubmitGPFIFO` — por isso o syncpoint avanca **na submissao** ✗ e a
-// accao dispara **imediatamente** ✗ se o valor ja foi alcancado ✗.
+// `SubmitGPFIFO` — por isso o syncpoint avanca **na submissao** e a
+// accao dispara **imediatamente** se o valor ja foi alcancado.
 //
 // Isto nao e' uma diferenca de arquitectura que se note: no Eden o
-// syncpoint avanca quando o trabalho **e' executado** ✗, e o guest so
-// repara depois ✗. Aqui o trabalho e' "executado" no `SubmitGPFIFO` ✗, e
-// o syncpoint avanca ai ✗. O guest ve o mesmo: o valor ja estar ta quando
+// syncpoint avanca quando o trabalho **e' executado**, e o guest so
+// repara depois. Aqui o trabalho e' "executado" no `SubmitGPFIFO`, e
+// o syncpoint avanca ai. O guest ve o mesmo: o valor ja estar ta quando
 // ele vem perguntar.
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
@@ -65,34 +65,34 @@ inline constexpr std::uint32_t kMaxNvEvents = 64;
 //
 // A semantica e' a do upstream (`SyncpointManager`):
 //
-//   - cada syncpoint tem um **valor** monotonico ✗;
-//   - `Increment(id)` sobe o valor ✗ e dispara as accoes cujo valor
-//     esperado foi alcancado ✗;
-//   - `RegisterAction(id, valor_esperado, accao)` regista uma accao ✗ que
-//     dispara quando o syncpoint chegar ao valor ✗.
+//   - cada syncpoint tem um **valor** monotonico;
+// - `Increment(id)` sobe o valor e dispara as accoes cujo valor
+//     esperado foi alcancado;
+// - `RegisterAction(id, valor_esperado, accao)` regista uma accao que
+//     dispara quando o syncpoint chegar ao valor.
 //
-// **A diferenca para o upstream** ✗: la' as accoes correm numa thread de
-// GPU ✗; aqui correm no ponto em que o syncpoint avanca ✗ — que e' o
-// `SubmitGPFIFO` ✗. O resultado para o guest e' o mesmo ✗.
+// **A diferenca para o upstream**: la' as accoes correm numa thread de
+// GPU; aqui correm no ponto em que o syncpoint avanca — que e' o
+// `SubmitGPFIFO`. O resultado para o guest e' o mesmo.
 class SyncpointManager {
 public:
-    // O valor actual do syncpoint ✗.
+    // O valor actual do syncpoint.
     [[nodiscard]] std::uint32_t Valor(std::uint32_t id) const {
         std::scoped_lock lock(garde);
         return valores_[id];
     }
 
-    // O syncpoint esta' no valor esperado ✗ (ou ja passou ✗).
+    // O syncpoint esta' no valor esperado (ou ja passou).
     [[nodiscard]] bool EstaSinalizado(std::uint32_t id, std::uint32_t valor) const {
         std::scoped_lock lock(garde);
         return valores_[id] >= valor;
     }
 
-    // Um syncpoint novo ✗ — o proximo id livre ✗.
+    // Um syncpoint novo — o proximo id livre.
     //
-    // O upstream aloca o syncpoint do canal na criacao do canal ✗
-    // (`nvhost_gpu.cpp`, `channel_syncpoint`) ✗. Aqui e' a mesma coisa ✗:
-    // o primeiro `AllocGPFIFOEx` de um canal ✗.
+    // O upstream aloca o syncpoint do canal na criacao do canal
+    // (`nvhost_gpu.cpp`, `channel_syncpoint`). Aqui e' a mesma coisa:
+    // o primeiro `AllocGPFIFOEx` de um canal.
     std::uint32_t Alocar() {
         std::scoped_lock lock(garde);
         for (std::uint32_t i = 0; i < kMaxSyncpoints; ++i) {
@@ -102,10 +102,10 @@ public:
                 return i;
             }
         }
-        return kMaxSyncpoints;  // sem sitio ✗
+        return kMaxSyncpoints;  // sem sitio
     }
 
-    // Sobe o syncpoint ✗ — e dispara as accoes ✗.
+    // Sobe o syncpoint — e dispara as accoes.
     void Incrementar(std::uint32_t id, std::uint32_t incremento) {
         std::vector<std::function<void()>> a_disparar;
         {
@@ -113,8 +113,8 @@ public:
             valores_[id] += incremento;
             const std::uint32_t valor = valores_[id];
 
-            // As accoes cujo valor esperado foi alcancado ✗ — as que
-            // ficaram para tras ✗ sao removidas ✗.
+            // As accoes cujo valor esperado foi alcancado — as que
+            // ficaram para tras sao removidas.
             auto& lista = acoes_[id];
             for (auto it = lista.begin(); it != lista.end();) {
                 if (valor >= it->second) {
@@ -125,31 +125,31 @@ public:
                 }
             }
         }
-        // **Fora do trinco** ✗ — a accao sinaliza um `KEvent` ✗, e isso
-        // pode acabar a mexer no estado do kernel ✗ ✗.
+        // **Fora do trinco** — a accao sinaliza um `KEvent`, e isso
+        // pode acabar a mexer no estado do kernel.
         for (auto& accao : a_disparar) {
             accao();
         }
     }
 
-    // Regista uma accao para quando o syncpoint chegar ao valor ✗.
+    // Regista uma accao para quando o syncpoint chegar ao valor.
     //
-    // Devolve `true` se a accao foi registada ✗ — e `false` se o valor
-    // **ja** foi alcancado ✗ (nesse caso a accao dispara logo ✗ e o
-    // chamador nao a regista ✗).
+    // Devolve `true` se a accao foi registada — e `false` se o valor
+    // **ja** foi alcancado (nesse caso a accao dispara logo e o
+    // chamador nao a regista).
     bool Registar(std::uint32_t id, std::uint32_t valor_esperado,
                   std::function<void()> accao) {
         {
             std::scoped_lock lock(garde);
             if (valores_[id] >= valor_esperado) {
-                return false;  // ja esta' cumprido ✗
+                return false;  // ja esta' cumprido
             }
             acoes_[id].emplace_back(std::move(accao), valor_esperado);
         }
         return true;
     }
 
-    // Cancela uma accao ✗ — o `DeregisterGuestAction` do upstream ✗.
+    // Cancela uma accao — o `DeregisterGuestAction` do upstream.
     void Remover(std::uint32_t id, std::uint32_t valor_esperado) {
         std::scoped_lock lock(garde);
         auto& lista = acoes_[id];
@@ -166,7 +166,7 @@ private:
     mutable std::mutex garde;
     std::uint32_t valores_[kMaxSyncpoints]{};
     bool alocados_[kMaxSyncpoints]{};
-    // As accoes registadas ✗: (accao ✗, valor esperado ✗).
+    // As accoes registadas: (accao, valor esperado).
     std::map<std::uint32_t, std::vector<std::pair<std::function<void()>, std::uint32_t>>> acoes_;
 };
 

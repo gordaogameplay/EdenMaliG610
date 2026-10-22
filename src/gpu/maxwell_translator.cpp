@@ -122,7 +122,7 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
     // O estado do desenho (o `draw_state` do upstream, `draw_manager.cpp` ✓).
     //
     // **Os contadores vivem nos registos** ✓ — como no upstream ✓, onde
-    // o `draw.end` lê `regs.vertex_buffer.count` e `regs.index_buffer` ✗.
+    // o `draw.end` lê `regs.vertex_buffer.count` e `regs.index_buffer`.
     // Por isso não se reiniciam no `draw.begin` ✓: quem os escreve é o
     // método correspondente ✓, e valem até ao próximo desenho ✓.
     std::uint32_t index_first = 0;
@@ -130,9 +130,9 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
     bool indexado = false;
     bool dentro = false;
 
-    // **O bind dos subcanais** ✗ — o upstream
-    // (`src/video_core/engines/puller.cpp:29-58` ✗) liga cada subcanal a
-    // um motor ✗, pelo método `BindObject` (o 0x00 do canal ✗):
+    // **O bind dos subcanais** — o upstream
+    // (`src/video_core/engines/puller.cpp:29-58`) liga cada subcanal a
+    // um motor, pelo método `BindObject` (o 0x00 do canal):
     //
     //     void Puller::ProcessBindMethod(const MethodCall& method_call) {
     //         const auto engine_id = static_cast<EngineID>(method_call.argument);
@@ -140,25 +140,25 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
     //         ...
     //     }
     //
-    // **Só os métodos do subcanal ligado ao motor 3D** ✗ sao do motor 3D
-    // ✗ — os dos outros subcanais sao de outros motores ✗ (o de copia ✗,
-    // o de computacao ✗) ✗ ✗.
+    // **Só os métodos do subcanal ligado ao motor 3D** sao do motor 3D
+    // — os dos outros subcanais sao de outros motores (o de copia,
+    // o de computacao).
     //
-    // **Medido** (`/tmp/boot_r27.log` ✗): sem este bind ✗, a casa traduz
-    // os métodos **de todos** os subcanais ✗ — e os ids que ela via ✗
-    // (`1410`, `1411` ✗) **nao** sao o `draw.begin`/`draw.end` ✗ (que sao
-    // `1414`/`1413` ✗) ✗ ✗ — o que explica os **0 comandos traduzidos**
-    // ✗ ✗.
+    // **Medido** (`/tmp/boot_r27.log`): sem este bind, a casa traduz
+    // os métodos **de todos** os subcanais — e os ids que ela via
+    // (`1410`, `1411`) **nao** sao o `draw.begin`/`draw.end` (que sao
+    // `1414`/`1413`) — o que explica os **0 comandos traduzidos**
+    //.
     //
-    // O mapa e' `subcanal -> motor` ✗ — e vale so' para o subcanal ligado
-    // ao 3D ✗ ✗.
+    // O mapa e' `subcanal -> motor` — e vale so' para o subcanal ligado
+    // ao 3D.
     std::uint32_t motores_por_subcanal[8] = {0};
 
     leitor.for_each(pushbuffer, [&](const gpu::MethodCall& m) {
         ++cmds_total_;
 
-        // O `BindObject` (o 0x00 do canal ✗) — o upstream
-        // (`puller.cpp:145-148` ✗) trata-o antes de tudo ✗.
+        // O `BindObject` (o 0x00 do canal) — o upstream
+        // (`puller.cpp:145-148`) trata-o antes de tudo.
         if (m.method == gpu::canal::BindObject) {
             if (m.subchannel < 8) {
                 motores_por_subcanal[m.subchannel] = m.argument;
@@ -166,10 +166,10 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
             return;
         }
 
-        // **Só o subcanal do motor 3D** ✗ tem métodos de motor ✗ — os
-        // outros ✗ (o `maxwell_dma` ✗, o `kepler_compute` ✗) tem
-        // *outros* ids ✗ ✗, e traduzi-los como se fossem do 3D ✗ dava
-        // desenhos errados ✗ ✗.
+        // **Só o subcanal do motor 3D** tem métodos de motor — os
+        // outros (o `maxwell_dma`, o `kepler_compute`) tem
+        // *outros* ids, e traduzi-los como se fossem do 3D dava
+        // desenhos errados.
         if (m.subchannel < 8 && motores_por_subcanal[m.subchannel] != gpu::motor::Maxwell3D) {
             return;
         }
@@ -234,8 +234,8 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
         case gpu::maxwell3d::vertex_array_instance_subsequent:
             // **Um desenho instanciado** (o upstream: `DrawArrayInstanced` ✓).
             // A topologia, o início e a contagem vivem num registo
-            // *empacotado* ✗ — o upstream tira-os bit a bit ✗. Fica a
-            // contagem ✗ e conta-se como degradado ✓ (é honesto: um
+            // *empacotado* — o upstream tira-os bit a bit. Fica a
+            // contagem e conta-se como degradado ✓ (é honesto: um
             // desenho instanciado sem a contagem exacta não é o desenho).
             ++cmds_dropped_;
             ++instance_count;

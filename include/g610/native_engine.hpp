@@ -123,8 +123,8 @@ struct GuestThreadState {
     std::uint64_t fault_sp         = 0;
     std::uint64_t fault_addr       = 0;
 
-    // **Os registos no momento do fault** ✗ — sem eles ✗ nao se sabe o
-    // que o guest procurava ✗ ✗ (o id ✗, o ponteiro ✗) ✗ ✗.
+    // **Os registos no momento do fault** — sem eles nao se sabe o
+    // que o guest procurava (o id, o ponteiro).
     std::uint64_t fault_regs[22]   = {0};
 
     // O `x18` DESTA thread — o "platform register" (stack canary).
@@ -251,8 +251,8 @@ struct EngineHooks {
     std::uint64_t   fault_addr    = 0;
     bool            faulted       = false;
 
-    // **Os registos no momento do fault** ✗ — sem eles ✗ nao se sabe o
-    // que o guest procurava ✗ ✗ (o id ✗, o ponteiro ✗) ✗ ✗.
+    // **Os registos no momento do fault** — sem eles nao se sabe o
+    // que o guest procurava (o id, o ponteiro).
     std::uint64_t   fault_regs[22] = {0};
 
     // O guest fez `ret` sem ter chamado ExitProcess. Distingue esse bug de

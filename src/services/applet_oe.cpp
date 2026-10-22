@@ -1119,12 +1119,12 @@ private:
                     static_cast<unsigned>((resultado >> 9) & 0x3FFF),
                     resultado);
 
-        // **A stack do guest** ✗ — é ela que diz **qual** peça do SDK
-        // falhou ✗ ✗ (o módulo 64 ✗ e' do SDK ✗ ✗, e so' a cadeia de
-        // frames o diz ✗ ✗) ✗.
+        // **A stack do guest** — é ela que diz **qual** peça do SDK
+        // falhou (o módulo 64 e' do SDK, e so' a cadeia de
+        // frames o diz).
         if (std::getenv("IA_IPC_TRACE") != nullptr) {
-            // O contexto tem o `sp` do guest ✗? ✗ — nao ✗. O que se pode
-            // fazer e' ler a stack pelo endereco que o `am` tem ✗ ✗.
+            // O contexto tem o `sp` do guest ? — nao. O que se pode
+            // fazer e' ler a stack pelo endereco que o `am` tem.
             (void)0;
         }
 

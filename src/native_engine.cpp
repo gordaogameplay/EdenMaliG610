@@ -60,16 +60,16 @@
 
 namespace g610 {
 
-// A pagina do watchpoint ✗ — ver `SvcDispatcher::ArmarWatchpoint` ✗ ✗.
+// A pagina do watchpoint — ver `SvcDispatcher::ArmarWatchpoint`.
 extern volatile std::uint64_t g_watch_pagina;
-// **O watchpoint ainda nao foi armado** ✗ ✗ — porque o rtld ✗ ✗
-// escreve na pagina ✗ ✗ (as relocacoes ✗) ✗ ✗.
+// **O watchpoint ainda nao foi armado** — porque o rtld
+// escreve na pagina (as relocacoes).
 void ReporWatchpoint();
-// **Ler o global do jogo** ✗ ✗ — o handler de sinais e' estatico ✗ ✗.
+// **Ler o global do jogo** — o handler de sinais e' estatico.
 bool LerGlobalDoJogo(std::uint64_t* valor);
 void ReArmarWatchpoint();
 void ArmarWatchpointNoProximoTrap();
-// **A flag de re-armar** ✗ — ver `svc_dispatcher.cpp` ✗ ✗.
+// **A flag de re-armar** — ver `svc_dispatcher.cpp`.
 extern volatile bool g_rearmar_watchpoint;
 
 namespace {
@@ -619,32 +619,32 @@ RunResult NativeEngine::run(void (*code)(), std::uint64_t sp) {
     // execução seguinte e faria um fault parecer uma saída limpa.
     svc_.reset_run_state();
 
-    // **O watchpoint** ✗ — o global do jogo que guarda a base da tabela
-    // que o guest consultou ✗ (`0x824B8232` ✗, lido em `0x8177d0c8` ✗)
-    // ✗.
+    // **O watchpoint** — o global do jogo que guarda a base da tabela
+    // que o guest consultou (`0x824B8232`, lido em `0x8177d0c8`)
+    //.
     //
-    // **So' depois do rtld** ✗ ✗ — antes disso ✗, o rtld escreve na
-    // pagina ✗ (as relocacoes ✗) ✗ e o watchpoint disparava em
-    // Write ✗ ✗.
+    // **So' depois do rtld** — antes disso, o rtld escreve na
+    // pagina (as relocacoes) e o watchpoint disparava em
+    // Write.
     //
-    // `IA_WATCH=rtld` ✗ — arma no **primeiro SVC** ✗ ✗, que e' depois
-    // do rtld ✗ ✗ (o rtld nao faz SVC ✗ ✗ — so' o jogo ✗ ✗) ✗.
+    // `IA_WATCH=rtld` — arma no **primeiro SVC**, que e' depois
+    // do rtld (o rtld nao faz SVC — so' o jogo).
     //
-    // **O guarda e' obrigatorio** ✗ ✗ — medido ✗ ✗: sem ele ✗, a
-    // pagina do global fica em so' leitura ✗ ✗ desde o **primeiro**
-    // SVC ✗ ✗ — e o primeiro SVC e' o `QueryMemory` do rtld ✗ ✗, que e'
-    // **antes** das relocacoes ✗ ✗. As relocacoes do rtld ✗ (a
-    // instrucao `str x11, [x12, x8]` em `0x84461980` ✗) escrevem nessa
-    // pagina ✗ ✗ e levantavam um `SIGSEGV` ✗ (SEGV_ACCERR ✗) ✗ — o
-    // guest ficava a repetir a mesma escrita ✗ ✗ ate ao limite de traps
-    // ✗ ✗, e o GOT do `main` ficava por relocar ✗ ✗ (todos os slots com
-    // o mesmo valor ✗) ✗ ✗.
+    // **O guarda e' obrigatorio** — medido: sem ele, a
+    // pagina do global fica em so' leitura desde o **primeiro**
+    // SVC — e o primeiro SVC e' o `QueryMemory` do rtld, que e'
+    // **antes** das relocacoes. As relocacoes do rtld (a
+    // instrucao `str x11, [x12, x8]` em `0x84461980`) escrevem nessa
+    // pagina e levantavam um `SIGSEGV` (SEGV_ACCERR) — o
+    // guest ficava a repetir a mesma escrita ate ao limite de traps
+    //e o GOT do `main` ficava por relocar (todos os slots com
+    // o mesmo valor).
     if (std::getenv("IA_WATCH") != nullptr) {
         svc_.ArmarWatchpointSePedir(0x824B5CA0ull, 8);
     }
 
-    // **O valor do global ANTES do jogo** ✗ — para comparar com o de
-    // depois ✗ ✗.
+    // **O valor do global ANTES do jogo** — para comparar com o de
+    // depois.
     {
         std::uint64_t antes = 0;
         if (svc_.read_guest(0x824B5CA0ull, &antes, sizeof antes)) {
@@ -733,9 +733,9 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
     hooks_.limit_hit    = g_hooks.limit_hit;
     hooks_.fault_pc    = g_hooks.fault_pc;
     hooks_.fault_addr  = g_hooks.fault_addr;
-    // **Os registos do fault** ✗ — o handler escreve em `g_hooks` ✗ e o
-    // relatorio le em `hooks_` ✗ ✗: sem esta copia ✗, o dump lia zeros ✗
-    // ✗ (e foi exactamente o que acontecia ✗ ✗).
+    // **Os registos do fault** — o handler escreve em `g_hooks` e o
+    // relatorio le em `hooks_`: sem esta copia, o dump lia zeros
+    // (e foi exactamente o que acontecia).
     for (int i = 0; i < 22; ++i) {
         hooks_.fault_regs[i] = g_hooks.fault_regs[i];
     }
@@ -870,14 +870,14 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
             }
         }
 
-        // **A tabela que o guest estava a consultar** ✗ — o lookup que
-        // devolveu nulo ✗ ✗.
+        // **A tabela que o guest estava a consultar** — o lookup que
+        // devolveu nulo.
         //
-        // **O `x0` do fault NAO e' a base** ✗ — e' o **resultado** do
-        // lookup ✗ (que foi nulo ✗) ✗. A base e' o campo `+16` do
-        // objecto ✗ (`x19` ✗) ✗ — o mesmo que o caller leu ✗ ✗.
+        // **O `x0` do fault NAO e' a base** — e' o **resultado** do
+        // lookup (que foi nulo). A base e' o campo `+16` do
+        // objecto (`x19`) — o mesmo que o caller leu.
         //
-        // **O `id`** ✗ e' o `u16` em `x19 + 50` ✗ ✗.
+        // **O `id`** e' o `u16` em `x19 + 50`.
         {
             const std::uint64_t obj = hooks_.fault_regs[19];
             std::uint64_t base = 0;
@@ -893,7 +893,7 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
                                "[fault] tabela: obj=0x%llx base=0x%llx id=%u tam=%u",
                                (unsigned long long)obj, (unsigned long long)base,
                                (unsigned)id, (unsigned)tam));
-            // **O byte de "presente"** ✗ — e' o que o lookup testa ✗ ✗.
+            // **O byte de "presente"** — e' o que o lookup testa.
             std::uint8_t presente = 0;
             if (svc_.read_guest(base + id + 0x1888, &presente, 1)) {
                 n += static_cast<std::size_t>(
@@ -901,7 +901,7 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
                                    " presente=%u (em 0x%llx)", (unsigned)presente,
                                    (unsigned long long)(base + id + 0x1888)));
             }
-            // **A lista de ids** ✗ — a tabela paralela ✗ ✗.
+            // **A lista de ids** — a tabela paralela.
             std::uint64_t lista = 0;
             if (svc_.read_guest(base + id * 8 + 0x18AC, &lista, sizeof lista)) {
                 n += static_cast<std::size_t>(
@@ -924,12 +924,12 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
             (void)w;
         }
 
-        // **O global do jogo** ✗ — o `0x824B8232` ✗, que e' onde o
-        // jogo guarda a base da tabela ✗ (`adrp x8, 0x824b5000` ✗ +
-        // `ldr x8, [x8, #3232]` ✗, em `0x8177d0c8` ✗) ✗ ✗.
+        // **O global do jogo** — o `0x824B8232`, que e' onde o
+        // jogo guarda a base da tabela (`adrp x8, 0x824b5000` +
+        // `ldr x8, [x8, #3232]`, em `0x8177d0c8`).
         //
-        // **Se estiver a zero** ✗ ✗, o lookup e' feito sobre a base 0 ✗
-        // ✗ — que e' o que o dump mostra ✗ ✗.
+        // **Se estiver a zero**, o lookup e' feito sobre a base 0
+        // — que e' o que o dump mostra.
         {
             std::uint64_t global = 0;
             char linha[1024];
@@ -940,9 +940,9 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
                                    "[fault] global 0x824B5CA0 = 0x%llx",
                                    (unsigned long long)global));
             }
-            // **A volta do global** ✗ — os bytes crus ✗ ✗ (e lidos tres
-            // vezes ✗ — para se ver se o valor muda ✗ ✗: o guest tem
-            // varias threads ✗ e uma delas pode estar a escrever ✗ ✗).
+            // **A volta do global** — os bytes crus (e lidos tres
+            // vezes — para se ver se o valor muda: o guest tem
+            // varias threads e uma delas pode estar a escrever).
             {
                 std::uint8_t cru[64]{};
                 for (int tentativa = 0; tentativa < 3; ++tentativa) {
@@ -1219,9 +1219,9 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
 
     ++*ts.traps;
 
-    // **Re-armar o watchpoint** ✗ — a escrita que o disparou ja' passou ✗
-    // ✗ (a pagina ficou gravavel ✗ ✗) ✗, e agora pode voltar a ser so'
-    // de leitura ✗ ✗ — para apanhar a escrita **seguinte** ✗ ✗.
+    // **Re-armar o watchpoint** — a escrita que o disparou ja' passou
+    // (a pagina ficou gravavel), e agora pode voltar a ser so'
+    // de leitura — para apanhar a escrita **seguinte**.
     if (g_rearmar_watchpoint) {
         g_rearmar_watchpoint = false;
         ReArmarWatchpoint();
@@ -1257,9 +1257,9 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             (unsigned long long)g_watch_pagina);
         ssize_t w = ::write(2, b, (size_t)k); (void)w;
 
-        // **O mapa do processo** ✗ — a regiao que contem o endereco ✗ ✗.
+        // **O mapa do processo** — a regiao que contem o endereco.
         // E' a unica forma de dizer "nao esta' mapeado" de "esta' mapeado
-        // mas sem escrita" ✗ ✗.
+        // mas sem escrita".
         {
             static bool feito = false;
             if (!feito && info != nullptr && sig == SIGSEGV) {
@@ -1333,11 +1333,11 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             return;
         }
 
-        // **A thread principal** ✗ — os traps dela nao tinham registo ✗
-        // ✗ (o dump de baixo e' so' para as threads de guest ✗) ✗, e e'
-        // nela que o rtld fica preso ✗ ✗.
+        // **A thread principal** — os traps dela nao tinham registo
+        // (o dump de baixo e' so' para as threads de guest), e e'
+        // nela que o rtld fica preso.
         //
-        // **O PC e' a pista** ✗ — diz ONDE o guest esta' ✗ ✗.
+        // **O PC e' a pista** — diz ONDE o guest esta'.
         if (st == nullptr && ::getenv("IA_TRACE") != nullptr) {
             std::fprintf(stderr,
                          "[main] trap #%u pc=0x%llx brk=%u x0=0x%llx x1=0x%llx "
@@ -1400,8 +1400,8 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             // A thread principal não tem slot (o motor conta-a à parte), e
             // o seu TLS é o `guest_tls` dos hooks.
             g_hooks.svc->set_tls_da_thread(st != nullptr ? st->guest_tls : g_hooks.guest_tls);
-            // **O valor do global** ✗ — a cada SVC ✗ ✗, para se ver
-            // **quando** muda ✗ ✗.
+            // **O valor do global** — a cada SVC, para se ver
+            // **quando** muda.
             if (std::getenv("IA_WATCH") != nullptr) {
                 static std::uint32_t n = 0;
                 if ((++n % 100) == 0) {
@@ -1500,22 +1500,22 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         if (tls_de_quem != 0 && emulate_tls_read(uc, pc, st))
             return;   // retoma o guest no PC seguinte
 
-        // **O watchpoint** ✗ — a pagina armada em so' leitura ✗ ✗.
-        // Uma escrita nela e' o guest a escrever ✗ — e e' o que estamos
-        // a procurar ✗ ✗.
+        // **O watchpoint** — a pagina armada em so' leitura.
+        // Uma escrita nela e' o guest a escrever — e e' o que estamos
+        // a procurar.
         const auto endereco_do_fault =
             reinterpret_cast<std::uintptr_t>(info->si_addr);
         if (g_watch_pagina != 0 &&
             (endereco_do_fault >= g_watch_pagina &&
              endereco_do_fault < g_watch_pagina + 0x1000)) {
-            // **O valor antigo** ✗ — o que estava no sitio antes da
-            // escrita ✗ ✗.
+            // **O valor antigo** — o que estava no sitio antes da
+            // escrita.
             //
-            // A instrucao e' um `str` ✗ ✗ — mas descodificar todas as
-            // variantes nao vale o effort ✗ ✗. O que interessa e' o **PC**
-            // ✗ ✗ (que da o rtld ✗) ✗ e o valor **depois** ✗ ✗.
-            // **O valor a escrever** ✗ — o `str x11, [x12, x8]` ✗
-            // (em `0x84461980` ✗) ✗ escreve o `x11` ✗ ✗.
+            // A instrucao e' um `str` — mas descodificar todas as
+            // variantes nao vale o effort. O que interessa e' o **PC**
+            // (que da o rtld) e o valor **depois**.
+            // **O valor a escrever** — o `str x11, [x12, x8]`
+            // (em `0x84461980`) escreve o `x11`.
             char b[512];
             int n = std::snprintf(b, sizeof b,
                                   "[watch] escrita na pagina 0x%llx (pc=0x%llx) "
@@ -1535,13 +1535,13 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
                                (unsigned long long)uc->uc_mcontext.regs[30]);
             ssize_t w = ::write(2, b, (size_t)n);
             (void)w;
-            // A pagina volta a ser de leitura-escrita ✗ — para o guest
-            // repetir a instrucao ✗ ✗.
+            // A pagina volta a ser de leitura-escrita — para o guest
+            // repetir a instrucao.
             ReporWatchpoint();
-            // E volta a armar ✗ — no **proximo trap** ✗ ✗ (a escrita
-            // actual ainda nao aconteceu ✗ ✗) ✗.
+            // E volta a armar — no **proximo trap** (a escrita
+            // actual ainda nao aconteceu).
             ArmarWatchpointNoProximoTrap();
-            // O guest repete a instrucao ✗ ✗.
+            // O guest repete a instrucao.
             uc->uc_mcontext.pc = pc;
             uc->uc_mcontext.sp = static_cast<std::uint64_t>(uc->uc_mcontext.sp);
             return;
@@ -1616,8 +1616,8 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         }
         *ts.faulted  = true;
 
-        // **Os registos** ✗ — sem eles ✗ nao se sabe o que o guest
-        // procurava ✗ ✗ (o id ✗, o ponteiro ✗) ✗ ✗.
+        // **Os registos** — sem eles nao se sabe o que o guest
+        // procurava (o id, o ponteiro).
         {
             char linha[400];
             std::size_t n = 0;
@@ -1651,8 +1651,8 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         // imprimir o relatório. Sem isto, um spin silencioso truncava a
         // saída e perdia-se o único rasto do que aconteceu.
         //
-        // **O PC** ✗ — é a única pista de ONDE o guest ficou preso ✗ ✗
-        // (um `b .` ✗ — o rtld do jogo, à espera de um módulo ✗) ✗ ✗.
+        // **O PC** — é a única pista de ONDE o guest ficou preso
+        // (um `b,` — o rtld do jogo, à espera de um módulo).
         if (::getenv("IA_TRACE") != nullptr) {
             char b[192];
             const int k = std::snprintf(b, sizeof b,

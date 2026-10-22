@@ -12,8 +12,8 @@
 //
 // O `rasterizer_interface.h` so' o **declara** ✓ (linha 22 ✓) — a
 // definicao esta' em `video_core/engines/maxwell_dma.h` ✓ (linha 78 ✓).
-// Sem este include, a classe fica incompleta ✗ e o `override` nao
-// compila ✗.
+// Sem este include, a classe fica incompleta e o `override` nao
+// compila.
 #include "video_core/engines/maxwell_dma.h"
 
 namespace g610::gpu {
@@ -21,9 +21,9 @@ namespace g610::gpu {
 namespace {
 
 // O `AccelerateDMAInterface` do upstream: as operações de cópia que o
-// motor 2D podia fazer na GPU. **A casa não as acelera** ✗ — o motor
-// cai no caminho normal ✗ (que é o mesmo caminho do Eden ✗, sem o
-// *renderer* ✗).
+// motor 2D podia fazer na GPU. **A casa não as acelera** — o motor
+// cai no caminho normal (que é o mesmo caminho do Eden, sem o
+// *renderer*).
 class AceleraDMAVazio final : public Tegra::Engines::AccelerateDMAInterface {
 public:
     bool BufferCopy(GPUVAddr, GPUVAddr, u64) override {
@@ -96,18 +96,18 @@ void RasterizerG610::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
 
     // O `Payload` é a **única** query que o guest usa para saber que o
     // trabalho acabou ✓ — o valor vai para a memória do guest ✓ (é o
-    // *payload* do semáforo ✗).
+    // *payload* do semáforo).
     if (type != VideoCommon::QueryType::Payload)
         return;
     if (!escreve_)
         return;
 
-    // O tamanho do payload depende das flags ✗ — o Eden escreve 64 bits
-    // quando o pedido é de 64 ✗ e 32 quando é de 32 ✗. Sem o flag ✗,
+    // O tamanho do payload depende das flags — o Eden escreve 64 bits
+    // quando o pedido é de 64 e 32 quando é de 32. Sem o flag,
     // escreve-se 64 ✓ (o registo do semáforo do Switch é de 64 bits ✓).
     const std::uint64_t valor = payload;
     if (True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout)) {
-        // O pedido com prazo ✗ — o valor tem o prazo embebido ✗.
+        // O pedido com prazo — o valor tem o prazo embebido.
         const std::uint64_t com_prazo = payload;
         (void)com_prazo;
     }
@@ -134,8 +134,8 @@ void RasterizerG610::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
 void RasterizerG610::SignalFence(std::function<void()>&& func) {
     ++contadores_.fences;
     // A fence do upstream é um *callback* que o renderizador chama
-    // quando o trabalho chega ao ecrã ✗. **A casa não tem ecrã ainda** ✗
-    // — por isso o callback fica guardado ✗ e é chamado no *flush* ✗.
+    // quando o trabalho chega ao ecrã. **A casa não tem ecrã ainda**
+    // — por isso o callback fica guardado e é chamado no *flush*.
     if (func)
         func();
 }
@@ -147,7 +147,7 @@ void RasterizerG610::SyncOperation(std::function<void()>&& func) {
 
 void RasterizerG610::SignalSyncPoint(u32 value) {
     ++contadores_.syncpoints;
-    // **A fence da GPU** ✓ — é o syncpoint do canal ✗ que sobe ✗.
+    // **A fence da GPU** ✓ — é o syncpoint do canal que sobe.
     if (sinaliza_)
         sinaliza_(value);
 }
@@ -161,10 +161,10 @@ void RasterizerG610::ReleaseFences(bool force) {
 
 // ── As caches ───────────────────────────────────────────────────────────────
 //
-// A casa **não tem caches de GPU** ✗: a memória do guest é um `mmap`
+// A casa **não tem caches de GPU**: a memória do guest é um `mmap`
 // plano ✓ e o motor escreve directamente nela ✓. Por isso estas são
-// todas no-ops ✗ — e são-no-op *com purpose* ✗ (o Eden só as tem por
-// causa do Vulkan ✗).
+// todas no-ops — e são-no-op *com purpose* (o Eden só as tem por
+// causa do Vulkan).
 
 void RasterizerG610::FlushAll() {
 }

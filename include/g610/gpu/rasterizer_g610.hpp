@@ -8,25 +8,25 @@
 // O motor Maxwell do Eden (`video_core/engines/maxwell_3d.cpp`) fala com
 // o renderizador por uma **interface abstracta**
 // (`video_core/rasterizer_interface.h`) ✓. É por essa interface que o
-// motor diz "desenha isto", "limpa isto", "espera pelo第五章" ✗.
+// motor diz "desenha isto", "limpa isto", "espera pelo第五章".
 //
 // A casa implementa essa interface — é o `ValhallBackend` que o desenho
 // do projecto já nomeia ✓ — em vez de vendorizar o `renderer_vulkan` do
 // upstream (que traz shaders gerados, PanVK e forks de cabeçalhos que não
-// existem em repositórios públicos ✗).
+// existem em repositórios públicos).
 //
 // ## O que a interface NÃO é
 //
-// A interface **não** é onde o push buffer é lido ✗ (isso é o
-// `dma_pusher` ✗) nem onde a fence é incrementada ✗ (isso é o *puller*
-// ✗, que escreve o *payload* do semáforo na memória do guest ✗ e sinaliza
-// o syncpoint ✗). O renderizador é a ponta de execução: os comandos de
+// A interface **não** é onde o push buffer é lido (isso é o
+// `dma_pusher`) nem onde a fence é incrementada (isso é o *puller*
+//que escreve o *payload* do semáforo na memória do guest e sinaliza
+// o syncpoint). O renderizador é a ponta de execução: os comandos de
 // desenho, e as invalidações de cache.
 //
 // ## Porquê uma *interface* e não uma classe
 //
 // Porque é a costura que o motor do upstream já traz ✓ — usá-la é o que
-// evita reescrever o motor ✗.
+// evita reescrever o motor.
 #pragma once
 
 #include <cstdint>
@@ -43,8 +43,8 @@ namespace g610::gpu {
 //
 // ## Estado
 //
-// Hoje a casa **conta** os comandos em vez de os executar ✗ — o backend
-// Vulkan (o `ValhallBackend` ✗) entra por cima desta classe ✗. A
+// Hoje a casa **conta** os comandos em vez de os executar — o backend
+// Vulkan (o `ValhallBackend`) entra por cima desta classe. A
 // contagem não é decoração: é o que permite dizer, com medição, que o
 // jogo chegou a desenhar ✓ — e o que a telemetria mostra ✓.
 // **O namespace é o global `VideoCore`** ✓ — medido no upstream: o
@@ -56,18 +56,18 @@ namespace g610::gpu {
 //
 // **Cuidado**: existe *outro* `VideoCore` ✓ — o `Tegra::VideoCore` de
 // `video_core/video_core.h:16-27` ✓, que é onde vive o `RendererBase` ✓.
-// São dois `VideoCore` diferentes ✓ e o upstream não os unifica ✗.
-// Escrever `Tegra::VideoCore::RasterizerInterface` não compila ✗ — e o
-// erro que dá ("'Tegra::VideoCore' has not been declared" ✗) não diz
-// nada sobre o namespace certo ✗.
+// São dois `VideoCore` diferentes ✓ e o upstream não os unifica.
+// Escrever `Tegra::VideoCore::RasterizerInterface` não compila — e o
+// erro que dá ("'Tegra::VideoCore' has not been declared") não diz
+// nada sobre o namespace certo.
 class RasterizerG610 final : public VideoCore::RasterizerInterface {
 public:
     // O que a casa sabe fazer hoje, exposto para quem sabe escrever no
     // guest e sinalizar fences ✓.
     //
-    // **Dois *hooks*** ✓: a escrita no guest ✗ e o sinal ✗ — porque quem
-    // os faz (o `nvdrv` ✓, o motor ✓) sabe mais sobre o estado ✗ do que
-    // o renderizador ✗.
+    // **Dois *hooks*** ✓: a escrita no guest e o sinal — porque quem
+    // os faz (o `nvdrv` ✓, o motor ✓) sabe mais sobre o estado do que
+    // o renderizador.
     using EscreveNoGuest =
         std::function<bool(std::uint64_t endereco, const void* dados, std::size_t tamanho)>;
     using SinalizaFence = std::function<void(std::uint32_t syncpoint)>;
@@ -131,7 +131,7 @@ public:
 
     // Os vertices/indices que o motor pediu no último desenho — é o que
     // permite confirmar que a traducao do estado está certa ✓ (a contagem
-    // de vertices e' o que a GPU faria ✗).
+    // de vertices e' o que a GPU faria).
     void AnotaDesenho(std::uint64_t vertices, std::uint64_t indices, bool indexado);
 
     std::uint64_t vertices_ultimo = 0;

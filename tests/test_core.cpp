@@ -423,10 +423,10 @@ void test_maxwell_extract() {
 
     // Formato: [bind][draw.begin][vertex_buffer.count = 3][draw.end]
     //
-    // **O bind** ✗ — o metodo `BindObject` (o 0x00 do canal ✗) liga o
-    // subcanal 0 ao motor 3D ✗ (o upstream,
-    // `src/video_core/engines/puller.cpp:29-58` ✗) ✗. Sem ele ✗ o
-    // tradutor nao sabe que o subcanal 0 e' o motor 3D ✗ ✗.
+    // **O bind** — o metodo `BindObject` (o 0x00 do canal) liga o
+    // subcanal 0 ao motor 3D (o upstream,
+    // `src/video_core/engines/puller.cpp:29-58`). Sem ele o
+    // tradutor nao sabe que o subcanal 0 e' o motor 3D.
     push(cabecalho(g610::gpu::canal::BindObject, 1));
     push(g610::gpu::motor::Maxwell3D); // o `EngineID` do motor 3D
     push(0x0000'0000); // Nop inicial — tem de ser saltado

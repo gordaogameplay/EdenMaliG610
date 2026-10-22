@@ -118,10 +118,10 @@ int main() {
     std::printf("\n[4] o tradutor produz o desenho\n");
     {
         std::vector<std::uint8_t> buffer;
-        // **O bind** ✗ — o metodo 0x00 do canal (`BindObject` ✗) liga o
-        // subcanal 0 ao motor 3D ✗ (o upstream,
-        // `src/video_core/engines/puller.cpp:29-58` ✗) ✗. Sem isto ✗ o
-        // tradutor nao sabe que o subcanal 0 e' o motor 3D ✗ ✗.
+        // **O bind** — o metodo 0x00 do canal (`BindObject`) liga o
+        // subcanal 0 ao motor 3D (o upstream,
+        // `src/video_core/engines/puller.cpp:29-58`). Sem isto o
+        // tradutor nao sabe que o subcanal 0 e' o motor 3D.
         empurrar(buffer, cabecalho(canal::BindObject, 0, 1, modo::Increasing));
         empurrar(buffer, motor::Maxwell3D);
         empurrar(buffer, cabecalho(maxwell3d::vertex_buffer_count, 0, 1, modo::Increasing));

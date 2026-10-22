@@ -350,13 +350,13 @@ bool GuestProgram::map_into(std::uint64_t heap_reserve, std::string& error) {
             return false;
         }
 
-        // **O cabecalho MOD0** ✗ — e' o que o rtld do jogo inspeciona ✗
-        // (`ldr w8, [base, #4]` ✗ — o offset ✗ — e depois a magic
-        // "MOD0" ✗, 0x30444F4D ✗, no offset ✗) ✗ ✗.
+        // **O cabecalho MOD0** — e' o que o rtld do jogo inspeciona
+        // (`ldr w8, [base, #4]` — o offset — e depois a magic
+        // "MOD0", 0x30444F4D, no offset).
         //
-        // Se a magic nao bater ✗, o rtld fica em `b .` ✗ (a espera
-        // eterna ✗, em `0x8446170c` ✗) ✗ — e o jogo nunca mais sai de
-        // la ✗ ✗. E' o sintoma do "limite de traps" ✗ ✗.
+        // Se a magic nao bater, o rtld fica em `b,` (a espera
+        // eterna, em `0x8446170c`) — e o jogo nunca mais sai de
+        // la. E' o sintoma do "limite de traps".
         {
             std::uint8_t cab[12]{};
             std::string erro;
@@ -369,13 +369,13 @@ bool GuestProgram::map_into(std::uint64_t heap_reserve, std::string& error) {
                              cab[2], cab[3], cab[4], cab[5], cab[6], cab[7],
                              cab[8], cab[9], cab[10], cab[11]);
 
-                // **O valor PRE-relocacao** ✗ — o slot que o rtld vai
-                // relocalizar ✗ (o global `0x824B8232` ✗, que e' o
-                // offset `0x24B5CA0` dentro do modulo ✗) ✗ ✗.
+                // **O valor PRE-relocacao** — o slot que o rtld vai
+                // relocalizar (o global `0x824B8232`, que e' o
+                // offset `0x24B5CA0` dentro do modulo).
                 //
-                // **E' o que diz se a imagem esta' boa** ✗ ✗: o rtld
-                // escreve `addend + bias` ✗ ✗ — e o `addend` tem de ser um
-                // deslocamento limpo ✗ ✗ (0x808e ✗), nao lixo ✗ ✗.
+                // **E' o que diz se a imagem esta' boa**: o rtld
+                // escreve `addend + bias` — e o `addend` tem de ser um
+                // deslocamento limpo (0x808e), nao lixo.
                 if (m.name() == std::string("main") &&
                     m.nso.image.size() > 0x24B5CA0 + 8) {
                     std::uint64_t antes = 0;
@@ -725,15 +725,15 @@ std::string GuestProgram::summary() const {
         out += "      addr spc : " + std::to_string(m.nso.address_space_type) +
                std::string(" (39-bit required)") + "\n";
 
-        // **Os primeiros bytes do modulo em memoria** ✗ — e' o que o
-        // rtld do jogo inspeciona ✗ (`ldr w8, [base, #4]` ✗ e depois a
-        // magic "MOD0" ✗) ✗ ✗.
+        // **Os primeiros bytes do modulo em memoria** — e' o que o
+        // rtld do jogo inspeciona (`ldr w8, [base, #4]` e depois a
+        // magic "MOD0").
         //
-        // O formato e' o do **MOD0** ✗ (o rtld, em `0x84461504` ✗):
-        // no inicio do `.text` ✗ vem `{u32, u32 offset_para_o_MOD0}` ✗
-        // e no offset ✗ a **magic "MOD0"** ✗ (0x30444F4D ✗) ✗ ✗.
-        // Se a magic nao bater ✗, o rtld fica em `b .` ✗ — a espera
-        // eterna ✗ — e o jogo nunca mais sai de la ✗ ✗.
+        // O formato e' o do **MOD0** (o rtld, em `0x84461504`):
+        // no inicio do `.text` vem `{u32, u32 offset_para_o_MOD0}`
+        // e no offset a **magic "MOD0"** (0x30444F4D).
+        // Se a magic nao bater, o rtld fica em `b,` — a espera
+        // eterna — e o jogo nunca mais sai de la.
         {
             std::uint8_t cab[16]{};
             std::string erro;
