@@ -4995,3 +4995,26 @@ sinalizado no `SetPreallocatedBuffer` ✗ ✗.
 
 **Medido depois** (`/tmp/boot_r40.log`): o fault e' o mesmo ✗ — o evento
 nao era a causa ✗ ✗, mas a divergencia com o Eden estava la ✗ ✗.
+
+## O PanVK funciona no Mali-G610 (medido, 2026-10-22)
+
+**Medido** (no Pi): o `vulkaninfo` mostra
+
+    GPU0: deviceName = Mali-G610, driverName = panvk, Mesa 25.2.8
+
+Isto e' o **driver Vulkan nativo do nosso GPU** ✗ — e o `panfrost` ja'
+esta' activo ✗ (`/usr/share/vulkan/icd.d/panfrost_icd.json` ✗) ✗.
+
+**O Eden usa-o** ✗ — com `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/panfrost_icd.json`
+✗ ✗: o `eden-cli` passa do `Report` ✗ (que com o `llvmpipe` ✗ o matava
+✗ ✗) e avanca para a criacao dos pipelines ✗ ✗.
+
+**Porquê que isto importa**: o `ValhallBackend` ✗ — o backend de
+execucao ✗ que a casa precisa de ligar ✗ ✗ — e' um backend **Vulkan**
+✗ ✗, e o PanVK e' a implementacao **desse** backend ✗ para o Mali-G610
+✗ ✗ ✗. A execucao na casa nao precisa de ser escrita do zero ✗ ✗ —
+pode ser o proprio PanVK ✗ ✗ ✗, como no Eden ✗ ✗.
+
+**Nota**: o `eden-cli` ainda **segfaulta** ✗ (no `GetSupportedFormat` ✗
+— os formatos que o panvk nao tem ✗ ✗) ✗ — mas isso e' um problema do
+**Eden** ✗ ✗, nao do jogo ✗ ✗, e nao serve de referencia ✗ ✗.
