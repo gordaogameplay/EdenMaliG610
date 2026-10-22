@@ -1060,6 +1060,13 @@ Result SvcDispatcher::svc_query_memory(SvcContext& ctx) {
     info.base_address = 0;
     info.size         = 0;
     info.state        = 0;   // Free
+
+    // **O que a casa responde** ✗ — o rtld percorre o espaco do processo
+    // a perguntar ✗ ✗, e o que ele aceita como modulo e' o que decide ✗ ✗.
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr, "[qm] query=0x%llx regioes=%zu\n",
+                     (unsigned long long)query, regions_.size());
+    }
     info.attribute    = 0;
     info.permission   = 0;   // None
     info.ipc_count    = 0;
@@ -1146,6 +1153,12 @@ Result SvcDispatcher::svc_query_memory(SvcContext& ctx) {
         info.state        = GuestRegion::kNormal;
         info.permission   = GuestRegion::kRead | GuestRegion::kWrite |
                             GuestRegion::kExecute;
+    }
+
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr, "[qm]   -> base=0x%llx size=0x%llx state=%u perm=%u\n",
+                     (unsigned long long)info.base_address,
+                     (unsigned long long)info.size, info.state, info.permission);
     }
 
     if (!write_guest(out_info, &info, sizeof(info)))
