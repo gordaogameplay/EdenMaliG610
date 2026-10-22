@@ -588,6 +588,19 @@ public:
         query_memory_calls_ = 0;
     }
 
+    // **Um watchpoint** ✗ — pôr uma página do guest em so' leitura ✗,
+    // para que a escrita do guest nela levante um SIGSEGV ✗ ✗ — e o
+    // motor reporte **quem** escreveu ✗ ✗ (o PC ✗ e os registos ✗) ✗ ✗.
+    //
+    // E' a unica forma de descobrir **qual** das respostas do host
+    // encheu um campo do jogo ✗ ✗ (e no Eden nao encheria ✗ ✗) ✗ ✗.
+    void ArmarWatchpoint(std::uint64_t endereco, std::uint64_t tamanho);
+
+    // **Armar o watchpoint depois do rtld** ✗ ✗ — o rtld escreve na
+    // pagina ✗ ✗ (as relocacoes ✗) ✗, e o watchpoint dispararia nessa
+    // altura ✗ ✗ ✗. O primeiro SVC e' do jogo ✗ ✗ — logo depois ✗ ✗.
+    void ArmarWatchpointSePedir(std::uint64_t endereco, std::uint64_t tamanho);
+
     // Chamadas de mapeamento desde o último reset.
     //
     // O rtld faz dezenas no arranque, e vê-las a crescer é a forma mais

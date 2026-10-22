@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sys/mman.h>
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -21,6 +22,47 @@
 #include <vector>
 
 namespace g610 {
+
+// A pagina do watchpoint ✗ — o motor usa-a para distinguir "o guest
+// escreveu aqui" ✗ de "o guest leu fora do mapa" ✗ ✗.
+volatile std::uint64_t g_watch_pagina = 0;
+
+// **O watchpoint ainda nao foi armado** ✗ ✗ — porque o rtld ✗ ✗
+// escreve na pagina ✗ ✗ (as relocacoes ✗) ✗ ✗.
+volatile bool g_esperar_pelo_rtld = false;
+
+// O endereco a vigiar ✗ ✗.
+std::uint64_t g_endereco_do_watchpoint = 0;
+
+// **Ler o global do jogo** ✗ ✗ — o handler de sinais e' estatico ✗ ✗
+// e nao alcanca o dispatcher ✗ ✗.
+bool LerGlobalDoJogo(std::uint64_t* valor) {
+    if (g_endereco_do_watchpoint == 0)
+        return false;
+    // A memoria do guest e' do proprio processo ✗ ✗ (o `mmap` com
+    // `MAP_FIXED_NOREPLACE` ✗) ✗ — e o handler e' estatico ✗ ✗.
+    std::memcpy(valor, reinterpret_cast<const void*>(g_endereco_do_watchpoint),
+                sizeof(std::uint64_t));
+    return true;
+}
+
+// **Repor a pagina do watchpoint** ✗ — o handler de sinais e' estatico
+// ✗ ✗, e por isso nao alcanca o dispatcher ✗ ✗. O `mprotect` e' feito
+// aqui mesmo ✗ — a pagina e' do guest e o motor sabe onde ela esta' ✗.
+void ReporWatchpoint() {
+    if (g_watch_pagina == 0)
+        return;
+    ::mprotect(reinterpret_cast<void*>(g_watch_pagina), 0x1000,
+               PROT_READ | PROT_WRITE);
+}
+
+// **Voltar a armar** ✗ — a pagina fica em so' leitura ✗ ✗, para a
+// escrita seguinte ser apanhada ✗ ✗.
+void ReArmarWatchpoint() {
+    if (g_watch_pagina == 0)
+        return;
+    ::mprotect(reinterpret_cast<void*>(g_watch_pagina), 0x1000, PROT_READ);
+}
 
 namespace {
 std::uint64_t host_tick_ns() {
@@ -45,6 +87,32 @@ bool SvcDispatcher::read_guest(std::uint64_t addr, void* dst, std::size_t size) 
     // dereference directo aqui seria um SIGSEGV dentro de um handler de
     // sinais, que é o pior sítio possível para um crash.
     return false;
+}
+
+// **O watchpoint** ✗ — ver a nota em `svc_dispatcher.hpp` ✗ ✗.
+//
+// A pagina fica em so' leitura ✗ ✗; a escrita do guest nela levanta um
+// SIGSEGV ✗ ✗, que o motor reconhece (o endereco esta' dentro do espaco
+// do guest ✗) ✗ e reporta ✗ ✗.
+// **Armar o watchpoint depois do rtld** ✗ ✗.
+void SvcDispatcher::ArmarWatchpointSePedir(std::uint64_t endereco, std::uint64_t tamanho) {
+    g_endereco_do_watchpoint = endereco;
+    g_esperar_pelo_rtld = true;
+}
+
+void SvcDispatcher::ArmarWatchpoint(std::uint64_t endereco, std::uint64_t tamanho) {
+    if (mem_ == nullptr || tamanho == 0)
+        return;
+    // A pagina que contem o endereco ✗.
+    const std::uint64_t pagina = endereco & ~static_cast<std::uint64_t>(0xFFF);
+    std::string erro;
+    if (!mem_->protect(pagina, 0x1000, Prot::Read, erro)) {
+        std::fprintf(stderr, "[watch] mprotect falhou: %s\n", erro.c_str());
+        return;
+    }
+    g_watch_pagina = pagina;
+    std::fprintf(stderr, "[watch] pagina 0x%llx em so' leitura\n",
+                 (unsigned long long)pagina);
 }
 
 bool SvcDispatcher::write_guest(std::uint64_t addr, const void* src,
@@ -244,6 +312,13 @@ void SvcDispatcher::close_handle(std::uint32_t handle) {
 // ---------------------------------------------------------------------------
 
 void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
+    // **O watchpoint** ✗ — armado no **primeiro SVC** ✗ ✗, que e'
+    // depois do rtld ✗ ✗ (o rtld nao faz SVC ✗ ✗) ✗ ✗.
+    if (g_esperar_pelo_rtld) {
+        g_esperar_pelo_rtld = false;
+        ArmarWatchpoint(g_endereco_do_watchpoint, 8);
+    }
+
     const tel::Nanos t0 = tel_.time_now();
     tel_.note_svc();
     tel_.exec().svc_calls.fetch_add(1, std::memory_order_relaxed);

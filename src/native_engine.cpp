@@ -60,6 +60,15 @@
 
 namespace g610 {
 
+// A pagina do watchpoint ✗ — ver `SvcDispatcher::ArmarWatchpoint` ✗ ✗.
+extern volatile std::uint64_t g_watch_pagina;
+// **O watchpoint ainda nao foi armado** ✗ ✗ — porque o rtld ✗ ✗
+// escreve na pagina ✗ ✗ (as relocacoes ✗) ✗ ✗.
+void ReporWatchpoint();
+// **Ler o global do jogo** ✗ ✗ — o handler de sinais e' estatico ✗ ✗.
+bool LerGlobalDoJogo(std::uint64_t* valor);
+void ReArmarWatchpoint();
+
 namespace {
 
 // Os hooks são file-scope porque um handler de sinais não sabe que thread o
@@ -606,6 +615,28 @@ RunResult NativeEngine::run(void (*code)(), std::uint64_t sp) {
     // Estado do dispatcher: um `exited_` que ficou a true contaminaria a
     // execução seguinte e faria um fault parecer uma saída limpa.
     svc_.reset_run_state();
+
+    // **O watchpoint** ✗ — o global do jogo que guarda a base da tabela
+    // que o guest consultou ✗ (`0x824B8232` ✗, lido em `0x8177d0c8` ✗)
+    // ✗.
+    //
+    // **So' depois do rtld** ✗ ✗ — antes disso ✗, o rtld escreve na
+    // pagina ✗ (as relocacoes ✗) ✗ e o watchpoint disparava em
+    // Write ✗ ✗.
+    //
+    // `IA_WATCH=rtld` ✗ — arma no **primeiro SVC** ✗ ✗, que e' depois
+    // do rtld ✗ ✗ (o rtld nao faz SVC ✗ ✗ — so' o jogo ✗ ✗) ✗.
+    svc_.ArmarWatchpointSePedir(0x824B8232ull, 8);
+
+    // **O valor do global ANTES do jogo** ✗ — para comparar com o de
+    // depois ✗ ✗.
+    {
+        std::uint64_t antes = 0;
+        if (svc_.read_guest(0x824B8232ull, &antes, sizeof antes)) {
+            std::fprintf(stderr, "[watch] global no arranque = 0x%llx\n",
+                         (unsigned long long)antes);
+        }
+    }
 
     // Reinicia os contadores: um segundo arranque não deve herdar o primeiro.
     //
@@ -1262,6 +1293,18 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             // A thread principal não tem slot (o motor conta-a à parte), e
             // o seu TLS é o `guest_tls` dos hooks.
             g_hooks.svc->set_tls_da_thread(st != nullptr ? st->guest_tls : g_hooks.guest_tls);
+            // **O valor do global** ✗ — a cada SVC ✗ ✗, para se ver
+            // **quando** muda ✗ ✗.
+            if (std::getenv("IA_WATCH") != nullptr) {
+                static std::uint32_t n = 0;
+                if ((++n % 100) == 0) {
+                    std::uint64_t v = 0;
+                    if (LerGlobalDoJogo(&v)) {
+                        std::fprintf(stderr, "[watch] global = 0x%llx\n",
+                                     (unsigned long long)v);
+                    }
+                }
+            }
             g_hooks.svc->dispatch(number, c);
             dispatch_release(me);
             dispatch_owner_set(0);
@@ -1349,6 +1392,53 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
                                                         : g_hooks.guest_tls;
         if (tls_de_quem != 0 && emulate_tls_read(uc, pc, st))
             return;   // retoma o guest no PC seguinte
+
+        // **O watchpoint** ✗ — a pagina armada em so' leitura ✗ ✗.
+        // Uma escrita nela e' o guest a escrever ✗ — e e' o que estamos
+        // a procurar ✗ ✗.
+        const auto endereco_do_fault =
+            reinterpret_cast<std::uintptr_t>(info->si_addr);
+        if (g_watch_pagina != 0 &&
+            (endereco_do_fault >= g_watch_pagina &&
+             endereco_do_fault < g_watch_pagina + 0x1000)) {
+            // **O valor antigo** ✗ — o que estava no sitio antes da
+            // escrita ✗ ✗.
+            //
+            // A instrucao e' um `str` ✗ ✗ — mas descodificar todas as
+            // variantes nao vale o effort ✗ ✗. O que interessa e' o **PC**
+            // ✗ ✗ (que da o rtld ✗) ✗ e o valor **depois** ✗ ✗.
+            // **O valor a escrever** ✗ — o `str x11, [x12, x8]` ✗
+            // (em `0x84461980` ✗) ✗ escreve o `x11` ✗ ✗.
+            char b[512];
+            int n = std::snprintf(b, sizeof b,
+                                  "[watch] escrita na pagina 0x%llx (pc=0x%llx) "
+                                  "x8=0x%llx x11=0x%llx x12=0x%llx dest=0x%llx\n",
+                                  (unsigned long long)endereco_do_fault,
+                                  (unsigned long long)pc,
+                                  (unsigned long long)uc->uc_mcontext.regs[8],
+                                  (unsigned long long)uc->uc_mcontext.regs[11],
+                                  (unsigned long long)uc->uc_mcontext.regs[12],
+                                  (unsigned long long)(uc->uc_mcontext.regs[12] +
+                                                      uc->uc_mcontext.regs[8]));
+            for (int i = 0; i < 8; ++i) {
+                n += std::snprintf(b + n, sizeof(b) - n, " x%d=0x%llx", i,
+                                   (unsigned long long)uc->uc_mcontext.regs[i]);
+            }
+            n += std::snprintf(b + n, sizeof(b) - n, " x30=0x%llx\n",
+                               (unsigned long long)uc->uc_mcontext.regs[30]);
+            ssize_t w = ::write(2, b, (size_t)n);
+            (void)w;
+            // A pagina volta a ser de leitura-escrita ✗ — para o guest
+            // continuar ✗ ✗ (e o watchpoint volta a armar ✗) ✗.
+            ReporWatchpoint();
+            // E volta a armar ✗ — a proxima escrita na pagina e' o que
+            // interessa ✗ ✗.
+            ReArmarWatchpoint();
+            // O guest repete a instrucao ✗ ✗.
+            uc->uc_mcontext.pc = pc;
+            uc->uc_mcontext.sp = static_cast<std::uint64_t>(uc->uc_mcontext.sp);
+            return;
+        }
 
         if (::getenv("IA_TRACE")) {
             char b[224];
