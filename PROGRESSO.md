@@ -4727,3 +4727,19 @@ a numeracao do Eden. O handle 0 nunca existe.
 (em vez de 2) ✓, e o jogo continua a ler 23 ficheiros do RomFS ✓ e a
 fazer a setup da GPU ✓. O fault e' o mesmo (`0x8177d290`) — este
 numero **nao** era a causa.
+
+### O `min_undequeued_buffers` — a casa devolvia 2, o Eden devolve 0
+
+**Medido** (o Eden, `nvnflinger/buffer_queue_core.cpp:41-52`): o
+`GetMinUndequeuedBufferCountLocked` so' conta um buffer extra quando o
+`DequeueBuffer` pode **falhar** — e nao e' o caso:
+
+    if (!use_async_buffer) {
+        return 0;
+    }
+
+A casa devolvia **2** (o `default_max_buffer_count` do upstream, que e'
+outra coisa). Agora devolve **0**.
+
+**Medido depois** (`/tmp/boot_r28.log`): o fault e' o mesmo
+(`0x8177d290`) — a correccao e' fiel ao Eden mas nao era a causa.

@@ -577,7 +577,19 @@ std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
             valor = static_cast<std::int32_t>(Fila().formato);
             break;
         case WindowMinUndequeuedBuffers:
-            valor = 2;
+            // **Zero** ✗ — o upstream
+            // (`nvnflinger/buffer_queue_core.cpp:41-52` ✗) so' conta um
+            // buffer extra ✗ quando o `DequeueBuffer` pode **falhar** ✗
+            // (`use_async_buffer` ✗) ✗ — e nao e' o caso ✗ ✗:
+            //
+            //     if (!use_async_buffer) {
+            //         return 0;
+            //     }
+            //
+            // A casa devolvia **2** ✗ — o que e' o `default_max_buffer_count`
+            // ✗ do upstream ✗ (`buffer_queue_core.h:91` ✗) ✗, que e' outra
+            // coisa ✗ ✗.
+            valor = 0;
             break;
         case WindowQueuesToWindowComposer:
             valor = 1;
