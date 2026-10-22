@@ -4945,3 +4945,36 @@ como no upstream ✗ ✗.
 
 **Medido depois** (`/tmp/boot_r39.log`): o `MapBufferEx: handle 0 nao
 esta' alocado` **desapareceu** ✗->✓ (ya' nao ha ✗) ✗.
+
+## O estado da casa (medido, 2026-10-22)
+
+### O que funciona
+
+| | |
+|---|---|
+| arranque do SDK | ✓ |
+| leitura do RomFS | ✓ 23 ficheiros |
+| idioma (`am` + `set:`) | ✓ |
+| a fonte do sistema (`pl:u`) | ✓ (a regiao e' vazia ✗, como no Eden sem NAND ✗) |
+| display e camada (`vi`) | ✓ |
+| o SurfaceFlinger (o `binder`) | ✓ |
+| a setup da GPU (o `nvdrv`) | ✓ 0 ioctls por implementar ✗ |
+| a submissao do push buffer | ✓ 8864 bytes ✗, 624 metodos ✗ |
+| o `Remap` do `MapBufferEx` | ✓ (corrigido ✗) ✗ |
+| o `nvmap_fd` do `SetNVMAPfd` | ✓ (corrigido ✗) ✗ |
+
+**Medido** (`/tmp/boot_r39.log`): 803 SVC ✗, 809 traps ✗, **23** ficheiros
+do RomFS ✗, **0** ioctls por implementar ✗, **0** `MapBufferEx` com
+handle invalido ✗.
+
+### O que falta
+
+1. **O fault** ✗ — `0x8177d290` ✗: um lookup do **proprio jogo** ✗ que
+   devolveu nulo ✗ ✗. O jogo procura um recurso que **nao esta'
+   registado** ✗ ✗.
+2. **O `DequeueBuffer`** ✗ nunca chega ✗ — e sem ele o jogo nao desenha
+   ✗ ✗.
+3. **O push buffer de desenho** ✗ — o que chegou ✗ foi de *setup* ✗
+   (sem `draw.begin`/`draw.end` ✗) ✗.
+4. **A execucao** ✗ — o tradutor traduz ✗ mas quem executa ✗ (o
+   `ValhallBackend` ✗, o PanVK ✗) nao esta' ligado ✗ ✗.
