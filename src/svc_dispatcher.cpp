@@ -1725,6 +1725,16 @@ Result SvcDispatcher::svc_create_thread(SvcContext& ctx) {
         }
     }
 
+    // **Tracer leve de criacoes** — quem (x30) cria cada thread e com que
+    // entry/arg/prio. O IA_IPC_TRACE e' pesado (despeja IPC por chamada);
+    // as criacoes em si sao poucas por run (~uma dezena).
+    if (std::getenv("G610_SVC_CREATE_TRACE") != nullptr)
+        std::fprintf(stderr,
+                     "[svc] CreateThread handle=0x%x entry=0x%llx arg=0x%llx prio=%d x30=0x%llx\n",
+                     static_cast<unsigned>(h.raw), (unsigned long long)entry,
+                     (unsigned long long)arg, priority,
+                     static_cast<unsigned long long>(ctx.gpr[30]));
+
     if (std::getenv("IA_IPC_TRACE") != nullptr) {
         std::fprintf(stderr,
                      "[svc] CreateThread handle=0x%x entry=0x%llx arg=0x%llx "
@@ -2390,6 +2400,35 @@ Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
                      "[svc] SignalProcessWideKey key=0x%llx count=%d x30=0x%llx\n",
                      static_cast<unsigned long long>(cv_key), count,
                      static_cast<unsigned long long>(ctx.gpr[30]));
+
+    // **Nivel de cima** — o frame-chain de x29: [x29] = fp do chamador,
+    // [x29+8] = lr do chamador (o pc dentro do site que chamou o produtor).
+    // O produtor da bomba (x30=0x805e6eb8, main+0x5E6EB8) vive no fim do
+    // submitter 0x805e6970; o lr do chamador identifica qual dos 23 call-
+    // sites posta a cada ciclo. Leves: uma leitura de 16 bytes por sinal.
+    static const bool trace_pai = std::getenv("G610_SVC_SIGNAL_FP") != nullptr;
+    if (trace_pai && !trace_sinal)
+        std::fprintf(stderr, "[svc] SignalProcessWideKey key=0x%llx x30=0x%llx\n",
+                     static_cast<unsigned long long>(cv_key),
+                     static_cast<unsigned long long>(ctx.gpr[30]));
+    if (trace_pai) {
+        const std::uint64_t fp = ctx.gpr[29];
+        constexpr std::uint64_t largura = 0x200000ull;
+        constexpr std::uint64_t topo = 0x800000000ull;
+        std::uint64_t f[6] = {0, 0, 0, 0, 0, 0};
+        bool ok = fp >= largura && fp < topo && read_guest(fp, f, 2 * sizeof f[0]);
+        if (ok && f[0] >= largura && f[0] < topo)
+            (void)read_guest(f[0], f + 2, 2 * sizeof f[0]);
+        if (ok && f[2] >= largura && f[2] < topo)
+            (void)read_guest(f[2], f + 4, 2 * sizeof f[0]);
+        if (ok)
+            std::fprintf(stderr,
+                         "[svc] SignalProcessWideKey cadeia key=0x%llx lvl1=0x%llx lvl2=0x%llx lvl3=0x%llx\n",
+                         static_cast<unsigned long long>(cv_key),
+                         static_cast<unsigned long long>(f[1]),
+                         static_cast<unsigned long long>(f[3]),
+                         static_cast<unsigned long long>(f[5]));
+    }
 
     std::vector<std::uint64_t> wakers;
     std::size_t acordados = 0;
