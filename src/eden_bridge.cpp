@@ -45,7 +45,9 @@
 #include "vendor/eden/core/hle/service/apm/apm_controller.h"
 #include "vendor/eden/core/hle/service/aoc/addon_content_manager.h"
 #include "g610/services/applet_oe.hpp"
+#include "g610/services/csrng.hpp"
 #include "g610/services/fsp_srv.hpp"
+#include "g610/services/hid.hpp"
 #include "g610/services/nvdrv.hpp"
 #include "g610/services/pl_u.hpp"
 #include "g610/services/set.hpp"
@@ -628,6 +630,18 @@ EdenSystem::EdenSystem(GuestMemory& memoria, std::uint64_t pid, std::uint64_t ti
     // Ver `src/services/pl_u.cpp`.
     g610::services::registar_pl_u(*this);
 
+    // O `hid` — a entrada (os comandos). **Medido** (`/tmp/boot_font.log`):
+    // depois das fontes, o SDK pede `GetService("hid")` e a casa nao o
+    // tinha — o `sm:` deferia o pedido e o guest abortava no leitor CMIF
+    // (`modulo=10 desc=212`). Ver `src/services/hid.cpp`.
+    g610::services::registar_hid(*this);
+
+    // O `csrng` — os bytes aleatorios. **Medido** (`/tmp/boot_hid.log`):
+    // depois do `hid`, o SDK pede `GetService("csrng")` e a casa nao o
+    // tinha — o `sm:` deferia e o guest abortava no leitor CMIF. Ver
+    // `src/services/csrng.cpp`.
+    g610::services::registar_csrng(*this);
+
     // O `nvdrv` — o driver da NVIDIA, que e' a porta de entrada da GPU.
     // Medido (`boot_p6l.log`): depois do `fsp-srv`, e' o proximo servico
     // que o SDK pede e que faltava. O servico e' **fino** (a interface do
@@ -859,21 +873,21 @@ bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_ha
     // ── O ENDEREÇO DO PEDIDO ─────────────────────────────────────────────
     //
     // `SendSyncRequest(handle, endereco, tamanho)` — o guest passa o
-    // endereço **do seu buffer de pedido** ✗ e o kernel escreve a resposta
-    // no buffer de resposta do TLS ✗.
+    // endereço **do seu buffer de pedido** e o kernel escreve a resposta
+    // no buffer de resposta do TLS.
     //
-    // **Medido** (`/tmp/boot_dom.log` ✗): o guest manda
-    // `x1=0x88004000` ✗ e a casa passava `0` ✗ — e o upstream, quando o
-    // endereço é zero ✗, vai buscar o pedido ao **TLS** da thread ✗
-    // (`k_server_session.cpp:1162` ✗) em vez de o ler de onde o guest o
-    // escreveu ✗. O que lá estava era a **resposta** anterior ✗ — o magic
-    // "SFCO" ✗ em vez de "SFCI" ✗ — e o `ParseCommandBuffer` do upstream
-    // queixava-se ✗ (`assert data_payload_header->magic` ✗).
+    // **Medido** (`/tmp/boot_dom.log`): o guest manda
+    // `x1=0x88004000` e a casa passava `0` — e o upstream, quando o
+    // endereço é zero, vai buscar o pedido ao **TLS** da thread
+    // (`k_server_session.cpp:1162`) em vez de o ler de onde o guest o
+    // escreveu. O que lá estava era a **resposta** anterior — o magic
+    // "SFCO" em vez de "SFCI" — e o `ParseCommandBuffer` do upstream
+    // queixava-se (`assert data_payload_header->magic`).
     //
-    // O tamanho ✗: o `x2` do guest ✗ **não** é um tamanho ✗ (no pedido
-    // medido ✗, `x2 = 0x481f7` ✗ — o mesmo valor do handle ✗ ✗). O
-    // caminho HLE ✗ do upstream lê o buffer pelo `COMMAND_BUFFER_LENGTH` ✗
-    // fixo ✗ e não usa o tamanho ✗ — por isso vai `0` ✗ ✓.
+    // O tamanho: o `x2` do guest **não** é um tamanho (no pedido
+    // medido, `x2 = 0x481f7` — o mesmo valor do handle). O
+    // caminho HLE do upstream lê o buffer pelo `COMMAND_BUFFER_LENGTH`
+    // fixo e não usa o tamanho — por isso vai `0` ✓.
     if (R_FAILED(sessao->SendSyncRequest(kernel, endereco, 0))) {
         if (std::getenv("IA_IPC_TRACE") != nullptr)
             std::fprintf(stderr,
@@ -892,18 +906,18 @@ bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_ha
     // atender".
     //
     // O upstream (`server_manager.cpp:418`) lanca `ResultNotFound` quando o
-    // pump nao encontrou trabalho ✗ — e o `svc_ipc.cpp:91` trata-o
-    // explicitamente como "continua a espera" ✗, nao como falha ✗.
+    // pump nao encontrou trabalho — e o `svc_ipc.cpp:91` trata-o
+    // explicitamente como "continua a espera", nao como falha.
     //
-    // **Medido** ✗: o pump da casa devolvia `ResultNotFound` (61953 ✗) e o
-    // `eden_send_sync_request` devolvia `false` ✗ — o que o
-    // `svc_send_sync_request` traduzia em `Result::InvalidHandle` ✗ ✗.
-    // O guest recebia um erro num pedido **legitimo** ✗ ✗ e abortava ✗
-    // (`SetTerminateResult modulo=2 desc=3005` ✗) ✗.
+    // **Medido**: o pump da casa devolvia `ResultNotFound` (61953) e o
+    // `eden_send_sync_request` devolvia `false` — o que o
+    // `svc_send_sync_request` traduzia em `Result::InvalidHandle`.
+    // O guest recebia um erro num pedido **legitimo** e abortava
+    // (`SetTerminateResult modulo=2 desc=3005`).
     //
-    // **O que e' um erro a serio** ✗: o `SendSyncRequest` enfileirar o
-    // pedido ✗ (linha acima ✗) ✗. O pump e' um **extra** ✗ — o pedido ja
-    // esta' na fila do servidor ✗ e sera' atendido no proximo ciclo ✗ ✗.
+    // **O que e' um erro a serio**: o `SendSyncRequest` enfileirar o
+    // pedido (linha acima). O pump e' um **extra** — o pedido ja
+    // esta' na fila do servidor e sera' atendido no proximo ciclo.
     const bool processado = R_SUCCEEDED(resultado);
     if (!processado && resultado != Kernel::ResultNotFound &&
         std::getenv("IA_IPC_TRACE") != nullptr) {

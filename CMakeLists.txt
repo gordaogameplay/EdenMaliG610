@@ -69,14 +69,22 @@ add_library(g610_core STATIC
   src/svc_dispatcher.cpp
   src/services/applet_oe.cpp
   src/services/binder.cpp
+  src/services/csrng.cpp
   src/services/fsp_srv.cpp
+  src/services/hid.cpp
   src/services/pl_u.cpp
   src/services/set.cpp
   src/services/shared_font.cpp
   # A fonte do sistema — os **dados** vem do upstream (embutidos em
-  # codigo ✗) ✗ e a **cifragem** e' a nossa ✗ (`src/services/
-  # shared_font.cpp` ✗) ✗.
+  # codigo) e a **partilha** e' a nossa (`src/services/shared_font.cpp`).
+  # Sao as 6 fontes do `SHARED_FONTS` do Eden; a `ext` entra duas vezes no
+  # blob (os mesmos dados), como no upstream.
   vendor/eden/core/file_sys/system_archive/data/font_standard.cpp
+  vendor/eden/core/file_sys/system_archive/data/font_chinese_simplified.cpp
+  vendor/eden/core/file_sys/system_archive/data/font_extended_chinese_simplified.cpp
+  vendor/eden/core/file_sys/system_archive/data/font_chinese_traditional.cpp
+  vendor/eden/core/file_sys/system_archive/data/font_korean.cpp
+  vendor/eden/core/file_sys/system_archive/data/font_nintendo_extended.cpp
   src/services/nvdrv.cpp
   src/services/time_u.cpp
   src/services/vi.cpp
@@ -114,10 +122,10 @@ target_include_directories(g610_core PUBLIC
 # As fontes vem do `CMakeLists.txt` do upstream — extraidas por
 # `tools/extrair_fontes_upstream.py` (a fonte da verdade e' o upstream).
 #
-# **Não entra no build** ✗: o `video_core` do upstream está acoplado ao
-# Eden inteiro — o `texture_cache` puxa o `bcdec` ✗, o `GPU` puxa o
-# `Core::System` completo ✗, e os renderers puxam shaders gerados ✗
-# (glslang ✗). A casa tem o **seu** tradutor ✓ — e agora com a ISA
+# **Não entra no build**: o `video_core` do upstream está acoplado ao
+# Eden inteiro — o `texture_cache` puxa o `bcdec`, o `GPU` puxa o
+# `Core::System` completo, e os renderers puxam shaders gerados
+# (glslang). A casa tem o **seu** tradutor ✓ — e agora com a ISA
 # **real** ✓ (`g610/gpu/maxwell_comandos.hpp` ✓, extraída do upstream ✓).
 #
 # O que fica vendorizado ✓ (e é a referência): o `video_core` ✓, o
@@ -176,11 +184,11 @@ add_library(spirv_reflect STATIC vendor/third_party/SPIRV-Reflect/spirv_reflect.
 target_include_directories(spirv_reflect PUBLIC vendor/third_party/SPIRV-Reflect)
 
 #
-# **Não entra no build** ✗: o `sirit` disponível (o `yuzu-mirror/sirit` ✓)
-# tem a API antiga ✗ — o `PatchDeferredPhi` ✗ — e o upstream usa a nova ✗
-# (que devolve um par ✗). O `shader_recompiler` fica vendorizado ✓ como
+# **Não entra no build**: o `sirit` disponível (o `yuzu-mirror/sirit` ✓)
+# tem a API antiga — o `PatchDeferredPhi` — e o upstream usa a nova
+# (que devolve um par). O `shader_recompiler` fica vendorizado ✓ como
 # referência ✓ (e é a via para a conversão NVIDIA GLSL -> SPIR-V ✓),
-# mas precisa do `sirit` certo ✗.
+# mas precisa do `sirit` certo.
 #
 # target_sources(g610_core PRIVATE ${IA_FONTES_SHADER_RECOMPILER})
 # target_link_libraries(g610_core PUBLIC SPIRV-Tools sirit spirv_reflect)
@@ -193,28 +201,28 @@ target_include_directories(spirv_reflect PUBLIC vendor/third_party/SPIRV-Reflect
 # **Sem os renderers** ✓: o motor fala com o renderizador pela
 # `RasterizerInterface` ✓ (uma interface abstracta ✓), e a casa
 # implementa-a (o `ValhallBackend` ✓ do desenho). O `renderer_vulkan` do
-# upstream traz shaders gerados ✗ (glslang ✗) e o PanVK ✗ — e nao e'
+# upstream traz shaders gerados (glslang) e o PanVK — e nao e'
 # preciso para o motor ✓.
 #
-# **E sem o resto do `video_core`** ✗ — medido (`/tmp/build.log` ✗): os
-# `.cpp` do upstream do `video_core` ✗ herdam o **kernel real** ✗
-# (`core/hle/kernel/kernel.h` ✗), que a casa **nao tem** ✗ — a casa tem o
-# `KernelCore` minimo ✗ (a ponte ✗, `k_kernel_core_bridge.h` ✗) porque o
-# `kernel.cpp` do Eden precisa de `Core::Timing` ✗ e da `CpuManager` ✗ — a
-# infra de emulacao ✗, que nao e' o que esta casa e' ✗.
+# **E sem o resto do `video_core`** — medido (`/tmp/build.log`): os
+# `.cpp` do upstream do `video_core` herdam o **kernel real**
+# (`core/hle/kernel/kernel.h`), que a casa **nao tem** — a casa tem o
+# `KernelCore` minimo (a ponte, `k_kernel_core_bridge.h`) porque o
+# `kernel.cpp` do Eden precisa de `Core::Timing` e da `CpuManager` — a
+# infra de emulacao, que nao e' o que esta casa e'.
 #
-# O que o upstream pede e' `KernelCore` completo ✗ — `GetMemoryManager` ✗,
-# `GetCurrentProcess` ✗, o `KDynamicPageManager` ✗ — e a casa nao o tem ✗.
+# O que o upstream pede e' `KernelCore` completo — `GetMemoryManager`,
+# `GetCurrentProcess`, o `KDynamicPageManager` — e a casa nao o tem.
 #
 # **Os CABECALHOS ficam** ✓ — e' o que a `RasterizerInterface` do upstream
-# e' ✗ (`video_core/rasterizer_interface.h` ✗), que o `RasterizerG610` da
+# e' (`video_core/rasterizer_interface.h`), que o `RasterizerG610` da
 # casa implementa ✓ ✓.
 #
-# **O upstream e' a REFERENCIA, nao a implementacao** ✗: a leitura do push
-# buffer ✗ e' a da casa ✗ (`src/gpu/pushbuffer.cpp` ✗ — 24 verificacoes
-# ✓) e o tradutor dos comandos Maxwell ✗ tambem ✗
-# (`src/gpu/maxwell_translator.cpp` ✗) ✗. O `dma_pusher.cpp` do upstream ✗
-# serve para conferir a semantica ✗, nao para ser linkado ✗.
+# **O upstream e' a REFERENCIA, nao a implementacao**: a leitura do push
+# buffer e' a da casa (`src/gpu/pushbuffer.cpp` — 24 verificacoes
+# ✓) e o tradutor dos comandos Maxwell tambem
+# (`src/gpu/maxwell_translator.cpp`). O `dma_pusher.cpp` do upstream
+# serve para conferir a semantica, nao para ser linkado.
 target_include_directories(g610_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/vendor/eden/src
   ${CMAKE_CURRENT_SOURCE_DIR}/vendor/third_party/Vulkan-Headers/include
