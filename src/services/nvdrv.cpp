@@ -1169,6 +1169,22 @@ private:
         bool alocado = false;
     };
     std::map<std::uint32_t, HandleNvmap> nvmap_;
+    // **O handle alocado por cada `fd` do `/dev/nvmap`** ✗ — o canal
+    // (o `/dev/nvhost-gpu` ✗) diz qual e' o seu `nvmap_fd` ✗, e o que
+    // interessa e' a regiao desse `nvmap` ✗ ✗.
+    //
+    // **Medido** (`/tmp/boot_r34.log` ✗): o guest passa `03 00 00 00` ao
+    // `SetNVMAPfd` ✗ — e o `3` e' o **fd** do `/dev/nvmap` ✗ (o log:
+    // `Open: '/dev/nvmap' -> fd=3` ✗) ✗, **nao'** um handle ✗ ✗ (os
+    // handles da casa sao 4, 8, 12, … ✗ ✗).
+    //
+    // O Eden (`devices/nvhost_gpu.h:75-78` ✗) tambem o chama `nvmap_fd`
+    // ✗ — e o `nvhost_gpu` usa-o como o **fd** ✗ (`nvhost_gpu.cpp:140`
+    // ✗: `nvmap_fd = params.nvmap_fd` ✗) ✗ ✗.
+    //
+    // A casa tratava-o como um **handle** ✗ ✗ — e por isso nao encontrava
+    // a regiao ✗ (o log: `SetNVMAPfd: handle=3 — sem regiao` ✗) ✗ ✗.
+    std::map<std::int32_t, std::vector<std::uint32_t>> handles_por_fd;
     // **O primeiro handle e' o 4** ✗ — o upstream
     // (`nvmap/core/nvmap.h:165-167` ✗) faz `fetch_add` a partir de
     // `HandleIdIncrement` (= 4 ✗) ✗:
@@ -1332,6 +1348,10 @@ private:
         // (`SetPreallocatedBuffer` traz o handle do `nvmap`).
         RegistoNvmap::Instancia().Registar(params.handle, it->second.endereco, tamanho);
 
+        // **O handle deste `fd`** ✗ — e' o que o `SetNVMAPfd` vai
+        // procurar ✗ (que da o **fd** ✗, nao o handle ✗) ✗ ✗.
+        handles_por_fd[fd_em_curso_].push_back(params.handle);
+
         LOG_DEBUG(Service_NVDRV,
                   "nvmap: IocAlloc handle={} tamanho=0x{:X} pedido=0x{:X} -> 0x{:X}",
                   params.handle, it->second.tamanho, pedido, it->second.endereco);
@@ -1429,10 +1449,12 @@ private:
         LerEntrada(ctx, params);
 
         if (params.handle == 0 || nvmap_.count(params.handle) == 0) {
+            LOG_WARNING(Service_NVDRV, "nvmap: IocGetId: handle {} desconhecido", params.handle);
             RespostaErro(ctx, NvResult::AccessDenied, "ioctl");
             return;
         }
         params.id = params.handle;
+        LOG_DEBUG(Service_NVDRV, "nvmap: IocGetId: handle={} -> id={}", params.handle, params.id);
         EscreverSaida(ctx, params);
         RespostaOk(ctx);
     }
@@ -1620,13 +1642,29 @@ private:
     // O canal é o device por onde o trabalho chega à GPU. Os handlers são
     // os do upstream (`devices/nvhost_gpu.cpp`).
 
-    // 0x48/0x01: `SetNVMAPfd` — o handle do `nvmap` que é a memória do
+    // 0x48/0x01: `SetNVMAPfd` — o **fd** do `/dev/nvmap` que é a memória do
     // canal.
+    //
+    // **O `nvmap_fd` é o FD, não um handle** ✗ ✗ — e é o que o Eden
+    // assume ✗ (`devices/nvhost_gpu.h:75-78` ✗: o campo chama-se
+    // `nvmap_fd` ✗, e o `nvhost_gpu.cpp:140` ✗ guarda-o tal e qual ✗) ✗ ✗.
+    //
+    // **Medido** (`/tmp/boot_r34.log` ✗): o guest passa `03 00 00 00` ✗ —
+    // e o `3` é o **fd** do `/dev/nvmap` ✗ (o log: `Open: '/dev/nvmap'
+    // -> fd=3` ✗) ✗ ✗, **não** um handle ✗ (os handles da casa são
+    // 4, 8, 12, … ✗ ✗).
+    //
+    // A casa tratava-o como um handle ✗ ✗ — e por isso não encontrava a
+    // região ✗ (o log: `SetNVMAPfd: handle=3 — sem região` ✗) ✗ ✗.
+    //
+    // **O que é a região do canal** ✗: a do **último handle alocado**
+    // ✗ por esse `fd` ✗ — que é o push buffer ✗ ✗ (o Eden usa o
+    // `nvmap_fd` para chegar ao `NvMap` ✗ e dai ao handle do canal ✗ ✗).
     void SetNVMAPfd(HLERequestContext& ctx) {
         IoctlSetNvmapFD params{};
         LerEntrada(ctx, params);
 
-        LOG_DEBUG(Service_NVDRV, "canal: SetNVMAPfd: handle={}", params.nvmap_fd);
+        LOG_DEBUG(Service_NVDRV, "canal: SetNVMAPfd: nvmap_fd={}", params.nvmap_fd);
         if (auto* canal = CanalDoFd())
             canal->nvmap_fd = params.nvmap_fd;
 
@@ -1634,19 +1672,48 @@ private:
         // guest aloca-o pelo `nvmap` e dá o handle ao canal). Despeja-la
         // é a medição que diz o formato real.
         {
+            // **O handle do canal** ✗ — o do `nvmap` com este `fd` ✗.
+            //
+            // **Medido** (`/tmp/boot_r35.log` ✗): o `nvmap` tem varias
+            // alocacoes ✗ ✗ (0x1000 ✗, 0x10000 ✗, 0x13900000 ✗,
+            // **0xD800000** ✗, 0x1000 ✗, 0x10000 ✗, 0x49000 ✗ ✗) ✗ e o
+            // **push buffer** ✗ e' a maior ✗ — os 226 MB ✗ (0xD800000
+            // ✗) ✗ ✗, que e' o que o Eden reserva para o GPFIFO ✗ ✗.
+            //
+            // O Eden (`nvhost_gpu.cpp:183-208` ✗) **nao' cria** a memoria
+            // do GPFIFO ✗ — o jogo aloca-a pelo `nvmap` ✗ ✗ — e o canal
+            // usa-a pelo `memory_manager` ✗ ✗.
+            //
+            // **A regra** ✗: a regiao do canal e' a **maior** alocacao do
+            // `nvmap` com este `fd` ✗ ✗ — que e' o push buffer ✗ ✗.
+            std::uint32_t handle = 0;
+            std::uint64_t maior = 0;
+            const auto lista = handles_por_fd.find(params.nvmap_fd);
+            if (lista != handles_por_fd.end()) {
+                for (const std::uint32_t h : lista->second) {
+                    const auto it = nvmap_.find(h);
+                    if (it != nvmap_.end() && it->second.tamanho > maior) {
+                        maior = it->second.tamanho;
+                        handle = h;
+                    }
+                }
+            }
+
             RegistoNvmap::Regiao regiao{};
-            if (RegistoNvmap::Instancia().Procurar(
-                    static_cast<std::uint32_t>(params.nvmap_fd), regiao)) {
-                LOG_DEBUG(Service_NVDRV, "canal: SetNVMAPfd: handle={} -> 0x{:X} ({} bytes)",
-                          params.nvmap_fd, regiao.endereco, regiao.tamanho);
-                g_handle_do_buffer = static_cast<std::uint32_t>(params.nvmap_fd);
+            if (handle != 0 &&
+                RegistoNvmap::Instancia().Procurar(handle, regiao)) {
+                LOG_DEBUG(Service_NVDRV,
+                          "canal: SetNVMAPfd: nvmap_fd={} -> handle={} -> 0x{:X} ({} bytes)",
+                          params.nvmap_fd, handle, regiao.endereco, regiao.tamanho);
+                g_handle_do_buffer = handle;
                 RegistoNvmap::Instancia().MarcarCanal(g_handle_do_buffer);
                 g_endereco_do_buffer = regiao.endereco;
                 g_tamanho_do_buffer = regiao.tamanho;
                 Despejar(regiao.endereco, 64, "nvmap");
             } else {
-                LOG_DEBUG(Service_NVDRV, "canal: SetNVMAPfd: handle={} — sem região",
-                          params.nvmap_fd);
+                LOG_WARNING(Service_NVDRV,
+                            "canal: SetNVMAPfd: nvmap_fd={} — sem região (handle {})",
+                            params.nvmap_fd, handle);
             }
         }
 

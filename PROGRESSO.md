@@ -4888,3 +4888,35 @@ nao tem efeito na casa ✗: o `RegistoNvmap` ✗ e' so' de leitura ✗ ✗.
    ✗ ✗ — o que chegou ✗ foi um push buffer de *setup* ✗ ✗.
 3. **A execucao** ✗ — o tradutor traduz ✗, mas quem executa ✗ (o
    `ValhallBackend` ✗, o PanVK ✗) ainda nao esta' ligado ✗ ✗.
+
+## O `nvmap_fd` do `SetNVMAPfd` e' o FD, nao' um handle (medido, 2026-10-22)
+
+### O bug
+
+**Medido** (`/tmp/boot_r34.log`): o guest passa `03 00 00 00` ao
+`SetNVMAPfd` — e o `3` e' o **fd** do `/dev/nvmap` ✗ (o log:
+`Open: '/dev/nvmap' -> fd=3` ✗) ✗, **nao'** um handle ✗ (os handles da
+casa sao 4, 8, 12, … ✗ ✗).
+
+O Eden assume o mesmo ✗ (`devices/nvhost_gpu.h:75-78` ✗: o campo
+chama-se `nvmap_fd` ✗, e o `nvhost_gpu.cpp:140` ✗ guarda-o tal e qual
+✗) ✗ ✗.
+
+**A casa tratava-o como um handle** ✗ ✗ — e por isso nao encontrava a
+regiao ✗ ✗ (o log: `SetNVMAPfd: handle=3 — sem regiao` ✗) ✗ ✗, e o
+canal ficava **sem push buffer** ✗ ✗.
+
+### A correccao
+
+* O `nvmap` passa a registar **os handles que aloca por `fd`** ✗.
+* O `SetNVMAPfd` procura a regiao pelo **fd** ✗ ✗ — e a regiao do canal
+  e' a **maior** alocacao desse `fd` ✗ ✗, que e' o push buffer ✗ (os
+  226 MB ✗ — `0xD800000` ✗) ✗ ✗.
+
+**Medido depois** (`/tmp/boot_r37.log`): o canal passa a ter a regiao
+correcta ✗->✓ —
+
+    SetNVMAPfd: nvmap_fd=3 -> handle=12 -> 0xE5D39000 (328204288 bytes)
+
+— que e' **a mesma regiao** que o compositor usa ✗ (o
+`SetPreallocatedBuffer` ✗) ✗ ✗.
