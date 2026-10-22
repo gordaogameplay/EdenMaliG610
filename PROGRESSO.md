@@ -23,15 +23,13 @@ mais caro:
 
 ## Regra que os bugs ensinaram
 
-Nove bugs came a mesma regra: **todo o valor de que o motor depende tem de
+Nove bugs ensinaram a mesma regra: **todo o valor de que o motor depende tem de
 vir da fonte ou de uma medição**. Nunca de memória, nunca de "deve ser".
 
 Quando uma hipótese é refutada, escreve-se. A lista está em
 `docs/ARQUITETURA.md`.
 
 ---
-
-## Estado
 
 | Marco | Estado |
 |---|---|
@@ -44,14 +42,44 @@ Quando uma hipótese é refutada, escreve-se. A lista está em
 | ThreadLocalRegion da thread principal | feito |
 | Patch de `MRS TPIDRRO_EL0` | feito |
 | **Passar o crt0** | **feito** |
-| Serviços / nvdrv / GPU | **bloqueio declarado** |
+| Serviços até `hid`/`csrng` (fonte, `pl:u`, `fs`) | feito, medido 22/10 |
+| Threads do SDK por `StartThread` | feito, medido 22/10 |
+| `CloseHandle` nas duas mesas | feito, 0x0CE01 desapareceu |
+| nvdrv: descriptor GPFIFO | feito (376 métodos, 0 traduzidos) |
+| Tradução semântica Maxwell→Mali | **parede actual** |
+| Apresentar frames (PanVK/HDMI) | pendente do tradutor |
 
 ---
 
-## Onde paramos
+## Onde paramos hoje (22/10)
+
+O jogo corre **240 s de relógio** sem abortar nos serviços: fonte servida,
+`hid` e `csrng` do próprio jogo passam, as 6+ SDK threads correm por
+`StartThread`, e o `CloseHandle` nas duas mesas eliminou o
+`ResultOutOfSessions (0x0CE01)` do `pl:u`.
+
+A parede de hoje tem **duas faces, medidas**:
+
+1. **GPU**: o `SubmitGPFIFO` lê 8864 bytes, decodifica **376 métodos**
+   (max id 3627, `draw_begin`=1414, `draw_end`=1413, os 7 subcanais com
+   histogramas completos) e traduz **0 comandos**. O tradutor semântico
+   Maxwell→Mali é o próximo passo; `DequeueBuffer`/`QueueBuffer` do
+   compositor nunca foram alcançados.
+2. **Thread de cv**: uma thread (tag 0x38005, sp 0x2c8cbeeb0) repete
+   `WaitProcessWideKeyAtomic` na cv 0xd9c2c22c com timeout ~5 ms; o único
+   `SignalProcessWideKey` dessa cv chegou **antes** do waiter (acordados=0;
+   o sinal pendente foi consumido uma vez). O watchdog "alarme de
+   segurança" (guest preso em código) matou o processo — é isto por que o
+   boot termina, e não o jogo em si.
+
+O detalhe medido está em "Diário de 22/10" no fim deste documento.
+
+---
+
+## Onde paramos (arquivo)
 
 O guest passou o crt0, pediu a porta **`sm:`**, e está a falar SMART IPC.
-Construí­mos o transporte e despachamos o primeiro comando — `sm: Initialize`
+Construímos o transporte e despachamos o primeiro comando — `sm: Initialize`
 — mas o guest continua a chamar `svc Break(x0=0)` a seguir.
 
 **164 verificações, 0 falhas.**
@@ -61,11 +89,11 @@ Construí­mos o transporte e despachamos o primeiro comando — `sm: Initialize
 Medido no pedido real do jogo, e conferido contra `core/hle/ipc.h` do Eden:
 
 ```
-0x00  CommandHeader        type=6 (RequestWithContext), data_size=10
-0x08  BufferDescriptorC    8 bytes
-0x10  HandleDescriptorHeader
-0x20  DataPayloadHeader    "SFCI"
-0x28  corpo: cmd_id = 0   -> Initialize
+0x00 CommandHeader        type=6 (RequestWithContext), data_size=10
+0x08 BufferDescriptorC    8 bytes
+0x10 HandleDescriptorHeader
+0x20 DataPayloadHeader    "SFCI"
+0x28 corpo: cmd_id = 0   -> Initialize
 ```
 
 E a resposta, de `ResponseBuilder` (`ipc_helpers.h:36-95`):
@@ -121,7 +149,7 @@ v=0..15   sync=1   svc=32   break=2
 **não escrevemos nada no buffer**. Se o conteúdo da resposta fosse a causa,
 uma delas teria de ser diferente.
 
-Conclusão, e é uma conclus��ão Negative que vale muito: **o guest não depende
+Conclusão, e é uma conclusão Negativa que vale muito: **o guest não depende
 do que escrevemos no buffer de IPC.** O problema está antes da resposta, ou
 noutro sítio.
 
@@ -130,21 +158,21 @@ noutro sítio.
 **O `Break(x0)` é um abort deliberado**, não um crash:
 
 ```
-0x82b7b1d8  mov  x1, x0            ; x1 = o endereço culpado
-0x82b7b1dc  orr  w2, wzr, #0x4
-0x82b7b1e0  mov  w0, wzr
-0x82b7b1e4  bl   0x82d79ba4        ; svc Break
-0x82b7b1e8  b    .                 ; e fica preso
+0x82b7b1d8 mov  x1, x0            ; x1 = o endereço culpado
+0x82b7b1dc orr  w2, wzr, #0x4
+0x82b7b1e0 mov  w0, wzr
+0x82b7b1e4 bl   0x82d79ba4        ; svc Break
+0x82b7b1e8 b    .                 ; e fica preso
 ```
 
 E o wrapper do `SendSyncRequest` confirma que o Result é lido:
 
 ```
-0x82d57c44  and  w9, w0, #0x3fffff
-0x82d57c50  cmp  w9, #0xf601
-0x82d57c5c  csel x8, x9, x8, eq    ; traduz Result inválido -> codigo interno
-0x82d57c60  cmp  w0, #0x0
-0x82d57c64  csel x0, xzr, x8, eq   ; 0 se sucesso
+0x82d57c44 and  w9, w0, #0x3fffff
+0x82d57c50 cmp  w9, #0xf601
+0x82d57c5c csel x8, x9, x8, eq    ; traduz Result inválido -> codigo interno
+0x82d57c60 cmp  w0, #0x0
+0x82d57c64 csel x0, xzr, x8, eq   ; 0 se sucesso
 ```
 
 Logo, o SDK le o nosso Result=0 e continua. O abort vem **depois**.
@@ -273,7 +301,7 @@ E o resultado decisivo:
 ```
 msr tpidr_el0, 0x88000000
 mrs tpidr_el0     -> 0x88000000   ✓
-mrs tpidrro_el0   -> 0x0          ✗
+mrs tpidrro_el0   -> 0x0         
 ```
 
 **Não são o mesmo registo neste kernel.** Trocar o TPIDR_EL0 não alimenta o
@@ -471,7 +499,7 @@ Cinco bugs/detalhes medidos a caminho, todos do "precisa de medir", não de
    `<cstdint>` o resto é cascade de "not declared".
 2. O env: o ssh traz `XDG_RUNTIME_DIR=/run/user/1000` (sessão tty) e NÃO traz
    `WAYLAND_DISPLAY` — sem ele libwayland tenta `wayland-0`, não existe.
-   **O compositor esteve são o tempo todo**; com os dois envs certos, 10/10
+**O compositor esteve são o tempo todo**; com os dois envs certos, 10/10
    capturas. O `mostra.cpp` agora seta os dois (os valores alvo são os mesmos
    dentro da sessão do sway).
 3. panvk reporta `currentExtent = 0xFFFFFFFF` no primeiro query (superfície
@@ -988,12 +1016,12 @@ Break               x0=0x0                (abort deliberado do SDK)
 só quatro têm alguma coisa:
 
 ```
-0000  06 00 00 00   type = 6 (RequestWithContext)
-0004  0a 00 00 80   data_size = 10, flags = 0, enable_handle_descriptor = 1
-0008  01 00 00 00   HandleDescriptorHeader: send_current_pid = 1
-0020  53 46 43 49   "SFCI"
-0024  01 00 00 00   <-- a palavra de enchimento, que valia 1
-01e0  24 56 54 21   "$VT!" — a nossa ThreadLocalRegion
+0000 06 00 00 00   type = 6 (RequestWithContext)
+0004 0a 00 00 80   data_size = 10, flags = 0, enable_handle_descriptor = 1
+0008 01 00 00 00   HandleDescriptorHeader: send_current_pid = 1
+0020 53 46 43 49   "SFCI"
+0024 01 00 00 00   <-- a palavra de enchimento, que valia 1
+01e0 24 56 54 21   "$VT!" — a nossa ThreadLocalRegion
 ```
 
 ## Três erros de 4 bytes, todos confirmados na fonte
@@ -1079,13 +1107,13 @@ Resposta: chegar ao codigo.
 `[cod]` despeja 0x100 bytes à volta do `x30` do `Break`. Desassemblado:
 
 ```
-82b7b1d0: stp  x29, x30, [sp, #-16]!
-82b7b1d4: mov  x29, sp
-82b7b1d8: mov  x1, x0            ; o argumento da função
-82b7b1dc: orr  w2, wzr, #4
-82b7b1e0: mov  w0, wzr           ; x0 = 0
-82b7b1e4: bl   0x82d79ba4        ; Break
-82b7b1e8: b    0x82b7b1e8        ; nunca sai
+82b7b1d0: stp x29, x30, [sp, #-16]!
+82b7b1d4: mov x29, sp
+82b7b1d8: mov x1, x0            ; o argumento da função
+82b7b1dc: orr w2, wzr, #4
+82b7b1e0: mov w0, wzr           ; x0 = 0
+82b7b1e4: bl 0x82d79ba4        ; Break
+82b7b1e8: b 0x82b7b1e8        ; nunca sai
 ```
 
 A função de abort começa em `0x82b7b1d0`, e `x1` NÃO é texto — o guess da
@@ -1115,22 +1143,22 @@ primeira. É sempre o caminho que não depende de haver símbolos.
 ## O chamador
 
 ```
-82b79c70: sub  sp, sp, #0xe0
-82b79c74: stp  x26, x25, [sp, #144]
+82b79c70: sub sp, sp, #0xe0
+82b79c74: stp x26, x25, [sp, #144]
 ...
-82b79c88: add  x29, sp, #0xd0
-82b79c8c: mov  x24, x0
+82b79c88: add x29, sp, #0xd0
+82b79c8c: mov x24, x0
 82b79c90: adrp x0, 0x83658000
-82b79c94: add  x0, x0, #0x4d0     ; x0 = 0x836584d0
-82b79cb0: bl   0x82f138c0
-82b79cb4: tbz  w0, #0, 0x82b79cc0 ; se w0 bit0 == 0, NAO aborta
-82b79cb8: mov  x0, x19
-82b79cbc: bl   0x82f138d0          ; aborta
+82b79c94: add x0, x0, #0x4d0     ; x0 = 0x836584d0
+82b79cb0: bl 0x82f138c0
+82b79cb4: tbz w0, #0, 0x82b79cc0 ; se w0 bit0 == 0, NAO aborta
+82b79cb8: mov x0, x19
+82b79cbc: bl 0x82f138d0          ; aborta
 82b79cc0: ...
-82b79cc4: adrp x0, 0x83658000     ; a MESMA referência
-82b79ccc: bl   0x82f0de60
-82b79cd0: orr  w8, wzr, #3         ; w8 = 3
-82b79cd4: str  w8, [sp, #80]      ; ... e constrói uma va_list
+82b79cc4: adrp x0, 0x83658000 ; a MESMA referência
+82b79ccc: bl 0x82f0de60
+82b79cd0: orr w8, wzr, #3         ; w8 = 3
+82b79cd4: str w8, [sp, #80]      ; ... e constrói uma va_list
 ```
 
 Isto é uma função de **log de erro** no formato do printf: guarda x0..x7, e
@@ -1455,7 +1483,7 @@ O caminho passa a ser:
 1. Deixar o guest passar o abort (falta o `sm:` a sério, e os serviços que o
    `SiGfx` usa).
 2. Apanhar o comando NVN em que o shader é enviado, e despejar a SASS
-   **antes** de a traduzir.
+**antes** de a traduzir.
 3. Passá-la pelo tradutor e devolver o GLSL.
 
 E é um caminho melhor, porque o passo 2 dá-nos a SASS de um shader que
@@ -1488,13 +1516,13 @@ E o abort era o **único** sintoma. O IPC já funcionava (`sm:` a sério,
 O `TryLock` do SDK, desassemblado:
 
 ```
-82d2a900: mrs  x8, tpidr_el0          ; x8 = TPIDR_EL0
-82d2a904: ldr  w9, [x0]               ; w9 = o dono do mutex
-82d2a908: ldr  x8, [x8, #504]         ; x8 = *(x8 + 0x1F8) = tv->tls_tp
-82d2a90c: and  w9, w9, #0xbfffffff    ; limpa o bit 29
-82d2a910: ldr  w8, [x8, #432]         ; w8 = *(tls_tp + 0x1B0)
-82d2a914: cmp  w9, w8
-82d2a918: cset w0, eq                 ; devolve "o dono sou eu?"
+82d2a900: mrs x8, tpidr_el0          ; x8 = TPIDR_EL0
+82d2a904: ldr w9, [x0]               ; w9 = o dono do mutex
+82d2a908: ldr x8, [x8, #504]         ; x8 = *(x8 + 0x1F8) = tv->tls_tp
+82d2a90c: and w9, w9, #0xbfffffff    ; limpa o bit 29
+82d2a910: ldr w8, [x8, #432]         ; w8 = *(tls_tp + 0x1B0)
+82d2a914: cmp w9, w8
+82d2a918: cset w0, eq ; devolve "o dono sou eu?"
 ```
 
 E o `TryLock` aborta quando a resposta é "sim". Ou seja: aborta quando
@@ -1522,18 +1550,18 @@ crt0 do SDK:
 
 ```
 82d2a35c: adrp x8, 0x8360d000
-82d2a360: ldr  x8, [x8, #1632]   ; x8 = g_OsBootParamter
-82d2a364: str  x0, [x8]          ; g_OsBootParamter[0] = x0  <<<<
+82d2a360: ldr x8, [x8, #1632]   ; x8 = g_OsBootParamter
+82d2a364: str x0, [x8]          ; g_OsBootParamter[0] = x0  <<<<
 ```
 
 O `x0` vem do **rtld**, que por sua vez o recebe no `x1` do entry point:
 
 ```
-80000008: cmp  x0, #0x0        ; o entry do rtld
+80000008: cmp x0, #0x0        ; o entry do rtld
 8000000c: b.ne 0x800000c4
-80000010: mov  w19, w1         ; <<<< o handle da thread, no x1
+80000010: mov w19, w1         ; <<<< o handle da thread, no x1
 ...
-80000088: mov  w0, w19         ; e passa-o ao SDK
+80000088: mov w0, w19         ; e passa-o ao SDK
 ```
 
 **A cadeia inteira, e onde ela se partia:**
@@ -1607,7 +1635,7 @@ o jogo não está docked).
 - o serviço é fino (o `apm.cpp` do Eden tem 29 linhas);
 - o estado vive num *controller*, que o `Core::System` possui;
 - a interface CMIF (os IDs dos comandos e as estruturas) é a parte que
-  **tem de ser exacta** e vem do Eden tal e qual;
+**tem de ser exacta** e vem do Eden tal e qual;
 - o `Core::System` do Eden **não** é adoptado: tem ~40 acessores a
   subsistemas reais (GPU, áudio, HID, temporização) e adoptá-lo seria
   adoptar o emulador.
@@ -1671,7 +1699,7 @@ validação da configuração, e o mapa `Normal→Config7`, `FastLoad→Config13
 - o serviço é fino (o `apm.cpp` do Eden tem 29 linhas);
 - o estado vive num *controller*, que o `Core::System` possui;
 - a interface CMIF (os IDs dos comandos e as estruturas) é a parte que
-  **tem de ser exacta** e vem do Eden tal e qual;
+**tem de ser exacta** e vem do Eden tal e qual;
 - o `Core::System` do Eden **não** é adoptado: tem ~40 acessores a
   subsistemas reais (GPU, áudio, HID, temporização) e adoptá-lo seria
   adoptar o emulador.
@@ -1811,7 +1839,7 @@ e o log é a lista de trabalho.
 
 Foi ele que mostrou, de uma vez, o que o jogo pede:
 
-    1311  ICommonStateGetter: comando 1 (ReceiveMessage)
+    1311 ICommonStateGetter: comando 1 (ReceiveMessage)
        3  sm:: comando 1 (GetService)
        1  IWindowController: comando 1 (GetAppletResourceUserId)
        1  ISelfController: comando 91 (GetAccumulatedSuspendedTickChangedEvent)
@@ -1942,7 +1970,7 @@ todos seria uma assinatura que nenhum dos outros tem.
 
 ## O que o log por comando mostrou
 
-    1311  ICommonStateGetter: comando 1 (ReceiveMessage)
+    1311 ICommonStateGetter: comando 1 (ReceiveMessage)
        3  sm:: comando 1 (GetService)
        1  sm:: comando 0 (Initialize)
        1  lm: comando 0 (OpenLogger)
@@ -2027,7 +2055,7 @@ dormir**:
     // Check if any of the objects are already signaled.
     for (auto i = 0; i < num_objects; ++i) {
         if (objects[i]->IsSignaled(kernel)) {
-            *out_index = i;
+*out_index = i;
             slp.CancelSleep();
             R_THROW(ResultSuccess);
         }
@@ -2263,11 +2291,11 @@ O projecto foi publicado em **https://github.com/gordaogameplay/EdenMaliG610**
 ```
 cfaad82  o `.gitattributes`: normalizacao de fim de linha
 e3a0bca  o `PROGRESSO.md`: as medicoes de hoje
-94adc95  a telemetria: o dump do modulo, a assercao do SDK e o endereco do fault
-325ec00  o `am`: a mensagem de foco e o tamanho da resposta
-1eddd28  o heap do guest: a ABI do `SetHeapSize` e o `GetInfo(21)`
-262c219  o `pctl` do Eden, vendorizado: o parental control
-3d3372e  o README: o que e' isto, o que e' do Eden e o que e' nosso
+94adc95 a telemetria: o dump do modulo, a assercao do SDK e o endereco do fault
+325ec00 o `am`: a mensagem de foco e o tamanho da resposta
+1eddd28 o heap do guest: a ABI do `SetHeapSize` e o `GetInfo(21)`
+262c219 o `pctl` do Eden, vendorizado: o parental control
+3d3372e o README: o que e' isto, o que e' do Eden e o que e' nosso
 bb65f12  a licenca GPL-3.0 e os cabecalhos SPDX nos ficheiros nossos
 ```
 
@@ -2325,7 +2353,7 @@ Duas causas:
    `.bss`) quando devia ocupar 0x4000 (o **fim do ultimo segmento**,
    0x3280, mais o `.bss` — que e' o que o Eden mede, `nso.cpp:131`).
 2. O `rtld` ocupava o sitio do `main`. O `rtld` (o `ldr`) e' linkado em
-   **PC-relativo**; o `main` e' linkado para um sitio **fixo**, e o `ldr`
+**PC-relativo**; o `main` e' linkado para um sitio **fixo**, e o `ldr`
    le-o de uma tabela (medido: **nove ocorrencias de 0x80000000** nos
    dados do `rtld`).
 
@@ -2387,7 +2415,7 @@ Tres correccoes, todas da regra do Eden:
    encontrava nada para sinalizar;
 3. o **`SetFocusHandlingMode` le os tres bools** (`notify`, `background`,
    `suspend`) — o Eden, `self_controller.cpp:187`. Os bools sao
-   **empacotados** (um byte cada), e o `Pop<u8>` avanca uma palavra
+**empacotados** (um byte cada), e o `Pop<u8>` avanca uma palavra
    inteira: foi preciso um `PopBools`.
 
 **E um bug nosso, medido:** o `WaitSynchronization` lia o **timeout de x0** —
@@ -2414,15 +2442,15 @@ reporta) aponta para o fim de outra string:
 
 O codigo do jogo (desassemblado, `0x80005d70`):
 
-    80005d88: ldr x8, [x23]          ; o singleton actual
-    80005d8c: str x0, [x23]          ; guarda o novo
-    80005d90: cbz x8, 0x80005dcc     ; se ja existia, nao destroi
+    80005d88: ldr x8, [x23] ; o singleton actual
+    80005d8c: str x0, [x23] ; guarda o novo
+    80005d90: cbz x8, 0x80005dcc ; se ja existia, nao destroi
     ...
     80005dc8: ldr x0, [x23]
     80005dcc: add x8, x0, #0x48
     80005dd0: cmp x0, #0x0
     80005dd4: csel x0, xzr, x8, eq
-    80005dd8: bl 0x805cf9c0          ; <-- aborta
+    80005dd8: bl 0x805cf9c0 ; <-- aborta
 
 **O singleton e' nulo** (o `csel` escolhe 0), e a funcao aborta. O
 `x21` (o objecto cujo byte e' lido) e' o **`SuperStripe`** do jogo.
@@ -2546,7 +2574,7 @@ E, na mesma medida, o que o SDK faz antes de abortar:
 * **527 chamadas a `svcQueryMemory`** — esta é a recolha de informação do
   relatório de crash do SDK (`nn::diag::GetAllModuleInfo`, que varre o
   espaço do processo a procurar módulos com cabeçalho `MOD0`). É
-  **sintoma**, não causa: é o SDK a preparar o relatório.
+**sintoma**, não causa: é o SDK a preparar o relatório.
 * `SetTerminateResult` com `0x2a2` (módulo Kernel, descrição 162) e o
   `Break`.
 
@@ -2593,31 +2621,31 @@ A função que faz as 527 `svcQueryMemory` é
 `subsdk`/SDK). O código, lido:
 
 ```
- 32c0d0: ldr  x9, [x0, #24]        ; o[24]
- 32c0d4: add  x8, x1, #0xfff
- 32c0dc: add  x8, x9, x8, lsr #12  ; o total, em paginas
- 32c0e0: ldp  x22, x9, [x0, #8]    ; o[8], o[16] — os limites da regiao
- 32c0e8: subs x23, x9, x22        ; o span (ja com o total descontado)
+ 32c0d0: ldr x9, [x0, #24]        ; o[24]
+ 32c0d4: add x8, x1, #0xfff
+ 32c0dc: add x8, x9, x8, lsr #12  ; o total, em paginas
+ 32c0e0: ldp x22, x9, [x0, #8]    ; o[8], o[16] — os limites da regiao
+ 32c0e8: subs x23, x9, x22 ; o span (ja com o total descontado)
  32c118: udiv x8, x0, x23
- 32c120: msub x8, x8, x23, x0      ; x0 % span   <- ALEATORIO
- 32c128: add  x8, x8, x22
- 32c12c: and  x27, x8, x25        ; alinha
- 32c130: lsl  x21, x27, #12       ; o endereco candidato
- 32c138: bl   0x37ea24            ; svcQueryMemory(candidato)
- 32c13c: ldr  w8, [sp, #24]       ; o ESTADO do bloco devolvido
- 32c140: cbnz w8, 0x32c158        ; se nao for Free -> outra tentativa
- 32c148: add  x8, x21, x26        ; candidato + total
- 32c14c: add  x9, x10, x9         ; base + tamanho do bloco
- 32c150: cmp  x8, x9
- 32c154: b.ls 0x32c194            ; cabe -> sucesso
+ 32c120: msub x8, x8, x23, x0 ; x0 % span   <- ALEATORIO
+ 32c128: add x8, x8, x22
+ 32c12c: and x27, x8, x25        ; alinha
+ 32c130: lsl x21, x27, #12       ; o endereco candidato
+ 32c138: bl 0x37ea24            ; svcQueryMemory(candidato)
+ 32c13c: ldr w8, [sp, #24]       ; o ESTADO do bloco devolvido
+ 32c140: cbnz w8, 0x32c158 ; se nao for Free -> outra tentativa
+ 32c148: add x8, x21, x26        ; candidato + total
+ 32c14c: add x9, x10, x9         ; base + tamanho do bloco
+ 32c150: cmp x8, x9
+ 32c154: b.ls 0x32c194 ; cabe -> sucesso
  ...
- 32c164: cmp  w24, #0x200          ; ate 512 tentativas
+ 32c164: cmp w24, #0x200          ; ate 512 tentativas
 ```
 
 Três coisas, todas medidas:
 
 1. O candidato é **aleatório** (daí os endereços espalhados) e está dentro da
-   **região da stack** (os limites `o[8]`/`o[16]`).
+**região da stack** (os limites `o[8]`/`o[16]`).
 2. O SDK **exige um bloco com estado `Free`** — o `ldr w8, [sp, #24]` lê o
    campo `state` do `MemoryInfo` que o SVC devolve.
 3. Tenta **512 vezes** e depois desiste.
@@ -2695,10 +2723,10 @@ memória**):
     f3 0f 1e f8   stp  x24, x23, [sp, #-16]!
     fd 7b 01 a9   stp  x29, x30, [sp, #984]!
     fd 43 00 91   mov  x29, sp
-    41 d0 3b d5   mrs  x3, tpidrro_el0     ; o TLS do guest
-    21 e0 07 91   mov  x7, sp
-    20 00 00 f9   str  x0, [x0]
-    1f 20 03 d5   msr  tpidrro_el0, x3     ; restaurar o TLS do host
+    41 d0 3b d5 mrs  x3, tpidrro_el0     ; o TLS do guest
+    21 e0 07 91 mov  x7, sp
+    20 00 00 f9 str  x0, [x0]
+    1f 20 03 d5 msr  tpidrro_el0, x3     ; restaurar o TLS do host
     ...
 
 **O `hactool` descomprime o `subsdk1` de outra forma** — com ele, o
@@ -2728,7 +2756,7 @@ contexto próprios) e um *scheduler*. **O nosso `vendor` não tem
 dá nada), e por isso:
 
 - o `TPIDR_EL0`, o `sigsetjmp` e a recuperação de faults têm de ser
-  **por thread** no nosso motor (o Eden não precisa: o estado do guest é o
+**por thread** no nosso motor (o Eden não precisa: o estado do guest é o
   estado do emulador, e o emulador tem um scheduler);
 - um IPC feito por uma thread de guest usaria o **buffer de mensagem da
   thread principal** — porque o Eden lê o buffer do `KThread` corrente, e
@@ -2896,12 +2924,12 @@ O `pc=0` e o `addr=0` com todos os registos a zero dizem que **não houve
 SIGSEGV**: o que houve foi um `brk #0` — a rotina em ensamblador, depois
 de a função do guest **voltar**. Ou seja: **a thread do guest correu e
 terminou** ✓ (o que resolve a dúvida sobre o *entry point* ser uma
-continuação: não é ✗ — ou é, mas o caminho é o certo ✗).
+continuação: não é — ou é, mas o caminho é o certo).
 
 O que falta agora é a **medida fina**: os registos no momento do `brk #0`
-(dizem o que o guest esperava ✗) e o porque de o guest morrer logo a
-seguir (o `Break` #191 ✗ — o mesmo abort de sempre ✗, mas com 189 SVCs em
-vez de 218 ✗, porque a thread morreu mais cedo ✗).
+(dizem o que o guest esperava) e o porque de o guest morrer logo a
+seguir (o `Break` #191 — o mesmo abort de sempre, mas com 189 SVCs em
+vez de 218, porque a thread morreu mais cedo).
 
 ## Estado
 
@@ -3102,7 +3130,7 @@ traps `#26`.
   entre execuções, exit igual (139) nos 3.
 - **Confirmação por desmontagem**: `pc=0x83b0bb2c` é o stub do SDK,
   offset `0x37eb2c` do `text.bin` do módulo `sdk` (base `0x8378d000`) =
-  **`svc #0x1a` real no binário** (o patcher reescreve para `brk #26`) —
+**`svc #0x1a` real no binário** (o patcher reescreve para `brk #26`) —
   o guest chama `svcArbitrateLock(dono=0x8000, addr=0x843ea4d0,
   tag=0x10001/0x18002/0x81ff…)` — os tags são os handles das threads,
   como previsto.
@@ -3329,12 +3357,12 @@ Com a native window, o guest passou a falar com o **binder** (o
 (`boot_p7m.log`):
 
 ```
-5c 00 00 00   data_size = 92
-10 00 00 00   data_offset = 16
-00 00 00 00   objects_size = 0
-6c 00 00 00   objects_offset = 108
-00 01 00 00   0x100
-22 00 00 00   34 (o comprimento do token, em caracteres)
+5c 00 00 00 data_size = 92
+10 00 00 00 data_offset = 16
+00 00 00 00 objects_size = 0
+6c 00 00 00 objects_offset = 108
+00 01 00 00 0x100
+22 00 00 00 34 (o comprimento do token, em caracteres)
 61 00 6e 00 64 00 72 00 6f 00 69 00 64 00 2e 00 67 00 75 00 69 00 2e 00
              "android.gui." em UTF-16
 ```
@@ -3358,9 +3386,9 @@ O guest submeteu (`SubmitGPFIFO: address=0xE2D62290 entradas=3
 flags=0x104 kickoff=1`) e os cabeçalhos, lidos crus, são:
 
 ```
-00 20 11 b9  00 76 22 80  74 42 11 b9
-00 06 00 80  78 42 11 b9  00 2a 00 80
-00 00 00 00  00 00 00 00
+00 20 11 b9 00 76 22 80  74 42 11 b9
+00 06 00 80 78 42 11 b9  00 2a 00 80
+00 00 00 00 00 00 00 00
 ```
 
 Isto é `0xB9112000`, `0x80227600`, `0xB9114274`, `0x80000600`,
@@ -3476,7 +3504,7 @@ entrada.
   teste** (md5 do `main` **igual** ao do `piDroid_Test_ARM`) — nunca
   foi o jogo.
 - O `main` **real** existe localmente em `main_uncompressed` — e é
-  **NSO0** ✓, que é o formato que o carregador da casa sabe ler (com
+**NSO0** ✓, que é o formato que o carregador da casa sabe ler (com
   descompressão LZ4). O `main_elf` é a mesma coisa em ELF.
 - O `hactool` **não existia** (era o que o `pokemon_convert.log`
   complainha). **Compilado no Pi** (Makefile, mbedtls) ✓.
@@ -3530,7 +3558,7 @@ descomprimido (38,5 MB = o NSO0 de 20,4 MB descomprimido) ✓.
 3. GPU: `MapBufferEx: handle=11 -> 0xB917C000` ✓ (o `MapBufferEx` está
    de acordo com o upstream: `size = mapping_size ? mapping_size :
    handle->orig_size` — o `tamanho=0x0` que aparece no log é o eco do
-   *input*, não um erro).
+*input*, não um erro).
 4. **Bloqueio**: o jogo fica à espera de um *futex*
    (`WaitProcessWideKeyAtomic`) — o seu *thread* de GPU está à espera
    da **fence**, que **nunca é sinalizada** pela casa.
@@ -3559,7 +3587,7 @@ desbloquear):
    por esse handle que o *thread* de GPU do jogo espera
    (`svcWaitSynchronization`).
 3. O `nvdrv`, no fim da submissão, incrementa o syncpoint do canal e
-   **sinaliza** o `KEvent` do semáforo.
+**sinaliza** o `KEvent` do semáforo.
 
 Ou seja: o que falta não é o tradutor — é o **sinal** que o trabalho
 terminou. Sem ele, o jogo bloqueia antes de desenhar o primeiro
@@ -3619,9 +3647,9 @@ esperar — e aí está a resposta.
 O log tem a sequência exacta (`boot_p9l.log`):
 
 ```
-4689  [svc] WaitProcessWideKeyAtomic addr=0x10a2c7b08 cv=0x10a2c7b0c tag=0x28004 timeout=-1
-4695  [svc] SignalProcessWideKey  key=0x10a2c7b0c count=1 acordados=0      ← o sinal CHEGA
-4698  [svc] WaitProcessWideKeyAtomic addr=0x10a2c7be0 cv=0x10a2c7bec tag=0x28004 timeout=-1
+4689 [svc] WaitProcessWideKeyAtomic addr=0x10a2c7b08 cv=0x10a2c7b0c tag=0x28004 timeout=-1
+4695 [svc] SignalProcessWideKey  key=0x10a2c7b0c count=1 acordados=0      ← o sinal CHEGA
+4698 [svc] WaitProcessWideKeyAtomic addr=0x10a2c7be0 cv=0x10a2c7bec tag=0x28004 timeout=-1
 ```
 
 **O sinal chega depois do `wait`** (não é um sinal perdido) — e mesmo
@@ -3673,8 +3701,8 @@ destrava: `grep -c ArbitrateUnlock` = 0 no log inteiro), o jogo sai
 do impasse:
 
 ```
-4758  [svc] SignalProcessWideKey key=0x10a2c7b0c count=1 acordados=1   ← acorda!
-4831  parou por: fault de memoria do guest em 0x83b0bb44 (endereco 0x0, sp=0x30fffe950)
+4758 [svc] SignalProcessWideKey key=0x10a2c7b0c count=1 acordados=1   ← acorda!
+4831 parou por: fault de memoria do guest em 0x83b0bb44 (endereco 0x0, sp=0x30fffe950)
 ```
 
 O *waiter* é **acordado** ✓ — e o jogo passa a correr até um
@@ -3688,7 +3716,7 @@ dono destrava, e essa é a regra certa — mas o jogo, no nosso motor,
 nunca destrava. As duas leituras possíveis:
 
 1. o SDK do guest, no caminho do destrave, não chama o SVC porque a
-   **palavra da mutex não tem o bit "há quem espere"** (`0x40000000`,
+**palavra da mutex não tem o bit "há quem espere"** (`0x40000000`,
    `svc_common.h:19`) — e o bit é posto em `UpdateLockAtomic`
    (`k_condition_variable.cpp:198-215`), que a casa não faz no
    caminho do *lock* rápido;
@@ -3726,18 +3754,18 @@ fault** (o VA do guest é plano ✓):
 ```
 [fault] cod em 0x83b0bb64:
   e0 0f 1f f8   LDR X0, [SP, #0x1F8]
-  60 04 20 d4   BRK #0x100          ← o SVC do SDK
+  60 04 20 d4 BRK #0x100          ← o SVC do SDK
   c0 03 5f d6   RET
   ...
   e0 0f 1f f8   LDR X0, [SP, #0x1F8]
-  60 04 20 d4   BRK #0x100
+  60 04 20 d4 BRK #0x100
   e2 03 40 f9   LDR X2, [X0]        ← carrega de x0 — e x0 é NULO
-  41 00 00 b9   LDR W1, [X0]
+  41 00 00 b9 LDR W1, [X0]
 ```
 
 **É o wrapper de SVC do SDK**: o `BRK #0x100` é a chamada ao
 serviço ✓, e o ponteiro para o bloco de argumentos é lido da stack
-(`[sp+0x1f8]`) ✓. O fault é num `LDR` desse ponteiro **nulo** ✗.
+(`[sp+0x1f8]`) ✓. O fault é num `LDR` desse ponteiro **nulo**.
 
 E o último serviço servido antes do fault foi o
 `nvdrv` **comando 8 (`SetAruid`)** ✓ (`pid=1` ✓) — a resposta saiu
@@ -3751,18 +3779,18 @@ argumento que nunca foiposto).
 ### Onde o jogo está — o mapa das cv (medido, `boot_p9w.log`)
 
 ```
-4687  SignalProcessWideKey key=0x10a2c7764  acordados=0     (sinal pendente ✓)
-4695  WaitProcessWideKeyAtomic cv=0x10a2c7844 tag=0x20003   (worker A)
-4700  WaitProcessWideKeyAtomic cv=0x10a2c7b0c tag=0x28004   (worker B)
-4706  SignalProcessWideKey  key=0x10a2c7b0c acordados=1      ← worker B acorda ✓
-4708  WaitProcessWideKeyAtomic cv=0x10a2c7bec tag=0x28004   (worker B, próximo posto)
-11916 SignalProcessWideKey  key=0x10a2c7844 acordados=0      ← worker A NÃO é encontrado
-11917 WaitProcessWideKeyAtomic cv=0x10a2c7d64 tag=0x81ff    (main, à espera da frame)
+4687 SignalProcessWideKey key=0x10a2c7764  acordados=0     (sinal pendente ✓)
+4695 WaitProcessWideKeyAtomic cv=0x10a2c7844 tag=0x20003   (worker A)
+4700 WaitProcessWideKeyAtomic cv=0x10a2c7b0c tag=0x28004   (worker B)
+4706 SignalProcessWideKey  key=0x10a2c7b0c acordados=1      ← worker B acorda ✓
+4708 WaitProcessWideKeyAtomic cv=0x10a2c7bec tag=0x28004   (worker B, próximo posto)
+11916 SignalProcessWideKey key=0x10a2c7844 acordados=0      ← worker A NÃO é encontrado
+11917 WaitProcessWideKeyAtomic cv=0x10a2c7d64 tag=0x81ff (main, à espera da frame)
 ```
 
 **O worker B acorda ✓** (o signal pendente + o signal que acorda o
-*waiter* funinam ✓) — **o worker A não** ✗: o signal chega e a fila
-da cv está vazia ✗, apesar de o worker A ter estacionado lá (linha
+*waiter* funinam ✓) — **o worker A não**: o signal chega e a fila
+da cv está vazia, apesar de o worker A ter estacionado lá (linha
 4695 ✓).
 
 E a correcção do *prazo de salvaguarda* (que tirei — com ele, o
@@ -3779,8 +3807,8 @@ perde. É uma linha de instrumentação e fecha o caso.
 O log dá o par:
 
 ```
-624   HSR appletOE: comando 0 tipo=6 tem_domain=1   → OpenApplicationProxy ✓
-11874 HSR appletOE: comando 0 tipo=0 tem_domain=0   → o MESMO comando, como comando
+624 HSR appletOE: comando 0 tipo=6 tem_domain=1   → OpenApplicationProxy ✓
+11874 HSR appletOE: comando 0 tipo=0 tem_domain=0 → o MESMO comando, como comando
 ```
 
 E logo a seguir, **dois asserts do Eden**:
@@ -3790,26 +3818,26 @@ service.cpp: assert command_type=0
 ```
 
 Ou seja: o pedido do jogo **chegou sem o cabeçalho de domínio**
-(`tem_domain=0` ✗), mas a sessão *é* de domínio ✓ (a primeira
+(`tem_domain=0`), mas a sessão *é* de domínio ✓ (a primeira
 chamada, a de controlo, foi `tipo=6 tem_domain=1` ✓). O Eden lê o
-cabeçalho de domínio onde não está ✗ → todos os deslocamentos
-erram ✗ → o `magic` do payload não é "SFCI" ✗ → assert ✗, e o
-comando é lido do sítio errado ✗.
+cabeçalho de domínio onde não está → todos os deslocamentos
+erram → o `magic` do payload não é "SFCI" → assert, e o
+comando é lido do sítio errado.
 
 **De onde vem**: o Eden devolve as sub-interfaces com
 `PushIpcInterface` (`ipc_helpers.h:114-131`) — e, quando a sessão é
-de domínio, o objecto vai por `ctx.AddDomainObject(...)` ✗ (e o
+de domínio, o objecto vai por `ctx.AddDomainObject(...)` (e o
 gestor de sessões fica com a *interface* como handler ✓). A casa
 respondeu ao `OpenApplicationProxy` de forma que o guest **não sabe
-que está numa sessão de domínio** ✗ — e manda o pedido sem o
-cabeçalho ✗.
+que está numa sessão de domínio** — e manda o pedido sem o
+cabeçalho.
 
 **O que fazer**: comparar a resposta da casa ao `OpenApplicationProxy`
 (control, tipo 6 ✓) com a do Eden (`applet_oe.cpp`) — em especial
 o handle devolvido e a forma como a sessão é criada (de domínio ✓ ou
-não ✗) — e corrigir a resposta ✗. Com isso, o pedido do
+não) — e corrigir a resposta. Com isso, o pedido do
 `GetEventHandle` entra bem ✓, o `applet:oe` responde ✓, e o jogo
-deixa de bater no assert ✗.
+deixa de bater no assert.
 
 ### O emulador Maxwell do Eden — o mapa (fonte: upstream)
 
@@ -3841,20 +3869,20 @@ Os IDs dos métodos do canal (do upstream, `puller.h` ✓):
   regras de incremento do método ✓.
 - **`nvdrv`** — o push buffer é lido com o formato certo ✓ e os
   métodos do **canal** são executados ✓:
-  - o **payload do semáforo** (0x07 com `WriteLong` ✓) é escrito na
+- o **payload do semáforo** (0x07 com `WriteLong` ✓) é escrito na
     memória do guest ✓ e quem espera por esse endereço é acordado ✓ —
     é assim que o driver diz ao jogo "o trabalho acabou" ✓ (o
     upstream: `rasterizer->Query(..., Payload, ...)` ✓);
-  - a **fence** (0x1D com `Increment` ✓) é tratada ✓.
+- a **fence** (0x1D com `Increment` ✓) é tratada ✓.
 
 O que **não** está: a tabela de IDs do motor 3D (o `Regs` do
-`maxwell_3d.h` ✗ — os índices saem de `offsetof` ✗, e o `video_core`
-não está vendorizado ✗ nem no Pi ✗), o estado, e o backend.
+`maxwell_3d.h` — os índices saem de `offsetof`, e o `video_core`
+não está vendorizado nem no Pi), o estado, e o backend.
 
 ### O caminho que resta (mecânico, com o upstream)
 
 1. **Vendorizar o `video_core` do Eden** ✓ (o upstream tem-no inteiro
-   ✓ — `src/video_core/**` ✗) e juntar-lhe o `renderer_vulkan` ✓. É o
+   ✓ — `src/video_core/**`) e juntar-lhe o `renderer_vulkan` ✓. É o
    que dá o motor Maxwell e a tradução Maxwell→Vulkan **do próprio
    Eden** ✓ — sem reescrever nada ✓. Depende do `core/` ✓ (que já
    está vendorizado ✓) e do `common/` ✓.
@@ -3873,11 +3901,11 @@ foram trazidos para `vendor/eden/src/` ✓ (624 ficheiros, 5,8 MiB ✓):
 
 A ferramenta é `tools/vendorizar_video_core.py` ✓ (tem `--fetch` ✓) —
 e o que ela traz substitui o `ShaderCache::compile` da casa, que hoje
-é um *placeholder* ✓ (copia o blob para dentro de um vector `spirv` ✗).
+é um *placeholder* ✓ (copia o blob para dentro de um vector `spirv`).
 
 O que falta para compilar isto dentro da casa: as dependências do
-`renderer_vulkan` (o **PanVK** ✗ — o driver Vulkan-sobre-Vulkan que o
-Eden usa ✗) e as flags de compilação ✗. É mecânico, mas não é trivial.
+`renderer_vulkan` (o **PanVK** — o driver Vulkan-sobre-Vulkan que o
+Eden usa) e as flags de compilação. É mecânico, mas não é trivial.
 
 ### O que falta para compilar o `video_core` na casa (medido)
 
@@ -3895,39 +3923,39 @@ vendorizado ✓) são:
 | | `SPIRV-Tools::SPIRV-Tools` | **falta** |
 
 **O PanVK não é uma dependência de compilação** ✓ — o upstream
-carrega-o em *runtime* (é um ICD ✗ que o carregador de Vulkan
-encontra ✗), e o Pi já o tem ✓ (é o que o `tests/mostra.cpp` usa ✓✓).
+carrega-o em *runtime* (é um ICD que o carregador de Vulkan
+encontra), e o Pi já o tem ✓ (é o que o `tests/mostra.cpp` usa ✓✓).
 
 **A receita, passo a passo:**
 
 1. `tools/vendorizar_video_core.py` já traz o `video_core` e o
    `shader_recompiler` ✓; falta trazer (e compilar):
-   - `KhronosGroup/Vulkan-Headers` ✓ (só cabeçalhos ✗),
-   - `GPUOpen-GameFoundations/VulkanMemoryAllocator` ✓,
-   - `KhronosGroup/SPIRV-Headers` ✓, `KhronosGroup/SPIRV-Tools` ✓,
+- `KhronosGroup/Vulkan-Headers` ✓ (só cabeçalhos),
+- `GPUOpen-GameFoundations/VulkanMemoryAllocator` ✓,
+- `KhronosGroup/SPIRV-Headers` ✓, `KhronosGroup/SPIRV-Tools` ✓,
      `KhronosGroup/SPIRV-Reflect` ✓.
 2. No `CMakeLists.txt` da casa: os alvos `video_core` e
    `shader_recompiler` ✓, com os includes do upstream (`vendor/eden/src`
-   ✗ — o upstream usa `src/` ✗, e o prefixo muda ✗ → ou um
-   `target_include_directories` com `vendor/eden` ✗ e um *symlink*
-   `src` → `vendor/eden/src` ✗, ou compilar com `-I` ✗).
-3. O `video_core` referencia `core/` e `common/` ✗ — já vendorizados ✓
+   — o upstream usa `src/`, e o prefixo muda → ou um
+   `target_include_directories` com `vendor/eden` e um *symlink*
+   `src` → `vendor/eden/src`, ou compilar com `-I`).
+3. O `video_core` referencia `core/` e `common/` — já vendorizados ✓
    — e `fmt` ✓.
 
 **O atalho que o desenho da casa já previa**: o motor Maxwell fala com
-um `RasterizerInterface` ✓ (uma interface abstracta ✓ do upstream ✗) —
-por isso a casa **não precisa** do `renderer_vulkan` ✗ nem do PanVK
-✗✗: basta implementar a interface ✓ com o backend de Vulkan ✓
-(o `ValhallBackend` ✗ que o desenho já nomeia ✗). O `renderer_vulkan`
-do upstream fica de fora ✗ — e com ele o PanVK ✗ e o VMA ✗ — e o
-`shader_recompiler` ✗ pode ser ligado depois ✓ (é o que troca o
+um `RasterizerInterface` ✓ (uma interface abstracta ✓ do upstream) —
+por isso a casa **não precisa** do `renderer_vulkan` nem do PanVK
+ : basta implementar a interface ✓ com o backend de Vulkan ✓
+(o `ValhallBackend` que o desenho já nomeia). O `renderer_vulkan`
+do upstream fica de fora — e com ele o PanVK e o VMA — e o
+`shader_recompiler` pode ser ligado depois ✓ (é o que troca o
 *placeholder* do `ShaderCache` ✓).
 
 ### Onde está a integração do motor (passo 1)
 
 Feito ✓:
 - o `video_core` e o `shader_recompiler` do upstream vendorizados ✓;
-- o `core/` e o `common/` **completos** ✓ (o que estava podado ✗);
+- o `core/` e o `common/` **completos** ✓ (o que estava podado);
 - as dependências de compilação vendorizadas ✓ (Vulkan-Headers ✓, VMA ✓,
   SPIRV-Headers/Tools/Reflect ✓) — o PanVK é só runtime ✓;
 - as listas de fontes extraídas dos `CMakeLists.txt` do upstream ✓
@@ -3936,27 +3964,27 @@ Feito ✓:
 - o `video_core` entra no **mesmo alvo** do `core/` ✓ (`g610_core` ✓ —
   separados dariam um círculo ao linker ✓);
 - **os índices numéricos dos registos do Maxwell3D** ✓ — extraídos
-  *compilando* o cabeçalho do upstream ✓ (a macro
+*compilando* o cabeçalho do upstream ✓ (a macro
   `MAXWELL3D_REG_INDEX` ✓ é a fonte da verdade ✓). Por exemplo:
   `draw.begin` = 1414 ✓, `draw.end` = 1413 ✓,
   `index_buffer.count` = 1528 ✓, `vertex_buffer.count` = 862 ✓,
   `vertex_array_instance_first` = 1157 ✓, `clear_surface` = 1652 ✓.
 
-O primeiro bloqueio da compilação ✓: os **shaders do host** ✗ — o
-upstream gera-os (`video_core/host_shaders/CMakeLists.txt` ✗, com
-glslang ✗). O renderer OpenGL já ficou de fora ✓ (a casa é Vulkan ✓);
-o `renderer_vulkan` precisa dos mesmos shaders gerados ✗.
+O primeiro bloqueio da compilação ✓: os **shaders do host** — o
+upstream gera-os (`video_core/host_shaders/CMakeLists.txt`, com
+glslang). O renderer OpenGL já ficou de fora ✓ (a casa é Vulkan ✓);
+o `renderer_vulkan` precisa dos mesmos shaders gerados.
 
 **Duas saídas** ✓:
-1. trazer o `glslang` ✗ e gerar os shaders ✓ (o caminho do upstream ✓);
-2. compilar **só o motor** ✓ (sem renderer ✗) e implementar a
+1. trazer o `glslang` e gerar os shaders ✓ (o caminho do upstream ✓);
+2. compilar **só o motor** ✓ (sem renderer) e implementar a
    `RasterizerInterface` ✓ na casa ✓ — o motor Maxwell fala com o
    renderer só por essa interface ✓✓ (40 métodos ✓, mecânicos ✓), e o
    `ValhallBackend` ✓ que o desenho da casa já nomeia ✓ é exactamente
    essa implementação ✓.
 
-A 2ª é a que dá o backend **da casa** ✓ (e não o do Eden ✗) — e é
-também a que evita o glslang ✗.
+A 2ª é a que dá o backend **da casa** ✓ (e não o do Eden) — e é
+também a que evita o glslang.
 
 ### O rasterizador da casa (passo 2)
 
@@ -3964,12 +3992,12 @@ também a que evita o glslang ✗.
 implementação da `RasterizerInterface` do upstream ✓ (~40 métodos ✓):
 
 - **`Query()`** ✓ — escreve o *payload* na memória do guest ✓: é o
-  **semáforo** ✓, por onde o jogo fica a saber que o trabalho acabou ✓✓;
+**semáforo** ✓, por onde o jogo fica a saber que o trabalho acabou ✓✓;
 - **`SignalSyncPoint()`** ✓ — a **fence** ✓ (o *hook* é o `nvdrv` ✓);
 - **`Draw()`**/`Clear()`/`DrawTexture()`/`DispatchCompute()` ✓ — contados ✓
   (o backend Vulkan entra por cima ✓ — o `ValhallBackend` ✓ do desenho);
 - as caches ✓ — **no-ops com propósito** ✓: a casa não tem caches de
-  GPU ✗ (a memória do guest é um `mmap` plano ✓ e o motor escreve
+  GPU (a memória do guest é um `mmap` plano ✓ e o motor escreve
   directamente nela ✓);
 - **`AccessAccelerateDMA()`** ✓ — a implementação vazia ✓ (o motor cai
   no caminho normal ✓, como no Eden ✓).
@@ -3977,30 +4005,30 @@ implementação da `RasterizerInterface` do upstream ✓ (~40 métodos ✓):
 **Três erros que faltam resolver** ✓ (todos no acoplamento da casa ao
 upstream ✓):
 
-1. **`Settings::Values`** ✗ — o override da casa (`tools/overrides/common/
-   settings.h` ✓) é um *subconjunto* ✗ e o `video_core` usa campos que
-   ele não tem ✗ (`skip_cpu_inner_invalidation` ✗ e mais ✗). A correção
-   é adicionar os campos ✗ ao override ✓ — o mecanismo dos overrides
+1. **`Settings::Values`** — o override da casa (`tools/overrides/common/
+   settings.h` ✓) é um *subconjunto* e o `video_core` usa campos que
+   ele não tem (`skip_cpu_inner_invalidation` e mais). A correção
+   é adicionar os campos ao override ✓ — o mecanismo dos overrides
    existe para isso ✓.
-2. **Definições duplicadas** ✗ em `common/logging/*` ✗ — o `common/` do
-   upstream e o da casa são o mesmo directório ✗ (agora com um symlink ✓
+2. **Definições duplicadas** em `common/logging/*` — o `common/` do
+   upstream e o da casa são o mesmo directório (agora com um symlink ✓
    — `vendor/eden/src/common -> ../common` ✓ — para que as *overrides*
    da casa valham para o motor do upstream ✓✓). Falta ver porque é que
-   o mesmo ficheiro é compilado duas vezes ✗.
-3. **`Tegra::VideoCore`** ✗ — o nome do namespace ✗ — é consequência do
-   (1) e do (2) ✗ (o cabeçalho não chega a compilar ✗).
+   o mesmo ficheiro é compilado duas vezes.
+3. **`Tegra::VideoCore`** — o nome do namespace — é consequência do
+   (1) e do (2) (o cabeçalho não chega a compilar).
 
 **Nota (do utilizador, registada para depois)** ✓: os jogos que correm
 nativamente no Switch usam **OpenGL 3.1** ✓ e **Vulkan 1.0–1.1** ✓ — e o
-Eden exige **OpenGL 4.3** ✗, mais do que o Switch dá ✗. Vale a pena
+Eden exige **OpenGL 4.3**, mais do que o Switch dá. Vale a pena
 registar: se a parte de Vulkan ficar feita ✓, talvez se possa eliminar a
-dependência do OpenGL 4.3 ✗ e deixar disponível também o OpenGL do
+dependência do OpenGL 4.3 e deixar disponível também o OpenGL do
 Switch ✓ (alguns jogos são só OpenGL ✓).
 
 ### A aritmética do pedido não conta o cabeçalho de domínio
 
 O `applet:oe` é um **gestor de domínio** ✓ — no Switch ✓ e no Eden ✓. O
-guest manda o cabeçalho de domínio ✓ (8 bytes ✗ = 2 palavras ✗) e o
+guest manda o cabeçalho de domínio ✓ (8 bytes = 2 palavras) e o
 Eden lê-o **se a sessão for um domínio** ✓ (`hle_ipc.cpp:199-215` ✓):
 
 ```cpp
@@ -4015,12 +4043,12 @@ if (GetManager()->IsDomain() && ((command_header->type == Request ||
 **A aritmética da casa** (`src/ipc_min.cpp:310-327` ✓) conta o
 `CommandHeader` ✓, o `HandleDescriptorHeader` ✓, o pid ✓, os
 descritores X/A/B/W ✓ e o `DataPayloadHeader` ✓ — **mas não o
-cabeçalho de domínio** ✗. E a sessão do `applet:oe` **não é um
-domínio** ✗ (a casa regista-o como serviço normal ✗) ✗.
+cabeçalho de domínio**. E a sessão do `applet:oe` **não é um
+domínio** (a casa regista-o como serviço normal).
 
-Resultado: o payload é lido **deslocado** ✗ → o `magic` não é "SFCI"
-✗ → `assert data_payload_header->magic` ✗, e o `command_type` lido
-✗ → `assert command_type=0` ✗. **É este o assert que faltava** ✓.
+Resultado: o payload é lido **deslocado** → o `magic` não é "SFCI"
+ → `assert data_payload_header->magic`, e o `command_type` lido
+ → `assert command_type=0`. **É este o assert que faltava** ✓.
 
 **A correcção são duas coisas** ✓:
 
@@ -4029,106 +4057,106 @@ Resultado: o payload é lido **deslocado** ✗ → o `magic` não é "SFCI"
    `ConvertToDomainOnRequestEnd()` ✓ é o que o guest dispara ✓, e
    mede-se no log ✓: "ConvertCurrentObjectToDomain: a sessao passa a
    dominio" ✓). A casa precisa de o fazer no mesmo sítio ✓ — o
-   `Controller::ConvertCurrentObjectToDomain` ✗ (o override da casa ✓)
-   converte a sessão **do `sm:`** ✗ ✗ — e o guest precisa da do
-   **`applet:oe`** ✗ ✗.
-2. **A aritmética tem de contar as 2 palavras** ✗ do cabeçalho de
-   domínio ✗ quando a sessão é um domínio ✓ — como o Eden ✗.
+   `Controller::ConvertCurrentObjectToDomain` (o override da casa ✓)
+   converte a sessão **do `sm:`** — e o guest precisa da do
+**`applet:oe`**.
+2. **A aritmética tem de contar as 2 palavras** do cabeçalho de
+   domínio quando a sessão é um domínio ✓ — como o Eden.
 
 ### O assert do payload — resolvido (era o endereço, não o domínio)
 
-O `assert data_payload_header->magic` **nao** era o cabeçalho de dominio ✗.
-Medido com um dump no `ParseCommandBuffer` (`/tmp/boot_dom.log` ✗):
+O `assert data_payload_header->magic` **nao** era o cabeçalho de dominio.
+Medido com um dump no `ParseCommandBuffer` (`/tmp/boot_dom.log`):
 
     [ipc-dom] payload SEM 'SFCI': data_payload_offset=6
     [ipc-dom]   [ 4] 0x4f434653  <- DataPayloadHeader
 
-`0x4f434653` e' **"SFCO"** ✗ — o magic de **RESPOSTA** ✗, nao de pedido ✗.
-O guest nao mandou um cabecalho de dominio ✗: mandou um pedido ✗ e a casa
-leu-o de um sitio onde estava a **resposta anterior** ✗.
+`0x4f434653` e' **"SFCO"** — o magic de **RESPOSTA**, nao de pedido.
+O guest nao mandou um cabecalho de dominio: mandou um pedido e a casa
+leu-o de um sitio onde estava a **resposta anterior**.
 
-**A causa** ✗: `eden_send_sync_request` ✗ chamava
-`sessao->SendSyncRequest(kernel, 0, 0)` ✗ — endereco **zero** ✗ — e o
-upstream, nesse caso ✗, vai buscar o pedido ao **TLS** da thread ✗
-(`k_server_session.cpp:1162` ✗) em vez de o ler de onde o guest o
-escreveu ✗. O guest passa o endereco do seu buffer em **x1** ✗ (medido:
-`x1=0x88004000` ✗) ✗.
+**A causa**: `eden_send_sync_request` chamava
+`sessao->SendSyncRequest(kernel, 0, 0)` — endereco **zero** — e o
+upstream, nesse caso, vai buscar o pedido ao **TLS** da thread
+(`k_server_session.cpp:1162`) em vez de o ler de onde o guest o
+escreveu. O guest passa o endereco do seu buffer em **x1** (medido:
+`x1=0x88004000`).
 
-**A correccao** ✗: passar `ctx.x[1]` ✗ (o endereco ✗). O `x2` ✗ **nao** e'
-um tamanho ✗ (no pedido medido ✗, `x2 = 0x481f7` ✗ = o handle ✗ ✗) ✗ — e
-o caminho HLE do upstream ✗ le o buffer pelo `COMMAND_BUFFER_LENGTH` ✗ fixo
-✗ e nao usa o tamanho ✗ ✓.
+**A correccao**: passar `ctx.x[1]` (o endereco). O `x2` **nao** e'
+um tamanho (no pedido medido, `x2 = 0x481f7` = o handle) — e
+o caminho HLE do upstream le o buffer pelo `COMMAND_BUFFER_LENGTH` fixo
+ e nao usa o tamanho ✓.
 
-**Medido depois da correccao** ✗: o assert **desapareceu** ✗ (0 ocorrencias
-✗ de `ipc-dom` ✗) e o jogo passa a fazer IPC a serio ✗ (o pump ✗ mostra
-sessoes a serem servidas ✗) ✗.
+**Medido depois da correccao**: o assert **desapareceu** (0 ocorrencias
+ de `ipc-dom`) e o jogo passa a fazer IPC a serio (o pump mostra
+sessoes a serem servidas).
 
 ### Onde o jogo está agora
 
-O guest chega ao **`Break` SVC (#0x26)** ✗ — o caminho de crash do proprio
-SDK ✗ — e a ultima linha do motor ✗ e' a mais informativa ✗:
+O guest chega ao **`Break` SVC (#0x26)** — o caminho de crash do proprio
+SDK — e a ultima linha do motor e' a mais informativa:
 
     [eden:D] Service::NVDRV: [canal] a regiao de 328204288 bytes esta toda a ZEROS
 
-Ou seja ✗: o guest **alocou a regiao do canal da GPU** ✗ (328 MB ✗) e
-**nao escreveu o push buffer** ✗ ✗. O proximo passo nao e' o IPC ✗ — e' o
-**canal do NVDRV** ✗ ✗: onde o guest escreve os comandos ✗, e de onde a
-casa os tem de ler ✗.
+Ou seja: o guest **alocou a regiao do canal da GPU** (328 MB) e
+**nao escreveu o push buffer**. O proximo passo nao e' o IPC — e' o
+**canal do NVDRV**: onde o guest escreve os comandos, e de onde a
+casa os tem de ler.
 
 ### O canal do NVDRV — quatro correcoes medidas
 
 O `SubmitGPFIFO` chegou a correr e a ler o push buffer, mas o jogo
-abortava com `SetTerminateResult modulo=2 desc=3005` ✗ — o pranto do SDK
-quando uma chamada devolve um resultado inesperado ✗ ✗.
+abortava com `SetTerminateResult modulo=2 desc=3005` — o pranto do SDK
+quando uma chamada devolve um resultado inesperado.
 
-**1. A tabela `SubmissionMode` estava errada** ✗ — e era o bug que
-des-sincronizava o leitor ✗.
+**1. A tabela `SubmissionMode` estava errada** — e era o bug que
+des-sincronizava o leitor.
 
-A casa tinha (`include/g610/gpu/pushbuffer.hpp` ✗):
+A casa tinha (`include/g610/gpu/pushbuffer.hpp`):
 
     Increasing = 0, NonIncreasing = 1, Inline = 2, IncreaseOnce = 3
 
-O upstream (`video_core/dma_pusher.h:35-42` ✗):
+O upstream (`video_core/dma_pusher.h:35-42`):
 
     IncreasingOld = 0, Increasing = 1, NonIncreasingOld = 2,
     NonIncreasing = 3, Inline = 4, IncreaseOnce = 5
 
-Todos deslocados ✗. E o pior ✗: **os modos 0 e 2 nao existem no
-upstream** ✗ — o `ProcessCommands` (`dma_pusher.cpp:189-191` ✗) cai no
-`default` e **ignora** a palavra ✗. A casa tratava-os como validos ✗ e
-comia o fluxo ✗ ✗.
+Todos deslocados. E o pior: **os modos 0 e 2 nao existem no
+upstream** — o `ProcessCommands` (`dma_pusher.cpp:189-191`) cai no
+`default` e **ignora** a palavra. A casa tratava-os como validos e
+comia o fluxo.
 
-Medido ✗: o leitor passou de **1404 metodos / 47 descartados** ✗ (errado
-✗) para **624 / 6** ✗ ✓.
+Medido: o leitor passou de **1404 metodos / 47 descartados** (errado
+) para **624 / 6** ✓.
 
-**2. O `size` do `CommandListHeader` e' em PALAVRAS** ✗. O upstream le
-`GpuGuestMemory<CommandHeader>` ✗ — `size` **elementos** de 4 bytes ✗ ✗.
-A casa lia o `size` como bytes ✗ (4x menos ✗).
+**2. O `size` do `CommandListHeader` e' em PALAVRAS**. O upstream le
+`GpuGuestMemory<CommandHeader>` — `size` **elementos** de 4 bytes.
+A casa lia o `size` como bytes (4x menos).
 
-Prova no pedido real ✗: a entrada 1 comeca em `0xE2D67000 + 0x2274` ✗, e
-`0x2274` = 8820 = **2205 palavras** ✗ ✓.
+Prova no pedido real: a entrada 1 comeca em `0xE2D67000 + 0x2274`, e
+`0x2274` = 8820 = **2205 palavras** ✓.
 
-**3. O `MapBufferEx` com `mapping_size = 0`** ✗ mapeia o handle inteiro ✗
-(upstream ✗, `nvhost_as_gpu.cpp:369` ✗). A casa mapeava **zero bytes** ✗ ✗.
+**3. O `MapBufferEx` com `mapping_size = 0`** mapeia o handle inteiro
+(upstream, `nvhost_as_gpu.cpp:369`). A casa mapeava **zero bytes**.
 
-**4. O primeiro handle do `nvmap` e' o 0** ✗. O upstream
-(`nvmap/core/nvmap.cpp:134` ✗) faz `fetch_add` a partir de zero ✗; a
-casa comecava em 1 ✗ ✗.
+**4. O primeiro handle do `nvmap` e' o 0**. O upstream
+(`nvmap/core/nvmap.cpp:134`) faz `fetch_add` a partir de zero; a
+casa comecava em 1.
 
-Medido ✗ (`boot_v12.log` ✗): `MapBufferEx: handle 0 nao esta alocado` ✗ —
-cinco vezes ✗ — e o `NvResult` de erro (11 ✗, `BadValue` ✗) **mata o
-jogo** ✗ ✗.
+Medido (`boot_v12.log`): `MapBufferEx: handle 0 nao esta alocado` —
+cinco vezes — e o `NvResult` de erro (11, `BadValue`) **mata o
+jogo**.
 
-**Instrumento novo** ✗: o `RespostaErro` no `nvdrv` ✗ escreve so
-quando o `NvResult` **nao** e' `Success` ✗ ✗. E' o que encontrou este
-bug em segundos ✗ ✗.
+**Instrumento novo**: o `RespostaErro` no `nvdrv` escreve so
+quando o `NvResult` **nao** e' `Success`. E' o que encontrou este
+bug em segundos.
 
 ### O `/dev/nvhost-ctrl` — o device da espera pela fence
 
-`TipoDeDevice::Controle` existia na enum ✗ mas **nao tinha caso no
-despacho** ✗ — e os ioctls do grupo 0x00 caíam em "nao implementado" ✗ ✗.
+`TipoDeDevice::Controle` existia na enum mas **nao tinha caso no
+despacho** — e os ioctls do grupo 0x00 caíam em "nao implementado".
 
-O upstream (`nvhost_ctrl.cpp:41-57` ✗) tem ai ✗:
+O upstream (`nvhost_ctrl.cpp:41-57`) tem ai:
 
     0x1b NvOsGetConfigU32
     0x1c IocCtrlClearEventWait
@@ -4138,20 +4166,20 @@ O upstream (`nvhost_ctrl.cpp:41-57` ✗) tem ai ✗:
     0x20 IocCtrlEventUnregister
     0x21 IocCtrlEventUnregisterBatch
 
-Implementados ✗ ✗, com um **syncpoint manager** novo
-(`include/g610/gpu/syncpoint.hpp` ✗) ✗ e um `KEvent` por slot ✗ — o
-mesmo `KEvent` que o upstream sinaliza ✗ (`nvhost_ctrl.cpp:297-320` ✗) ✗.
+Implementados, com um **syncpoint manager** novo
+(`include/g610/gpu/syncpoint.hpp`) e um `KEvent` por slot — o
+mesmo `KEvent` que o upstream sinaliza (`nvhost_ctrl.cpp:297-320`).
 
 O `QueryEvent` (comando 4) agora resolve o evento pelo **fd do device**
-✗, como o upstream (`nvdrv.cpp:211-229` ✗) ✗.
+, como o upstream (`nvdrv.cpp:211-229`).
 
-**A diferenca para o upstream** ✗: o upstream avanca o syncpoint numa
-thread de GPU ✗; aqui avanca **no `SubmitGPFIFO`** ✗ — que e' quando o
-trabalho e' "executado" ✗ ✗. O guest ve o mesmo ✗ ✗.
+**A diferenca para o upstream**: o upstream avanca o syncpoint numa
+thread de GPU; aqui avanca **no `SubmitGPFIFO`** — que e' quando o
+trabalho e' "executado". O guest ve o mesmo.
 
 ### A fence
 
-O upstream (`nvhost_gpu.cpp:367-372` ✗):
+O upstream (`nvhost_gpu.cpp:367-372`):
 
     params.fence.id = channel_syncpoint;
     u32 increment{(flags.fence_increment ? 2 : 0) +
@@ -4159,99 +4187,99 @@ O upstream (`nvhost_gpu.cpp:367-372` ✗):
     params.fence.value =
         syncpoint_manager.IncrementSyncpointMaxExt(channel_syncpoint, increment);
 
-**O incremento pode ser zero** ✗ ✗ — e nesse caso o syncpoint **nao sobe**
-✗ ✗. A casa incrementava sempre ✗ ✗, e devolvia um valor de fence que o
-Eden nunca devolveria ✗ ✗.
+**O incremento pode ser zero** — e nesse caso o syncpoint **nao sobe**
+. A casa incrementava sempre, e devolvia um valor de fence que o
+Eden nunca devolveria.
 
-O `AllocGPFIFOEx` aloca o syncpoint do canal ✗ (o upstream aloca-o na
-criacao do canal ✗) ✗, e devolve o par (syncpoint ✗, valor **actual** ✗)
-✗ ✗.
+O `AllocGPFIFOEx` aloca o syncpoint do canal (o upstream aloca-o na
+criacao do canal), e devolve o par (syncpoint, valor **actual**)
+.
 
 ### Onde o jogo esta agora
 
-Medido ✗ (`boot_v13.log` ✗):
+Medido (`boot_v13.log`):
 
-- o `NvResult` de erro do `nvmap` **desapareceu** ✗ ✓;
-- o syncpoint do canal avanca (0 -> 1) na submissao ✗ ✓;
-- o jogo **continua a abortar** ✗ com `desc=3005` ✗ ✗.
+- o `NvResult` de erro do `nvmap` **desapareceu** ✓;
+- o syncpoint do canal avanca (0 -> 1) na submissao ✓;
+- o jogo **continua a abortar** com `desc=3005`.
 
-**A espera que bloqueia** ✗: `WaitProcessWideKeyAtomic addr=0x10a2c7d58
-cv=0x10a2c7d64 tag=0x81ff timeout=-1` ✗ — espera infinita ✗, e o sinal
-**nunca chega** ✗ ✗.
+**A espera que bloqueia**: `WaitProcessWideKeyAtomic addr=0x10a2c7d58
+cv=0x10a2c7d64 tag=0x81ff timeout=-1` — espera infinita, e o sinal
+**nunca chega**.
 
-**O que se sabe** ✗ ✗:
+**O que se sabe**:
 
-- o guest **nao** espera pela fence pelo ioctl ✗ — abre
-  `/dev/nvhost-ctrl-gpu` (fd=1 ✗) e nunca `/dev/nvhost-ctrl` ✗ ✗;
-- a submissao que o jogo fez e' de **setup** ✗ (bind de objectos ✗, mem
-  ops ✗, registos 3D ✗) ✗ — os ids de canal presentes sao 0 ✗, 2 ✗ e
-  11 ✗ ✗, e **nao** ha `0x1D` (`SyncpointOperation` ✗) ✗ nem `0x07`
-  (`SemaphoreOperation` ✗) ✗ ✗;
-- logo: **o jogo ainda nao submeteu o trabalho** ✗ — a thread de render
-  esta bloqueada **antes** ✗ ✗.
+- o guest **nao** espera pela fence pelo ioctl — abre
+  `/dev/nvhost-ctrl-gpu` (fd=1) e nunca `/dev/nvhost-ctrl`;
+- a submissao que o jogo fez e' de **setup** (bind de objectos, mem
+  ops, registos 3D) — os ids de canal presentes sao 0, 2 e
+  11, e **nao** ha `0x1D` (`SyncpointOperation`) nem `0x07`
+  (`SemaphoreOperation`);
+- logo: **o jogo ainda nao submeteu o trabalho** — a thread de render
+  esta bloqueada **antes**.
 
-**A proxima medicao** ✗: o que a thread de render esta a esperar ✗ — a
-cv `0x10a2c7d64` ✗ e' do **proprio jogo** ✗ (o dump mostra
-`mutex=0x81ff cv=0x0` ✗) ✗, e o `tag=0x81ff` ✗ tem o bit 0x8000 ✗
-ligado ✗ — que no Eden e' o bit de "**waiter removido**" ✗ ✗.
+**A proxima medicao**: o que a thread de render esta a esperar — a
+cv `0x10a2c7d64` e' do **proprio jogo** (o dump mostra
+`mutex=0x81ff cv=0x0`), e o `tag=0x81ff` tem o bit 0x8000
+ligado — que no Eden e' o bit de "**waiter removido**".
 
 ### O `android.gui` — o token do parcel e o `Remap`
 
-**O token da interface e' lido SEM alinhamento** ✗ — o upstream usa
-`ReadUnaligned<u16>()` (`nvnflinger/parcel.h:96` ✗). A casa alinhava a 4
-bytes depois de cada caracter ✗ ✗.
+**O token da interface e' lido SEM alinhamento** — o upstream usa
+`ReadUnaligned<u16>()` (`nvnflinger/parcel.h:96`). A casa alinhava a 4
+bytes depois de cada caracter.
 
-Medido ✗ (`/tmp/boot_v17.log` ✗): o indice do parcel saltava de **16**
-para **164** depois do token ✗, quando devia ficar em **48** ✗ (16 do
-`data_offset` ✗ + 8 do cabecalho ✗ + 24 dos 12 caracteres ✗). A
-diferenca ✗ — 116 bytes ✗ — era o desperdicio de 2 bytes por caracter ✗.
+Medido (`/tmp/boot_v17.log`): o indice do parcel saltava de **16**
+para **164** depois do token, quando devia ficar em **48** (16 do
+`data_offset` + 8 do cabecalho + 24 dos 12 caracteres). A
+diferenca — 116 bytes — era o desperdicio de 2 bytes por caracter.
 
-**Consequencia medida** ✗: o `SetPreallocatedBuffer` (transaccao 14 ✗)
-lia o *slot* ✗ e o *objecto* ✗ de sitios errados ✗ ✗, o `LeObjecto`
-falhava ✗ ✗ e o compositor devolvia `StatusBadValue` ✗ ✗ — o jogo
-ficava sem poder desenhar ✗ ✗.
+**Consequencia medida**: o `SetPreallocatedBuffer` (transaccao 14)
+lia o *slot* e o *objecto* de sitios errados, o `LeObjecto`
+falhava e o compositor devolvia `StatusBadValue` — o jogo
+ficava sem poder desenhar.
 
-**O handle do `nvmap` e' o `buffer_id`** (offset **44** ✗), nao o
-`Handle` (offset **116** ✗) — o upstream
-(`nvnflinger/ui/graphic_buffer.cpp:23-25` ✗) usa `BufferId()` ✗ para o
-`DuplicateHandle` ✗ e o `PinHandle` ✗. O `Handle` e' o handle do
-*buffer de video* ✗ ✗.
+**O handle do `nvmap` e' o `buffer_id`** (offset **44**), nao o
+`Handle` (offset **116**) — o upstream
+(`nvnflinger/ui/graphic_buffer.cpp:23-25`) usa `BufferId()` para o
+`DuplicateHandle` e o `PinHandle`. O `Handle` e' o handle do
+*buffer de video*.
 
-**As dimensoes da fila** ✗ — o upstream (`buffer_queue_core.h:89-91` ✗)
-tem `default_width` ✗, `default_height` ✗ e `default_buffer_format` ✗,
-que o `SetPreallocatedBuffer` define ✗
-(`buffer_queue_producer.cpp:814-816` ✗) e que o `Connect` ✗ e o `Query`
-✗ devolvem ✗. A casa devolvia **1280x720 fixos** ✗ — um palpite ✗, nao
-o upstream ✗ ✗.
+**As dimensoes da fila** — o upstream (`buffer_queue_core.h:89-91`)
+tem `default_width`, `default_height` e `default_buffer_format`,
+que o `SetPreallocatedBuffer` define
+(`buffer_queue_producer.cpp:814-816`) e que o `Connect` e o `Query`
+ devolvem. A casa devolvia **1280x720 fixos** — um palpite, nao
+o upstream.
 
-**A `api` do `Connect`** ✗ tem de ser uma das quatro ✗ (Egl ✗, Cpu ✗,
-Media ✗, Camera ✗ — `buffer_queue_producer.cpp:716-726` ✗); o resto e'
-`Status::BadValue` ✗. A casa aceitava qualquer uma ✗ ✗.
+**A `api` do `Connect`** tem de ser uma das quatro (Egl, Cpu,
+Media, Camera — `buffer_queue_producer.cpp:716-726`); o resto e'
+`Status::BadValue`. A casa aceitava qualquer uma.
 
-**O `Remap` do `MapBufferEx`** ✗ (bit 8 das flags ✗ — o upstream,
-`nvhost_as_gpu.h:46` ✗) remapeia um VA **ja existente** ✗ e **nao
-altera o `params.offset`** ✗ ✗. A casa tratava-o como o caminho normal
-✗ e devolvia o **endereco da memoria** ✗ ✗.
+**O `Remap` do `MapBufferEx`** (bit 8 das flags — o upstream,
+`nvhost_as_gpu.h:46`) remapeia um VA **ja existente** e **nao
+altera o `params.offset`**. A casa tratava-o como o caminho normal
+ e devolvia o **endereco da memoria**.
 
-Medido ✗ (`/tmp/boot_v20.log` ✗): `MapBufferEx: handle=0 va=0xE5D39000
--> 0xF4CEF000 tamanho=0x870000 flags=0x100` ✗ ✗ — o `0x100` e' o
-`Remap` ✗ ✗. O guest escrevia num sitio ✗ e lia noutro ✗ — o
-framebuffer ficava partido ✗ ✗.
+Medido (`/tmp/boot_v20.log`): `MapBufferEx: handle=0 va=0xE5D39000
+-> 0xF4CEF000 tamanho=0x870000 flags=0x100` — o `0x100` e' o
+`Remap`. O guest escrevia num sitio e lia noutro — o
+framebuffer ficava partido.
 
-O `Mapping` do upstream (`nvhost_as_gpu.h:167-180` ✗) guarda o `ptr`
-base ✗, o `size` ✗ e o `fixed` ✗ — e e' o `ptr` **base** ✗ que o
-`Remap` usa ✗ (`nvhost_as_gpu.cpp:343` ✗), nao o `ptr` do handle ✗ ✗.
-Medido ✗: o remap do VA `0xE5D39000` dava `0xF8559000` ✗, quando o
-correcto e' `0xE5D39000 + 0x12820000` ✗ ✓.
+O `Mapping` do upstream (`nvhost_as_gpu.h:167-180`) guarda o `ptr`
+base, o `size` e o `fixed` — e e' o `ptr` **base** que o
+`Remap` usa (`nvhost_as_gpu.cpp:343`), nao o `ptr` do handle.
+Medido: o remap do VA `0xE5D39000` dava `0xF8559000`, quando o
+correcto e' `0xE5D39000 + 0x12820000` ✓.
 
-O `Remap` tambem exige ✗ (o upstream ✗): que o VA esteja mapeado ✗ (o
-`mapping_map.at()` ✗ **lanca** ✗) ✗ e que o tamanho do mapeamento
-baste ✗ (`BadValue` ✗ se nao ✗) ✗.
+O `Remap` tambem exige (o upstream): que o VA esteja mapeado (o
+`mapping_map.at()` **lanca**) e que o tamanho do mapeamento
+baste (`BadValue` se nao).
 
-**O `ResultNotFound` do pump nao e' um erro** ✗ — e' "ainda nao ha nada
-para atender" ✗. O upstream trata-o explicitamente ✗
-(`svc/svc_ipc.cpp:91` ✗). A casa devolvia-o ao guest como se fosse
-falha ✗ ✗.
+**O `ResultNotFound` do pump nao e' um erro** — e' "ainda nao ha nada
+para atender". O upstream trata-o explicitamente
+(`svc/svc_ipc.cpp:91`). A casa devolvia-o ao guest como se fosse
+falha.
 
 ### Onde o jogo esta agora
 
@@ -4276,15 +4304,15 @@ cv=0x10a2c7d64 tag=0x81ff timeout=-1` — espera infinita, e o sinal
 **O que esta medido, e o que nao esta**:
 
 - **medido**: o codigo do guest em `0x83abc1e8` (desassemblado) e' o
-  **inicio de uma funcao** que contem o `WaitProcessWideKeyAtomic`; o
+**inicio de uma funcao** que contem o `WaitProcessWideKeyAtomic`; o
   `str w0,[sp,#8]` e o `cbnz w0` verificam o resultado de um SVC
-  **anterior**. O SVC que volta para la tem `x0` = o endereco do mutex e
+**anterior**. O SVC que volta para la tem `x0` = o endereco do mutex e
   `ret=0`.
 - **medido**: o `WaitProcessWideKeyAtomic` com `timeout=-1` **nao pode
   falhar** — o upstream (`svc_condition_variable.cpp:18-47`) so' devolve
   erro de endereco invalido ou de timeout zero.
 - **medido**: o guest sinaliza `0x8434ed4c` 22 vezes com `count=-1` e
-  **nunca espera** nessa chave — o sinal fica pendente. As esperas do
+**nunca espera** nessa chave — o sinal fica pendente. As esperas do
   guest sao em `0x10a2c78xx` (heap) e nos sinais em `0x8437e20c` /
   `0x8434ed4c` (dados).
 - **medido**: o guest **nao** abre `/dev/nvhost-ctrl` (abre
@@ -4361,7 +4389,7 @@ O `Break` (SVC 0x26) e' o caminho de abort do SDK. Medido
 O SDK **nao esta' sem simbolos**: o `dynsym` do NSO (`dynsym`/`dynstr` no
 cabecalho) da 30 893 nomes. Com eles, o endereco de regresso resolve:
 
-    0x8390bd3c  nn::diag::detail::VAbortImpl(char const*, char const*, char
+    0x8390bd3c nn::diag::detail::VAbortImpl(char const*, char const*, char
                 const*, int, nn::Result const*, nn::os::UserExceptionInfo
                 const*, nn::diag::detail::MetaLogContext const&, char
                 const*, __va_list)
@@ -4369,12 +4397,12 @@ cabecalho) da 30 893 nomes. Com eles, o endereco de regresso resolve:
 E a cadeia de chamadas, seguindo o `x29` da pilha do guest (o `boot_trace`
 agora despeja 0x2000 bytes da pilha no abort):
 
-    #0 x29=0x2f0bb3d70  x30=0x8390be08   (nn::diag::detail::AbortImpl)
-    #1 x29=0x2f0bb3e40  x30=0x8397f920   (nn::fs::OpenFile)
-    #2 x29=0x2f0bb3ea0  x30=0x805e605c   (o jogo)
-    #3 x29=0x2f0bb3ec0  x30=0x805e27f8   (o jogo)
+#0 x29=0x2f0bb3d70 x30=0x8390be08   (nn::diag::detail::AbortImpl)
+#1 x29=0x2f0bb3e40 x30=0x8397f920   (nn::fs::OpenFile)
+#2 x29=0x2f0bb3ea0 x30=0x805e605c   (o jogo)
+#3 x29=0x2f0bb3ec0 x30=0x805e27f8   (o jogo)
     ...
-    #7 x29=0x2f0bb3f80  x30=0x83ab6e88   (nn::os::detail::ThreadManager::
+#7 x29=0x2f0bb3f80 x30=0x83ab6e88   (nn::os::detail::ThreadManager::
                                           CreateThread)
 
 **O jogo aborta dentro de `nn::fs::OpenFile`** — o SDK aborta quando o
@@ -4409,14 +4437,14 @@ Medido (cifra do NCA resolvida em Python, ver abaixo):
   `PFS0` com 6 entradas; a primeira e' o NCA do jogo (9.53 GiB);
 - o **cabecalho do NCA esta' cifrado** com AES-XTS (*standard crypto*),
   chave `header_key` (`header_key[0:16]` e `header_key[16:32]`), com o
-  *tweak* = o numero do sector (0x200) em big-endian nas posicoes 8..15;
+*tweak* = o numero do sector (0x200) em big-endian nas posicoes 8..15;
   decifrado, a magica e' `NCA3` e o `program_id` e'
   `0x1008db008c2c000`;
 - a *key area* (0x100 bytes do cabecalho) decifra-se com AES-ECB, chave
   `key_area_key_application_00`; a chave AES-CTR do sector e'
   `7919170a032a1af39484db0e86864d3d`;
 - os quatro `NcaFsHeader` (0x400..0xC00 do ficheiro) dizem: `fs[1]` e' o
-  **RomFS** (`fs_type=0`), com `encryption_type=3` (AES-CTR);
+**RomFS** (`fs_type=0`), com `encryption_type=3` (AES-CTR);
 - o `fs[1]` ocupa os sectores `0xe0..0x1300a20`, ou seja os bytes
   `0x1C000..0x260144000` do ficheiro: **10 201 759 744 bytes (9.5 GiB)**.
 
@@ -4644,7 +4672,7 @@ buscar o `set:` ao `sm:` — que a casa nao tinha:
 um jogo em ingles.
 
 **Medido depois**: o SDK usa o `set:` (comandos 5 e 0 ✓) e **ja nao
-aborta** ✗→✓.
+aborta** →✓.
 
 ### `pl:u` (a plataforma: a fonte do sistema)
 
@@ -4660,7 +4688,7 @@ sistema vem do firmware** da consola, que a casa nao tem — por isso a
 regiao da fonte e' **vazia** (`GetSize` = 0), como no Eden sem NAND.
 
 **Medido depois**: o jogo **le 23 ficheiros** do RomFS, faz 800 SVC e 346
-pedidos ao IPC, e **o abort de CMIF desapareceu** ✗→✓.
+pedidos ao IPC, e **o abort de CMIF desapareceu** →✓.
 
 ### Onde o jogo esta agora
 
@@ -4780,7 +4808,7 @@ E os ids por subcanal:
 
 **Os ids `1410` e `1411`** — que a casa tomava por `draw.begin`/`draw.end`
 (que sao `1414`/`1413`) — estão no **subcanal 1**, que e' o **Kepler
-Compute** ✗. A casa traduzia-os como se fossem do motor 3D ✗.
+Compute**. A casa traduzia-os como se fossem do motor 3D.
 
 ### A correccao
 
@@ -4789,22 +4817,22 @@ o motor de cada subcanal e **so' traduz os métodos do subcanal do
 Maxwell 3D**.
 
 **Medido depois** (`/tmp/boot_r31.log`): o `BindObject` e' lido com o
-subcanal e o motor correctos ✗->✓, e o resultado são **0 comandos
-traduzidos** — o que e' **o mesmo** que antes ✗, porque este push
-buffer **nao tem** `draw.begin`/`draw.end` ✗ (e' um push buffer de
-*setup* ✗, nao de desenho ✗).
+subcanal e o motor correctos →✓, e o resultado são **0 comandos
+traduzidos** — o que e' **o mesmo** que antes, porque este push
+buffer **nao tem** `draw.begin`/`draw.end` (e' um push buffer de
+*setup*, nao de desenho).
 
-**O que fica por fazer**: o push buffer de *desenho* — que vem depois ✗ —
-e' que tem os `draw_begin`/`draw_end` ✗, e o que o tradutor tem de
-traduzir ✗.
+**O que fica por fazer**: o push buffer de *desenho* — que vem depois —
+e' que tem os `draw_begin`/`draw_end`, e o que o tradutor tem de
+traduzir.
 
 ### Os testes: o bind passa a fazer parte do push buffer
 
 Os testes do tradutor (`tests/test_core.cpp` e
 `tests/test_pushbuffer.cpp`) empurravam um push buffer **sem** o
-`BindObject` ✗ — e com o bind ✗ ja' nao havia motor 3D ✗ ✗.
+`BindObject` — e com o bind ja' nao havia motor 3D.
 
-**Medido**: `ctest` — **7/7 passam** ✗->✓ (a-sdk; antes 5/7 ✗).
+**Medido**: `ctest` — **7/7 passam** ✓ (a-sdk; antes 5/7).
 
 ## Onde esta o jogo (medido, 2026-10-22)
 
@@ -4812,114 +4840,114 @@ Os testes do tradutor (`tests/test_core.cpp` e
 
 O jogo, com a casa, faz (medido em `/tmp/boot_r32.log`):
 
-1. O SDK arranca e le **23 ficheiros** do RomFS ✗->✓ (os *sound banks*
-   BNSH ✗ — `424e5348` ✗).
-2. O SDK le o idioma ✗->✓ (o `am`, comando 21 ✗), o `set:` ✗->✓ e o
-   `pl:u` ✗->✓.
-3. O jogo abre o display ✗->✓ (`vi:u`, 1010 ✗) e a camada ✗->✓
-   (2020 ✗), e fica com a **native window** em `0x9C800000` ✗.
-4. O jogo fala com o **SurfaceFlinger** pelo `IHOSBinderDriver` ✗: o
-   `Connect` (10 ✗), o `Query` (9 ✗) e dois `SetPreallocatedBuffer`
-   (14 ✗) ✗.
-5. O jogo faz a **setup da GPU** ✗: `SetNVMAPfd` ✗, `AllocGPFIFOEx` ✗,
-   `AllocateObjectContext` (classe `0xB197` ✗ — o motor 3D ✗),
-   `ChannelSetTimeout` ✗, `SetErrorNotifier` ✗, `SetClientData` ✗,
-   `ChannelSetTimeslice` ✗, `ZCullBind` ✗, e **submete um push buffer**
-   ✗ (8864 bytes ✗, 624 metodos ✗).
-6. O jogo **faulta** ✗ em `0x8177d290` ✗ (`ldrb w8, [x0, #0x38]` com
-   `x0` = 0 ✗) ✗.
+1. O SDK arranca e le **23 ficheiros** do RomFS ✓ (os *sound banks*
+   BNSH — `424e5348`).
+2. O SDK le o idioma ✓ (o `am`, comando 21), o `set:` ✓ e o
+   `pl:u` →✓.
+3. O jogo abre o display ✓ (`vi:u`, 1010) e a camada →✓
+   (2020), e fica com a **native window** em `0x9C800000`.
+4. O jogo fala com o **SurfaceFlinger** pelo `IHOSBinderDriver`: o
+   `Connect` (10), o `Query` (9) e dois `SetPreallocatedBuffer`
+   (14).
+5. O jogo faz a **setup da GPU**: `SetNVMAPfd`, `AllocGPFIFOEx`,
+   `AllocateObjectContext` (classe `0xB197` — o motor 3D),
+   `ChannelSetTimeout`, `SetErrorNotifier`, `SetClientData`,
+   `ChannelSetTimeslice`, `ZCullBind`, e **submete um push buffer**
+   (8864 bytes, 624 metodos).
+6. O jogo **faulta** em `0x8177d290` (`ldrb w8, [x0, #0x38]` com
+   `x0` = 0).
 
 ### O que o fault **nao' e'
 
-* **Nao' e' um patch em falta** ✗ — o codigo em memoria e' byte a byte
-  igual ao NSO descomprimido ✗ (medido ✗).
-* **Nao' e' o `nvmap`** ✗ — a numeracao dos handles ja' e' a do Eden
-  ✗ (4, 8, 12, … ✗).
-* **Nao' e' a geometria do IPC** ✗ — a resposta e' identica a do Eden
-  ✗ (medido ✗).
-* **Nao' e' o `pl:u`** ✗ — a forma das respostas e' a do Eden ✗.
-* **Nao' e' o `vi`** ✗ — o `OpenLayer`, o `Connect` e o `Query` devolvem
-  o mesmo que o Eden ✗ (1x1 no `Connect` ✗ — que e' o `default_width`
-  do upstream ✗).
+* **Nao' e' um patch em falta** — o codigo em memoria e' byte a byte
+  igual ao NSO descomprimido (medido).
+* **Nao' e' o `nvmap`** — a numeracao dos handles ja' e' a do Eden
+  (4, 8, 12, …).
+* **Nao' e' a geometria do IPC** — a resposta e' identica a do Eden
+  (medido).
+* **Nao' e' o `pl:u`** — a forma das respostas e' a do Eden.
+* **Nao' e' o `vi`** — o `OpenLayer`, o `Connect` e o `Query` devolvem
+  o mesmo que o Eden (1x1 no `Connect` — que e' o `default_width`
+  do upstream).
 
 ### O que o fault **e'**
 
-Um **lookup do proprio jogo** ✗: a funcao `0x817815c0` ✗ procura um id
-de 16 bits ✗ numa tabela do objecto do jogo ✗ (`x0 + 0x1888 + id` ✗) ✗ e
-**devolve nulo** ✗ quando nao o encontra ✗ (o ramo `0x817816c8` ✗:
-`mov x0, xzr` ✗) ✗ ✗. O jogo desreferencia esse nulo ✗.
+Um **lookup do proprio jogo**: a funcao `0x817815c0` procura um id
+de 16 bits numa tabela do objecto do jogo (`x0 + 0x1888 + id`) e
+**devolve nulo** quando nao o encontra (o ramo `0x817816c8`:
+`mov x0, xzr`). O jogo desreferencia esse nulo.
 
-Ou seja: o jogo procura um recurso que **nao esta registado** ✗. O
-que o registraria ✗ e' um **recurso que o host lhe deu** ✗ — e o
-recurso que o jogo acabou de pedir ✗ e' o **buffer de video** ✗ (o
-`SetPreallocatedBuffer` ✗) ✗ ✗.
+Ou seja: o jogo procura um recurso que **nao esta registado**. O
+que o registraria e' um **recurso que o host lhe deu** — e o
+recurso que o jogo acabou de pedir e' o **buffer de video** (o
+`SetPreallocatedBuffer`).
 
 ### A pista que fica
 
-**Medido**: os dois `SetPreallocatedBuffer` ✗ (slots 0 e 1 ✗) recebem
-o **mesmo** `buffer_id` (12 ✗) ✗ e o **mesmo** endereco ✗. No Eden,
-cada slot tem o **seu** buffer ✗ ✗.
+**Medido**: os dois `SetPreallocatedBuffer` (slots 0 e 1) recebem
+o **mesmo** `buffer_id` (12) e o **mesmo** endereco. No Eden,
+cada slot tem o **seu** buffer.
 
-E o `DequeueBuffer` ✗ (a transaccao 3 ✗) — que e' onde o jogo vai
-**buscar um buffer para desenhar** ✗ — **nunca chega** ✗ ✗. Sem ele
-o jogo nunca desenha ✗ ✗.
+E o `DequeueBuffer` (a transaccao 3) — que e' onde o jogo vai
+**buscar um buffer para desenhar** — **nunca chega**. Sem ele
+o jogo nunca desenha.
 
 ### O `MapBufferEx` e o `PinHandle` — porque a casa devolve o endereco do guest
 
-No Eden, o `MapBufferEx` (`nvhost_as_gpu.cpp:359` ✗) devolve o VA do
-**GMMU** (o espaco do dispositivo ✗) — e o `PinHandle` (`nvmap.cpp:160`
-✗) aloca essa memoria ✗ ✗.
+No Eden, o `MapBufferEx` (`nvhost_as_gpu.cpp:359`) devolve o VA do
+**GMMU** (o espaco do dispositivo) — e o `PinHandle` (`nvmap.cpp:160`
+) aloca essa memoria.
 
-**Na casa o VA da GPU e' o espaco do guest** ✗ (a nota da `VmDaGpu` ✗) —
-por isso o endereco que o jogo pede serve tal e qual ✗ e o host le-o
-directamente ✗ ✗. Nao ha GMMU na casa ✗ ✗.
+**Na casa o VA da GPU e' o espaco do guest** (a nota da `VmDaGpu`) —
+por isso o endereco que o jogo pede serve tal e qual e o host le-o
+directamente. Nao ha GMMU na casa.
 
-**O `DuplicateHandle`** ✗ (o Eden duplica o handle do `nvmap` ✗ no
-`SetPreallocatedBuffer` ✗ — `ui/graphic_buffer.cpp:23-25` ✗) ✗ tambem
-nao tem efeito na casa ✗: o `RegistoNvmap` ✗ e' so' de leitura ✗ ✗.
+**O `DuplicateHandle`** (o Eden duplica o handle do `nvmap` no
+`SetPreallocatedBuffer` — `ui/graphic_buffer.cpp:23-25`) tambem
+nao tem efeito na casa: o `RegistoNvmap` e' so' de leitura.
 
 **O que fica por fazer** (a lista, do mais para o menos):
 
-1. O **`DequeueBuffer`** ✗ nunca chega ✗ — e sem ele o jogo nunca
-   desenha ✗ ✗. A casa responde `StatusBadValue` ✗ quando nao ha slot
-   livre ✗; o Eden responde `Status::Busy` ✗ ✗.
-2. O **tradutor** ✗ nao produz comandos ✗ porque o push buffer de
-   *desenho* ✗ (o que tem `draw.begin`/`draw.end` ✗) ainda nao chegou
-   ✗ ✗ — o que chegou ✗ foi um push buffer de *setup* ✗ ✗.
-3. **A execucao** ✗ — o tradutor traduz ✗, mas quem executa ✗ (o
-   `ValhallBackend` ✗, o PanVK ✗) ainda nao esta' ligado ✗ ✗.
+1. O **`DequeueBuffer`** nunca chega — e sem ele o jogo nunca
+   desenha. A casa responde `StatusBadValue` quando nao ha slot
+   livre; o Eden responde `Status::Busy`.
+2. O **tradutor** nao produz comandos porque o push buffer de
+*desenho* (o que tem `draw.begin`/`draw.end`) ainda nao chegou
+   — o que chegou foi um push buffer de *setup*.
+3. **A execucao** — o tradutor traduz, mas quem executa (o
+   `ValhallBackend`, o PanVK) ainda nao esta' ligado.
 
 ## O `nvmap_fd` do `SetNVMAPfd` e' o FD, nao' um handle (medido, 2026-10-22)
 
 ### O bug
 
 **Medido** (`/tmp/boot_r34.log`): o guest passa `03 00 00 00` ao
-`SetNVMAPfd` — e o `3` e' o **fd** do `/dev/nvmap` ✗ (o log:
-`Open: '/dev/nvmap' -> fd=3` ✗) ✗, **nao'** um handle ✗ (os handles da
-casa sao 4, 8, 12, … ✗ ✗).
+`SetNVMAPfd` — e o `3` e' o **fd** do `/dev/nvmap` (o log:
+`Open: '/dev/nvmap' -> fd=3`), **nao'** um handle (os handles da
+casa sao 4, 8, 12, …).
 
-O Eden assume o mesmo ✗ (`devices/nvhost_gpu.h:75-78` ✗: o campo
-chama-se `nvmap_fd` ✗, e o `nvhost_gpu.cpp:140` ✗ guarda-o tal e qual
-✗) ✗ ✗.
+O Eden assume o mesmo (`devices/nvhost_gpu.h:75-78`: o campo
+chama-se `nvmap_fd`, e o `nvhost_gpu.cpp:140` guarda-o tal e qual
+).
 
-**A casa tratava-o como um handle** ✗ ✗ — e por isso nao encontrava a
-regiao ✗ ✗ (o log: `SetNVMAPfd: handle=3 — sem regiao` ✗) ✗ ✗, e o
-canal ficava **sem push buffer** ✗ ✗.
+**A casa tratava-o como um handle** — e por isso nao encontrava a
+regiao (o log: `SetNVMAPfd: handle=3 — sem regiao`), e o
+canal ficava **sem push buffer**.
 
 ### A correccao
 
-* O `nvmap` passa a registar **os handles que aloca por `fd`** ✗.
-* O `SetNVMAPfd` procura a regiao pelo **fd** ✗ ✗ — e a regiao do canal
-  e' a **maior** alocacao desse `fd` ✗ ✗, que e' o push buffer ✗ (os
-  226 MB ✗ — `0xD800000` ✗) ✗ ✗.
+* O `nvmap` passa a registar **os handles que aloca por `fd`**.
+* O `SetNVMAPfd` procura a regiao pelo **fd** — e a regiao do canal
+  e' a **maior** alocacao desse `fd`, que e' o push buffer (os
+  226 MB — `0xD800000`).
 
 **Medido depois** (`/tmp/boot_r37.log`): o canal passa a ter a regiao
-correcta ✗->✓ —
+correcta ✓ —
 
     SetNVMAPfd: nvmap_fd=3 -> handle=12 -> 0xE5D39000 (328204288 bytes)
 
-— que e' **a mesma regiao** que o compositor usa ✗ (o
-`SetPreallocatedBuffer` ✗) ✗ ✗.
+— que e' **a mesma regiao** que o compositor usa (o
+`SetPreallocatedBuffer`).
 
 ## O `Remap` do `MapBufferEx` nao' valida o handle (medido, 2026-10-22)
 
@@ -4929,22 +4957,22 @@ correcta ✗->✓ —
 
     MapBufferEx: flags=0x100 handle=0 va=0xE5D39000 ...
 
-O `0x100` e' o **`Remap`** ✗ (o bit 8 ✗ — `nvhost_as_gpu.h:42-47` ✗) ✗.
-E o `handle` e' **zero** ✗ ✗ — porque o `Remap` **nao' usa o handle**
-✗ ✗: o upstream (`nvhost_as_gpu.cpp:328-352` ✗) faz o remapeamento
-**antes** de qualquer `GetHandle` ✗ ✗ (o `GetHandle` so' e' chamado na
-linha 353 ✗) ✗ ✗.
+O `0x100` e' o **`Remap`** (o bit 8 — `nvhost_as_gpu.h:42-47`).
+E o `handle` e' **zero** — porque o `Remap` **nao' usa o handle**
+: o upstream (`nvhost_as_gpu.cpp:328-352`) faz o remapeamento
+**antes** de qualquer `GetHandle` (o `GetHandle` so' e' chamado na
+linha 353).
 
-**A casa validava o handle primeiro** ✗ ✗ e respondia `BadValue` ✗ ✗ —
-e o guest ficava **sem o remapeamento** ✗ ✗.
+**A casa validava o handle primeiro** e respondia `BadValue` —
+e o guest ficava **sem o remapeamento**.
 
 ### A correccao
 
-A validacao do handle foi movida para **depois** do `Remap` ✗ ✗ —
-como no upstream ✗ ✗.
+A validacao do handle foi movida para **depois** do `Remap` —
+como no upstream.
 
 **Medido depois** (`/tmp/boot_r39.log`): o `MapBufferEx: handle 0 nao
-esta' alocado` **desapareceu** ✗->✓ (ya' nao ha ✗) ✗.
+esta' alocado` **desapareceu** ✓ (ya' nao ha).
 
 ## O estado da casa (medido, 2026-10-22)
 
@@ -4955,46 +4983,46 @@ esta' alocado` **desapareceu** ✗->✓ (ya' nao ha ✗) ✗.
 | arranque do SDK | ✓ |
 | leitura do RomFS | ✓ 23 ficheiros |
 | idioma (`am` + `set:`) | ✓ |
-| a fonte do sistema (`pl:u`) | ✓ (a regiao e' vazia ✗, como no Eden sem NAND ✗) |
+| a fonte do sistema (`pl:u`) | ✓ (a regiao e' vazia, como no Eden sem NAND) |
 | display e camada (`vi`) | ✓ |
 | o SurfaceFlinger (o `binder`) | ✓ |
-| a setup da GPU (o `nvdrv`) | ✓ 0 ioctls por implementar ✗ |
-| a submissao do push buffer | ✓ 8864 bytes ✗, 624 metodos ✗ |
-| o `Remap` do `MapBufferEx` | ✓ (corrigido ✗) ✗ |
-| o `nvmap_fd` do `SetNVMAPfd` | ✓ (corrigido ✗) ✗ |
+| a setup da GPU (o `nvdrv`) | ✓ 0 ioctls por implementar |
+| a submissao do push buffer | ✓ 8864 bytes, 624 metodos |
+| o `Remap` do `MapBufferEx` | ✓ (corrigido) |
+| o `nvmap_fd` do `SetNVMAPfd` | ✓ (corrigido) |
 
-**Medido** (`/tmp/boot_r39.log`): 803 SVC ✗, 809 traps ✗, **23** ficheiros
-do RomFS ✗, **0** ioctls por implementar ✗, **0** `MapBufferEx` com
-handle invalido ✗.
+**Medido** (`/tmp/boot_r39.log`): 803 SVC, 809 traps, **23** ficheiros
+do RomFS, **0** ioctls por implementar, **0** `MapBufferEx` com
+handle invalido.
 
 ### O que falta
 
-1. **O fault** ✗ — `0x8177d290` ✗: um lookup do **proprio jogo** ✗ que
-   devolveu nulo ✗ ✗. O jogo procura um recurso que **nao esta'
-   registado** ✗ ✗.
-2. **O `DequeueBuffer`** ✗ nunca chega ✗ — e sem ele o jogo nao desenha
-   ✗ ✗.
-3. **O push buffer de desenho** ✗ — o que chegou ✗ foi de *setup* ✗
-   (sem `draw.begin`/`draw.end` ✗) ✗.
-4. **A execucao** ✗ — o tradutor traduz ✗ mas quem executa ✗ (o
-   `ValhallBackend` ✗, o PanVK ✗) nao esta' ligado ✗ ✗.
+1. **O fault** — `0x8177d290`: um lookup do **proprio jogo** que
+   devolveu nulo. O jogo procura um recurso que **nao esta'
+   registado**.
+2. **O `DequeueBuffer`** nunca chega — e sem ele o jogo nao desenha
+  .
+3. **O push buffer de desenho** — o que chegou foi de *setup*
+   (sem `draw.begin`/`draw.end`).
+4. **A execucao** — o tradutor traduz mas quem executa (o
+   `ValhallBackend`, o PanVK) nao esta' ligado.
 
 ## O `buffer_wait_event` — o evento da fila de buffers (medido, 2026-10-22)
 
 O upstream devolve ao jogo, no `GetNativeHandle` do binder
-(`hos_binder_driver.cpp:49-56` ✗), o **`buffer_wait_event`** ✗
-(`nvnflinger/buffer_queue_producer.cpp:825-827` ✗) ✗ — e **sinaliza-o**
-✗ no `SetPreallocatedBuffer` ✗ (a linha 820 ✗) ✗, no `QueueBuffer` ✗ e
-no `CancelBuffer` ✗ ✗ ✗.
+(`hos_binder_driver.cpp:49-56`), o **`buffer_wait_event`**
+(`nvnflinger/buffer_queue_producer.cpp:825-827`) — e **sinaliza-o**
+ no `SetPreallocatedBuffer` (a linha 820), no `QueueBuffer` e
+no `CancelBuffer` .
 
-A casa devolvia um `KEvent` ✗ que **ninguem sinalizava** ✗ ✗ — e o
-jogo, que espera por ele ✗ ✗, ficava bloqueado ✗ ✗.
+A casa devolvia um `KEvent` que **ninguem sinalizava** — e o
+jogo, que espera por ele, ficava bloqueado.
 
-Agora o evento e' o mesmo (`g610/services/binder.hpp` ✗) e e'
-sinalizado no `SetPreallocatedBuffer` ✗ ✗.
+Agora o evento e' o mesmo (`g610/services/binder.hpp`) e e'
+sinalizado no `SetPreallocatedBuffer`.
 
-**Medido depois** (`/tmp/boot_r40.log`): o fault e' o mesmo ✗ — o evento
-nao era a causa ✗ ✗, mas a divergencia com o Eden estava la ✗ ✗.
+**Medido depois** (`/tmp/boot_r40.log`): o fault e' o mesmo — o evento
+nao era a causa, mas a divergencia com o Eden estava la.
 
 ## O PanVK funciona no Mali-G610 (medido, 2026-10-22)
 
@@ -5002,123 +5030,123 @@ nao era a causa ✗ ✗, mas a divergencia com o Eden estava la ✗ ✗.
 
     GPU0: deviceName = Mali-G610, driverName = panvk, Mesa 25.2.8
 
-Isto e' o **driver Vulkan nativo do nosso GPU** ✗ — e o `panfrost` ja'
-esta' activo ✗ (`/usr/share/vulkan/icd.d/panfrost_icd.json` ✗) ✗.
+Isto e' o **driver Vulkan nativo do nosso GPU** — e o `panfrost` ja'
+esta' activo (`/usr/share/vulkan/icd.d/panfrost_icd.json`).
 
-**O Eden usa-o** ✗ — com `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/panfrost_icd.json`
-✗ ✗: o `eden-cli` passa do `Report` ✗ (que com o `llvmpipe` ✗ o matava
-✗ ✗) e avanca para a criacao dos pipelines ✗ ✗.
+**O Eden usa-o** — com `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/panfrost_icd.json`
+: o `eden-cli` passa do `Report` (que com o `llvmpipe` o matava
+) e avanca para a criacao dos pipelines.
 
-**Porquê que isto importa**: o `ValhallBackend` ✗ — o backend de
-execucao ✗ que a casa precisa de ligar ✗ ✗ — e' um backend **Vulkan**
-✗ ✗, e o PanVK e' a implementacao **desse** backend ✗ para o Mali-G610
-✗ ✗ ✗. A execucao na casa nao precisa de ser escrita do zero ✗ ✗ —
-pode ser o proprio PanVK ✗ ✗ ✗, como no Eden ✗ ✗.
+**Porquê que isto importa**: o `ValhallBackend` — o backend de
+execucao que a casa precisa de ligar — e' um backend **Vulkan**
+, e o PanVK e' a implementacao **desse** backend para o Mali-G610
+ . A execucao na casa nao precisa de ser escrita do zero —
+pode ser o proprio PanVK , como no Eden.
 
-**Nota**: o `eden-cli` ainda **segfaulta** ✗ (no `GetSupportedFormat` ✗
-— os formatos que o panvk nao tem ✗ ✗) ✗ — mas isso e' um problema do
-**Eden** ✗ ✗, nao do jogo ✗ ✗, e nao serve de referencia ✗ ✗.
+**Nota**: o `eden-cli` ainda **segfaulta** (no `GetSupportedFormat`
+— os formatos que o panvk nao tem) — mas isso e' um problema do
+**Eden**, nao do jogo, e nao serve de referencia.
 
 ## Onde esta' o trabalho que falta (medido, 2026-10-22)
 
 ### O `RasterizerG610` — o motor de desenho da casa
 
-`src/gpu/rasterizer_g610.cpp` tem **258 linhas** ✗ e os comandos de
-desenho sao **vazios** ✗ (`Draw` so' conta ✗, `BufferCopy` devolve
-`false` ✗) ✗ ✗.
+`src/gpu/rasterizer_g610.cpp` tem **258 linhas** e os comandos de
+desenho sao **vazios** (`Draw` so' conta, `BufferCopy` devolve
+`false`).
 
-E' o **`RasterizerInterface`** do upstream ✗ (`video_core/rasterizer_interface.h`
-✗) — a mesma interface que o `renderer_vulkan` do Eden implementa ✗ ✗.
+E' o **`RasterizerInterface`** do upstream (`video_core/rasterizer_interface.h`
+) — a mesma interface que o `renderer_vulkan` do Eden implementa.
 
 ### O caminho
 
-O upstream (`video_core/renderer_vulkan/` ✗ — **61 ficheiros** ✗, todos
-vendorizados ✗ ✗) e' o backend que **executa** os comandos Maxwell ✗
-como Vulkan ✗ ✗ — e o **PanVK** ✗ (medido ✗: `Mali-G610` + `panvk` ✗) e'
-a implementacao desse backend para o nosso GPU ✗ ✗ ✗.
+O upstream (`video_core/renderer_vulkan/` — **61 ficheiros**, todos
+vendorizados) e' o backend que **executa** os comandos Maxwell
+como Vulkan — e o **PanVK** (medido: `Mali-G610` + `panvk`) e'
+a implementacao desse backend para o nosso GPU .
 
-**Logo**: a execucao da casa **nao tem de ser escrita do zero** ✗ ✗ —
-pode ser o proprio `renderer_vulkan` do upstream ✗ ✗, a falar com o
-PanVK ✗ ✗, como o Eden ✗ ✗.
+**Logo**: a execucao da casa **nao tem de ser escrita do zero** —
+pode ser o proprio `renderer_vulkan` do upstream, a falar com o
+PanVK, como o Eden.
 
-**O que impede isso hoje** ✗ (medido ✗): os `.cpp` do upstream do
-`video_core` ✗ herdam o **`KernelCore` completo** ✗ (`GetMemoryManager` ✗,
-`GetCurrentProcess` ✗, o `KDynamicPageManager` ✗) ✗ — e a casa tem so'
-o `KernelCore` minimo ✗ (a ponte ✗) ✗ ✗.
+**O que impede isso hoje** (medido): os `.cpp` do upstream do
+`video_core` herdam o **`KernelCore` completo** (`GetMemoryManager`,
+`GetCurrentProcess`, o `KDynamicPageManager`) — e a casa tem so'
+o `KernelCore` minimo (a ponte).
 
-**O caminho possivel** ✗: dar ao `video_core` do upstream a **ponte**
-✗ que ele precisa ✗ — um `KernelCore` que sirva a memoria do guest ✗
-✗ (que e' o que a casa ja' tem ✗) ✗ ✗.
+**O caminho possivel**: dar ao `video_core` do upstream a **ponte**
+ que ele precisa — um `KernelCore` que sirva a memoria do guest
+ (que e' o que a casa ja' tem).
 
 ### O que falta, por ordem
 
-1. **O fault** ✗ — `0x8177d290` ✗: um lookup do **proprio jogo** ✗ que
-   devolveu nulo ✗ ✗.
-2. **O `DequeueBuffer`** ✗ — nunca chega ✗.
-3. **O push buffer de desenho** ✗ — o que chegou ✗ foi de *setup* ✗.
-4. **A execucao** ✗ — o `RasterizerG610` ✗ e' um esqueleto ✗ ✗; o
-   caminho e' o `renderer_vulkan` ✗ do upstream ✗ + o PanVK ✗ ✗ ✗.
-5. **A apresentacao** ✗ — o `QueueBuffer` ✗ tem de pôr o frame ✗ na
-   janela ✗ ✗ (e a janela na HDMI ✗ ✗) ✗.
+1. **O fault** — `0x8177d290`: um lookup do **proprio jogo** que
+   devolveu nulo.
+2. **O `DequeueBuffer`** — nunca chega.
+3. **O push buffer de desenho** — o que chegou foi de *setup*.
+4. **A execucao** — o `RasterizerG610` e' um esqueleto; o
+   caminho e' o `renderer_vulkan` do upstream + o PanVK .
+5. **A apresentacao** — o `QueueBuffer` tem de pôr o frame na
+   janela (e a janela na HDMI).
 
 ## A fonte do sistema: a casa passa a servir a fonte verdadeira (medido, 2026-10-22)
 
 ### O que era
 
-A `pl:u` devolveva a regiao da fonte **vazia** (`GetSize` = 0 ✗) ✗ — a
-fonte vem do **firmware** da consola ✗ ✗, que a casa nao tem ✗ ✗.
+A `pl:u` devolveva a regiao da fonte **vazia** (`GetSize` = 0) — a
+fonte vem do **firmware** da consola, que a casa nao tem.
 
 ### O que se descobriu
 
-**O Eden tambem nao tem NAND** ✗ — e por isso **sintetiza** a fonte ✗: os
-dados estao **embutidos em codigo** ✗ (`core/file_sys/system_archive/data/
-font_standard.cpp` ✗ — 217 KB ✗) ✗ e sao **cifrados** com a mesma
-transformacao do hardware ✗ ✗ (`platform_service_manager.cpp:77-91` ✗) ✗ ✗.
+**O Eden tambem nao tem NAND** — e por isso **sintetiza** a fonte: os
+dados estao **embutidos em codigo** (`core/file_sys/system_archive/data/
+font_standard.cpp` — 217 KB) e sao **cifrados** com a mesma
+transformacao do hardware (`platform_service_manager.cpp:77-91`).
 
-**Sao um recurso do Eden** ✗ ✗ — nao do firmware da consola ✗ ✗ — e
-portanto a casa pode usa-los ✗ ✗ (o mesmo que o Eden ✗ ✗).
+**Sao um recurso do Eden** — nao do firmware da consola — e
+portanto a casa pode usa-los (o mesmo que o Eden).
 
 ### A correccao
 
-`src/services/shared_font.cpp` (novo) ✗ — a **cifragem** ✗ (a do
-hardware ✗) ✗ e as **regioes** ✗ ✗. `include/g610/services/shared_font.hpp`
-(novo) ✗ — a interface ✗ ✗.
+`src/services/shared_font.cpp` (novo) — a **cifragem** (a do
+hardware) e as **regioes**. `include/g610/services/shared_font.hpp`
+(novo) — a interface.
 
-O `pl:u` passa a devolver ✗: o `GetSize` ✗ e o
-`GetSharedMemoryAddressOffset` ✗ **reais** ✗ ✗, e o
-`GetSharedFontInOrderOfPriority` ✗ as tres listas ✗ (os codigos ✗, os
-offsets ✗ e os tamanhos ✗) ✗ nos tres **buffers de saida** ✗ ✗ — como
-o Eden ✗ (`platform_service_manager.cpp:248-277` ✗) ✗ ✗.
+O `pl:u` passa a devolver: o `GetSize` e o
+`GetSharedMemoryAddressOffset` **reais**, e o
+`GetSharedFontInOrderOfPriority` as tres listas (os codigos, os
+offsets e os tamanhos) nos tres **buffers de saida** — como
+o Eden (`platform_service_manager.cpp:248-277`).
 
 ### O que mudou
 
-**Medido** (`/tmp/boot_r41.log`): o **fault desapareceu** ✗->✓ ✗ — o
-jogo **nao aborta** com o CMIF ✗ ✗ e nao desreferencia um ponteiro nulo
-✗ ✗. Saiu pelo **limite de traps** ✗ ✗ — o jogo entrou num ciclo de
-IPC ✗ ✗, mas **faz** coisas a mais ✗ ✗: le **21** ficheiros ✗ ✗ (o
-RomFS ✗ e os **BNS** ✗) ✗ e as **duas ultimas leituras sao as fontes do
-proprio jogo** ✗ ✗ (magic `36f81a1e` ✗ — o BFTTF ✗) ✗ ✗.
+**Medido** (`/tmp/boot_r41.log`): o **fault desapareceu** ✓ — o
+jogo **nao aborta** com o CMIF e nao desreferencia um ponteiro nulo
+. Saiu pelo **limite de traps** — o jogo entrou num ciclo de
+IPC, mas **faz** coisas a mais: le **21** ficheiros (o
+RomFS e os **BNS**) e as **duas ultimas leituras sao as fontes do
+proprio jogo** (magic `36f81a1e` — o BFTTF).
 
-O erro que resta e' **novo** ✗: `SetTerminateResult modulo=64 desc=0`
-✗ ✗ — nao e' o CMIF ✗ ✗.
+O erro que resta e' **novo**: `SetTerminateResult modulo=64 desc=0`
+ — nao e' o CMIF.
 
 ## A referencia: o Eden com o PanVK no Mali-G610 (medido, 2026-10-22)
 
 ### O que se mediu
 
-O Eden esta' **compilado no Pi** (`~/eden/build/bin/eden-cli`) ✗ ✗ e
-corre o **mesmo jogo** ✗ ✗ — com o **PanVK** ✗ (o driver Vulkan do
-Mali-G610 ✗) ✗ ✗:
+O Eden esta' **compilado no Pi** (`~/eden/build/bin/eden-cli`) e
+corre o **mesmo jogo** — com o **PanVK** (o driver Vulkan do
+Mali-G610):
 
     XDG_RUNTIME_DIR=/run/emuos WAYLAND_DISPLAY=wayland-1 \
     VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/panfrost_icd.json \
     ~/eden/build/bin/eden-cli -g "Pokemon Shield ...nsp"
 
-O `eden_log.txt` mostra o Eden a chegar aos **4.2 s** ✗ ✗ — a passar do
-`Report` do renderer ✗ ✗, a inicializar o audio ✗ (`GetOutputSinkDetails`
-✗) ✗ e a avançar ✗ ✗.
+O `eden_log.txt` mostra o Eden a chegar aos **4.2 s** — a passar do
+`Report` do renderer, a inicializar o audio (`GetOutputSinkDetails`
+) e a avançar.
 
-**Medido** (`~/user/log/eden_log.txt` ✗):
+**Medido** (`~/user/log/eden_log.txt`):
 
     Render.Vulkan <Info> renderer_vulkan.cpp:215:Report: Driver: panvk 25.2.8
     Render.Vulkan <Info> renderer_vulkan.cpp:216:Report: Device: Mali-G610
@@ -5126,20 +5154,143 @@ O `eden_log.txt` mostra o Eden a chegar aos **4.2 s** ✗ ✗ — a passar do
     Render.Vulkan <Info> renderer_vulkan.cpp:218:Report: Available VRAM: 4.00 GiB
     Service.Audio <Info> sink_details.cpp:127:GetOutputSinkDetails: Auto-selecting the sdl3 backend
 
-O Eden **segmenta** aos 4.2 s ✗ ✗ — num bug do **PanVK** ✗ (os
-formatos que o panvk nao tem ✗ — `GetSupportedFormat` ✗) ✗ ✗. Isso e'
-do **Eden** ✗ ✗, nao do jogo ✗ ✗.
+O Eden **segmenta** aos 4.2 s — num bug do **PanVK** (os
+formatos que o panvk nao tem — `GetSupportedFormat`). Isso e'
+do **Eden**, nao do jogo.
 
 ### O que isto muda
 
-**A casa precisa de chegar ao mesmo ponto** ✗ ✗ — e o caminho esta'
-claro ✗ ✗:
+**A casa precisa de chegar ao mesmo ponto** — e o caminho esta'
+claro:
 
-1. O `pl:u` **com a fonte verdadeira** ✗ (ja' feito ✗ ✗).
-2. O `SetPreallocatedBuffer` ✗ e o `DequeueBuffer` ✗ (o render loop ✗).
-3. A **execucao** ✗ — o `renderer_vulkan` do upstream (vendorizado ✗)
-   a falar com o PanVK ✗ ✗, como o Eden ✗ ✗.
+1. O `pl:u` **com a fonte verdadeira** (ja' feito).
+2. O `SetPreallocatedBuffer` e o `DequeueBuffer` (o render loop).
+3. A **execucao** — o `renderer_vulkan` do upstream (vendorizado)
+   a falar com o PanVK, como o Eden.
 
-**O `renderer_vulkan` do upstream e' a via** ✗ ✗ — o Eden usa-o ✗ ✗ e
-ele **ja' esta' vendorizado** ✗ (61 ficheiros ✗) ✗ ✗ — e o que falta e' a
-**ponte do `KernelCore`** ✗ ✗ que ele precisa ✗ ✗.
+**O `renderer_vulkan` do upstream e' a via** — o Eden usa-o e
+ele **ja' esta' vendorizado** (61 ficheiros) — e o que falta e' a
+**ponte do `KernelCore`** que ele precisa.
+
+## Diário de 22/10: fonte, hid, csrng, StartThread, CloseHandle — e as duas paredes
+
+### Como se mediu
+
+    cd ~/EdenMaliG610/build && timeout 240 env IA_NOOB=1 G610_TRAP_LIMIT=0 \
+      G610_NSP="$HOME/piDroid/roms/Pokemon Shield [01008DB008C2C000][v0] (9.53 GB).nsp" \
+      G610_KEYS="$HOME/piDroid/prod.keys" ./g610_boot ~/piDroid/pokemon/exefs > /tmp/LOG 2>&1
+
+Com `IA_IPC_TRACE=1` numa segunda corrida de 90 s (`/tmp/LOG2`, 124860+ linhas)
+para o pormenor das SVC e do IPC. Saída antes destas mudanças: abort com
+`SetTerminateResult modulo=1 desc=103` depois de ~40 aberturas de `pl:u`
+(`ResultOutOfSessions 0x0CE01`).
+
+### O que passou (medido)
+
+**`pl:u` — fonte de letra completa.** `GetSize`: tipo1=217276, tipo2=293516,
+tipo3=222236, tipo4=217276. `GetSharedMemoryAddressOffset`: tipo1=217292,
+tipo2=434576, tipo3=728100, tipo4=950344. A geometria fecha por soma: cada
+região começa no offset anterior + 8 (cabeçalho de 2 u32 por região) + o
+tamanho do blob anterior; o offset aponta para o TTF cru dentro do blob.
+Os tamanhos dos arrays embutidos do upstream: standard 217276,
+chinese_simplified 217276, extended_chinese_simplified 293516,
+chinese_traditional 222236, korean 217276, nintendo_extended 6024. O jogo
+percorre `GetService("pl:u")` + comando 0 + comando 2 (`GetSize`) + comando 3
+(`GetSharedMemoryAddressOffset`) para os tipos 1..4 e segue em frente.
+
+**`hid`.** `GetService("hid")` → `CreateAppletResource` →
+`IAppletResource::GetSharedMemoryHandle` → `ActivateNpadWithRevision` (109) →
+`SetSupportedNpadStyleSet` (100). Sem abort.
+
+**`csrng`.** `GetService("csrng")` servido, sem abort.
+
+**`CloseHandle` nas duas mesas.** Num boot de 90 s com `IA_IPC_TRACE=1`, 39
+fechos servidos (log `[svc] CloseHandle 0x…: remover da mesa casa/Eden`). No
+boot de 240 s o padrão `0xCE01` tem **grep=0** — o esgotamento de sessões do
+`pl:u` desapareceu. A causa estava no fecho antigo, que consultava
+`name_by_handle_` (nenhuma escrita no ficheiro inteiro) e por isso não fechava
+nada.
+
+**Threads.** As threads dos SDK arranquem por `StartThread` (a thread do host
+nasce em `run_guest_thread`); log medido: `(a thread corre)`.
+
+ctest no Pi: **7/7**.
+
+### Parede 1 — GPU (medida, não resolvida)
+
+No boot de 240 s (`/tmp/LOG`):
+
+    [eden:D] Service::NVDRV: SubmitGPFIFO: max id=3627 (draw_begin=1414 draw_end=1413) total=376
+    [eden:D] Service::NVDRV: SubmitGPFIFO: 8864 bytes, 0 comandos traduzidos (0 desconhecidos, 0 descartados)
+    [eden:D] Service::NVDRV: syncpoint 1 Advanced para 1
+
+O descriptor GPFIFO lê-se: **376 métodos** num submit de 8864 bytes, histograma
+por método (concentração enorme no zero, com ids até 3627), `draw_begin` (id
+1414) e `draw_end` (id 1413) presentes. Os `BindObject` do canal distribuem os
+subcanais 0..4 = 0xB197 (Maxwell 3D), 0xB1C0, 0xA140, 0x902D, 0xB0B5. Depois do
+submit, o `nvdrv` continua: `nvmap IocCreate` (0x1000) → handle 120;
+`IocAlloc` → 0xE2DD3000; `Open '/dev/nvhost-gpu'` → fd 6; `BindChannel` fd 6.
+
+Falta o passo que dá nome ao projecto: **a tradução semântica do pushbuffer
+para o fluxo de comandos do Mali-Csf** (G610). Hoje o tradutor emite **0
+comandos** — e por isso `DequeueBuffer`/`QueueBuffer` do compositor nunca
+foram alcançados, e nada chega ao ecrã.
+
+### Parede 2 — thread de cv (medida, em discussão)
+
+A thread com tag **0x38005** (sp 0x2c8cbeeb0 na corrida de 90 s; 0x2962e5eb0 na
+de 240 s — ASLR) repete `trap #28` (o wrapper `brk #0x1c` do SDK) em
+pc=0x83b0bb3c com os mesmos registos em ~1500 linhas seguidas (log 8115..9631):
+
+    x0=0xd9c2c228 (palavra do mutex)  x1=0xd9c2c22c (chave do cv)
+    x2=0x38005 (tag próprio)          x3=0x4c4b74 (timeout em ns, ~5 ms)
+
+O SVC devolve `TimedOut (0xEA01)`. O desmonte do chamador — o código em
+x30=0x83abc2a4 (`ConditionVariable::TimedWait` do SDK, asm 0x82d2a2a4) — lê o
+resultado, compara com `movz w9, #0xEA00` e **trata o 0xEA01 como caminho
+normal** do `TimedWait`. O ciclo do SDK (asm 0x82d20770, chamador
+0x83ab2774/asm 0x82d20774) faz polling do byte `[x20+18]` entre chamadas ao
+PLT `bl 0x82f1eb50` (GOT 0x836060xx/0x835fcxxx), lendo o tempo com
+`mrs x0, cntpct_el0`.
+
+**Quantifica o sinal:** no log de 90 s há UM único
+`[svc] SignalProcessWideKey key=0xd9c2c22c count=-1 acordados=0`, emitido
+ANTES de o waiter se registar — a casa registou o sinal pendente, consumiu-o
+uma vez (log `WaitProcessWideKeyAtomic: sinal pendente na cv 0xd9c2c22c`) e o
+guest voltou a esperar. Sem novo sinal, o wait repete. Quem devia acender o
+predicado desse cv é o produtor do lado do jogo; qual thread é esse produtor
+(por cima do PLT sem GOT resolvido no desmonte) está por apurar.
+
+O watchdog "alarme de seguranca" do motor — tempo sem progresso com o mesmo
+pc — aborta: corrida de 90 s terminou **EXIT=133** (SIGTRAP), a de 240 s
+terminou **EXIT=139** (variante SIGSEGV do mesmo alarme),
+`parou por: alarme de seguranca — o guest ficou preso em codigo`.
+
+Distribuição de wrappers `brk` do SDK no log de 240 s (contagem por pc):
+0x83b0bb3c ×1591, 0x83b0bb64 ×911, 0x83b0bb44 ×861, 0x83b0bb34 ×857,
+0x83b0bb2c ×26.
+
+### O que decidir no passo seguinte
+
+1. **cv**: medir o lado do produtor — que thread devia sinalizar 0xd9c2c22c e
+   por que não corre — ou alargar o limiar do watchdog para não abortar
+   repetições legítimas de `TimedWait`.
+2. **GPU**: fazer o tradutor semântico emitir comandos para o subcanal 0
+   (0xB197, Maxwell 3D) e sinalizar o fence do `SubmitGPFIFO` para o guest
+   considerar o trabalho feito.
+3. **Apresentar**: ligar o `renderer_vulkan` do upstream ao PanVK (valida o
+   patch SNORM) e mostrar a janela nativa 0x9C800000, depois hdmi.
+
+### Ficheiros que mudaram nesta semana
+
+Novos: `src/services/hid.cpp`, `include/g610/services/hid.hpp`,
+`src/services/csrng.cpp`, `include/g610/services/csrng.hpp`.
+Mudados: `svc_dispatcher.cpp` (`close_handle` nas duas mesas; Arbiter),
+`kobject.hpp` (`HandleTable::remover`),
+`ipc_min.cpp` (`service_name_for_handle` sem o mapa morto),
+`shared_font.cpp`/`pl_u.cpp` (blob de 7 regiões na ordem do Eden),
+`eden_bridge.cpp` (registos), `CMakeLists.txt` (serviços + 6 fontes de dados),
+`vulkan_device.cpp` vendido (SNORM→UNORM para o PanVK).
+Commits (em `wip/passo-4-thread`): 3f86811 fonte, 6c9fc4b hid+csrng,
+a2a17a9 threads/handles/CloseHandle, 7f25210 limpeza de glifos,
+5a64d8f SNORM, e este documento.
