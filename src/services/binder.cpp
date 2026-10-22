@@ -59,10 +59,15 @@
 #include <unistd.h>
 
 #include "vendor/eden/common/logging.h"
+#include "vendor/eden/core/hle/kernel/k_event.h"
 #include "vendor/eden/core/hle/kernel/k_process_bridge.h"
 #include "g610/services/nvmap_registry.hpp"
 
 namespace g610::services {
+
+// **O evento da fila** ✗ — ver a nota em `g_evento_da_fila` ✗ ✗.
+void DefinirEventoDaFila(Kernel::KEvent* evento);
+void SinalizarEventoDaFila(Kernel::KernelCore& kernel);
 
 namespace {
 
@@ -477,6 +482,18 @@ FilaDeBuffers& Fila() {
     return f;
 }
 
+// **O `buffer_wait_event`** ✗ — o evento da fila de buffers ✗ (o
+// `buffer_wait_event` do upstream ✗, `nvnflinger/buffer_queue_producer.h:81`
+// ✗) ✗.
+//
+// E' o que o `GetNativeHandle` do binder devolve ao jogo ✗ ✗ — e o
+// upstream **sinaliza-o** ✗ no `SetPreallocatedBuffer` ✗
+// (`buffer_queue_producer.cpp:820` ✗) ✗, no `QueueBuffer` ✗ e no
+// `CancelBuffer` ✗ ✗ ✗.
+//
+// **O jogo espera-o** ✗ — e sem o sinal ✗ o guest fica bloqueado ✗ ✗.
+Kernel::KEvent* g_evento_da_fila = nullptr;
+
 } // namespace
 
 std::uint64_t AlocarJanelaDoCompositor(std::uint64_t tamanho) {
@@ -549,7 +566,8 @@ static_assert(sizeof(QueueBufferInput) == 84, "tamanho errado");
 // chamador passou, e o formato é o do `OutputParcel`.
 // ─────────────────────────────────────────────────────────────────────────────
 std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
-                                               const std::vector<std::uint8_t>& entrada) {
+                                               const std::vector<std::uint8_t>& entrada,
+                                               Kernel::KernelCore& kernel) {
     LeitorParcel leitor(entrada);
     EscritorParcel escritor;
 
@@ -685,6 +703,10 @@ std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
         Fila().largura = buffer.Width();
         Fila().altura = buffer.Height();
         Fila().formato = buffer.Format();
+        // **O evento da fila** ✗ — o upstream sinaliza-o aqui ✗
+        // (`buffer_queue_producer.cpp:820` ✗) ✗ ✗: o jogo esta' a
+        // espera dele ✗ ✗.
+        SinalizarEventoDaFila(kernel);
         LOG_DEBUG(Service_NVDRV,
                   "compositor: SetPreallocatedBuffer: slot={} buffer_id={} -> 0x{:X} "
                   "({} bytes)",
@@ -783,6 +805,19 @@ std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
         std::fprintf(stderr, "[binder] transaccao %u -> status=%d\\n", codigo, status);
     }
     return escritor.Serializa();
+}
+
+// **O evento da fila** ✗ — ver a nota em `g_evento_da_fila` ✗ ✗.
+void DefinirEventoDaFila(Kernel::KEvent* evento) {
+    g_evento_da_fila = evento;
+}
+
+// O `buffer_wait_event->Signal()` do upstream ✗ — o `Signal` do
+// `KEvent` precisa do `kernel` ✗ (`k_event.h:49` ✗) ✗ ✗.
+void SinalizarEventoDaFila(Kernel::KernelCore& kernel) {
+    if (g_evento_da_fila != nullptr) {
+        g_evento_da_fila->Signal(kernel);
+    }
 }
 
 } // namespace g610::services

@@ -4978,3 +4978,20 @@ handle invalido ✗.
    (sem `draw.begin`/`draw.end` ✗) ✗.
 4. **A execucao** ✗ — o tradutor traduz ✗ mas quem executa ✗ (o
    `ValhallBackend` ✗, o PanVK ✗) nao esta' ligado ✗ ✗.
+
+## O `buffer_wait_event` — o evento da fila de buffers (medido, 2026-10-22)
+
+O upstream devolve ao jogo, no `GetNativeHandle` do binder
+(`hos_binder_driver.cpp:49-56` ✗), o **`buffer_wait_event`** ✗
+(`nvnflinger/buffer_queue_producer.cpp:825-827` ✗) ✗ — e **sinaliza-o**
+✗ no `SetPreallocatedBuffer` ✗ (a linha 820 ✗) ✗, no `QueueBuffer` ✗ e
+no `CancelBuffer` ✗ ✗ ✗.
+
+A casa devolvia um `KEvent` ✗ que **ninguem sinalizava** ✗ ✗ — e o
+jogo, que espera por ele ✗ ✗, ficava bloqueado ✗ ✗.
+
+Agora o evento e' o mesmo (`g610/services/binder.hpp` ✗) e e'
+sinalizado no `SetPreallocatedBuffer` ✗ ✗.
+
+**Medido depois** (`/tmp/boot_r40.log`): o fault e' o mesmo ✗ — o evento
+nao era a causa ✗ ✗, mas a divergencia com o Eden estava la ✗ ✗.

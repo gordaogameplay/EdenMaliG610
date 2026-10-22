@@ -10,6 +10,11 @@
 #include <cstdint>
 #include <vector>
 
+namespace Kernel {
+class KEvent;
+class KernelCore;
+}
+
 namespace g610::services {
 
 // Atende uma transaccao do `IGraphicBufferProducer` (o protocolo do
@@ -19,7 +24,8 @@ namespace g610::services {
 // 14 = SetPreallocatedBuffer, 3 = DequeueBuffer, 7 = QueueBuffer) e
 // `entrada` e' o parcel que o jogo mandou.
 std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
-                                               const std::vector<std::uint8_t>& entrada);
+                                               const std::vector<std::uint8_t>& entrada,
+                                               Kernel::KernelCore& kernel);
 
 // Aloca o buffer da **native window** (onde o jogo desenha) e devolve o
 // endereco (0 se nao houver espaco).
@@ -31,5 +37,23 @@ void DespejarJanelaDoCompositor();
 
 // Varre a regiao do canal da GPU a procura de conteudo escrito.
 void VarrerRegiaoDoCanalDoCompositor();
+
+// **O evento da fila de buffers** ✗ — o `buffer_wait_event` do upstream
+// ✗ (`nvnflinger/buffer_queue_producer.h:81` ✗) ✗.
+//
+// E' o evento que o `GetNativeHandle` do binder devolve ao jogo ✗
+// (`hos_binder_driver.cpp:49-56` ✗) ✗ — e que o upstream **sinaliza**
+// ✗ no `SetPreallocatedBuffer` ✗ (`buffer_queue_producer.cpp:820` ✗),
+// no `QueueBuffer` ✗ e no `CancelBuffer` ✗ ✗ ✗.
+//
+// **O jogo espera-o** ✗ — e sem o sinal ✗ o guest fica bloqueado ✗ ✗.
+//
+// A casa nao tinha este evento ✗ ✗: o `GetNativeHandle` devolvia um
+// `KEvent` ✗ que **ninguem sinalizava** ✗ ✗.
+void DefinirEventoDaFila(Kernel::KEvent* evento);
+
+// Sinaliza o evento da fila (o `buffer_wait_event->Signal()` do
+// upstream).
+void SinalizarEventoDaFila(Kernel::KernelCore& kernel);
 
 } // namespace g610::services

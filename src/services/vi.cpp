@@ -399,7 +399,9 @@ private:
 
         // A resposta: a do **compositor** (`src/services/binder.cpp`), que
         // e' quem atende o protocolo do `IGraphicBufferProducer`.
-        const std::vector<std::uint8_t> reply = TransactionarParcel(transacao, entrada);
+        auto& kernel = system_.Kernel();
+        const std::vector<std::uint8_t> reply =
+            TransactionarParcel(transacao, entrada, kernel);
 
         // **A resposta, em hexadecimal.** E' o parcel que volta ao jogo ✗
         // — e nunca foi medido ✗ ✗. O Eden (`parcel.h:155-170` ✗) escreve
@@ -456,6 +458,11 @@ private:
             auto& processo = Kernel::GetCurrentProcess(kernel);
             evento_ = new Kernel::KEvent(kernel);
             evento_->Initialize(kernel, &processo);
+            // **O evento da fila** ✗ — e' este ✗ que o upstream devolve
+            // ao jogo (`buffer_queue_producer.cpp:825-827` ✗: o
+            // `buffer_wait_event` ✗) ✗ ✗, e que o compositor sinaliza
+            // quando ha' buffer ✗ ✗.
+            services::DefinirEventoDaFila(evento_);
         }
 
         ResponseBuilder rb{ctx, 2, 1};
