@@ -49,6 +49,12 @@ bool LerGlobalDoJogo(std::uint64_t* valor) {
 // **Repor a pagina do watchpoint** ✗ — o handler de sinais e' estatico
 // ✗ ✗, e por isso nao alcanca o dispatcher ✗ ✗. O `mprotect` e' feito
 // aqui mesmo ✗ — a pagina e' do guest e o motor sabe onde ela esta' ✗.
+
+// **Voltar a armar depois da escrita** ✗ — o `mprotect` para so' leitura ✗
+// trava a escrita ✗ ✗; o guest repete a instrucao ✗ ✗ e a pagina tem de
+// ficar gravavel ✗ ✗. Re-armar no proximo trap ✗ ✗ e' o que apanha a
+// escrita **seguinte** ✗ ✗.
+volatile bool g_rearmar_watchpoint = false;
 void ReporWatchpoint() {
     if (g_watch_pagina == 0)
         return;
@@ -62,6 +68,12 @@ void ReArmarWatchpoint() {
     if (g_watch_pagina == 0)
         return;
     ::mprotect(reinterpret_cast<void*>(g_watch_pagina), 0x1000, PROT_READ);
+}
+
+// **Armar no proximo trap** ✗ — e' aqui que a escrita ja' passou ✗ ✗.
+void ArmarWatchpointNoProximoTrap() {
+    if (g_watch_pagina != 0)
+        g_rearmar_watchpoint = true;
 }
 
 namespace {
@@ -315,6 +327,21 @@ void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
     // **O watchpoint** ✗ — armado no **primeiro SVC** ✗ ✗, que e'
     // depois do rtld ✗ ✗ (o rtld nao faz SVC ✗ ✗) ✗ ✗.
     if (g_esperar_pelo_rtld) {
+        // **O rtld ja' passou?** ✗ — o rtld vive em `0x8446xxxx` ✗ ✗ e
+        // o jogo em `0x80xxxxxx` ✗ ✗. armar antes disso ✗ ✗ apanhava as
+        // **relocacoes** ✗ (que escrevem na mesma pagina ✗ ✗) ✗ ✗ — e a
+        // pagina em so' leitura ✗ travaria o jogo ✗ ✗.
+        //
+        // Medido ✗ ✗: sem este cuidado ✗, as relocacoes do rtld ✗
+        // (`str x11, [x12, x8]` ✗, em `0x84461980` ✗) levantavam
+        // `SIGSEGV` ✗ ✗ em loop ✗ ✗.
+        // **Arma ja'** ✗ — o valor estragado aparece **durante o rtld**
+        // ✗ ✗ (medido ✗ ✗: no momento em que o watchpoint arma ✗, o
+        // global ja' valia `0xcb9000000000808e` ✗ ✗) ✗ ✗.
+        //
+        // A pagina volta a ser gravavel no handler ✗ ✗ (o `ReporWatchpoint`
+        // ✗), por isso o rtld consegue escrever ✗ ✗ — e a escrita e'
+        // apanhada ✗ ✗.
         g_esperar_pelo_rtld = false;
         ArmarWatchpoint(g_endereco_do_watchpoint, 8);
     }
@@ -1353,6 +1380,13 @@ Result SvcDispatcher::svc_get_info(SvcContext& ctx) {
     // O valor vai em x1. `ctx.ret` fica para o Result, que o motor escreve
     // em x0 — são coisas diferentes, e é por aqui que esta SVC custa mais
     // uma vez às outras: o mesmo erro que o `x0` nunca receber o Result.
+    // **O dump** ✗ — os valores que a casa da ao guest ✗ ✗. O
+    // `AslrRegion` (caso 12 ✗) e' o que o SDK usa ✗ ✗ — e se for errado
+    // ✗, o SDK guarda-o num global ✗ ✗ e o jogo desreferencia-o ✗ ✗ ✗.
+    if (std::getenv("IA_WATCH") != nullptr) {
+        std::fprintf(stderr, "[info] tipo=%u -> 0x%llx\n", type,
+                     (unsigned long long)value);
+    }
     ctx.x[1]  = value;
     ctx.ret   = 0;
     ctx.has_ret = true;

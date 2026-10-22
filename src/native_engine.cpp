@@ -68,6 +68,9 @@ void ReporWatchpoint();
 // **Ler o global do jogo** ✗ ✗ — o handler de sinais e' estatico ✗ ✗.
 bool LerGlobalDoJogo(std::uint64_t* valor);
 void ReArmarWatchpoint();
+void ArmarWatchpointNoProximoTrap();
+// **A flag de re-armar** ✗ — ver `svc_dispatcher.cpp` ✗ ✗.
+extern volatile bool g_rearmar_watchpoint;
 
 namespace {
 
@@ -626,13 +629,25 @@ RunResult NativeEngine::run(void (*code)(), std::uint64_t sp) {
     //
     // `IA_WATCH=rtld` ✗ — arma no **primeiro SVC** ✗ ✗, que e' depois
     // do rtld ✗ ✗ (o rtld nao faz SVC ✗ ✗ — so' o jogo ✗ ✗) ✗.
-    svc_.ArmarWatchpointSePedir(0x824B8232ull, 8);
+    //
+    // **O guarda e' obrigatorio** ✗ ✗ — medido ✗ ✗: sem ele ✗, a
+    // pagina do global fica em so' leitura ✗ ✗ desde o **primeiro**
+    // SVC ✗ ✗ — e o primeiro SVC e' o `QueryMemory` do rtld ✗ ✗, que e'
+    // **antes** das relocacoes ✗ ✗. As relocacoes do rtld ✗ (a
+    // instrucao `str x11, [x12, x8]` em `0x84461980` ✗) escrevem nessa
+    // pagina ✗ ✗ e levantavam um `SIGSEGV` ✗ (SEGV_ACCERR ✗) ✗ — o
+    // guest ficava a repetir a mesma escrita ✗ ✗ ate ao limite de traps
+    // ✗ ✗, e o GOT do `main` ficava por relocar ✗ ✗ (todos os slots com
+    // o mesmo valor ✗) ✗ ✗.
+    if (std::getenv("IA_WATCH") != nullptr) {
+        svc_.ArmarWatchpointSePedir(0x824B5CA0ull, 8);
+    }
 
     // **O valor do global ANTES do jogo** ✗ — para comparar com o de
     // depois ✗ ✗.
     {
         std::uint64_t antes = 0;
-        if (svc_.read_guest(0x824B8232ull, &antes, sizeof antes)) {
+        if (svc_.read_guest(0x824B5CA0ull, &antes, sizeof antes)) {
             std::fprintf(stderr, "[watch] global no arranque = 0x%llx\n",
                          (unsigned long long)antes);
         }
@@ -718,6 +733,12 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
     hooks_.limit_hit    = g_hooks.limit_hit;
     hooks_.fault_pc    = g_hooks.fault_pc;
     hooks_.fault_addr  = g_hooks.fault_addr;
+    // **Os registos do fault** ✗ — o handler escreve em `g_hooks` ✗ e o
+    // relatorio le em `hooks_` ✗ ✗: sem esta copia ✗, o dump lia zeros ✗
+    // ✗ (e foi exactamente o que acontecia ✗ ✗).
+    for (int i = 0; i < 22; ++i) {
+        hooks_.fault_regs[i] = g_hooks.fault_regs[i];
+    }
     hooks_.fault_sp    = g_hooks.fault_sp;
 
     // Já estamos no host. O `siglongjmp` deixou o TLS do guest instalado, e o
@@ -849,33 +870,51 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
             }
         }
 
-        // **A tabela que o guest estava a consultar** ✗ — e' o lookup
-        // que devolveu nulo ✗ ✗: a base ✗ (o `x0` ✗), o indice ✗ (o
-        // `w3` ✗) ✗ e o byte de "presente" ✗ ✗.
+        // **A tabela que o guest estava a consultar** ✗ — o lookup que
+        // devolveu nulo ✗ ✗.
+        //
+        // **O `x0` do fault NAO e' a base** ✗ — e' o **resultado** do
+        // lookup ✗ (que foi nulo ✗) ✗. A base e' o campo `+16` do
+        // objecto ✗ (`x19` ✗) ✗ — o mesmo que o caller leu ✗ ✗.
+        //
+        // **O `id`** ✗ e' o `u16` em `x19 + 50` ✗ ✗.
         {
-            const std::uint64_t base = hooks_.fault_regs[0];
-            const std::uint64_t w3 = hooks_.fault_regs[3] & 0xFFFF;
+            const std::uint64_t obj = hooks_.fault_regs[19];
+            std::uint64_t base = 0;
+            std::uint16_t id = 0;
+            std::uint32_t tam = 0;
+            svc_.read_guest(obj + 16, &base, sizeof base);
+            svc_.read_guest(obj + 50, &id, sizeof id);
+            svc_.read_guest(obj + 52, &tam, sizeof tam);
             char linha[400];
             std::size_t n = 0;
             n += static_cast<std::size_t>(
-                std::snprintf(linha + n, sizeof(linha) - n, "[fault] tabela: base=0x%llx id=%llu",
-                               (unsigned long long)base, (unsigned long long)w3));
+                std::snprintf(linha + n, sizeof(linha) - n,
+                               "[fault] tabela: obj=0x%llx base=0x%llx id=%u tam=%u",
+                               (unsigned long long)obj, (unsigned long long)base,
+                               (unsigned)id, (unsigned)tam));
+            // **O byte de "presente"** ✗ — e' o que o lookup testa ✗ ✗.
             std::uint8_t presente = 0;
-            if (svc_.read_guest(base + w3 + 0x1888, &presente, 1)) {
+            if (svc_.read_guest(base + id + 0x1888, &presente, 1)) {
                 n += static_cast<std::size_t>(
-                    std::snprintf(linha + n, sizeof(linha) - n, " presente=%u", presente));
+                    std::snprintf(linha + n, sizeof(linha) - n,
+                                   " presente=%u (em 0x%llx)", (unsigned)presente,
+                                   (unsigned long long)(base + id + 0x1888)));
             }
+            // **A lista de ids** ✗ — a tabela paralela ✗ ✗.
             std::uint64_t lista = 0;
-            if (svc_.read_guest(base + w3 * 8 + 0x18AC, &lista, sizeof lista)) {
+            if (svc_.read_guest(base + id * 8 + 0x18AC, &lista, sizeof lista)) {
                 n += static_cast<std::size_t>(
-                    std::snprintf(linha + n, sizeof(linha) - n, " lista=0x%llx", lista));
-                std::uint8_t ids[16]{};
+                    std::snprintf(linha + n, sizeof(linha) - n, " lista=0x%llx",
+                                   (unsigned long long)lista));
+                std::uint8_t ids[24]{};
                 if (lista != 0 && svc_.read_guest(lista, ids, sizeof ids)) {
                     n += static_cast<std::size_t>(
                         std::snprintf(linha + n, sizeof(linha) - n, " ids="));
                     for (std::size_t i = 0; i < sizeof ids; ++i)
                         n += static_cast<std::size_t>(
-                            std::snprintf(linha + n, sizeof(linha) - n, " %u", ids[i]));
+                            std::snprintf(linha + n, sizeof(linha) - n, " %u",
+                                           (unsigned)ids[i]));
                 }
             }
             if (n + 2 < sizeof(linha))
@@ -893,23 +932,30 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
         // ✗ — que e' o que o dump mostra ✗ ✗.
         {
             std::uint64_t global = 0;
-            char linha[200];
+            char linha[1024];
             std::size_t n = 0;
-            if (svc_.read_guest(0x824B8232ull, &global, sizeof global)) {
+            if (svc_.read_guest(0x824B5CA0ull, &global, sizeof global)) {
                 n += static_cast<std::size_t>(
-                    std::snprintf(linha + n, sizeof(linha) - n, "[fault] global 0x824B8232 = 0x%llx",
+                    std::snprintf(linha + n, sizeof(linha) - n,
+                                   "[fault] global 0x824B5CA0 = 0x%llx",
                                    (unsigned long long)global));
             }
-            // **A volta do global** ✗ — o que o guest escreveu ali ✗ ✗.
+            // **A volta do global** ✗ — os bytes crus ✗ ✗ (e lidos tres
+            // vezes ✗ — para se ver se o valor muda ✗ ✗: o guest tem
+            // varias threads ✗ e uma delas pode estar a escrever ✗ ✗).
             {
-                std::uint64_t vizinho[8]{};
-                if (svc_.read_guest(0x824B8200ull, vizinho, sizeof vizinho)) {
+                std::uint8_t cru[64]{};
+                for (int tentativa = 0; tentativa < 3; ++tentativa) {
+                    std::memset(cru, 0, sizeof cru);
+                    svc_.read_guest(0x824B5C80ull, cru, sizeof cru);
                     n += static_cast<std::size_t>(
-                        std::snprintf(linha + n, sizeof(linha) - n, " |"));
-                    for (const auto v : vizinho) {
+                        std::snprintf(linha + n, sizeof(linha) - n, "\n[fault] 0x824B5C80:"));
+                    for (std::size_t i = 0; i < sizeof cru; ++i) {
                         n += static_cast<std::size_t>(
-                            std::snprintf(linha + n, sizeof(linha) - n, " %llx",
-                                           (unsigned long long)v));
+                            std::snprintf(linha + n, sizeof(linha) - n, " %02x", cru[i]));
+                        if ((i % 16) == 15)
+                            n += static_cast<std::size_t>(
+                                std::snprintf(linha + n, sizeof(linha) - n, "\n           "));
                     }
                 }
             }
@@ -1173,6 +1219,14 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
 
     ++*ts.traps;
 
+    // **Re-armar o watchpoint** ✗ — a escrita que o disparou ja' passou ✗
+    // ✗ (a pagina ficou gravavel ✗ ✗) ✗, e agora pode voltar a ser so'
+    // de leitura ✗ ✗ — para apanhar a escrita **seguinte** ✗ ✗.
+    if (g_rearmar_watchpoint) {
+        g_rearmar_watchpoint = false;
+        ReArmarWatchpoint();
+    }
+
     if (g_hooks.trapper != nullptr)
         g_hooks.trapper(sig, pc, static_cast<std::uint64_t>(uc->uc_mcontext.sp),
                         g_hooks.trapper_user);
@@ -1190,12 +1244,50 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
     }
 
     if (::getenv("IA_TRACE")) {
-        char b[160];
+        char b[288];
         const int k = std::snprintf(b, sizeof b,
-            "[h] sig=%d armed=%d obs=%p tel=%p svc=%p rec=%llx\n", sig,
-            (int)g_hooks.armed, (void*)g_hooks.observer, (void*)g_hooks.tel,
-            (void*)g_hooks.svc, (unsigned long long)g_hooks.recovery_pc);
+            "[h] sig=%d pc=0x%llx addr=%p code=%d x0=0x%llx x1=0x%llx "
+            "armed=%d watch=0x%llx\n", sig,
+            (unsigned long long)pc,
+            info ? info->si_addr : nullptr,
+            info ? info->si_code : 0,
+            (unsigned long long)uc->uc_mcontext.regs[0],
+            (unsigned long long)uc->uc_mcontext.regs[1],
+            (int)g_hooks.armed,
+            (unsigned long long)g_watch_pagina);
         ssize_t w = ::write(2, b, (size_t)k); (void)w;
+
+        // **O mapa do processo** ✗ — a regiao que contem o endereco ✗ ✗.
+        // E' a unica forma de dizer "nao esta' mapeado" de "esta' mapeado
+        // mas sem escrita" ✗ ✗.
+        {
+            static bool feito = false;
+            if (!feito && info != nullptr && sig == SIGSEGV) {
+                feito = true;
+                const auto alvo = reinterpret_cast<std::uintptr_t>(info->si_addr);
+                FILE* f = std::fopen("/proc/self/maps", "r");
+                if (f != nullptr) {
+                    char linha[512];
+                    char antes[8][512]{};
+                    int n_antes = 0;
+                    while (std::fgets(linha, sizeof linha, f) != nullptr) {
+                        unsigned long long lo = 0, hi = 0;
+                        if (std::sscanf(linha, "%llx-%llx", &lo, &hi) != 2)
+                            continue;
+                        if (alvo >= lo && alvo < hi) {
+                            std::fprintf(stderr, "[maps] --- contexto ---\n");
+                            for (int i = 0; i < n_antes; ++i)
+                                std::fprintf(stderr, "[maps] %s", antes[i]);
+                            std::fprintf(stderr, "[maps] %s", linha);
+                            break;
+                        }
+                        std::snprintf(antes[n_antes % 8], 512, "%s", linha);
+                        ++n_antes;
+                    }
+                    std::fclose(f);
+                }
+            }
+        }
     }
 
     switch (sig) {
@@ -1239,6 +1331,21 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             uc->uc_mcontext.sp = rec_sp;
             uc->uc_mcontext.pc = g_hooks.recovery_pc;
             return;
+        }
+
+        // **A thread principal** ✗ — os traps dela nao tinham registo ✗
+        // ✗ (o dump de baixo e' so' para as threads de guest ✗) ✗, e e'
+        // nela que o rtld fica preso ✗ ✗.
+        //
+        // **O PC e' a pista** ✗ — diz ONDE o guest esta' ✗ ✗.
+        if (st == nullptr && ::getenv("IA_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[main] trap #%u pc=0x%llx brk=%u x0=0x%llx x1=0x%llx "
+                         "x2=0x%llx\n",
+                         number, (unsigned long long)pc, number,
+                         (unsigned long long)uc->uc_mcontext.regs[0],
+                         (unsigned long long)uc->uc_mcontext.regs[1],
+                         (unsigned long long)uc->uc_mcontext.regs[2]);
         }
 
         // Numa thread de guest, cada trap e' uma pista: e' o unico registo
@@ -1429,11 +1536,11 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             ssize_t w = ::write(2, b, (size_t)n);
             (void)w;
             // A pagina volta a ser de leitura-escrita ✗ — para o guest
-            // continuar ✗ ✗ (e o watchpoint volta a armar ✗) ✗.
+            // repetir a instrucao ✗ ✗.
             ReporWatchpoint();
-            // E volta a armar ✗ — a proxima escrita na pagina e' o que
-            // interessa ✗ ✗.
-            ReArmarWatchpoint();
+            // E volta a armar ✗ — no **proximo trap** ✗ ✗ (a escrita
+            // actual ainda nao aconteceu ✗ ✗) ✗.
+            ArmarWatchpointNoProximoTrap();
             // O guest repete a instrucao ✗ ✗.
             uc->uc_mcontext.pc = pc;
             uc->uc_mcontext.sp = static_cast<std::uint64_t>(uc->uc_mcontext.sp);
@@ -1543,6 +1650,22 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         // levanta traps) e o tracer quer que o programa volte ao host para
         // imprimir o relatório. Sem isto, um spin silencioso truncava a
         // saída e perdia-se o único rasto do que aconteceu.
+        //
+        // **O PC** ✗ — é a única pista de ONDE o guest ficou preso ✗ ✗
+        // (um `b .` ✗ — o rtld do jogo, à espera de um módulo ✗) ✗ ✗.
+        if (::getenv("IA_TRACE") != nullptr) {
+            char b[192];
+            const int k = std::snprintf(b, sizeof b,
+                "[alarme] o guest esta preso em pc=0x%llx x0=0x%llx x1=0x%llx "
+                "x2=0x%llx x19=0x%llx\n",
+                (unsigned long long)pc,
+                (unsigned long long)uc->uc_mcontext.regs[0],
+                (unsigned long long)uc->uc_mcontext.regs[1],
+                (unsigned long long)uc->uc_mcontext.regs[2],
+                (unsigned long long)uc->uc_mcontext.regs[19]);
+            const ssize_t w = ::write(2, b, (size_t)k);
+            (void)w;
+        }
         *ts.limit_hit = true;
         *ts.last = TrapKind::Breakpoint;
         uc->uc_mcontext.sp = rec_sp;

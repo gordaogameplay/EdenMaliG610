@@ -92,7 +92,7 @@ public:
     // Lê `size` bytes de `src`. Com `scratch`, a leitura é feita por um
     // processo filho separado — o mecanismo clássico para ler memória do
     // guest sem que o acesso do host possa</think>faultar.
-    bool read(std::uint64_t src, void* dst, std::uint64_t size, std::string& error);
+    bool read(std::uint64_t src, void* dst, std::uint64_t size, std::string& error) const;
 
     // Um trap de memória (SIGSEGV/SIGBUS) dentro do espaço do guest tem de ser
     // distinguido de um trap do host. Isto marca os limites da região guest.

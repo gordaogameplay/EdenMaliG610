@@ -5,11 +5,13 @@
 
 #include "g610/nso_loader.hpp" // kGuestPageSize
 
+#include <execinfo.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -119,8 +121,31 @@ bool GuestMemory::protect(std::uint64_t base, std::uint64_t size, Prot prot,
     return true;
 }
 
+// A pagina do watchpoint ✗ — o mesmo global do despachante ✗ ✗.
+extern volatile std::uint64_t g_watch_pagina;
+
 bool GuestMemory::write(std::uint64_t dst, const void* src, std::uint64_t size,
                         std::string& error) {
+    // **O canario** ✗ — a escrita do HOST na memoria do guest ✗ ✗ e' um
+    // `memcpy` ✗ ✗: nao levanta fault ✗ ✗ (a pagina pode estar em so'
+    // leitura ✗ ✗) ✗ ✗ e por isso o watchpoint nao a apanha ✗ ✗.
+    //
+    // **Esta e' a unica forma de ver QUEM escreve** ✗ ✗ — e a resposta
+    // importa ✗ ✗: o global do jogo vale `0xcb9000000000808e` ✗ ✗ (um
+    // valor que nao e' do guest ✗ ✗) ✗ ✗.
+    if (std::getenv("IA_WATCH") != nullptr && g_watch_pagina != 0 && size != 0) {
+        const std::uint64_t lo = g_watch_pagina;
+        const std::uint64_t hi = lo + 0x1000;
+        if (dst < hi && dst + size > lo) {
+            std::fprintf(stderr,
+                         "[watch] O HOST escreve em 0x%llx (+%llu bytes) ✗ — "
+                         "a pagina e' do jogo ✗ ✗\n",
+                         (unsigned long long)dst, (unsigned long long)size);
+            void* quadros[16]{};
+            const int n = ::backtrace(quadros, 16);
+            ::backtrace_symbols_fd(quadros, n, 2);
+        }
+    }
     if (!mapped()) {
         error = "espaço do guest não mapeado";
         return false;
@@ -141,7 +166,7 @@ bool GuestMemory::write(std::uint64_t dst, const void* src, std::uint64_t size,
 }
 
 bool GuestMemory::read(std::uint64_t src, void* dst, std::uint64_t size,
-                       std::string& error) {
+                       std::string& error) const {
     if (!mapped()) {
         error = "espaço do guest não mapeado";
         return false;
