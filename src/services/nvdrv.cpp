@@ -2299,39 +2299,135 @@ private:
                 char caminho[512];
                 std::snprintf(caminho, sizeof caminho, "%s.%06u.txt", va_base,
                               static_cast<unsigned>(seq));
-                // Os VAs distintos, a ordem do primeiro recebimento
-                // preservada (a contagem por submit também é medida).
-                std::vector<std::uint32_t> vistos;
-                for (const std::uint32_t va : tradutor_.falcon_vas()) {
-                    bool ja = false;
-                    for (const std::uint32_t v : vistos)
-                        if (v == va) {
-                            ja = true;
-                            break;
-                        }
-                    if (!ja)
-                        vistos.push_back(va);
-                    if (vistos.size() >= 256)
-                        break;
-                }
+                // O tamanho da janela lida em cada VA distinto (o
+                // ambiente `G610_VA_DUMP_TAM`, hexa ou decimal; o
+                // "todo o VA": quanto maior, mais do blob se ve —
+                // 0x1000 por VA revela a estrutura sem esgotar).
+                static const std::size_t va_tam = [&] {
+                    const char* t = std::getenv("G610_VA_DUMP_TAM");
+                    const unsigned long long v =
+                        t != nullptr ? std::strtoull(t, nullptr, 0) : 32ull;
+                    return static_cast<std::size_t>(
+                        v < 32 ? 32 : (v > 0x40000 ? 0x40000 : v));
+                }();
                 if (std::FILE* f = std::fopen(caminho, "w"); f != nullptr) {
+                    // VAs distintos com a contagem de repeticoes (as 29
+                    // chamadas do submit podem repetir ou nao endereco).
+                    std::vector<std::uint32_t> vistos;
+                    std::vector<std::uint32_t> conts;
+                    for (const std::uint32_t va : tradutor_.falcon_vas()) {
+                        std::size_t i = 0;
+                        bool ja = false;
+                        for (const std::uint32_t v : vistos) {
+                            if (v == va) {
+                                ja = true;
+                                break;
+                            }
+                            ++i;
+                        }
+                        if (ja) {
+                            ++conts[i];
+                        } else {
+                            vistos.push_back(va);
+                            conts.push_back(1);
+                        }
+                        if (vistos.size() >= 256)
+                            break;
+                    }
+                    // A mesa do espaco de enderecos do guest: a porta de
+                    // traducao de um VA de falcon (fixed => a chave = o
+                    // VA de GPU; o resto => a chave = o endereco do CPU). Sem ela, `falcon` entrega VAs que o
+                    // guest nao ve.
                     std::fprintf(f,
                                  "submit=%u bytes=%zu chamadas_falcon=%zu "
-                                 "vas_distintos=%zu\n",
+                                 "vas_distintos=%zu janela=%zu as=%zu\n",
                                  seq, pushbuffer.size(),
-                                 tradutor_.falcon_vas().size(), vistos.size());
-                    for (const std::uint32_t va : vistos) {
-                        std::vector<std::uint8_t> janela(32, 0);
-                        const bool ok =
-                            LerDoGuest(va, janela.data(), janela.size());
-                        std::fprintf(f, "%s va=0x%08X", ok ? "" : "NAO_LIDO",
-                                     va);
-                        for (std::size_t j = 0; j < janela.size(); j += 4) {
+                                 tradutor_.falcon_vas().size(), vistos.size(),
+                                 va_tam, mapeamentos_.size());
+                    for (const auto& [chave, mapa] : mapeamentos_)
+                        std::fprintf(f,
+                                     "as chave=0x%llX ptr=0x%llX tam=0x%llX fixo=%u\n",
+                                     static_cast<unsigned long long>(chave),
+                                     static_cast<unsigned long long>(mapa.ptr),
+                                     static_cast<unsigned long long>(mapa.size),
+                                     mapa.fixed ? 1u : 0u);
+                    std::vector<std::uint8_t> janela(va_tam, 0);
+                    for (std::size_t q = 0; q < vistos.size(); ++q) {
+                        const std::uint32_t va = vistos[q];
+                        // A tradução do VA: a única entrada que o cobre —
+                        // a mesma forma para os dois cenas (o ptr +
+                        // (va - chave) vira o endereco do CPU).
+                        auto cu = mapeamentos_.upper_bound(va);
+                        bool coberto = false;
+                        std::uint64_t cpu = va;
+                        if (cu != mapeamentos_.begin()) {
+                            --cu;
+                            if ((va - cu->first) < cu->second.size &&
+                                cu->second.size != 0) {
+                                coberto = true;
+                                cpu = cu->second.ptr + (va - cu->first);
+                            }
+                        }
+                        // As entradas por cima/por baixo (o diagnóstico
+                        // de um VA sem cobertura).
+                        if (!coberto) {
+                            auto al = mapeamentos_.lower_bound(va);
+                            if (al != mapeamentos_.end())
+                                std::fprintf(f, " acima=0x%llX",
+                                             static_cast<unsigned long long>(al->first));
+                            if (al != mapeamentos_.begin()) {
+                                auto ba = std::prev(al);
+                                std::fprintf(f, " abaixo=0x%llX",
+                                             static_cast<unsigned long long>(ba->first));
+                            }
+                        }
+                        // A janela adaptativa: a inteira, e se o piso
+                        // do guest não tiver a pagina toda, encolhe (o
+                        // buraco do mapa nao para a medida).
+                        std::size_t ok_tam = 0;
+                        for (std::size_t t = janela.size();;) {
+                            if (LerDoGuest(cpu, janela.data(), t)) {
+                                ok_tam = t;
+                                break;
+                            }
+                            if (t <= 16) {
+                                if (LerDoGuest(cpu, janela.data(), 16)) {
+                                    ok_tam = 16;
+                                }
+                                break;
+                            }
+                            t /= 4;
+                        }
+                        std::fprintf(f, "va=0x%08X reps=%u %s cpu=0x%llX ok_tam=%zu",
+                                     va, conts[q], coberto ? "coberto" : "CRU",
+                                     static_cast<unsigned long long>(cpu),
+                                     ok_tam);
+                        for (std::size_t j = 0; j < 16 && j < janela.size();
+                             j += 4) {
                             std::uint32_t d = 0;
                             std::memcpy(&d, janela.data() + j, 4);
                             std::fprintf(f, " d%zu=%08X", j / 4, d);
                         }
                         std::fprintf(f, "\n");
+                        if (ok_tam == 0)
+                            continue;
+                        // O hexdump da janela lida (16 em 16, com a
+                        // coluna de ascii).
+                        for (std::size_t off = 0; off < ok_tam; off += 16) {
+                            std::fprintf(f, " %06zX", off);
+                            char ascii[17] = {};
+                            for (std::size_t j = 0;
+                                 j < 16 && off + j < ok_tam; ++j) {
+                                const unsigned c = janela[off + j];
+                                if (j % 4 == 0)
+                                    std::fprintf(f, " ");
+                                std::fprintf(f, "%02X", c);
+                                ascii[j] = (c >= 0x20 && c < 0x7F)
+                                               ? static_cast<char>(c)
+                                               : '.';
+                            }
+                            std::fprintf(f, " |%s|\n", ascii);
+                        }
                     }
                     std::fclose(f);
                 }

@@ -5710,7 +5710,71 @@ sinal) ja mede tudo de novo de gratis.
 
 1. **~~A caça ao poster das cinco cv~~** — fechado: sem poster no
    estado capturado, medida acima.
-2. **GPU**: medir o VA entregue pelas 29 chamadas de firmware 4
-   (`falcon[4]`) num run vivo, lado GPU — o run vivo e quem tem a
-   memoria; o teste `gpfifo_replay` e o contrato (Parte B verde:
-   1637 passos / 901 envios).
+2. **~~GPU: medir o VA entregue pelas 29 chamadas de firmware 4~~** —
+   fechado: medida abaixo («O VA do falcon[4]»), commit próprio.
+
+---
+
+## O VA do falcon[4]: 29 chamadas, 13 tokens, zero leitura (medido, 22/10)
+
+A pergunta: os 29 valores que as macros entregam ao `falcon[4]`
+(metodo 2244) por submit — o que sao enderecos, quem os mapeou e onde
+mora o conteudo. A medida rodou em tres patas sobre o submit estável
+(8864 bytes; 1637 passos / 901 envios; 29 falcons — o mesmo do
+fixture) num run vivo (LOG14, EXIT=139 de sempre), com o instrumento
+`G610_VA_DUMP` ampliado (`G610_VA_DUMP_TAM=0x1000` por token, a mesa
+do espaco de enderecos impressa por submit, traducao pela
+`mapeamentos_` com a forma unica `cpu = ptr + (va - chave)` e janela
+adaptativa quando a leitura falha (janela por estilo: /4 de repente
+ate 16 bytes).
+
+### A medida
+
+- **As 4 submissoes do run**: submits 1-3 = a mesma corrente de 8864
+  bytes (`29 falcons -> 13 valores distintos`, o mesmo perfil em
+  todos), submit 4 = 300 bytes com `chamadas_falcon=0`. Nenhuma
+  leitura: `ok_tam=0` nos 13 VAs de todos os submits: **nenhum dos
+  13 valores e' legivel**.
+- **A mesa do espaco** (`as=` no dump): cresce por submit (7 -> 42 ->
+  44 -> 48). Os VAs do guest comecam em `0xC0000000` (fixo=1) e o
+  resto e' identity (`fixo=0`, chave=endereco CPU):
+  `0xE2D3F000/0xE2D50000/0xE2D67000/0xE2D78000/0xE5D39000
+  (tam 0x13900000)/0xF963A000 (tam 0xD800000)`. **Nada mapeado em
+  [0, 0xC0000000)** — os 13 valores (`0x404468..0x419F78`) nao tem
+  cobertura **e nao pode ter**: o guest nunca mapeou essa zona
+  (`VARegions` = `[0x98000000, 0x290000000)`, `split=0xC0000000`;
+  um unico `AllocateSpace` de paginas grandes no run: 65536 x
+  0x10000 a partir de `0xC0000000` — e nenhum de pagina pequena).
+- **Os valores sao literais do push buffer** (contraprova no fixture,
+  8864 bytes): os 13 tokens estao la contados 29/29 no exacto das
+  reps medidas (`x1/x2/x3/x8`...). Formato por chamada: pacotes
+  `[A0030E0A, endereco, v0, v1]` = invocacao da macro entry 5
+  (bucket 49, 25 instrucoes, hash `9e3ca7054d12d63c`, fora da tabela
+  HLE) com os 3 params. Duas familias: 6 pacotes de arranque em
+  palavras 976-996 e 23 pacotes em 2057-2160 com a familia
+  `0x418E40` a andar de 4 em 4 bytes (os pares valor/mascara
+  `{07/0F, 70/0F0, ..., 07000000/0F000000}` ciclam as posicoes de
+  byte); os pares de meia-palavra `{0842/FFFF, 04F10000/FFFF0000}`
+  e vizinhos completam o passeio.
+- **O microcode fecha o sentido** (o `trace_macro.py` sobre o bucket
+  49 real, e o desmonte instr-instr): a macro escreve o rascunho
+  `[0xD00]=0`, `[0xD01]=v0`, `[0xD02]=v1`, manda `0x8C4=endereco` (o
+  disparo), le o rascunho `0xD1A` (byte-2, curto-circuito em 0) e
+  depois **espirala a ler `[0xD00]` ate ==1**, mandando `0x40=0` a
+  cada volta. **Nao ha uma so leitura de memoria do guest na macro** — o
+  endereco e' o argumento opaco do blob de firmware, nunca
+  desreferenciado pelo MME. O stub da casa (`regs[0xD00]=1`) e' o
+  valor que a espiral espera; a macro sai a cada chamada e o jogo
+  segue (os 1637/901 medidos e o 0 desconhecidos/descartados dao
+  garantia).
+
+### Conclusao
+
+Os 29 VAs do `falcon[4]` nao sao enderecos que a casa tenha de ler:
+sao **tokens** (endereco, valor, mascara) que o jogo entrega ao blob
+de firmware pela mesa e pela espiral no `[0xD00]` — o contrato do
+jogo consiste no flag, nao no conteudo. A leitura `ok_tam=0` e' o
+estado correcto, nao um sintoma; nenhuma cobertura nova em
+[0, 0xC0000000) e' necessaria para a emulacao. O instrumento fica
+(env-gated) para runs futuros: o dia em que o guest mapear essa
+zona, o dump da mesa prova de graca.
