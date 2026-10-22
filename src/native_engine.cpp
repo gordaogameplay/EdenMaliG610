@@ -853,6 +853,41 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
             const ssize_t w = ::write(2, linha, n);
             (void)w;
         }
+
+        // **O global do jogo** ✗ — o `0x824B8232` ✗, que e' onde o
+        // jogo guarda a base da tabela ✗ (`adrp x8, 0x824b5000` ✗ +
+        // `ldr x8, [x8, #3232]` ✗, em `0x8177d0c8` ✗) ✗ ✗.
+        //
+        // **Se estiver a zero** ✗ ✗, o lookup e' feito sobre a base 0 ✗
+        // ✗ — que e' o que o dump mostra ✗ ✗.
+        {
+            std::uint64_t global = 0;
+            char linha[200];
+            std::size_t n = 0;
+            if (svc_.read_guest(0x824B8232ull, &global, sizeof global)) {
+                n += static_cast<std::size_t>(
+                    std::snprintf(linha + n, sizeof(linha) - n, "[fault] global 0x824B8232 = 0x%llx",
+                                   (unsigned long long)global));
+            }
+            // **A volta do global** ✗ — o que o guest escreveu ali ✗ ✗.
+            {
+                std::uint64_t vizinho[8]{};
+                if (svc_.read_guest(0x824B8200ull, vizinho, sizeof vizinho)) {
+                    n += static_cast<std::size_t>(
+                        std::snprintf(linha + n, sizeof(linha) - n, " |"));
+                    for (const auto v : vizinho) {
+                        n += static_cast<std::size_t>(
+                            std::snprintf(linha + n, sizeof(linha) - n, " %llx",
+                                           (unsigned long long)v));
+                    }
+                }
+            }
+            if (n + 2 < sizeof(linha))
+                n += static_cast<std::size_t>(
+                    std::snprintf(linha + n, sizeof(linha) - n, "\n"));
+            const ssize_t w = ::write(2, linha, n);
+            (void)w;
+        }
     }
 
     r.exited    = svc_.exited();
