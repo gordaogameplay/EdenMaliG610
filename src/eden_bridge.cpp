@@ -820,6 +820,13 @@ bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_ha
         std::fprintf(stderr, "[ipc] SendSyncRequest handle=0x%x typed=%p\n",
                      session_handle, static_cast<const void*>(sessao.GetPointerUnsafe()));
 
+        // **Onde vai a resposta.** A resposta do IPC vai para o TLS da
+        // thread do *cliente* (o Eden, `hle_ipc.cpp:330`). Se o pedido e o
+        // TLS nao forem o mesmo sitio, o guest le lixo.
+        std::fprintf(stderr, "[ipc]   pedido em 0x%llx, resposta vai para 0x%llx\n",
+                     static_cast<unsigned long long>(endereco),
+                     static_cast<unsigned long long>(
+                         Kernel::GetCurrentThread(kernel).GetTlsAddress()));
     }
     // A referência ao pai: o pai tem de sobreviver ao pedido. Sem este
     // `KScopedAutoObject` a sessão pode ser destruída a meio e o pedido

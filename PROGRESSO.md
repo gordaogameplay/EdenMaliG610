@@ -4567,3 +4567,51 @@ leitura de 2 MB do RomFS passa de meio segundo para **7 microsegundos**.
 E um bug encontrado pelo caminho: o **ultimo bloco parcial** de uma leitura
 cujo tamanho nao e' multiplo de 16 ficava *cifrado* (o fluxo de chaves
 acabava no bloco inteiro). Corrigido.
+
+## A resposta do IPC ia para o TLS errado (medido, 2026-10-21)
+
+### O que estava a acontecer
+
+A resposta do IPC vai para o **TLS da thread que fez o pedido** — o Eden
+(`hle_ipc.cpp:330`):
+
+    memory.WriteBlock(thread->GetTlsAddress(), cmd_buf.data(), ...);
+
+E a casa tem **um só** `KThread` para todas as threads de guest, por isso
+o `GetTlsAddress()` dele era sempre o da thread principal. A resposta de
+uma thread de guest ia para o buffer da principal — e o guest, que a lê do
+TLS *dela*, lia lixo.
+
+**Medido** (com o novo log `[ipc] pedido em ..., resposta vai para ...`):
+
+    pedido em 0x88004000, resposta vai para 0x88004000     (a thread de worker)
+    pedido em 0x88000000, resposta vai para 0x88000000     (a principal)
+
+**O sintoma**: o `nn::fs` do SDK lia os ficheiros do RomFS em*vários*
+pedidos, e a resposta de cada um ia para o sitio errado. O SDK abortava
+com `SetTerminateResult modulo=10 desc=212` — o **CMIF**: o leitor CMIF
+rejeita a resposta.
+
+### A correccao
+
+`SvcDispatcher::set_tls_da_thread(endereco)` — põe o endereco do TLS da
+thread que pede, **sem** mexer no `tls_base_` (a base de onde se tiram os
+TLS das threads novas) nem no handle da thread principal (que e' de uma
+so). O motor chama-o antes de cada despacho, com o `guest_tls` do slot da
+thread que armou a trap.
+
+### O que mudou (medido)
+
+**Antes**: o SDK lia o cabecalho do RomFS, as tabelas, e abortava a ler os
+dados do **primeiro** ficheiro (`autosave_00.arc`).
+
+**Depois**: o SDK le **12+ ficheiros** do RomFS (e continua), e o abort
+mudou de sitio: o `nn::fs::ReadFile` ja' nao e' o culpado. O abort actual
+e' do `nn::settings` — o SDK a ler o **idioma** (`GetDesiredLanguage` do
+`am`), que responde correctamente (o `Result` e' 0 e a linguagem e' 1 =
+AmericanEnglish, medido no buffer do guest).
+
+**O que ainda nao se sabe**: porque e' que o leitor CMIF do SDK rejeita a
+resposta do `GetDesiredLanguage`, que e' geometricamente identica a do
+Eden (o `SFCO` em 0x20, o `Result` em 0x28, o `data_size` = 18 — que e'
+o que a formula do `ResponseBuilder` do Eden da).

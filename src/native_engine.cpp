@@ -1173,6 +1173,16 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             // (ArbitrateLock) larga o dono e repõe `me` ao acordar. `me` e o
             // token em curso coincidem aqui; no fim, ambos voltam a 0.
             dispatch_owner_set(me);
+            // **O TLS da thread que pede.** A resposta do IPC vai para o TLS
+            // da thread do *cliente* (o Eden, `hle_ipc.cpp:330`) — e a casa
+            // tem um só `KThread` para todas as threads de guest. Sem isto,
+            // a resposta de uma thread de guest vai para o TLS da principal
+            // e o guest lê-a do sítio errado (lixo) — o sintoma é um abort
+            // do SDK com um erro de CMIF.
+            //
+            // A thread principal não tem slot (o motor conta-a à parte), e
+            // o seu TLS é o `guest_tls` dos hooks.
+            g_hooks.svc->set_tls_da_thread(st != nullptr ? st->guest_tls : g_hooks.guest_tls);
             g_hooks.svc->dispatch(number, c);
             dispatch_release(me);
             dispatch_owner_set(0);

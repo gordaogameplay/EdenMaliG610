@@ -494,6 +494,16 @@ void SvcDispatcher::set_eden_tls(std::uint64_t endereco) noexcept {
     }
 }
 
+void SvcDispatcher::set_tls_da_thread(std::uint64_t endereco) noexcept {
+    // Só o endereço do TLS da thread que pede. O `tls_base_` (a base de
+    // onde se tiram os TLS das threads novas) e o handle da thread
+    // principal ficam como estão — ver a nota no cabeçalho.
+    if (!eden_ || endereco == 0) {
+        return;
+    }
+    eden_->set_tls(endereco);
+}
+
 std::uint32_t SvcDispatcher::main_thread_handle() const noexcept {
     // Definido aqui, e nao no cabecalho, porque `EdenSystem` so esta completo
     // neste ficheiro. O mesmo movimento que o `~SvcDispatcher`.

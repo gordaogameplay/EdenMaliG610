@@ -412,6 +412,26 @@ public:
     // e é o que o loader espera.
     void set_eden_tls(std::uint64_t endereco) noexcept;
 
+    // O TLS **da thread que está a fazer o pedido** — não o bloco base.
+    //
+    // **A resposta do IPC vai para aqui.** O Eden (`hle_ipc.cpp:330`):
+    //
+    //     memory.WriteBlock(thread->GetTlsAddress(), cmd_buf.data(), ...);
+    //
+    // e `thread` é a thread do **cliente** — a que fez o pedido. A casa
+    // tem **um só** `KThread` para todas as threads de guest, por isso o
+    // seu `GetTlsAddress()` tem de ser o da thread que está a pedir.
+    //
+    // **Medido**: sem isto, a resposta de uma thread de guest vai para o
+    // TLS da principal (0x88000000) — e o guest, que a lê do TLS *dela*
+    // (0x88004000), lê lixo. O sintoma é um abort do SDK com um erro de
+    // CMIF (modulo 10, desc 212): o leitor CMIF rejeita a resposta.
+    //
+    // A diferença para `set_eden_tls`: aqui **não** se mexe no `tls_base_`
+    // (a base de onde se tiram os TLS das threads novas) nem no handle da
+    // thread principal (que é de uma só).
+    void set_tls_da_thread(std::uint64_t endereco) noexcept;
+
     // Onde começa o heap que SetHeapSize devolve.
     //
     // Vem do layout do programa (`g610::layout::kHeapBase`). Definir aqui
