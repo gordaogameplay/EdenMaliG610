@@ -582,6 +582,31 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
     // a cadeia de chamadas. O abort do SDK (`nn::diag::detail::AbortImpl`)
     // tem uma frame de 0x190 bytes, logo o chamador esta' muito acima do
     // `sp`: sem a pilha toda nao se chega ao chamador.
+    if (number == 0x26 && g_ultimo_req != 0 && g_mem != nullptr) {
+        // **O buffer de IPC do guest, no momento do abort.**
+        //
+        // E' o que o SDK leu por ultimo — a resposta que ele rejeitou.
+        // Sem isto, so se sabe que a resposta "parece certa"; com isto,
+        // ve-se o que o guest tem de facto.
+        std::uint8_t buf[0x60]{};
+        std::string e7;
+        if (g_mem->read(g_ultimo_req, buf, sizeof buf, e7)) {
+            std::printf("[ipcB] buffer do guest em %llu:\n",
+                        (unsigned long long)g_ultimo_req);
+            for (std::size_t i = 0; i < sizeof buf; i += 16) {
+                std::printf("[ipcB]  +%02zx ", i);
+                for (std::size_t j = 0; j < 16; ++j)
+                    std::printf("%02x ", buf[i + j]);
+                std::printf(" |");
+                for (std::size_t j = 0; j < 16; ++j) {
+                    const char c = (char)buf[i + j];
+                    std::printf("%c", (c >= ' ' && c <= '~') ? c : '.');
+                }
+                std::printf("|\n");
+            }
+        }
+    }
+
     if (number == 0x26 && sp != 0 && g_mem != nullptr) {
         std::uint64_t palavras[128] = {0};
         std::string e;

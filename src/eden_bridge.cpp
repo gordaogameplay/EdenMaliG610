@@ -47,6 +47,8 @@
 #include "g610/services/applet_oe.hpp"
 #include "g610/services/fsp_srv.hpp"
 #include "g610/services/nvdrv.hpp"
+#include "g610/services/pl_u.hpp"
+#include "g610/services/set.hpp"
 #include "g610/services/time_u.hpp"
 #include "g610/services/vi.hpp"
 #include "vendor/eden/core/hle/service/lm/lm.h"
@@ -611,6 +613,20 @@ EdenSystem::EdenSystem(GuestMemory& memoria, std::uint64_t pid, std::uint64_t ti
     // devolve uma resposta de 0 palavras em vez de deixar o guest
     // bloqueado. Ver `src/services/fsp_srv.cpp`.
     g610::services::registar_fsp_srv(*this);
+
+    // O `set:` — as preferencias do sistema (a lingua, a regiao).
+    // **Medido** (`/tmp/boot_r22.log`): o SDK pede `GetService("set")` e a
+    // casa nao o tinha — o `sm:` respondia "Server is not registered" e o
+    // guest abortava no leitor CMIF (`modulo=10 desc=212`).
+    // Ver `src/services/set.cpp`.
+    g610::services::registar_set(*this);
+
+    // O `pl:u` — o servico da plataforma (a fonte do sistema).
+    // **Medido** (`/tmp/boot_r23.log`): o SDK pede `GetService("pl:u")` e a
+    // casa nao o tinha — o `sm:` deferia o pedido e o guest abortava no
+    // leitor CMIF (`modulo=10 desc=212`).
+    // Ver `src/services/pl_u.cpp`.
+    g610::services::registar_pl_u(*this);
 
     // O `nvdrv` — o driver da NVIDIA, que e' a porta de entrada da GPU.
     // Medido (`boot_p6l.log`): depois do `fsp-srv`, e' o proximo servico

@@ -501,6 +501,14 @@ void SvcDispatcher::set_tls_da_thread(std::uint64_t endereco) noexcept {
     if (!eden_ || endereco == 0) {
         return;
     }
+    // **O endereço e' o bloco de TLS da thread**, nao o buffer de IPC.
+    //
+    // Medido: o ponteiro que esta no principio do bloco de TLS **nao** e' o
+    // buffer de IPC (o que la esta mede-se `0x8000000a00000006` — lixo).
+    // E' o Eden que, com o endereco do bloco, escreve a resposta no sitio
+    // certo: o guest passa o endereco do seu buffer de IPC no `x1` e a
+    // resposta vai para la (ver `WriteToOutgoingCommandBuffer`, no override
+    // do `hle_ipc.cpp`).
     eden_->set_tls(endereco);
 }
 

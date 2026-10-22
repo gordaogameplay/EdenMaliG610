@@ -4615,3 +4615,66 @@ AmericanEnglish, medido no buffer do guest).
 resposta do `GetDesiredLanguage`, que e' geometricamente identica a do
 Eden (o `SFCO` em 0x20, o `Result` em 0x28, o `data_size` = 18 — que e'
 o que a formula do `ResponseBuilder` do Eden da).
+
+## Os servicos que faltavam: `set:` e `pl:u` (medido, 2026-10-21)
+
+### O padrao
+
+O `sm:` **difere** o pedido de um servico que nao existe, e no motor
+nativo o diferimento devolve uma resposta de **0 palavras** — o guest
+le-a como um CMIF invalido e aborta com
+`SetTerminateResult modulo=10 desc=212`.
+
+E' o mesmo caminho do `fsp-srv` e do `time:u`, e a **cadeia e' sempre a
+mesma**: o SDK pede um servico, o `sm:` nao o tem, o guest aborta.
+
+### `set:` (as preferencias do sistema)
+
+**Medido** (`/tmp/boot_r23.log`): o SDK le o idioma
+(`nn::settings::GetLanguageCode` -> o `am`, comando 21) e depois vai
+buscar o `set:` ao `sm:` — que a casa nao tinha:
+
+    Service: SM: GetService: nome lido = "set"
+    Service: SM: Server is not registered! service=set
+    Service: Audio: SetTerminateResult: modulo=10 desc=212
+
+`src/services/set.cpp` (novo): a tabela do Eden
+(`settings_server.cpp:93-108`, 13 comandos), a lingua inglesa
+(`EN_US`) e a regiao global. O Eden com uma*NAND* daria o mesmo para
+um jogo em ingles.
+
+**Medido depois**: o SDK usa o `set:` (comandos 5 e 0 ✓) e **ja nao
+aborta** ✗→✓.
+
+### `pl:u` (a plataforma: a fonte do sistema)
+
+**Medido** (`/tmp/boot_r24.log`): o proximo servico em falta:
+
+    Service: SM: GetService: nome lido = "pl:u"
+    Service: SM: Server is not registered! service=pl:u
+    Service: SM: Waiting for service pl:u to become available
+
+`src/services/pl_u.cpp` (novo): a tabela do Eden
+(`platform_service_manager.cpp:138-153`, 16 comandos). A **fonte do
+sistema vem do firmware** da consola, que a casa nao tem — por isso a
+regiao da fonte e' **vazia** (`GetSize` = 0), como no Eden sem NAND.
+
+**Medido depois**: o jogo **le 23 ficheiros** do RomFS, faz 800 SVC e 346
+pedidos ao IPC, e **o abort de CMIF desapareceu** ✗→✓.
+
+### Onde o jogo esta agora
+
+**Medido** (`/tmp/boot_r24.log`): o jogo passa a fazer GPU (os ioctls do
+`nvdrv` de canais e de buffers) e depois **faulta** —
+
+    [fault] stack sp=0x30fffea30
+    [fault] cod (pc-16) 0x8177d290: ... 08 e0 40 39 ...
+
+`ldr w0, [x0, #0x38]` com `x0` = 0: uma **chamada a um ponteiro nulo**
+(uma chamada virtual sobre um objecto nulo). O `x0` = 0 vem do
+chamador: o codigo do jogo (0x8177d280 e' do `main`).
+
+**O que ainda nao se sabe**: o que o jogo tentou chamar. A pista mais
+forte e' a **fonte**: o `pl:u` foi o ultimo servico novo, e o Eden sem
+uma NAND daria a mesma resposta (fonte vazia) — logo a fonte **nao
+explica** o fault, a nao ser que o SDK *exija* uma fonte nao vazia.

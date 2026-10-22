@@ -35,6 +35,17 @@
 
 namespace Service {
 
+namespace {
+
+// O endereco do buffer de onde o pedido em curso foi lido.
+//
+// A resposta vai para aqui (ver `WriteToOutgoingCommandBuffer`). E' um
+// `static` porque o motor serializa os SVCs: entre o pedido ser lido e a
+// resposta ser escrita, nenhum outro pedido e' lido.
+std::uint64_t g_endereco_do_pedido = 0;
+
+} // namespace
+
 SessionRequestHandler::SessionRequestHandler(Kernel::KernelCore& kernel_, const char* service_name_)
     : kernel{kernel_} {}
 
@@ -311,6 +322,24 @@ void HLERequestContext::ParseCommandBuffer(u32_le* src_cmdbuf, bool incoming) {
 Result HLERequestContext::PopulateFromIncomingCommandBuffer(u32_le* src_cmdbuf) {
     client_handle_table = &thread->GetOwnerProcess()->GetHandleTable();
 
+    // **O endereco do pedido em curso.**
+    //
+    // A resposta tem de ir para o buffer de onde o pedido veio — que e'
+    // onde o guest a vai ler. No Eden as duas coisas sao o mesmo sitio (o
+    // pedido e' lido do TLS da thread, e a resposta e' escrita no TLS da
+    // thread), mas a casa tem **um so** `KThread` para todas as threads de
+    // guest, e o pedido *pode* ser servido por outra thread: o pedido que
+    // ficou na fila (o pump devolvera "ainda nao ha nada para atender") e'
+    // atendido no SVC de outra thread, e a resposta ia para o TLS dela.
+    //
+    // **Medido**: o sintoma era um abort do SDK com um erro de CMIF
+    // (modulo 10, desc 212) — o leitor CMIF rejeita a resposta.
+    //
+    // O motor serializa os SVCs (um dono de despacho de cada vez), por isso
+    // um `static` e' seguro: entre o pedido ser lido e a resposta ser
+    // escrita nao passa outro pedido.
+    g_endereco_do_pedido = reinterpret_cast<std::uint64_t>(src_cmdbuf);
+
     ParseCommandBuffer(src_cmdbuf, true);
 
     if (command_header->IsCloseCommand()) {
@@ -373,7 +402,16 @@ Result HLERequestContext::WriteToOutgoingCommandBuffer() {
     }
 
     // Copy the translated command buffer back into the thread's command buffer area.
-    memory.WriteBlock(thread->GetTlsAddress(), cmd_buf.data(), write_size * sizeof(u32));
+    //
+    // **Para o buffer de onde o pedido veio** — e nao para o TLS da thread.
+    // Sao o mesmo sitio no Eden (o pedido e' lido do TLS), mas na casa nao
+    // sao: o guest passa o endereco do seu buffer de IPC no `x1` e le a
+    // resposta de la. Escrever no TLS mandava a resposta para o sitio
+    // errado sempre que o pedido fosse servido por outra thread.
+    const std::uint64_t destino =
+        g_endereco_do_pedido != 0 ? g_endereco_do_pedido
+                                  : static_cast<std::uint64_t>(thread->GetTlsAddress());
+    memory.WriteBlock(destino, cmd_buf.data(), write_size * sizeof(u32));
 
     return ResultSuccess;
 }
