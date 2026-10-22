@@ -140,6 +140,27 @@ cmake --build build -j"$(nproc)"
 ./build/g610_boot /path/to/exefs
 ```
 
+### The game files — yours, not ours
+
+The engine needs the game's own data (its **RomFS**) to serve the
+`fsp-srv` file system. That data lives in an encrypted NCA inside the `.nsp`
+you bought, and decrypting it needs **your own console keys**.
+
+**Neither the keys nor the ROMs are in this repository, and they must never
+be**: this repository is public, and they belong to whoever holds them. The
+engine only needs to be told where they are:
+
+| Variable | Meaning |
+|---|---|
+| `G610_NSP` | path to the game's `.nsp` (or a directory containing it) |
+| `G610_KEYS` | path to your `prod.keys` |
+| `G610_PROGRAM_ID` | the title id to pick out of the `.nsp` (optional) |
+
+With `G610_KEYS` unset the engine looks for the Eden's own
+`~/.local/share/eden/keys/prod.keys`. With none of them available the engine
+still runs — the `fsp-srv` simply serves an empty data storage, and the game
+aborts when it opens its first file.
+
 Useful environment variables:
 
 | Variable | Effect |

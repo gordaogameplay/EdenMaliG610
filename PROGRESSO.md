@@ -4434,3 +4434,99 @@ O build da casa ja' compila **a cripto do Eden**
 
 **As chaves nao vao para o repositorio** (que e' publico): vao para o
 directorio de chaves do Eden no Pi, que e' de fora do repositorio.
+
+## O RomFS: servido (medido, 2026-10-21)
+
+### O que era preciso
+
+O `nn::fs` do SDK pede ao `fsp-srv` o **armazenamento de dados** do
+processo (o "romfs") e le-o ai. A casa respondia com um armazenamento
+**vazio**, e o SDK abortava em `nn::fs::OpenFile` (medido: o `Result`
+`0x00177A02`, modulo 2, desc 3005).
+
+### A forma do NCA (medida)
+
+O NSP (`PFS0`) tem 6 entradas; a primeira e' o NCA do jogo (9.53 GiB). O
+**cabecalho do NCA esta' cifrado** com AES-XTS (*standard crypto* do
+Switch), e as seccoes com AES-CTR. Medido:
+
+| coisa | valor |
+|---|---|
+| magic do NCA | `NCA3` |
+| `program_id` | `0x01008db008c2c000` |
+| `content_type` | 0 = Program (os outros NCAs do NSP sao Meta, Control, Manual e Data — **todos** com o mesmo `program_id`) |
+| geracao de chaves | 8 (em 0x206 e em 0x220) -> `master_key_id` = `max(8,1)-1` = **7** |
+| chave da *key area* | `key_area_key_application_07` (o Eden: `MasterKeyIdForKeyGeneration`) |
+| chave AES-CTR do sector | o slot 2 da *key area* (o Eden: `DecryptionKey_AesCtr` = 2) |
+| o RomFS | `fs[1]` (`fs_type` = 0), sectores `0xe0..0x1300a20` = ficheiro `0x1C000..0x260144000` |
+| o `upper IV` | `0x0000000200000000` (o `aes_ctr_upper_iv` do `NcaFsHeader`) |
+| as camadas de hash | `info[0..4]`, de `0x0` a `0x1310000` |
+| os dados | `info[5].offset` = `0x1310000`, `info[5].size` = **10 181 768 972** (9.48 GiB) |
+
+**O RomFS e' maior do que o espaco livre do Pi** (11 GB) e o NSP ja' esta'
+la. Logo o RomFS **nao pode ser extraido para um ficheiro**: tem de ser
+decifrado no sitio, a cada leitura.
+
+### As tres cifras, e porque nao sao as de serie
+
+O XTS do Switch **nao e' o XTS de serie**: o Eden (`AesXtsStorage::Read`)
+re-deriva o *tweak* de cada sector de 0x200 bytes a partir do numero do
+sector (`MakeAesXtsIv`: o sector em big-endian nas posicoes 8..15), e
+dentro do sector o tweak e' multiplicado por alpha a cada bloco de 16
+bytes. O OpenSSL (e o mbedtls) fazem o outro: um tweak so, multiplicado
+por alpha ao longo de tudo. **Nao sao a mesma coisa** — por isso o tweak e'
+calculado aqui, sobre o bloco.
+
+O CTR tem o contador de 128 bits big-endian, e os 8 primeiros bytes sao o
+"upper" que vem do `NcaFsHeader` (`AesCtrStorage::MakeIv`).
+
+E o **contador e' relativo a seccao, nao ao ficheiro**:
+`(off_regiao + off_dados + X) / 16`. Confundir as duas coisas da' lixo que
+parece texto — e, se o resultado for menor, um salto negativo que vira um
+contador de 2^64 voltas (o motor fica la preso: medido, o `IStorage::Read`
+nao voltava).
+
+### O que o motor faz agora
+
+`src/fs/romfs.cpp` (novo) e `src/crypto/aes.cpp` (novo):
+
+* abre o `.nsp` que o **utilizador** indicar (`G610_NSP`) e o ficheiro de
+  chaves que o utilizador indicar (`G610_KEYS`);
+* acha o NCA de **programa** (`content_type` = 0), decifra o cabecalho,
+  a *key area* e o `NcaFsHeader` do RomFS;
+* serve a imagem do RomFS pelo `IStorage` do `fsp-srv`: `Read(offset,
+  length)` e `GetSize()`.
+
+**As chaves e as ROMs nao vao para o repositorio** (que e' publico): o
+`.gitignore` bloqueia `*.keys`, `*.nsp`, `*.xci` e `*.nca`, e o README
+explica as variaveis de ambiente.
+
+### Medido: o SDK le o RomFS
+
+    IStorage::Read: offset=0x0         length=80      (o cabecalho)
+    IStorage::Read: offset=0x25EBD5850 length=3988     (a tabela de hash)
+    IStorage::Read: offset=0x25EBD67E4 length=34996    (os directorios)
+    IStorage::Read: offset=0x25EBDF098 length=166828   (a tabela de ficheiros)
+    IStorage::Read: offset=0x25EC07C44 length=2161352  (as entradas)
+    IStorage::Read: offset=0x25EBB3E40 length=100376   (os dados de um ficheiro)
+
+Os offsets que o SDK pede sao **exactamente** os que estao no cabecalho do
+RomFS — o SDK le-o e parseia-o. E o ficheiro que ele le comeca' por
+`BNSH` (a assinatura de um banco de som), que e' o que se espera.
+
+### Onde o jogo aborta agora
+
+**Medido** (com o observador ligado): o abort e' do `nn::fs::ReadFile`
+(a cadeia de frames: `nn::fs::ReadFile` -> `nn::diag::detail::Abort` ->
+`nn::diag::detail::AbortImpl`), e o `Result` e' `0x0001A80A` — modulo 10
+(**CMIF**), desc 212. Ou seja: o **leitor CMIF do SDK** rejeitou a
+resposta.
+
+O `nn::fs` do SDK le o ficheiro em **ranges** (o log do proprio SDK
+imprime `fetched: [{ offset, size }, ...]`, com sete entradas) e o abort
+vem a seguir a leitura dos dados do ficheiro.
+
+**O que ainda nao se sabe**: porque e' que o leitor CMIF rejeita a resposta
+a esta leitura e nao as outras seis. As respostas tem a mesma forma (12
+palavras, `Result` = 0), e os dados sao bons (o `BNSH` bate certo com uma
+decifracao de referencia em Python). E' a proxima parede.

@@ -5,3 +5,15 @@ build/
 # O clone que o GitHub Desktop gere: e' um repositorio dentro deste, e
 # nao faz parte do projecto.
 /EdenMaliG610/
+
+# As chaves do console e as ROMs do jogo **nao entram no repositorio**.
+#
+# O repositorio e' publico, e as chaves (prod.keys, title.keys) e as ROMs
+# (.nsp, .xci, .nca) pertencem a quem as tem — e a lei. O motor le-as de
+# fora: `G610_KEYS` e `G610_NSP` (ver README.md).
+*.keys
+*.nsp
+*.xci
+*.nca
+*.cnmt.nca
+*.cnmt.xml

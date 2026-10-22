@@ -43,6 +43,18 @@ find_package(SDL2 REQUIRED)
 # o sintoma de duas copias que o linker nao consegue juntar.
 find_package(fmt REQUIRED)
 
+# O OpenSSL — **so' para o bloco AES**.
+#
+# O motor precisa de AES para ler o RomFS do jogo (o NCA esta' cifrado com
+# AES-XTS e AES-CTR). O `libcrypto` e' a implementacao; o XTS e o CTR do
+# Switch sao escritos por cima, porque **nao sao os de serie** (ver
+# `include/g610/crypto/aes.hpp`).
+#
+# A alternativa seria escrever o AES de raiz — e nao vale a pena: nao e'
+# onde esta' o valor do projecto, e o AES e' o alvo de uma historia infinita
+# de bugs que ja foi escrita por outros.
+find_package(OpenSSL REQUIRED)
+
 # --- núcleo reutilizável -----------------------------------------------------
 # Separado do executável para que os testes liguem as mesmas fontes e não uma
 # cópia — um teste que passa contra uma cópia não garante nada sobre o
@@ -63,6 +75,8 @@ add_library(g610_core STATIC
   src/services/vi.cpp
   src/ipc_min.cpp
   src/guest_placement.cpp
+  src/crypto/aes.cpp
+  src/fs/romfs.cpp
   src/gpu/ir.cpp
   src/gpu/maxwell_isa.cpp
   src/gpu/maxwell_program.cpp
@@ -201,7 +215,8 @@ target_include_directories(g610_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/vendor/third_party/bcdec
 )
 target_compile_definitions(g610_core PUBLIC ANKERL_UNORDERED_DENSE_STD_MODULE=1)
-target_link_libraries(g610_core PUBLIC Vulkan::Vulkan SDL2::SDL2 fmt::fmt pthread)
+target_link_libraries(g610_core PUBLIC Vulkan::Vulkan SDL2::SDL2 fmt::fmt pthread
+  OpenSSL::Crypto)
 
 # --- o Eden vendorizado ------------------------------------------------------
 # A parte SISTEMÁTICA do OS do Eden: a camada de IPC e os objectos de porta e

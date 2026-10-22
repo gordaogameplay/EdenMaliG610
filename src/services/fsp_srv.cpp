@@ -60,11 +60,15 @@
 // SPDX-FileCopyrightText: 2018 Yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "g610/fs/romfs.hpp"
 #include "vendor/eden/common/logging.h"
 #include "vendor/eden/core/system_ref.h"  // o `Core::System` nosso
 #include "vendor/eden/core/hle/kernel/k_event.h"
@@ -80,6 +84,100 @@ using Service::HLERequestContext;
 
 using IPC::RequestParser;
 using IPC::ResponseBuilder;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// O armazenamento de dados do processo: o RomFS do jogo.
+//
+// **O jogo traz as suas coisas.** O `fsp-srv` da casa serve o RomFS que
+// o utilizador tem — o ficheiro `.nsp` (ou `.xci`) do jogo e o ficheiro
+// de chaves que o utilizador tem.
+//
+// **Nada disto entra no repositorio.** O repositorio e' publico, e as
+// chaves do console e as ROMs sao do utilizador (e da lei). O motor so
+// precisa de saber onde estao:
+//
+//   * `G610_NSP`   — o caminho do `.nsp` (ou de um directorio com ele);
+//   * `G610_KEYS`  — o caminho do ficheiro de chaves (`prod.keys`).
+//
+// Se nao estiverem marcados, procura-se no sitio habitual do Eden
+// (`~/.local/share/eden/keys/prod.keys`) e no directorio de ROMs do
+// utilizador. **E' tudo opcional**: sem chaves ou sem ROM, o motor
+// arranca e o `fsp-srv` responde vazio — como antes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// O RomFS — um só, aberto a primeira vez.
+RomfsJogo& O_Romfs() {
+    static RomfsJogo romfs;
+    return romfs;
+}
+
+// O ficheiro de chaves do utilizador.
+ChavesConsole& As_Chaves() {
+    static ChavesConsole chaves;
+    return chaves;
+}
+
+// O caminho do `.nsp` do utilizador (ou `""`).
+std::string O_CaminhoDoNsp() {
+    if (const char* v = std::getenv("G610_NSP"); v != nullptr && v[0] != 0) {
+        return v;
+    }
+    return "";
+}
+
+// O caminho do ficheiro de chaves do utilizador (ou `""`).
+std::string O_CaminhoDasChaves() {
+    if (const char* v = std::getenv("G610_KEYS"); v != nullptr && v[0] != 0) {
+        return v;
+    }
+    // O sitio do Eden, se o utilizador o tiver.
+    const char* base = std::getenv("XDG_DATA_HOME");
+    std::string xdg = base != nullptr ? base : "";
+    if (xdg.empty()) {
+        if (const char* home = std::getenv("HOME"); home != nullptr) {
+            xdg = std::string(home) + "/.local/share";
+        }
+    }
+    if (!xdg.empty()) {
+        const std::string candidato = xdg + "/eden/keys/prod.keys";
+        if (std::ifstream(candidato).good()) {
+            return candidato;
+        }
+    }
+    return "";
+}
+
+// Abre o RomFS (uma vez). Devolve `true` se estiver pronto.
+bool AbrirORomfs() {
+    RomfsJogo& romfs = O_Romfs();
+    if (romfs.Aberto()) {
+        return true;
+    }
+    const std::string nsp = O_CaminhoDoNsp();
+    if (nsp.empty()) {
+        LOG_INFO(Service_FS,
+                "fsp-srv: sem 'G610_NSP' — o armazenamento de dados fica vazio");
+        return false;
+    }
+    if (!As_Chaves().Vazia()) {
+        // ja' carregadas
+    } else {
+        const std::string chaves = O_CaminhoDasChaves();
+        if (chaves.empty()) {
+            LOG_INFO(Service_FS,
+                    "fsp-srv: sem 'G610_KEYS' — o armazenamento de dados fica vazio");
+            return false;
+        }
+        As_Chaves().Carregar(chaves);
+    }
+    // O `program_id` do jogo: o do NPDM, se o soubermos. Sem ele, o
+    // motor usa o NCA de programa que encontrar no NSP.
+    std::uint64_t program_id = 0;
+    if (const char* v = std::getenv("G610_PROGRAM_ID"); v != nullptr && v[0] != 0) {
+        program_id = std::strtoull(v, nullptr, 0);
+    }
+    return romfs.Abrir(nsp, program_id, As_Chaves());
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utilitários
@@ -354,29 +452,59 @@ public:
     }
 
 private:
-    // 0: ler do armazenamento. Sem romfs, zero bytes. O `Result` é
-    // sucesso — o Eden também não falha aqui, devolve a leitura vazia.
+    // 0: ler do armazenamento — a imagem do RomFS.
     //
     // **O `offset` e o `length` que o guest pede são o instrumento.** São
     // eles que dizem se o guest está a ler uma imagem de RomFS (cabeçalho
     // em 0, depois as tabelas) ou outra coisa. Sem o log, "vazio" não diz
     // nada.
+    //
+    // **Medido**: o `nn::fs` do SDK abre o armazenamento e pede
+    // `Read(offset=0, length=80)` — 80 bytes é o cabeçalho do RomFS.
     void Read(HLERequestContext& ctx) {
         RequestParser rp{ctx};
         const auto offset = rp.PopRaw<std::int64_t>();
         const auto length = rp.PopRaw<std::int64_t>();
-        LOG_DEBUG(Service_FS, "IStorage::Read: offset={:#X} length={} -> vazio (sem romfs)",
-                  static_cast<std::uint64_t>(offset), static_cast<std::int64_t>(length));
+        const std::size_t saida = ctx.GetWriteBufferSize(0);
+        LOG_DEBUG(Service_FS, "IStorage::Read: offset={:#X} length={} (buffer={})",
+                  static_cast<std::uint64_t>(offset), static_cast<std::int64_t>(length), saida);
+
+        if (length > 0 && saida > 0 && AbrirORomfs()) {
+            const std::size_t n = static_cast<std::size_t>(
+                std::min<std::int64_t>(static_cast<std::int64_t>(saida), length));
+            std::vector<std::uint8_t> buffer(n);
+            if (O_Romfs().Ler(static_cast<std::uint64_t>(offset), n, buffer.data())) {
+                ctx.WriteBuffer(buffer.data(), n, 0);
+                // **Os primeiros bytes da leitura.** Sao o que permite
+                // comparar com uma decifracao de referencia (o Python) sem
+                // despejar o ficheiro todo.
+                std::string hex;
+                for (std::size_t i = 0; i < std::min<std::size_t>(16, n); ++i) {
+                    char b[3];
+                    std::snprintf(b, sizeof b, "%02x", buffer[i]);
+                    hex += b;
+                }
+                LOG_DEBUG(Service_FS, "IStorage::Read: primeiros bytes: {}", hex);
+            } else {
+                LOG_WARNING(Service_FS, "IStorage::Read: a leitura de {:#X} falhou",
+                            static_cast<std::uint64_t>(offset));
+            }
+        }
+
         ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
 
-    // 4: o tamanho do armazenamento. Zero.
+    // 4: o tamanho do armazenamento — o tamanho da imagem do RomFS.
     void GetSize(HLERequestContext& ctx) {
-        LOG_DEBUG(Service_FS, "IStorage::GetSize: 0 (sem romfs)");
+        std::uint64_t tamanho = 0;
+        if (AbrirORomfs()) {
+            tamanho = O_Romfs().Tamanho();
+        }
+        LOG_DEBUG(Service_FS, "IStorage::GetSize: {}", tamanho);
         ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
-        rb.Push<std::uint64_t>(0);
+        rb.Push<std::uint64_t>(tamanho);
     }
 };
 
@@ -776,10 +904,21 @@ private:
             ctx, std::make_shared<ISaveDataTransferProhibiter>(system));
     }
 
-    // 200: o armazenamento de dados do processo (o "romfs"). O Eden
-    // abre o romfs real; nós abrimos um armazenamento **vazio**.
+    // 200: o armazenamento de dados do processo (o "romfs").
+    //
+    // O Eden abre o romfs real do processo; a casa abre o RomFS que o
+    // **utilizador** traz (o `.nsp` dele). Sem esse ficheiro — ou sem as
+    // chaves — o armazenamento e' vazio, e o jogo aborta ao abrir um
+    // ficheiro (medido: `nn::fs::OpenFile`).
     void OpenDataStorageByCurrentProcess(HLERequestContext& ctx) {
-        LOG_DEBUG(Service_FS, "fsp-srv::OpenDataStorageByCurrentProcess: vazio (sem romfs)");
+        if (AbrirORomfs()) {
+            LOG_DEBUG(Service_FS, "fsp-srv::OpenDataStorageByCurrentProcess: {} bytes",
+                      O_Romfs().Tamanho());
+        } else {
+            LOG_WARNING(Service_FS,
+                        "fsp-srv::OpenDataStorageByCurrentProcess: vazio (sem 'G610_NSP' ou "
+                        "sem 'G610_KEYS')");
+        }
         ResponseBuilder rb{ctx, 2, 0, 1};
         rb.Push(ResultSuccess);
         rb.PushIpcInterface<IStorage>(ctx, std::make_shared<IStorage>(system));
