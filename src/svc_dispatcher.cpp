@@ -2428,6 +2428,57 @@ Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
                          static_cast<unsigned long long>(f[1]),
                          static_cast<unsigned long long>(f[3]),
                          static_cast<unsigned long long>(f[5]));
+
+        // O prologo do submitter (0x805e6970) salvou o x19/x20 do chamador
+        // em fp_sub-0x08/-0x10 (str x25,[sp,#-0x50]!; stp x20,x19,[sp,#0x30];
+        // add x29,sp,#0x40). Vale para todos os sites que o chamam (o
+        // submitter e unico): medir o dono por sinal, com o lvl1 emparelhado.
+        const std::uint64_t fps = ctx.gpr[29];
+        std::uint64_t cal[2] = {};
+        if (fps >= largura + 0x10 && fps < topo &&
+            read_guest(fps - 0x10, cal, sizeof cal)) {
+            std::uint64_t filas[2] = {0, 0};
+            const bool tem_fila =
+                cal[1] >= largura && cal[1] < topo &&
+                read_guest(cal[1] + 0x138, filas, sizeof filas);
+            if (tem_fila)
+                std::fprintf(stderr,
+                             "[svc] Sinal origem lvl1=0x%llx dono=0x%llx "
+                             "filaA=0x%llx filaB=0x%llx\n",
+                             static_cast<unsigned long long>(f[1]),
+                             static_cast<unsigned long long>(cal[1]),
+                             static_cast<unsigned long long>(filas[0]),
+                             static_cast<unsigned long long>(filas[1]));
+            else
+                std::fprintf(stderr,
+                             "[svc] Sinal origem lvl1=0x%llx dono=0x%llx\n",
+                             static_cast<unsigned long long>(f[1]),
+                             static_cast<unsigned long long>(cal[1]));
+        }
+        if (ok) {
+            const std::uint64_t fp1 = f[0];
+            std::uint64_t janela[13] = {};
+            if (fp1 >= largura + 0x48 && fp1 < topo &&
+                read_guest(fp1 - 0x48, janela, sizeof janela))
+                std::fprintf(stderr,
+                             "[svc] Sinal janela fp1=0x%llx "
+                             "j0=0x%llx j1=0x%llx j2=0x%llx j3=0x%llx "
+                             "j4=0x%llx j5=0x%llx j6=0x%llx j7=0x%llx "
+                             "j8=0x%llx j9=0x%llx j10=0x%llx j11=0x%llx\n",
+                             static_cast<unsigned long long>(fp1),
+                             static_cast<unsigned long long>(janela[0]),
+                             static_cast<unsigned long long>(janela[1]),
+                             static_cast<unsigned long long>(janela[2]),
+                             static_cast<unsigned long long>(janela[3]),
+                             static_cast<unsigned long long>(janela[4]),
+                             static_cast<unsigned long long>(janela[5]),
+                             static_cast<unsigned long long>(janela[6]),
+                             static_cast<unsigned long long>(janela[7]),
+                             static_cast<unsigned long long>(janela[8]),
+                             static_cast<unsigned long long>(janela[9]),
+                             static_cast<unsigned long long>(janela[10]),
+                             static_cast<unsigned long long>(janela[11]));
+        }
     }
 
     std::vector<std::uint64_t> wakers;

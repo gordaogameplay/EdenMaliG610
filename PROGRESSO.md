@@ -5589,3 +5589,128 @@ e o novo alvo `g610_gpfifo_replay`),
 Commits (em `wip/passo-4-thread`): 3f86811 fonte, 6c9fc4b hid+csrng,
 a2a17a9 threads/handles/CloseHandle, 7f25210 limpeza de glifos,
 5a64d8f SNORM, e este documento.
+
+## O dono do dispatcher da bomba e o leito das cinco cv (medido, 22/10)
+
+### Como se mediu
+
+Três corridas (`LOG11`/`LOG12`/`LOG13`, 16k-17k linhas cada, `EXIT=139`
+de sempre, boot completo - os 1875 sinais) com o instrumento env-gated
+da casa (`G610_SVC_SIGNAL_TRACE=1 G610_SVC_SIGNAL_FP=1`). O
+`svc_dispatcher.cpp` imprime por sinal:
+
+- `cadeia` (3 niveis de `x29`) + a janela crua do frame do site
+  (12xu64 desde `fp1-0x48`);
+- **por sinal: `origem lvl1=... dono=... filaA=... filaB=...`** - o
+  `lvl1` da cadeia emparelhado com os dois registos que o chamador
+  tinha na hora do post, lidos do prologo do proprio submitter.
+
+O caminho da leitura do dono: o submitter `0x805e6970` (unico, os 23
+sites e mais o esqueleto todos o chamam) comeca com
+`str x25,[sp,#-0x50]!; stp x20,x19,[sp,#0x30]; add x29,sp,#0x40` -
+callee-save, guardou o `x19` do chamador em `fp_sub-0x08`. Portanto
+**dono = guest[ctx.x29-0x08] no instante do sinal**, sem
+adivinhar layouts de frame. Note-se a armadilha que a medida
+corrigiu: o prologo do caster (`0x805dd790`, achado pelo pad) guarda
+o `x19` de ENTRADA em `fp-8` (a janela[8] = `0xd9a9b740` constante em
+799/806) — mas o corpo re-carrega `x19` (de `x24+8`, de `x28+0x48`,
+do spill `[sp+0x38]`, de `[x24]`) e antes do site faz
+`ldp x21,x19,[sp,#0x30]` (0x805ddff8) = o spill `[sp+0x38]` que no
+prologo guardou o **x20 de entrada** (`str x20,[sp,#0x38]` em
+0x805dd844). O x19 do site = arg0 do caster, não o slot da janela.
+Os fundamentos estaticos vieram de capstone 5.0.7 no anfitrião (o
+`objdump` no Pi falha por pipeline - nunca mais).
+
+### O dono (medido)
+
+`LOG12` = 846/846 sinais do site `0x805de05c` com **UM** dono:
+
+    dono=0x10a2c6ef0  x20=0x10a2c29e8  filaA=0x10a509360  filaB=0x10a509708
+
+As duas filas = **o mesmo array de pools** (passo `0x3A8`),
+`filaA=[dono+0x138]` = pool[0] e `filaB=[dono+0x140]` = pool[1], com
+cv = cabeça+0x384 (nao +0x380: as filas antigas
+"fila = cv-0x380" estavam off-by-4 — a correcta é pool = cv-0x384):
+
+- pool[0] `0x10a509360`, cv `0x10a5096e4` = a bomba (859 sinais/run);
+- pool[1] `0x10a509708`, cv `0x10a509a8c` = **a do 0x28004** - as duas
+  threads compartem o MESMO dono, que escolhe a fila por duas pistas.
+
+### O gate que escolhe a fila (o fecho do 0x28004)
+
+O site antes do post: trava `dono+0x124`, le o flag `[dono+0x14b]`,
+e em AMBAS as rotas faz `bl 0x805e2500` (a sonda, com `x1=0` ou
+`x1=[sp+8]` conforme o flag) → `cmp w27,#1` → **`<=1` posta em
+`[x19+0x138]` (pool[0]), `>1` posta em `[x19+0x140]` (pool[1])**; o
+flag so muda o argumento da sonda. Na corrida o `w27` ficou sempre
+`<=1` (846x o ramo A) ⇒ **pool[1] nunca recebe post: a cv
+`0x10a509a8c` = 0 sinais em toda a corrida** - a thread do 0x28004
+fica starved pela trava de contentao (pendentes nunca >1), **nao por
+falta de dono**. Em `LOG13` a mesma medida universal (1875/1875
+sinais com dono) confirma: chaves das cinco = 0x28004: **0**,
+0x8000: 0, 0x10001: 0, 0x18002: 0, parede: **1**, bomba: 859.
+
+### A correcao estrutural do lvl1 0x805e70b0
+
+O "fluxo A" das run anteriores (43x) era captura parcial do
+LOG9/LOG10: `LOG11` e `LOG13` tem **859x/846x identicas** — numeros
+estaveis entre runs. E o lvl1 `0x805e70b0` nao e retorno de chamada
+ao submitter: `0x805e70ac` = `bl 0x805e2d80` **dentro da drenadora
+`0x805e6ee0`** (arg0 = `0x10a509360` = pool[0], `x19 = arg0+0x360`,
+trava, drena `[x20+0x300]`/`[+0x308]` e `[+0x330]/[+0x338]`, executa
+os nos via `blr` (vtable `+0x38`/`+0x48`; flag de release `+0x2f8`),
+e depois `bl 0x805e2d80` = o fan-out de callbacks: trava
+`[x0+0x110]`/`[x0+0x130]`, flag `[x0+0x170]=1`, varre
+`[x0+0xb0..0xb8]` com dedup contra `[x0+0xe0..0xe8]` e chama a
+`vtable[0]` de cada observador (cada observador sinaliza o proprio
+cv — daí as chaves 1x-cada, strides `0x1C0`/`0x228` em `0x10a51`/
+`0x10a52`). O corredor `0x805d1030` = `add x0,x0,#0x60; bl 0x805cf920;
+ldr x8,[x19]; ldr x8,[x8,#0x40]; blr` + o flag `+0x2f8`;
+`0x805d1080` = release directo. O dono de `0x805e70b0` = `0x10a5096c0`
+= pool[0]+0x360, constante x859.
+
+### Donos por lvl1 (o mapa completo, LOG13)
+
+    0x805de05c -> 0x10a2c6ef0 x846        (o caster; filaA/filaB = o par)
+    0x805e4040  -> 0x10a2c6ef0 x1         (irmaos do caster, MESMO dono)
+    0x805e410c  -> 0x10a2c6ef0 x1
+    0x8000de4c  -> 0x10982d768/0x10982d9e8/0x10982db00 x12  (x0 directo)
+    0x805e70b0  -> 0x10a5096c0 x859       (o retorno da drenadora)
+    0x83c418e8/0x83c1fb44 -> 0x83c2b83c x102 (SDK)
+    0x83994acc e irmaos    -> 0x8434ed10 x~14 (filaA=0x8434ee50,
+                                       cv=0x8434ed4c x24)
+    0x8398842c -> 0x88000000 x6; 0x83988f0c -> pilha x9 (SDK)
+
+Os notifies de arranque 1x (`0x13f20fe0c` por `0x805d3b60`;
+`0x13f31035c` por `0x805d3e4c`; `0xe20280e4` por `0x805e00ec`;
+`0x13f310098`/`0x13f3104d8` por `0x805d6cbc`) = os clones inlinados a
+-0xB0 das cvs dos cinco. E a parede tem **um unico sinal**
+(key `0xd9c2c22c`, lvl1=`0x8065b3cc`/lvl2=`0x8065afa4`/lvl3=
+`0x806598a0`) com dono = endereco de pilha `0x30fffec08` = one-shot
+de cleanup, nao post de objecto.
+
+**Total: 51 grupos (lvl1, dono, filaA, filaB) medidos por corrida.**
+Os quatro pools fora do par da bomba (cabecas ~`0x13f20fb38`,
+`0x13f310088`, `0xe2027e10`, ~`0xd9c2bea8`) **nao aparecem como
+filaA/filaB de nenhum grupo** — nenhum poster em qualquer ramo via
+submitter em toda a corrida.
+
+### Conclusao da Parede 2
+
+As cinco cv de espera nao tem poster que corra neste estado de boot:
+o par da bomba tem um unico dono com duas filas (e a segunda nunca e
+escolhida porque os pendentes nunca chegam a >1), e as quatro
+restantes nao sao fila de ninguem. **Fecha como inactividade correcta
+do jogo nesta fase**: sao workers de subsistemas que o jogo ainda nao
+alimenta no boot capturado. Fica de alerta para runs futuros em que o
+guest passe desta fase — o instrumento (env-gated, 2 leituras por
+sinal) ja mede tudo de novo de gratis.
+
+### O que decidir no passo seguinte
+
+1. **~~A caça ao poster das cinco cv~~** — fechado: sem poster no
+   estado capturado, medida acima.
+2. **GPU**: medir o VA entregue pelas 29 chamadas de firmware 4
+   (`falcon[4]`) num run vivo, lado GPU — o run vivo e quem tem a
+   memoria; o teste `gpfifo_replay` e o contrato (Parte B verde:
+   1637 passos / 901 envios).
