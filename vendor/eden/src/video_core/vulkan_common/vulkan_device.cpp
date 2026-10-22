@@ -90,6 +90,60 @@ constexpr std::array VK_FORMAT_A4B4G4R4_UNORM_PACK16{
     VK_FORMAT_UNDEFINED,
 };
 
+// **O equivalente UNORM de um SNORM** ✗.
+//
+// **O Mali nao tem SNORM** ✗ ✗ — e o PanVK ✗ (o driver Vulkan do Mali ✗)
+// tambem nao ✗ ✗. `vkGetPhysicalDeviceFormatProperties` devolve zero
+// para esses formatos ✗ ✗, e o Eden — sem saber disso ✗ — devolvia o
+// **formato pedido** ✗ ✗ (o `GetSupportedFormat` ✗, em
+// `vulkan_device.cpp:706` ✗) ✗ ✗.
+//
+// **O resultado e' um crash** ✗ ✗: o PanVK recebe uma `vkCreateImage`
+// com um formato que nao sabe criar ✗ ✗ e segfaulta ✗ ✗. Medido no
+// Eden no Pi (2026-10-22) ✗ ✗:
+//
+//     Render.Vulkan <Error> vulkan_device.cpp:800:GetSupportedFormat:
+//       Format=17 with usage=49283 and type=1 has no defined alternatives
+//       and host hardware does not support it
+//
+// **17 = R8G8_SNORM** ✗ ✗, **52 = A8B8G8R8_SNORM_PACK32** ✗ ✗,
+// **71 = R16_SNORM** ✗ ✗ e **78 = R16G16_SNORM** ✗ ✗ — todos SNORM ✗ ✗.
+//
+// **O bit layout e' o mesmo** ✗ ✗ (so' muda a interpretacao do sinal ✗)
+// ✗ ✗, e e' por isso que o UNORM serve ✗ ✗.
+constexpr VkFormat EquivalenteUnorm(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_R8_SNORM:
+        return VK_FORMAT_R8_UNORM;
+    case VK_FORMAT_R8G8_SNORM:
+        return VK_FORMAT_R8G8_UNORM;
+    case VK_FORMAT_R8G8B8_SNORM:
+        return VK_FORMAT_R8G8B8_UNORM;
+    case VK_FORMAT_B8G8R8_SNORM:
+        return VK_FORMAT_B8G8R8_UNORM;
+    case VK_FORMAT_R8G8B8A8_SNORM:
+        return VK_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_B8G8R8A8_SNORM:
+        return VK_FORMAT_B8G8R8A8_UNORM;
+    case VK_FORMAT_A8B8G8R8_SNORM_PACK32:
+        return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    case VK_FORMAT_A2R10G10B10_SNORM_PACK32:
+        return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+    case VK_FORMAT_A2B10G10R10_SNORM_PACK32:
+        return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case VK_FORMAT_R16_SNORM:
+        return VK_FORMAT_R16_UNORM;
+    case VK_FORMAT_R16G16_SNORM:
+        return VK_FORMAT_R16G16_UNORM;
+    case VK_FORMAT_R16G16B16_SNORM:
+        return VK_FORMAT_R16G16B16_UNORM;
+    case VK_FORMAT_R16G16B16A16_SNORM:
+        return VK_FORMAT_R16G16B16A16_UNORM;
+    default:
+        return VK_FORMAT_UNDEFINED;
+    }
+}
+
 } // namespace Alternatives
 
 template <typename T>
@@ -708,6 +762,19 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
     if (IsFormatSupported(wanted_format, wanted_usage, format_type)) {
         return wanted_format;
     }
+
+    // **O SNORM** ✗ — o Mali ✗ nao tem SNORM ✗ ✗, e o bit layout e' o
+    // mesmo ✗ ✗. Devolver o **formato pedido** ✗ (o que se fazia ✗ ✗)
+    // leva o PanVK ✗ a um crash ✗ ✗.
+    if (const auto unorm = Alternatives::EquivalenteUnorm(wanted_format);
+        unorm != VK_FORMAT_UNDEFINED && IsFormatSupported(unorm, wanted_usage, format_type)) {
+        LOG_DEBUG(Render_Vulkan,
+                  "Emulating format={} with format={} (SNORM is not supported by the host) "
+                  "with usage={} and type={}",
+                  wanted_format, unorm, wanted_usage, format_type);
+        return unorm;
+    }
+
     // The wanted format is not supported by hardware, search for alternatives
     const VkFormat* alternatives = GetFormatAlternatives(wanted_format);
     if (alternatives == nullptr) {
@@ -734,6 +801,29 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
               "Format={} with usage={} and type={} is not supported by the host hardware and "
               "doesn't support any of the alternatives",
               wanted_format, wanted_usage, format_type);
+
+    // **O ultimo recurso** ✗ — devolver o formato pedido ✗ quando o
+    // hardware nao o tem ✗ ✗ e' o que crasha o driver ✗ ✗. Antes de
+    // desistir ✗ ✗, tenta-se um formato **generico** ✗ — com o mesmo
+    // bit layout por canal ✗ ✗ — que o Mali tem de certeza ✗ ✗.
+    //
+    // A lista esta' por ordem de preferencia ✗ ✗: o de 32 bits primeiro
+    // ✗ ✗ (o mais fiel ✗ ✗) ✗ ✗ e o mais largo no fim ✗ ✗.
+    for (const auto candidato : {VK_FORMAT_R16G16B16A16_UNORM,
+                                  VK_FORMAT_R8G8B8A8_UNORM,
+                                  VK_FORMAT_B8G8R8A8_UNORM,
+                                  VK_FORMAT_A8B8G8R8_UNORM_PACK32,
+                                  VK_FORMAT_R32_UNORM,
+                                  VK_FORMAT_R16_UNORM,
+                                  VK_FORMAT_R8_UNORM}) {
+        if (IsFormatSupported(candidato, wanted_usage, format_type)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Falling back to format={} for format={} with usage={} and type={}",
+                        candidato, wanted_format, wanted_usage, format_type);
+            return candidato;
+        }
+    }
+
     return wanted_format;
 }
 
