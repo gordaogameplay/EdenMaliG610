@@ -46,8 +46,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -2065,6 +2068,32 @@ private:
                             cab.Endereco());
                 RespostaErro(ctx, NvResult::InvalidAddress, "ioctl");
                 return;
+            }
+        }
+
+        // ── O instrumento do dump bruto (o ambiente: `G610_GPFIFO_DUMP`) ─
+        //
+        // **A medição do teste determinístico**: escreve o push buffer
+        // completo de cada submit num arquivo próprio (o caminho dado no
+        // ambiente, com o número da submissão preso ao fim), para o
+        // teste reproduzir a ordenação real do jogo — nada inventado.
+        // Sem a variável no ambiente, zero custo (só `getenv`).
+        {
+            const char* dump_base = std::getenv("G610_GPFIFO_DUMP");
+            if (dump_base != nullptr && *dump_base != '\0' && !pushbuffer.empty()) {
+                static std::atomic<std::uint32_t> submissoes_dump{0};
+                const std::uint32_t seq = submissoes_dump.fetch_add(1);
+                char caminho[512];
+                std::snprintf(caminho, sizeof caminho, "%s.%06u.bin", dump_base,
+                              static_cast<unsigned>(seq));
+                if (std::FILE* f = std::fopen(caminho, "wb"); f != nullptr) {
+                    const std::size_t gravado =
+                        std::fwrite(pushbuffer.data(), 1, pushbuffer.size(), f);
+                    std::fclose(f);
+                    LOG_INFO(Service_NVDRV,
+                             "SubmitGPFIFO: push buffer de {} bytes ({} gravados) em {}",
+                             pushbuffer.size(), gravado, caminho);
+                }
             }
         }
 

@@ -360,6 +360,17 @@ add_executable(g610_pushbuffer tests/test_pushbuffer.cpp)
 target_link_libraries(g610_pushbuffer PRIVATE g610_core)
 add_test(NAME pushbuffer COMMAND g610_pushbuffer)
 
+# O teste do caso REAL capturado (o instrumento `G610_GPFIFO_DUMP`):
+# 8864 bytes de um submit de Pokemon Shield, com 29 desenhos por macro
+# MME e `draw_begin`/`draw_end` AUSENTES. A Parte B hoje FALHA (o
+# tradutor devolve 0) — e' a marca da causa demonstrada; fica verde
+# quando as macros forem interpretadas.
+add_executable(g610_gpfifo_replay tests/test_gpfifo_replay.cpp)
+target_link_libraries(g610_gpfifo_replay PRIVATE g610_core)
+target_compile_definitions(g610_gpfifo_replay PRIVATE
+  GPFIFO_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/gpfifo_submit0.bin")
+add_test(NAME gpfifo_replay COMMAND g610_gpfifo_replay)
+
 # Teste do programa multi-modulo. Precisa de um ExeFS real, por isso nao e'
 # um add_test sem argumentos: corre contra os ROMs do utilizador.
 add_executable(g610_program tests/test_program.cpp)

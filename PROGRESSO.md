@@ -60,11 +60,17 @@ O jogo corre **240 s de relógio** sem abortar nos serviços: fonte servida,
 
 A parede de hoje tem **duas faces, medidas**:
 
-1. **GPU**: o `SubmitGPFIFO` lê 8864 bytes, decodifica **376 métodos**
-   (max id 3627, `draw_begin`=1414, `draw_end`=1413, os 7 subcanais com
-   histogramas completos) e traduz **0 comandos**. O tradutor semântico
-   Maxwell→Mali é o próximo passo; `DequeueBuffer`/`QueueBuffer` do
-   compositor nunca foram alcançados.
+1. **GPU — causa demonstrada**: o `SubmitGPFIFO` lê 8864 bytes, decodifica
+   **624 chamadas** de método (**376 ids únicos** — a leitura antiga de
+   "376 métodos" contava ids, não chamadas), liga os 5 subcanais
+   (`BindObject` sc0=0xB197 Maxwell 3D) e traduz **0 comandos** — porque
+   o jogo **não usa** `draw_begin` (1414) / `draw_end` (1413): desenha
+   via **macros MME** (id ≥ 0xE00; a estrutura medida é
+   `3594:29 3595:29 …` = a macro `(0xE0A-0xE00)>>1` invocada 29 vezes).
+   O tradutor da casa só trata 1414/1413 — por isso 0. O caso real
+   está fixado: `tests/fixtures/gpfifo_submit0.bin` + teste
+   `gpfifo_replay` (Parte A toda verde; a Parte B é a falha
+   deliberada da expectativa — fica verde na próxima etapa).
 2. **Thread de cv**: uma thread (tag 0x38005, sp 0x2c8cbeeb0) repete
    `WaitProcessWideKeyAtomic` na cv 0xd9c2c22c com timeout ~5 ms; o único
    `SignalProcessWideKey` dessa cv chegou **antes** do waiter (acordados=0;
@@ -5216,7 +5222,7 @@ nasce em `run_guest_thread`); log medido: `(a thread corre)`.
 
 ctest no Pi: **7/7**.
 
-### Parede 1 — GPU (medida, não resolvida)
+### Parede 1 — GPU (a causa demonstrada, 22/10 tarde)
 
 No boot de 240 s (`/tmp/LOG`):
 
@@ -5224,17 +5230,80 @@ No boot de 240 s (`/tmp/LOG`):
     [eden:D] Service::NVDRV: SubmitGPFIFO: 8864 bytes, 0 comandos traduzidos (0 desconhecidos, 0 descartados)
     [eden:D] Service::NVDRV: syncpoint 1 Advanced para 1
 
-O descriptor GPFIFO lê-se: **376 métodos** num submit de 8864 bytes, histograma
-por método (concentração enorme no zero, com ids até 3627), `draw_begin` (id
-1414) e `draw_end` (id 1413) presentes. Os `BindObject` do canal distribuem os
-subcanais 0..4 = 0xB197 (Maxwell 3D), 0xB1C0, 0xA140, 0x902D, 0xB0B5. Depois do
-submit, o `nvdrv` continua: `nvmap IocCreate` (0x1000) → handle 120;
-`IocAlloc` → 0xE2DD3000; `Open '/dev/nvhost-gpu'` → fd 6; `BindChannel` fd 6.
+**A leitura antiga desta secção estava errada, e a medição de hoje
+refuta-a**: o `total=376` é `metodos_vistos.size()` — **ids únicos**,
+não chamadas — e o `(draw_begin=1414 draw_end=1413)` é **literal do
+formato** da linha de log (os dois valores nunca foram medidos). O
+histograma real do stream provou o contrário:
 
-Falta o passo que dá nome ao projecto: **a tradução semântica do pushbuffer
-para o fluxo de comandos do Mali-Csf** (G610). Hoje o tradutor emite **0
-comandos** — e por isso `DequeueBuffer`/`QueueBuffer` do compositor nunca
-foram alcançados, e nada chega ao ecrã.
+    1410:2 1411:2 1412:1 …   — 1413 e 1414 NUNCA aparecem.
+
+O fluxo completo, agora capturado em bytes reais:
+
+    SubmitGPFIFO: push buffer de 8864 bytes (8864 gravados) em /tmp/pb/cap.000000.bin
+
+**O instrumento novo** (`G610_GPFIFO_DUMP`, no `nvdrv.cpp`, antes do
+`translate`) grava cada submit num arquivo; o run dele repete o caso
+medido: 3 submits de 8864 bytes + 1 de 300, os mesmos 5 `BindObject`
+por submit (sc0=0xB197, sc1=0xB1C0, sc4=0xB0B5, sc2=0xA140,
+sc3=0x902D), e as mesmas contagens: **624 chamadas, 6 descartados
+(os modos 0 do arranque), 376 ids únicos** — e **0 comandos
+traduzidos nas quatro submissões** (o instrumento não mudou
+comportamento).
+
+**Sequência original do submit** (item 2 do pedido; o decodificador
+`tools/decodificar_pushbuffer.py` reproduz a máquina do
+`PushBufferReader::for_each` e bate com o log vivo):
+
+- palavras 0–9: os 5 `BindObject` (header + classe; sc0→0xB197 em
+  index 1);
+- palavras 10–15: **6 palavras de modo 0** (o `IncreasingOld`
+  do arranque) — descartadas palavra a palavra, o mesmo que o
+  `default` do upstream;
+- a partir de 16: o upload do micro-código MME, em tripletos
+  `71/72/69/70` (`load_mme_instruction_ptr`, `load_mme_start_address`,
+  `load_mme_instruction`), blocos de 17+16, 11+10, 10+9, 9+8, 7+6,
+  26+25, … — o jogo **carrega macros no arranque do canal**;
+- índices 976+: as chamadas de desenho, SEMPRE na forma
+  `m=3594 (0xE0A) arg≈0x004xxxxx args=3` seguido de
+  `m=3595 (0xE0B) arg args=2` — **29 vezes** (mais
+  `3612:1 3616:2 3624:2 3625:2 3626:1 3627:1`);
+- fim: 2 chamadas de canal no **subcanal 6** (`m=11`,
+  args `0x80000000` / `0x70000000`) — semáforo/fence, que nunca
+  receberam `BindObject`.
+
+**A causa demonstrada** (o upstream: `maxwell_3d.cpp`,
+`MacroRegistersStart = 0xE00`): métodos ≥ 0xE00 são **chamadas de
+macro MME** — `CallMacroMethod` mapeia
+`entry = (method - 0xE00) >> 1` e executa o micro-código carregado
+com os parâmetros colhidos no método seguinte. O jogo (nn::g3d)
+**desenha por macro**; o tradutor da casa (`MaxwellTranslator`)
+só emite `DrawCommand` em `draw_begin` (1414) / `draw_end` (1413) —
+ids que **não existem no stream** — e deixa o resto cair no
+`default` em silêncio: daí "0 comandos, 0 desconhecidos, 0
+descartados".
+
+**A prova determinística** (novo teste `gpfifo_replay`, com o
+fixture `tests/fixtures/gpfifo_submit0.bin`):
+
+    parte A (10 checks, todos verdes): 2216 palavras; 624 chamadas;
+    6 descartados; 5 BindObject; sc0=0xB197; 1413/1414 ausentes;
+    0xE0A×29; 0xE0B×29; 2 chamadas de canal no subcanal 6.
+    parte B (a expectativa): translate() → 0 comandos — FALHA
+    deliberada hoje; fica verde quando as macros forem interpretadas.
+
+    ctest: 7 de 8 passam; o `gpfifo_replay` é o 1 falho esperado.
+
+**Comparação de builds (item 4)**: o build do run (LOG/LOG2) e o
+atual são funcionalmente idênticos no caminho — `git diff
+a2a17a9..HEAD` nos 6 ficheiros do caminho dá 6 linhas fora de
+comentários, todas a retirar o glifo de cruz de comentários inline;
+o `pushbuffer.cpp` (o decoder) não mudou.
+
+Falta o passo que dá nome ao projecto: **interpretar as macros MME
+no tradutor** (a MESMA máquina do upstream é a Fonte). Por isso
+`DequeueBuffer`/`QueueBuffer` do compositor nunca foram alcançados,
+e nada chega ao ecrã.
 
 ### Parede 2 — thread de cv (medida, em discussão)
 
@@ -5275,21 +5344,33 @@ Distribuição de wrappers `brk` do SDK no log de 240 s (contagem por pc):
 1. **cv**: medir o lado do produtor — que thread devia sinalizar 0xd9c2c22c e
    por que não corre — ou alargar o limiar do watchdog para não abortar
    repetições legítimas de `TimedWait`.
-2. **GPU**: fazer o tradutor semântico emitir comandos para o subcanal 0
-   (0xB197, Maxwell 3D) e sinalizar o fence do `SubmitGPFIFO` para o guest
-   considerar o trabalho feito.
+2. **GPU**: interpretar as macros MME no tradutor (`MacroRegistersStart
+   = 0xE00` do upstream é a Fonte; a macro `(0xE0A)>>1` é a de
+   desenho, chamada 29 vezes no caso capturado). O teste
+   `gpfifo_replay` é o contrato: a Parte B fica verde quando o
+   `translate()` emitir ≥ 1 `DrawCommand` para os mesmos 8864 bytes.
+   **Nesta etapa** a expectativa foi deixada em falha deliberada —
+   foi a marca da causa, e o `ctest` mostra 7/8.
 3. **Apresentar**: ligar o `renderer_vulkan` do upstream ao PanVK (valida o
    patch SNORM) e mostrar a janela nativa 0x9C800000, depois hdmi.
 
 ### Ficheiros que mudaram nesta semana
 
 Novos: `src/services/hid.cpp`, `include/g610/services/hid.hpp`,
-`src/services/csrng.cpp`, `include/g610/services/csrng.hpp`.
+`src/services/csrng.cpp`, `include/g610/services/csrng.hpp`,
+`docs/PUBLICAR_MAIN.md` (a regra de publicar a `main`),
+`tools/decodificar_pushbuffer.py` (a máquina do `for_each` offline),
+`tests/test_gpfifo_replay.cpp` + `tests/fixtures/gpfifo_submit0.bin`
+(o caso real capturado: 8864 bytes com 29 desenhos por macro MME e
+`draw_begin`/`draw_end` ausentes).
 Mudados: `svc_dispatcher.cpp` (`close_handle` nas duas mesas; Arbiter),
 `kobject.hpp` (`HandleTable::remover`),
 `ipc_min.cpp` (`service_name_for_handle` sem o mapa morto),
 `shared_font.cpp`/`pl_u.cpp` (blob de 7 regiões na ordem do Eden),
-`eden_bridge.cpp` (registos), `CMakeLists.txt` (serviços + 6 fontes de dados),
+`eden_bridge.cpp` (registos), `CMakeLists.txt` (serviços + 6 fontes de dados,
+e o novo alvo `g610_gpfifo_replay`),
+`src/services/nvdrv.cpp` (o instrumento `G610_GPFIFO_DUMP` no
+`SubmitGPFIFO`, env-gated; sem ele, zero custo),
 `vulkan_device.cpp` vendido (SNORM→UNORM para o PanVK).
 Commits (em `wip/passo-4-thread`): 3f86811 fonte, 6c9fc4b hid+csrng,
 a2a17a9 threads/handles/CloseHandle, 7f25210 limpeza de glifos,
