@@ -5352,6 +5352,43 @@ de fonte (não de mais código): ler o que vive no VA dos parámetros no
 run vivo (a evidência do conteúdo) e decidir com isso — ou documentar
 a parede aqui.
 
+#### O instrumento dos parámetros do blob: a janela 0x400000 é só do
+blob (22/10 noite, `G610_VA_DUMP`)
+
+O instrumento novo (`G610_VA_DUMP`, no `nvdrv.cpp`; a lista dos VAs
+vem do tradutor via `falcon_vas()`) mede o que as macros entregam e o
+que vive na memória do guest nesses endereços. Medido no submit 0
+(8864 bytes: `/tmp/va.000000.txt`):
+
+- **29 chamadas ao falcon[4], 13 VAs distintos** (0x00418800,
+  0x00419A08, 0x00419F78, 0x00404468, 0x00419A04, 0x00418E40,
+  0x00418E44, 0x00418E58, 0x00418E5C, 0x00418E60, 0x00418E64,
+  0x00418E68, 0x00418E6C — a ordem do primeiro recebimento);
+- a leitura de 32 bytes falhou em TODOS (`NAO_LIDO`) — a faixa
+  0x400000..0x41FFFF **não é memória do guest**;
+- os cruzamentos medidos no run: 38 `nvmap IocAlloc` e 193
+  `MapBufferEx`, e **nenhum** abre essa faixa (as alocações medidas
+  vivem em 0xC/0xD/0xE/0xF/0x10B...); o guest nunca a mapeou.
+
+A forma dos 29 chamados, agora completa (a fixação do fixture): cada
+um é **(endereço, valor, máscara)** — a série na 0x418E40 escreve o
+valor 7 deslocado pelos nibbles com a máscara deslocada em trava
+(7/0xF, 0x70/0xF0, ... 0x70000000/0xF0000000): **protocolo de escrita
+de campo** — e a janela 0x400000..0x41FFFF só recebe conteúdo pelos
+chamados do blob, nunca pelo caminho público do driver.
+
+A fonte externa, medida no web: toda a linhagem stubiza este blob — o
+yuzu (o PR 2824, o autor da máquina MME) e as derivas (suyu, Eden)
+têm o mesmo `ProcessFirmwareCall4` com `0xd00 = 1`; o comentário
+antigo remete ao **issue 2501 do repositório PRIVADO do yuzu** (404
+público, inacessível). Ou seja: **não existe fonte pública da
+semântica do blob** — implementá-la seria invenção.
+
+E a nota do desfecho do boot: a parede que travar a corrida é a 2 (o
+laço do `trap #28` na thread 0x38005, em LOG4/LOG5 igual a LOG3
+×1592→×1593) — **independente dos desenhos**; o jogo não está preso
+por causa do desenho em falta.
+
 ### Parede 2 — thread de cv (medida, em discussão)
 
 A thread com tag **0x38005** (sp 0x2c8cbeeb0 na corrida de 90 s; 0x2962e5eb0 na
