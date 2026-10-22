@@ -1113,6 +1113,17 @@ Result SvcDispatcher::svc_map_shared_memory(SvcContext& ctx) {
     }
 
     ++map_memory_calls_;
+
+    // **Instrumento leve — Parede 2**: onde o guest escolhe mapear cada
+    // `MapSharedMemory` (o shmem do hid incluido, cujo map era silencioso).
+    // `G610_MAP_TRACE` no ambiente liga a linha.
+    static const bool trace_map = std::getenv("G610_MAP_TRACE") != nullptr;
+    if (trace_map)
+        std::fprintf(stderr,
+                     "[svc] MapSharedMemory handle=0x%llx addr=0x%llx size=0x%llx\n",
+                     static_cast<unsigned long long>(ctx.x[0]),
+                     static_cast<unsigned long long>(addr),
+                     static_cast<unsigned long long>(size));
     return Result::Success;
 }
 
@@ -2042,6 +2053,47 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
     const std::uint32_t tag     = static_cast<std::uint32_t>(ctx.x[2]);
     const std::int64_t  timeout = static_cast<std::int64_t>(ctx.x[3]);
 
+    // **Instrumento leve — Parede 2**: a evolucao do predicate da parede.
+    // `G610_CV_DUMP=base,key` (ex.: `0xd9c2c200,0xd9c2c22c`): a cada wait
+    // da chave `key`, le 0x30 bytes em `base` e despeja-as. As primeiras
+    // 24 esperas e depois 1 em cada 128 — o laco repete a ~5 ms e o log
+    // nao inunda (medido na LOG5: 729 esperas numa corrida curta).
+    static const char* dump_cfg = std::getenv("G610_CV_DUMP");
+    if (dump_cfg != nullptr) {
+        std::uint64_t dump_base = 0;
+        std::uint64_t dump_key = 0;
+        {
+            char* fim = nullptr;
+            dump_base = std::strtoull(dump_cfg, &fim, 16);
+            if (fim != nullptr && *fim == ',')
+                dump_key = std::strtoull(fim + 1, nullptr, 16);
+        }
+        static std::size_t dump_n = 0;
+        if (dump_base != 0 && cv_key == dump_key) {
+            ++dump_n;
+            if (dump_n <= 24 || dump_n % 128 == 0) {
+                std::uint8_t janela[0x30] = {};
+                const bool lido =
+                    read_guest(dump_base, janela, sizeof janela);
+                std::fprintf(stderr,
+                             "[svc] cv-dump n=%zu cv=0x%llx base=0x%llx:",
+                             dump_n,
+                             static_cast<unsigned long long>(cv_key),
+                             static_cast<unsigned long long>(dump_base));
+                if (lido) {
+                    for (std::size_t i = 0; i < sizeof janela; i += 4) {
+                        std::uint32_t d = 0;
+                        std::memcpy(&d, janela + i, sizeof d);
+                        std::fprintf(stderr, " %08X", d);
+                    }
+                    std::fprintf(stderr, "\n");
+                } else {
+                    std::fprintf(stderr, " NAO_LIDO\n");
+                }
+            }
+        }
+    }
+
     if (std::getenv("IA_IPC_TRACE") != nullptr) {
         std::fprintf(stderr,
                      "[svc] WaitProcessWideKeyAtomic addr=0x%llx cv=0x%llx tag=0x%x "
@@ -2326,6 +2378,18 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
 Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
     const std::uint64_t cv_key = ctx.x[0] & ~std::uint64_t{3};
     const auto count = static_cast<std::int32_t>(ctx.x[1]);
+
+    // **Instrumento leve — Parede 2** (a produtora das cv's do jogo). O
+    // `IA_IPC_TRACE` despeja codigo e stack por chamada e fica fora das
+    // corridas vivas; os **sinais** por si sao poucos (medido: 1847 numa
+    // corrida completa, quase todos da bomba 0x10a5096e4). Esta linha leve
+    // identifica o CIRCUITO — o `x30` e' o pc do guest produtor.
+    static const bool trace_sinal = std::getenv("G610_SVC_SIGNAL_TRACE") != nullptr;
+    if (trace_sinal)
+        std::fprintf(stderr,
+                     "[svc] SignalProcessWideKey key=0x%llx count=%d x30=0x%llx\n",
+                     static_cast<unsigned long long>(cv_key), count,
+                     static_cast<unsigned long long>(ctx.gpr[30]));
 
     std::vector<std::uint64_t> wakers;
     std::size_t acordados = 0;
