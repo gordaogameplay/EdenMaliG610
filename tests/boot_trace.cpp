@@ -157,6 +157,9 @@ static std::string g_scratch;
 static volatile int g_samples = 0;
 static volatile std::uint64_t g_sample_pc = 0;
 
+// O dump por thread (definido em native_engine.cpp).
+extern "C" void g610_dump_threads();
+
 // O numero de paragem e' parametrizavel (`IA_STOP_SAMPLES`, default 4):
 // o boot de um jogo chega a fases que so' existem depois do 4 sample
 // (o laco de render do titulo, LOG34), e sem a janela aberta o tracer
@@ -191,6 +194,9 @@ static std::uint64_t g_batimento_antes[kSvcContagensTam] = {};
 // env: leitura UMA vez aqui, nunca dentro do handler).
 static const bool g_wait_trace = ::getenv("IA_WAIT_TRACE") != nullptr;
 static std::atomic<int> g_foto_wait{0};
+
+// **O dump por thread** (`IA_THREAD_TRACE=1`).
+static const bool g_thread_trace = ::getenv("IA_THREAD_TRACE") != nullptr;
 
 // O ultimo `SendSyncRequest`: o buffer do pedido (x1) e o da resposta (x3).
 //
@@ -249,6 +255,15 @@ void on_alarm(int, siginfo_t*, void* raw) {
             g_batimento_antes[n] =
                 g_svc_contagens[n].load(std::memory_order_relaxed);
     }
+
+    // **O dump por thread** (gated por IA_THREAD_TRACE=1).
+    if (g_thread_trace) {
+        char cab[32];
+        int kc = std::snprintf(cab, sizeof cab, "[thr %d]\n", g_samples);
+        ::write(2, cab, static_cast<std::size_t>(kc));
+        g610_dump_threads();
+    }
+
 
     // O g_stop_samples e' lido uma vez em contexto normal (acima): a sua
     // leitura inicializante (getenv+strtoul) NAO pode correr dentro do

@@ -96,6 +96,32 @@ struct GuestThreadSlot {
 
 GuestThreadSlot g_thread_slots[kMaxGuestThreads];
 
+// O dump por thread — para medir quem bloqueia e em que. Async-signal-safe:
+// itera os slots (in_use atómico) e escreve via ::write.
+void dump_threads_impl() {
+    char b[128];
+    for (int i = 0; i < kMaxGuestThreads; ++i) {
+        if (!g_thread_slots[i].in_use.load(std::memory_order_acquire))
+            continue;
+        const GuestThreadState& st = g_thread_slots[i].st;
+        const int k = std::snprintf(
+            b, sizeof b,
+            "    [thr] tls=0x%llx pc=0x%llx traps=%llu svc=%llu faults=%llu\\n",
+            (unsigned long long)st.guest_tls, (unsigned long long)st.last_pc,
+            (unsigned long long)st.traps, (unsigned long long)st.svc_calls,
+            (unsigned long long)st.faults);
+        ::write(2, b, static_cast<std::size_t>(k));
+    }
+}
+
+// Ponteiro para o dump — preenchido na inicialização estática, para que a
+// função extern "C" (fora do namespace anónimo) possa chamá-lo.
+void (*g_dump_threads_ptr)() = nullptr;
+
+struct DumpThreadsPtrInit {
+    DumpThreadsPtrInit() { g_dump_threads_ptr = dump_threads_impl; }
+} g_dump_threads_ptr_init;
+
 // Toma um slot para uma thread nova. Async-signal-safe por construção:
 // um test-and-set atómico, nenhuma alocação, nenhum lock.
 GuestThreadState* register_guest_thread_state(std::uint64_t guest_tls) {
@@ -114,9 +140,6 @@ GuestThreadState* register_guest_thread_state(std::uint64_t guest_tls) {
     return nullptr;
 }
 
-// Devolve o slot. Chama-se no fim da vida da thread — nunca com traps
-// pendentes desta: nenhum trap novo desta thread pode chegar depois do
-// des-registo (o guest dela já parou).
 void unregister_guest_thread_state(GuestThreadState* st) {
     if (st == nullptr)
         return;
@@ -429,7 +452,11 @@ inline void dispatch_release(std::uint64_t me) {
 
 } // namespace
 
-// ── Exportações do dono do despacho (ver native_engine.hpp) ──────────────
+// Porta externa para o dump por thread (chamada do boot_trace via on_alarm).
+extern "C" void g610_dump_threads() {
+    if (g_dump_threads_ptr != nullptr)
+        g_dump_threads_ptr();
+}
 //
 // Implementa-se aqui, e não no SvcDispatcher, porque o estado (`g_dispatch_owner`)
 // vive neste TU. Os helpers anónimos acima são visíveis no mesmo TU a partir
@@ -1147,12 +1174,12 @@ int NativeEngine::run_guest_thread(std::uint64_t entry, std::uint64_t arg,
         // que não corre destructors), liberta aqui.
         dispatch_release(reinterpret_cast<std::uint64_t>(st));
         std::fprintf(stderr,
-                     "[thrd] a thread de guest parou: pc=0x%llx addr=0x%llx "
-                     "sp=0x%llx (traps=%llu faults=%llu)\n",
-                     (unsigned long long)st->fault_pc,
-                     (unsigned long long)st->fault_addr,
-                     (unsigned long long)st->fault_sp,
+                     "[thrd] a thread de guest parou: tls=0x%llx pc=0x%llx "
+                     "traps=%llu svc=%llu faults=%llu\n",
+                     (unsigned long long)st->guest_tls,
+                     (unsigned long long)st->last_pc,
                      (unsigned long long)st->traps,
+                     (unsigned long long)st->svc_calls,
                      (unsigned long long)st->faults);
         unregister_guest_thread_state(st);
         return 1;
@@ -1246,6 +1273,11 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             : g_hooks.recovery_sp;
 
     ++*ts.traps;
+
+    // **A medida do thread**: o ultimo pc desta thread, para o relatorio
+    // de paragem (quem bloqueou e onde). A principal fica em g_last_pc.
+    if (st != nullptr)
+        st->last_pc = pc;
 
     // **Re-armar o watchpoint** — a escrita que o disparou ja' passou
     // (a pagina ficou gravavel), e agora pode voltar a ser so'

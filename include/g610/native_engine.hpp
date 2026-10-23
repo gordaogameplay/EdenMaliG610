@@ -132,6 +132,7 @@ struct GuestThreadState {
     std::uint64_t host_faults = 0;
     std::uint64_t svc_time_ns = 0;
     TrapKind      last        = TrapKind::None;
+    std::uint64_t last_pc     = 0;   // último pc desta thread (medida)
 
     // O ultimo fault DESTA thread.
     bool          limit_hit        = false;
