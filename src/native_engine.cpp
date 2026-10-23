@@ -1343,6 +1343,31 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             // de um run limitado a 4000 traps pelo tracer).
             static const bool trace_relogio =
                 std::getenv("G610_TRAP_CLOCK") != nullptr;
+            // **Custo por trap** (`G610_TRAP_NS=1`): o tempo entre o
+            // "agora" lido no arranque do caminho rapido e o fim do
+            // tratamento dele. Conta so' o trecho do handler; a entrega
+            // do sinal pelo kernel (o grosso do ~1,4 us medido no
+            // sandbox 980cb7f) fica fora por natureza. The a cada 5000
+            // leituras para nao imprimir por trap.
+            static const bool medir_custo_enviado = [] {
+                static const bool en = std::getenv("G610_TRAP_NS") != nullptr;
+                return en;
+            }();
+            if (medir_custo_enviado) {
+                static std::uint64_t n_custo = 0;
+                static std::uint64_t ns_custo = 0;
+                static std::uint64_t ns_max = 0;
+                const std::uint64_t t_fim = g_hooks.tel->time_now();
+                const std::uint64_t custo = t_fim - agora;
+                ns_custo += custo;
+                if (custo > ns_max) ns_max = custo;
+                if ((++n_custo % 5000) == 0)
+                    std::fprintf(stderr,
+                                 "[simclock] n=%llu ns/trap medio=%.0f max=%llu\n",
+                                 (unsigned long long)n_custo,
+                                 double(ns_custo) / double(n_custo),
+                                 (unsigned long long)ns_max);
+            }
             if (trace_relogio) {
                 static std::uint32_t n_leituras = 0;
                 if ((++n_leituras % 1000) == 0) {
