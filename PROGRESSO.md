@@ -118,16 +118,21 @@ Com `G610_TRAP_LIMIT=0 IA_STOP_SAMPLES=0` (LOG36, run de 30,08 s ate o
   custo = 4.753.000 leituras do relogio em 30 s (~200k/s no handler
   do mrs): o proximo dilema = tornar o trap do relogio barato ou
   cortar o laco do guest.
-- **As SendSyncRequest de 30 Hz sao 2 sessoes irmas** (LOGK/LOGL,
-  prints `[ipc ] #33` no on_trap do tracer, 1135 envios em 12 s):
-  `0x981f1` cmd **0x10** (856/15 s = 57 Hz) e `0xa01f0` cmd **0xc0b**
-  (246/15 s = 16 Hz), aos vizinhos de handle 0x1f0/0x1f1 (mesma
+- **As SendSyncRequest varias sao 2 sessoes irma + o trafego de boot**
+  (prints `[ipc ] #33` do on_trap; recontagem do LOGK de hoje:
+  `0x981f1` cmd **0x10** = 866 envios em ~15 s = 58 Hz e `0xa01f0`
+  cmd **0xc0b** = 264 = 18 Hz; mais ~184 sends de outras sessoes no
+  mesmo run, aos vizinhos de handle 0x1f0/0x1f1 = mesma
   CreateSession). TODAS passam pelo site sdk `x30=0x83ae9c44` (a
-  wrapper com cache de sessao por `tpidr_el0`: o teste `cmp x9,x1`
-  nunca acerta, 1135/1135 pelo ramo lento — aberto: e' design do
-  guest ou o nosso tpidr esta' errado). Nome do servico ainda
-  sem simbolo no SDK (readd "laco de render de 30 Hz": DESDIZIDO por
-  enquanto — devem apontar para sessoes do jogo, 57+16 Hz).
+  wrapper com cache de sessao por `tpidr_el0`): o teste `cmp x9,x1`
+  acerta 1135/1135 — o RAMO RAPIDO em todas. Prova: as prints `[svc]`
+  mostram `x30=0x83ae9c44` sem excecao, e 0x83ae9c44 e' o return-site
+  do `bl` que so' existe no ramo rapido; o ramo lento deixaria
+  0x83ae9c38 (nota de ontem, corrigida — detalhe no
+  DOC_TLS_INVESTIGACAO.md, secao 0). `x1` no brk = 0x88000000 = o
+  cookie = a TLS base. Nome do servico ainda sem simbolo no SDK
+  (readd "laco de render de 30 Hz": DESDIZIDO por enquanto — devem
+  apontar para sessoes do jogo, 58+18 Hz).
 
 Commits da secao: `5057ac1` (o ritmo do relogio, 19,2 MHz medido),
 `aa2580f` (a cadencia da parede com `pedido`/`real`/`desde`), `b16730e`
