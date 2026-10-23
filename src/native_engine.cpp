@@ -609,6 +609,19 @@ bool NativeEngine::install_handlers(std::string& error) {
     return true;
 }
 
+// **O instantâneo t0 do run** — posto no primeiro passo de `run()` e lido
+// na etiqueta do ExitProcess (`G610_EXIT_TRACE`): a diferenca dos dois
+// devolve os segundos de boot ate' o guest pedir a saida. Atomico
+// porque o handler le' de qualquer thread.
+static std::atomic<std::uint64_t> g_run_start_ns{0};
+
+// O gatilho da etiqueta do exit — lido AQUI (contexto normal, init de
+// statics), nunca dentro do handler: getenv nao e' async-signal-safe e um
+// `static const` local no handler guarda com lock — a mesma forma do
+// LOG42 (strtoul dentro do on_alarm matou o processo) e com o agravante
+// do guard: duas threads de guest no mesmo instante = deadlock.
+static const bool g_exit_trace = std::getenv("G610_EXIT_TRACE") != nullptr;
+
 RunResult NativeEngine::run(void (*code)(), std::uint64_t sp) {
     RunResult r;
 
@@ -624,6 +637,11 @@ RunResult NativeEngine::run(void (*code)(), std::uint64_t sp) {
         r.error = "handlers nao instalados";
         return r;
     }
+
+    // **O instantâneo t0 do run** — a âncora da etiqueta do exit: só depois
+    // do guard, com o `g_hooks` já armado (o `tel` existe).
+    g_run_start_ns.store(g_hooks.tel->time_now(),
+                         std::memory_order_relaxed);
 
     // Estado do dispatcher: um `exited_` que ficou a true contaminaria a
     // execução seguinte e faria um fault parecer uma saída limpa.
@@ -1603,6 +1621,36 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         // A saída faz-se como a dos faults: saltar para uma rotina com a
         // stack DE QUEM PEDIU, que regressa ao host por siglongjmp.
         if (g_hooks.svc->exited()) {
+            // A etiqueta do exit (`G610_EXIT_TRACE`, lida fora do handler):
+            // quem pediu a saida e quanto tempo correu ate' ela. Nos runs
+            // padrão o guest nem aqui chega — o sampler do tracer força a
+            // saida aos ~4 s (medido LOGE1: "parou por: alarme de
+            // seguranca"). Com `IA_STOP_SAMPLES=0` o run vive ate' ao
+            // timeout do shell, e aqui a etiqueta responde a pergunta do
+            // steady-state: QUE thread e QUE sitio pedem o ExitProcess (se
+            // algum o pedir).
+            if (g_exit_trace) {
+                const std::uint64_t agora = g_hooks.tel->time_now();
+                const double seg =
+                    static_cast<double>(agora -
+                                        g_run_start_ns.load(
+                                            std::memory_order_relaxed)) / 1e9;
+                char b[256];
+                const int kb = std::snprintf(
+                    b, sizeof b,
+                    "[exit] code=0x%x pc=0x%llx sp=0x%llx x30=0x%llx "
+                    "fp=0x%llx tls=0x%llx svc_calls=%llu t=%.3fs\n",
+                    g_hooks.svc->exit_code(),
+                    (unsigned long long)pc,
+                    (unsigned long long)uc->uc_mcontext.sp,
+                    (unsigned long long)uc->uc_mcontext.regs[30],
+                    (unsigned long long)uc->uc_mcontext.regs[29],
+                    (unsigned long long)(st != nullptr ? st->guest_tls
+                                                       : g_hooks.guest_tls),
+                    (unsigned long long)*ts.svc_calls, seg);
+                const ssize_t wb = ::write(2, b, static_cast<std::size_t>(kb));
+                (void)wb;
+            }
             uc->uc_mcontext.sp = rec_sp;
             uc->uc_mcontext.pc = g_hooks.recovery_pc;
             return;

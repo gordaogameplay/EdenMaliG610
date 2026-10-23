@@ -26,8 +26,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <unistd.h>
@@ -169,6 +172,26 @@ static const unsigned long g_stop_samples =
     [] { const char* s = ::getenv("IA_STOP_SAMPLES");
          return s == nullptr ? 4ul : ::strtoul(s, nullptr, 0); }();
 
+// **O batimento do steady-state** (`IA_HEARTBEAT=1`, mesma regra da env:
+// leitura UMA vez aqui, nunca dentro do on_alarm — a lição do LOG42).
+//
+// Por que existe: o run padrão morre aos ~4 s PELO sampler (o
+// `force_stop` do 4.º tick — medido LOGE1: "parou por: alarme de
+// seguranca", pc=0x83b0bb3c) e NÃO por decisão do guest — o
+// `ExitProcess` nunca chega a ser chamado. Com `IA_STOP_SAMPLES=0` o
+// guest corre até ao `timeout` do shell; o steady-state do jogo é então
+// o que este batimento descreve: por segundo, o delta do histograma de
+// SVC — quem ainda trabalha, quem calou, e qual o novo serviço que
+// entra. A impressão e' write(2) (contexto de sinal) e leitura dos
+// contadores atomicos do observer.
+static const bool g_batimenta = ::getenv("IA_HEARTBEAT") != nullptr;
+static std::uint64_t g_batimento_antes[kSvcContagensTam] = {};
+
+// **O retato do WaitSynchronization** (`IA_WAIT_TRACE=1`, mesma regra da
+// env: leitura UMA vez aqui, nunca dentro do handler).
+static const bool g_wait_trace = ::getenv("IA_WAIT_TRACE") != nullptr;
+static std::atomic<int> g_foto_wait{0};
+
 // O ultimo `SendSyncRequest`: o buffer do pedido (x1) e o da resposta (x3).
 //
 // A resposta do servico vai para x3, no espaco do guest. E' ai que o SDK le
@@ -186,6 +209,46 @@ void on_alarm(int, siginfo_t*, void* raw) {
     const auto pc = static_cast<std::uint64_t>(uc->uc_mcontext.pc);
     g_sample_pc = pc;
     ++g_samples;
+
+    // **O batimento** (por segundo; a nota do g_batimenta acima explica
+    // por que existe): o delta do histograma de SVC desde o batimento
+    // anterior. Duas passadas: a primeira so' soma, a segunda imprime e
+    // actualiza o instantaneo. Os nomes vêm da tabela pré-computada
+    // (async-signal-safe, sem alocacao) e a impressao e' write(2).
+    if (g_batimenta) {
+        std::uint64_t delta = 0;
+        for (std::size_t n = 0; n < kSvcContagensTam; ++n)
+            delta += g_svc_contagens[n].load(std::memory_order_relaxed) -
+                     g_batimento_antes[n];
+        char b0[80];
+        int k = std::snprintf(b0, sizeof b0,
+                              "[bat %d] pc=0x%llx (delta +%llu)\n",
+                              g_samples, (unsigned long long)pc,
+                              (unsigned long long)delta);
+        ::write(2, b0, static_cast<std::size_t>(k));
+        unsigned linhas = 0;
+        for (std::size_t n = 0; n < kSvcContagensTam && linhas < 12; ++n) {
+            const std::uint64_t d =
+                g_svc_contagens[n].load(std::memory_order_relaxed) -
+                g_batimento_antes[n];
+            if (d == 0)
+                continue;
+            char bb[80];
+            const int kb = std::snprintf(
+                bb, sizeof bb, "    0x%02zx %-24s %llu\n", n,
+                nome_de_svc(static_cast<std::uint32_t>(n)),
+                (unsigned long long)d);
+            ::write(2, bb, static_cast<std::size_t>(kb));
+            ++linhas;
+        }
+        if (linhas >= 12) {
+            static const char mais[] = "    (mais omitidas)\n";
+            ::write(2, mais, sizeof mais - 1);
+        }
+        for (std::size_t n = 0; n < kSvcContagensTam; ++n)
+            g_batimento_antes[n] =
+                g_svc_contagens[n].load(std::memory_order_relaxed);
+    }
 
     // O g_stop_samples e' lido uma vez em contexto normal (acima): a sua
     // leitura inicializante (getenv+strtoul) NAO pode correr dentro do
@@ -450,6 +513,85 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
                 mh32[12], mh32[13], mh32[14], mh32[15], mh32[16],
                 mh32[17], mh32[18], mh32[19], mh32[20], mh32[21],
                 mh32[22], mh32[23]);
+        }
+    }
+    // **O portão do wait** (`IA_WAIT_TRACE=1`, env lida fora do handler,
+    // à maneira do `g_batimenta`).
+    //
+    // Nos 120 s de LOGE2 o steady-state resume-se a dois padrões: a bomba
+    // (Wait/Signal na cv 0xd9c2c228, ~630/s) e este tríptico de
+    // `WaitSynchronization` 0x18 a 30/s com x0=0x30fffcfac,
+    // x1=0x30fffd1c4, x2=1, x5=0x28, até ao fim do run. O x0 e' da pilha do
+    // guest — não é array de handles conhecido: o portão mora na variável
+    // no sitio. O retrato lê a janela dos dois ponteiros (16 bytes cada)
+    // e marca os handles não-nulos UMA VEZ por handle novo (o mesmo
+    // padrão "vistos" do bloco 0x21, sem alloc repetido). Ritmo: as 3
+    // primeiras chamadas e depois uma em 600 (30/s medido → ~1 foto a
+    // cada 20 s).
+    if (number == 0x18 && g_wait_trace && g_mem != nullptr) {
+        const int n_foto = g_foto_wait.fetch_add(1, std::memory_order_relaxed);
+        if (n_foto < 3 || (n_foto % 600) == 0) {
+            std::uint8_t w0[16] = {};
+            std::uint8_t w1[16] = {};
+            std::string e3;
+            const bool ok0 = g_mem->read(ctx.x[0], w0, sizeof w0, e3);
+            const bool ok1 = g_mem->read(ctx.x[1], w1, sizeof w1, e3);
+            std::printf(
+                "[wait] n=%d x0=0x%llx x1=0x%llx x2=%llu x3=0x%llx "
+                "x4=0x%llx x5=0x%llx pc=0x%llx\n",
+                n_foto, (unsigned long long)ctx.x[0],
+                (unsigned long long)ctx.x[1], (unsigned long long)ctx.x[2],
+                (unsigned long long)ctx.x[3], (unsigned long long)ctx.x[4],
+                (unsigned long long)ctx.x[5], (unsigned long long)pc);
+            if (ok0) {
+                std::printf("    [@x0] %02x %02x %02x %02x  %02x %02x %02x "
+                            "%02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+                            w0[0], w0[1], w0[2], w0[3], w0[4], w0[5], w0[6],
+                            w0[7], w0[8], w0[9], w0[10], w0[11], w0[12],
+                            w0[13], w0[14], w0[15]);
+            } else {
+                std::printf("    [@x0] leitura falhou (%s)\n", e3.c_str());
+            }
+            if (ok1) {
+                std::printf("    [@x1] %02x %02x %02x %02x  %02x %02x %02x "
+                            "%02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+                            w1[0], w1[1], w1[2], w1[3], w1[4], w1[5], w1[6],
+                            w1[7], w1[8], w1[9], w1[10], w1[11], w1[12],
+                            w1[13], w1[14], w1[15]);
+            } else {
+                std::printf("    [@x1] leitura falhou (%s)\n", e3.c_str());
+            }
+            // Os u32 nas duas janelas, tomados como handles. UMA vez por
+            // handle novo: a mesa do dsp atrás do nome (o mesmo esquema
+            // do bloco 0x21).
+            {
+                static std::uint32_t vistos_wait[64] = {0};
+                constexpr std::size_t kWvistosTam =
+                    sizeof vistos_wait / sizeof vistos_wait[0];
+                const std::uint32_t cand0 = *reinterpret_cast<const std::uint32_t*>(w0);
+                const std::uint32_t cand1 = *reinterpret_cast<const std::uint32_t*>(w1);
+                const std::uint32_t cands[2] = {cand0, cand1};
+                for (const std::uint32_t h : cands) {
+                    if (h == 0)
+                        continue;
+                    bool novo = true;
+                    std::size_t furo = kWvistosTam;
+                    for (std::size_t i = 0; i < kWvistosTam; ++i) {
+                        if (vistos_wait[i] == h) { novo = false; break; }
+                        if (vistos_wait[i] == 0) { furo = i; break; }
+                    }
+                    if (novo && furo < kWvistosTam) {
+                        vistos_wait[furo] = h;
+                        if (g_svc != nullptr) {
+                            const std::string nome =
+                                g_svc->service_name_for_tracer(h);
+                            std::printf(
+                                "[wait] handle=%llx nome=%s\n",
+                                (unsigned long long)h, nome.c_str());
+                        }
+                    }
+                }
+            }
         }
     }
    // Endereços de retorno do guest na stack, para seguir de onde veio o
@@ -1898,6 +2040,62 @@ int main(int argc, char** argv) {
     {
         struct itimerval tv{};
         setitimer(ITIMER_REAL, &tv, nullptr);
+    }
+
+    // ── 3a. manter vivo ───────────────────────────────────────────────────
+    //
+    // Nos runs padrão o run nem passa daqui de forma limpa: o sampler do
+    // tracer força a saida aos ~4 s (4.º tick do itimer, `force_stop` —
+    // medido LOGE1) e o run devolve com `limit_hit`. a' saída limpa
+    // (`ExitProcess` do guest — `r.exited`), este bloco mantém o processo
+    // vivo MAIS <seg> segundos (`G610_KEEP_ALIVE=<seg>`): os handlers
+    // continuam armados, as threads de guest continuam vivas (a paragem
+    // so' e' pedida pelo ~NativeEngine), e por segundo imprime o DELTA do
+    // histograma de SVC — o steady-state visto de quem sobra sem o main.
+    // Com `IA_STOP_SAMPLES=0` este bloco nunca acorda (o run vive ate' ao
+    // timeout do shell); o batimento (`IA_HEARTBEAT=1`) e' quem mede essa
+    // janela nesses runs.
+    if (const char* env = std::getenv("G610_KEEP_ALIVE")) {
+        const long segs = std::strtol(env, nullptr, 10);
+        if (segs > 0 && !r.exited) {
+            std::printf("[alive] o run NAO saiu pelo ExitProcess (%s) — "
+                        "manter vivo saltado\n",
+                        r.error.empty() ? "(sem erro)" : r.error.c_str());
+        } else if (segs > 0) {
+            std::printf("[alive] o guest saiu (code=0x%x, %llu svc) — manter "
+                        "o processo vivo %ld s com as threads de guest\n",
+                        r.exit_code, (unsigned long long)g_svcs.load(), segs);
+            std::uint64_t antes[kSvcContagensTam] = {};
+            for (std::size_t n = 0; n < kSvcContagensTam; ++n)
+                antes[n] = g_svc_contagens[n].load();
+            for (long s = 1; s <= segs; ++s) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                std::uint64_t delta = 0;
+                for (std::size_t n = 0; n < kSvcContagensTam; ++n)
+                    delta += g_svc_contagens[n].load() - antes[n];
+                std::printf("[alive %02ld/%ld] total=%u (delta +%llu nesta "
+                            "segunda)\n",
+                            s, segs, (unsigned)g_svcs.load(),
+                            (unsigned long long)delta);
+                unsigned linhas = 0;
+                for (std::size_t n = 0; n < kSvcContagensTam; ++n) {
+                    const std::uint64_t v =
+                        g_svc_contagens[n].load() - antes[n];
+                    antes[n] += v;
+                    if (v != 0) {
+                        std::printf("    0x%02zx %-24s %llu\n", n,
+                                    nome_de_svc(static_cast<std::uint32_t>(n)),
+                                    (unsigned long long)v);
+                        if (++linhas >= 16) {
+                            std::printf("    (mais omitidas)\n");
+                            break;
+                        }
+                    }
+                }
+            }
+            std::printf("[alive] fim; o desligamento segue pelo caminho de "
+                        "sempre\n");
+        }
     }
 
     // ── 4. relatório ──────────────────────────────────────────────────────
