@@ -25,6 +25,7 @@
 // óbvia nos comentários: aqui não há semântica, há medições.
 #include <cstdint>
 #include <cstdio>
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -58,17 +59,47 @@ const char* dump_dir() {
 long long g_inicio_ns = 0;
 
 
-// Registo de cada SVC pedido, na ordem.
+// Registo de cada SVC pedido, na ordem. **Sem heap**: o `on_svc` corre
+// DENTRO de um handler de sinal em TODOS os threads do guest em
+// paralelo, e um push_back de vector (que realoca e faz free do bloco
+// velho) de dois threads ao mesmo tempo liberta o MESMO chunk duas
+// vezes — medido: o core do abort de 23/10 ve' o chunk
+// 0xaaaac8651840 (229392 bytes) LIVRE no unsorted bin (fd/bk iludidos)
+// no instante do `free` do push_back, e os frames das threads 4/5/6
+// todos em `svc_wait_process_wide_key_atomic` despachados dentro do
+// handler. O nome deixa de ser `std::string` (uma alocacao e uma
+// libertacao POR SVC) e passa a ponteiro de tabela pre-computada.
 struct SvcCall {
     std::uint32_t number;
-    std::string   name;
+    const char*   name;
     std::uint64_t x[6];
     std::uint32_t result;
     std::uint64_t pc;
     std::uint64_t sp;
 };
 
-std::vector<SvcCall> g_calls;
+// Os primeiros SVCs, em ordem — a ordem e' o que o dump de fim usa
+// ("servicos pedidos, por ordem"). Teto fixo: nada cresce em contexto
+// de sinal.
+constexpr std::size_t kSvcOrdenadoTam = 120;
+SvcCall g_primeiros[kSvcOrdenadoTam] = {};
+std::atomic<std::uint32_t> g_primeiros_cursor{0};
+// A contagem por numero de SVC vale o agregado de fim (que era o laco
+// O(N^2) sobre o vector). 0x100 cobre o enum visto; o resto conta no
+// final.
+constexpr std::size_t kSvcContagensTam = 0x100;
+std::atomic<std::uint64_t> g_svc_contagens[kSvcContagensTam] = {};
+// O nome por numero, produzido UMA vez no thread principal (o
+// `to_string(Svc)` devolve std::string — alocacao — e no handler nao
+// ha' alocamento).
+constexpr std::size_t kSvcNomeTam = 16;
+char g_nomes[kSvcContagensTam][kSvcNomeTam] = {};
+const char* g_nomes_ptr[kSvcContagensTam] = {};
+const char* nome_de_svc(std::uint32_t n) {
+    if (n < kSvcContagensTam)
+        return g_nomes_ptr[n];
+    return "Svc?";
+}
 
 // Trace uma função de escrita async-signal-safe (write(2)), porque isto
 // corre DENTRO de um handler de sinais.
@@ -237,19 +268,38 @@ void on_trap(int sig, std::uint64_t pc, std::uint64_t sp, void* user) {
 
 // Callback do motor. Assinatura async-signal-safe: só escreve em memória
 // (o vector) e num buffer fixo. Nenhuma alocação, nenhum printf.
-static volatile int g_svcs = 0;
+static std::atomic<std::uint32_t> g_svcs{0};
 
 void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
             std::uint64_t sp, void* user) {
-    ++g_svcs;
+    // O contador total: atomico (era `volatile int ++` — a soma de dois
+    // threads perde updates; o numero impresso `[svc #N]` ficava
+    // duplicado e a conta do fim subestimada).
+    const std::uint32_t n_svc = static_cast<std::uint32_t>(
+        g_svcs.fetch_add(1, std::memory_order_relaxed)) + 1;
+    // O cursor "sem rolar": cada thread ganha o SEU index (o
+    // `fetch_add` e' atomico, dois em paralelo nunca caem no mesmo
+    // slot) — e o escritor de cada slot e' um so'. Sem heap por
+    // invocacao (o push_back das linhas velhas realocava o vector e
+    // librava o bloco velho; dois threads no mesmo instante = free
+    // duplo, medido no core 23/10).
+    const std::uint64_t idx = static_cast<std::uint64_t>(
+        g_primeiros_cursor.fetch_add(1, std::memory_order_relaxed));
+    if (number < kSvcContagensTam) {
+        g_svc_contagens[number].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_svc_contagens[kSvcContagensTam - 1].fetch_add(1,
+                                                        std::memory_order_relaxed);
+    }
     SvcCall c{};
     c.number = number;
-    c.name   = g610::to_string(static_cast<g610::Svc>(number));
+    c.name   = nome_de_svc(number);
     for (int i = 0; i < 6; ++i)
         c.x[i] = ctx.x[i];
     c.pc = pc;
     c.sp = sp;
-    g_calls.push_back(c);
+    if (idx < kSvcOrdenadoTam)
+        g_primeiros[idx] = c;
 
     // O pedido de IPC, em bruto.
     //
@@ -667,7 +717,7 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
         if (g_inicio_ns != 0) {
             std::printf("[arranque] o guest abortou em %.3f ms, apos %llu SVC(s)\n",
                         (ns - g_inicio_ns) / 1e6,
-                        (unsigned long long)g_svcs);
+                        (unsigned long long)g_svcs.load());
         }
     }
 
@@ -1077,7 +1127,7 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
     // guest parado não deixa rasto nenhum.
     // Dump da stack: fica para o dump textual em main(), onde o
     // GuestProgram está acessível. Aqui só se guarda o sp.
-    if (g_svcs <= 1) {
+    if (n_svc <= 1) {
         char b[32];
         const int k = std::snprintf(b, sizeof b, "[stk] sp=0x%llx\n",
                                     (unsigned long long)sp);
@@ -1101,7 +1151,7 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
         }
     }
 
-    if (g_svcs <= 4 && number == 0x06) {
+    if (n_svc <= 4 && number == 0x06) {
         // O QueryMemory escreve 40 bytes no stack do guest. Mostrar o que
         // ficou lá é a forma de saber se a resposta é plausível — e um
         // endereço todo a zero é o sintoma de "não escrevemos nada".
@@ -1120,7 +1170,7 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
     const int k = std::snprintf(b, sizeof b,
         "[svc #%u] 0x%02x %-18s x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx "
         "x4=0x%llx x5=0x%llx x18=0x%llx x30=0x%llx\n",
-        g_svcs, number, c.name.c_str(),
+        n_svc, number, c.name,
         (unsigned long long)ctx.x[0], (unsigned long long)ctx.x[1],
         (unsigned long long)ctx.x[2],
         (unsigned long long)ctx.gpr[3], (unsigned long long)ctx.gpr[4],
@@ -1637,6 +1687,16 @@ int main(int argc, char** argv) {
     // várias threads. Com IA_TRACE=0 os prints do [h]/[run] desaparecem, mas
     // o observer (printf/„string") mantém-se — [svc] sempre printa.
     if (::getenv("IA_NOOB") == nullptr) {
+        // O nome por numero de SVC: e' produzido UMA vez aqui, no
+        // thread principal, ANTES dos guest existirem. O `to_string`
+        // devolve std::string (alocacao!) — no handler, `on_svc`
+        // deixou de chama-lo e le' da tabela (medido: 1 malloc+1 free
+        // POR SVC no caminho velho).
+        for (std::uint32_t n = 0; n < kSvcContagensTam; ++n) {
+            std::string nome = g610::to_string(static_cast<g610::Svc>(n));
+            std::snprintf(g_nomes[n], kSvcNomeTam, "%s", nome.c_str());
+            g_nomes_ptr[n] = g_nomes[n];
+        }
         engine.set_observer(&on_svc, nullptr);
         engine.set_trapper(&on_trap, nullptr);
     }
@@ -1929,7 +1989,7 @@ int main(int argc, char** argv) {
         }
     }
     std::printf("  traps vistas: %d\n", g_traps);
-    std::printf("  svcs vistas : %d\n", g_svcs);
+    std::printf("  svcs vistas : %u\n", g_svcs.load());
     std::printf("  amostras    : %d  (último PC 0x%llx)\n", g_samples,
                 (unsigned long long)g_sample_pc);
     if (!svc.last_ipc().empty())
@@ -1942,24 +2002,28 @@ int main(int argc, char** argv) {
     std::printf("  MapMemory   : %llu chamadas\n",
                 (unsigned long long)svc.map_memory_calls());
 
-    // Sequência de serviços, na ordem em que foram pedidos.
+    // Sequência de serviços, na ordem em que foram pedidos. O anel
+    // `g_primeiros` guarda os primeiros 120 (teto fixo, sem heap no
+    // handler); o cursor e' o total de SVCs.
     std::printf("\n══════ serviços pedidos, por ordem ══════\n");
-    if (g_calls.empty()) {
-        std::printf("  (nenhum — o rtld não chegou a chamar um serviço)\n");
-    } else {
-        std::size_t mostrar = g_calls.size();
-        if (mostrar > 120) {
-            mostrar = 120;
-            std::printf("  (a mostrar os primeiros %zu de %zu)\n\n",
-                        mostrar, g_calls.size());
-        }
-        std::printf("  %-4s %-24s %-18s %s\n", "#", "serviço", "x0", "x1");
-        for (std::size_t i = 0; i < mostrar; ++i) {
-            const auto& c = g_calls[i];
-            std::printf("  %-4zu %-24s 0x%-16llx 0x%-16llx\n", i,
-                        c.name.c_str(),
-                        (unsigned long long)c.x[0],
-                        (unsigned long long)c.x[1]);
+    {
+        const std::uint32_t total = g_primeiros_cursor.load();
+        if (total == 0) {
+            std::printf("  (nenhum — o rtld não chegou a chamar um serviço)\n");
+        } else {
+            const std::uint32_t mostrar = total < kSvcOrdenadoTam
+                                              ? total
+                                              : kSvcOrdenadoTam;
+            if (mostrar < total)
+                std::printf("  (a mostrar os primeiros %u de %u)\n\n", mostrar,
+                            total);
+            std::printf("  %-4s %-24s %-18s %s\n", "#", "serviço", "x0", "x1");
+            for (std::uint32_t i = 0; i < mostrar; ++i) {
+                const SvcCall& c = g_primeiros[i];
+                std::printf("  %-4u %-24s 0x%-16llx 0x%-16llx\n", i, c.name,
+                            (unsigned long long)c.x[0],
+                            (unsigned long long)c.x[1]);
+            }
         }
     }
 
@@ -2118,22 +2182,20 @@ int main(int argc, char** argv) {
     }
 
     // Resumo por serviço: o que o rtld pede mais vezes é o que vale a pena
-    // implementar primeiro.
-    struct Agg { std::uint32_t n; std::size_t count; };
-    std::vector<Agg> agg;
-    for (const auto& c : g_calls) {
-        bool found = false;
-        for (auto& a : agg)
-            if (a.n == c.number) { ++a.count; found = true; break; }
-        if (!found)
-            agg.push_back({c.number, 1});
-    }
+    // implementar primeiro. Contagem por numero, acumulada no handler
+    // por atómicos — sem o laço O(N^2) sobre o vector velho.
     std::printf("\n══════ resumo ══════\n");
-    std::printf("  serviços distintos: %zu\n", agg.size());
-    for (auto& a : agg)
-        std::printf("    0x%02x %-24s %zu vez%s\n", a.n,
-                    g610::to_string(static_cast<g610::Svc>(a.n)).c_str(),
-                    a.count, a.count == 1 ? "" : "es");
+    std::uint32_t distintos = 0;
+    for (std::uint32_t n = 0; n < kSvcContagensTam; ++n) {
+        const std::uint64_t v = g_svc_contagens[n].load();
+        if (v > 0) {
+            ++distintos;
+            std::printf("    0x%02x %-24s %llu vez%s\n", n,
+                        g_nomes_ptr[n] != nullptr ? g_nomes_ptr[n] : "Svc?",
+                        (unsigned long long)v, v == 1 ? "" : "es");
+        }
+    }
+    std::printf("  serviços distintos: %u\n", distintos);
 
     trace("\n[boot] fim\n");
     return 0;
