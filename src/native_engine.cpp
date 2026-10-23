@@ -1333,6 +1333,31 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             static const std::uint64_t epoca = agora;
             uc->uc_mcontext.regs[number - 0x40] =
                 (agora - epoca) * 192 / 10000;
+            // **Medida do relogio** (`G610_TRAP_CLOCK=1`): a cada 1000
+            // leituras imprime o real_ns decorrido e os ticks que o trap
+            // respondeu, desde a epoca. Prova o ritmo do relogio do guest
+            // contra o do host: LOG26 mediu n=1000 real_ns=990453048
+            // ticks=19016698 escala=0.019 — a resposta avanca a 19,2 MHz
+            // fiável, logo o relogio NAO e' a causa da cadencia da parede
+            // do TimerEvent (que dorme 4,8 ms e reentra ~158x nos 1,6 s
+            // de um run limitado a 4000 traps pelo tracer).
+            static const bool trace_relogio =
+                std::getenv("G610_TRAP_CLOCK") != nullptr;
+            if (trace_relogio) {
+                static std::uint32_t n_leituras = 0;
+                if ((++n_leituras % 1000) == 0) {
+                    const std::uint64_t ns_real = agora - epoca;
+                    const std::uint64_t ticks = (agora - epoca) * 192 / 10000;
+                    std::fprintf(stderr,
+                                 "[simclock] n=%u real_ns=%llu ticks=%llu "
+                                 "escala=%.3f\n",
+                                 n_leituras,
+                                 static_cast<unsigned long long>(ns_real),
+                                 static_cast<unsigned long long>(ticks),
+                                 static_cast<double>(ticks) /
+                                     static_cast<double>(ns_real));
+                }
+            }
             uc->uc_mcontext.pc = pc + 4;
             return;
         }
