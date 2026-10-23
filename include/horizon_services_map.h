@@ -1,20 +1,31 @@
 // include/horizon_services_map.h
 //
-// Mapeamento TEORICO (sem confirmacao) dos dois pares sessao+comando que o
-// run longo do Pokemon Shield gera por SendSyncRequest (svc 0x21):
+// As duas sessoes que o run do Pokemon Shield usa por SendSyncRequest
+// (svc 0x21) na rotina:
 //
-//     sessao 0x981f1, comando 0x10  (16)     ~58 Hz
-//     sessao 0xa01f0, comando 0xC0B (3079)   ~18 Hz
+//     sessao 0x981f1  =  fsp-srv (IFileSystemProxy, com dominio)   ~58 Hz
+//     sessao 0xa01f0  =  nvdrv    (nvidia, CMIF simples)           ~18 Hz
 //
-// Tudo aqui e' CANDIDATO: um id de comando so' se fecha contra as tabelas
-// publicas (Switchbrew, "Services IPC" por servico; o Ryujinx e' a segunda
-// fonte). Este header existe para o despachante de traps poder etiquetar
-// as traps com o que ja' e' medido, sem derivar logica de meros palpites.
+// FECHADO em 23/10 com tres correntes independentes que concordam:
 //
-// Fonte das medidas: os prints `[ipc ] #33` e `[svc #...]` do on_trap
-// (tests/boot_trace.cpp) no log LOGK da board — o run longo do Pokemon
-// Shield (janela de ~15 s). O on_trap le 24 bytes da mensagem via
-// g_mem->read.
+//   1. o NOME vem do proprio sm: — o Eden despeja os pedidos GetService
+//      ([eden:W] Service::SM: GetService: nome lido = "...", LOGR da
+//      board). A cadeia medida no log: GetService("fsp-srv") na linha
+//      1667 e os handles 0x881f3/0x901f2/0x981f1 nascem logo a seguir
+//      (linhas 1743-1831); GetService("nvdrv") na linha 2156 e 0xa01f0
+//      nasce na 2194. O nome nao mora na mesa do despachante — o
+//      `service_name_for_tracer` devolve vazio para as sessoes do Eden.
+//
+//   2. o ATENDIMENTO concorda: cada envio a 0x981f1 e' seguido por
+//      `[eden:W] Service: IStorage: comando 0 (Read)` (473 no LOGR) e
+//      cada envio a 0xa01f0 por
+//      `[eden:W] Service: nvdrv: comando 1 (Ioctl)` (128), comando 0
+//      (Open, 4) e comando 4 (QueryEvent, 2).
+//
+//   3. os MethodId medidos nos corpos batem nas tabelas publicas — ver
+//      kSessoes abaixo. O "comando 0x10/0xC0B" do diario era um ERRO de
+//      leitura: o word1 do request e' o Header1 (RawCount bits 0-9 e
+//      ReceiveListCount bits 10-13), NAO o id de comando.
 
 #pragma once
 
@@ -33,117 +44,162 @@ enum : std::uint32_t {
 };
 
 // ---------------------------------------------------------------------------
-// O que esta' MEDIDO no run (LOGK, janela de ~15 s; ver PROGRESSO.md de 23/10):
+// A decodificacao HIPC (Switchbrew, pagina "HIPC", wikitexto lido em
+// 23/10/2026; a pagina antiga chama-se IPC_Marshalling e redireciona a
+// HIPC). O buffer vive no Thread Local Region do guest (o x1 =
+// 0x88000000 que o guest passa ao SendSyncRequest):
 //
-//   request: word0 = desc do HIPC; word1 = o id do comando;
-//            word0 medido 0x01000006 (sessao 57 Hz) e 0x01110006 ?? (16 Hz)
-//            — a diferente no bit 12 pode ser flag de domain/desc e esta
-//            POR CONFIRMAR;
-//   corpos (os 6 words que o on_trap le em [x1 = 0x88000000 = o IPC/TLS
-//            do guest]):
-//            rotina da 57 Hz: [01000006][0010][token variavel][ptr 0xd9b9xxxx][1][0]
-//            rotina da 16 Hz: [01110006][c0b][tag {283000|282000|202000|82000}][0fffe5xx][0][0]
-//            A chamada DE SETUP de cada sessao (a primeira) e' diferente:
-//            os pares {0, 0x0000000E} e {6, 0x0000000C} do diario = os
-//            words W4/W5 dessa chamada de setup (nao e' "resposta"!) —
-//            o 0xE/0xC tem a cara de conta de recv-list do descriptor A
-//            (os prints `pedido em ... type=6 unk=0x8000000E`, a outra
-//            familia de print do boot_trace.cpp:274, tem o mesmo padrao).
+//   0x00 HeaderData (0x8): W0 = Header0Tag, W1 = Header1Tag
+//   0x08 SpecialTag + pid/copy-handles/move-handles (se Header1 bit31)
+//   0x?? PointerData (0x8 cada), SendData/ReceiveData/ExchangeData
+//        (MapData, 0xC cada), por ordem, conforme os counts
+//   0x?? RawData (RawCount words) — aqui vive o CMIF
+//   0x?? ReceiveListData (0x8 cada, se ReceiveListCount > 0)
+//
+// Header0Tag: bits 0-15 = Tag (MessageType: 6 = Invoke2Method [5.0.0+],
+//   7 = Invoke2ManagerMethod); 16-19 PointerCount; 20-23 SendCount;
+//   24-27 ReceiveCount; 28-31 ExchangeCount.
+// Header1Tag: bits 0-9 RawCount em words; 10-13 ReceiveListCount;
+//   20-30 ReceiveListOffset; 31 SpecialCount.
+// SpecialTag: bit 0 = Pid; bits 1-4 CopyHandleCount; bits 5-8
+//   MoveHandleCount. Pid ocupa 0x8 bytes depois do SpecialTag.
+//
+// Os valores MEDIDOS das duas rotinas:
+//     0x00000006  = Tag 6, sem descritores
+//     0x01000006  = Tag 6, ReceiveCount = 1      (o C-buf do Read)
+//     0x01110006  = Tag 6, PointerCount = 1 + SendCount = 1
+//                   (o par que o HipcAutoSelect cria: um dos dois e'
+//                   NULL de tamanho 0, o outro traz o valor real)
+//   — o "cmd 0x10/0xC0B" do diario = o Header1 medido (RawCount 12 e
+//   raw 11 + ReceiveListCount 3), nunca foi um id de comando.
 // ---------------------------------------------------------------------------
-struct CmdMedida {
+
+// O CMIF dentro do RawData (Switchbrew HIPC + o `vendor/eden/core/hle/
+// ipc.h` — DataPayloadHeader e DomainMessageHeader do upstream):
+//
+//   Padding de 16 bytes — o total de padding dentro do raw e' SEMPRE
+//   0x10; se o raw comeca a 0x8 faz 8 bytes antes e 0x14 (pad) etc.
+//   CmifMessage: CmifInHeader (0x10) { "SFCI", version=1, MethodId,
+//                Token } + os parametros de entrada.
+//   CmifDomain (se a sessao serve um dominio): o CmifDomainMessageIn-
+//   Header (0x10) vem ANTES do CmifMessage, no desenho medido a 0x10
+//   (o campo {kind u8, InObjectCount u8, InRawSize u16} fica comprimido
+//   na primeira palavra: 0x00100001 = kind=1, objs=0, rawsize=16):
+//     { RequestKind (1 = InvokeMethod, 2 = Release), InObjectCount,
+//       InRawSize, TargetObjectId, Reserved, Token }
+//     + CmifMessage de tamanho InRawSize
+//     + array de CmifDomainObjectId (InObjectCount)
+//   Depois: os tamanhos (u16) do buffer type 0xA (OutPointer).
+//
+// SFCI = 0x49434653 (a assinatura do pedido), SFCO = 0x4f434653 (a
+// resposta; [14.0.0+] o campo a +0xC do SFCO = InterfaceId = sha256 do
+// nome da interface).
+//
+// Medido no LOGQ/LOGR da board (o on_trap le 24 words = 96 bytes de
+// x1 desde a obra de 23/10):
+//
+//   rotina de 0x981f1 (a forma (b): 182 dos 327 sends):
+//     [01000006][00000010][size-lo][addr-lo][tag mapa]{0,0,0}
+//     [00200001][objId {2|3}][0][0] ['SFCI'][1][0=Read][0]
+//     [option=0][offset-lo][offset-hi=2][size]
+//   = Read de IFile/IStorage por dominio: TargetObjectId {2|3}, o
+//   InRawSize=32, MethodId 0 = Read (Switchbrew "Filesystem services":
+//   IStorage::Read/IFile::Read = cmd 0, "type 0x46 buffer, offset and
+//   length"). O size-lo do MapData = o tamanho do read (0x50=80,
+//   0xf94=3988, 0x88b4, 0x28bac, 0x20fac8...) e e' o mesmo valor que
+//   o Eden imprime (`IStorage::Read: offset=0X22D853950
+//   length=27148` — o 27148 = 0x6a0c e' o caso comum medido antes).
+//   Primeiro read de cada objeto = 80 bytes no pointer-buffer
+//   (addr 0x3_0FFFE9xx).
+//
+//   chamada de init de 0x981f1 (a forma (a): 3 sends no run):
+//     [00000006][0000000c][0][0][00100001][obj=1][0][0]
+//     ['SFCI'][1][MethodId][0]['SFCI'][1]...
+//   MethodId 0x3ED = 1005 = GetGlobalAccessLogMode e 0xC8 = 200 =
+//   OpenDataStorageByCurrentProcess (a tabela IFileSystemProxy) — o
+//   open que cria os objectos de dominio 2/3 que a rotina le. A cauda
+//   ['SFCI'][1] dos 12 words do raw esta' medida mas sem interpretacao
+//   decidida; nao interfere na etiqueta da trap.
+//
+//   rotina de 0xa01f0 (nvdrv):
+//     [01110006][00000c0b][ptr-{size|addr}] [send nulo 0,0] [0]
+//     ['SFCI'][1][MethodId][0][args...]
+//   MethodId {1 = Ioctl, 0 = Open, 4 = QueryEvent} — a tabela "NV
+//   services" do Switchbrew (nv: Open/Ioctl/QueryEvent). O PointerData
+//   = o par HipcAutoSelect (send NULL de tamanho 0; pointer com
+//   size {0xb0=176|0x18=24|0=0|0x28=40} e addr 0x0FFFExxx — o
+//   pointer-buffer do processo). O Header1 0xC0B = raw 11 words +
+//   ReceiveListCount 3 (as listas de receive do lado do server).
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// As sessoes medidas. Os campos ficam no mesmo pacote que o run mostra
+// para o despachante etiquetar as traps sem derivar logica de palpite:
+// o (handle, w0) identifica a sessao; `metodo_id` = o MethodId CMIF
+// dominante da rotina.
+// ---------------------------------------------------------------------------
+struct SessaoMedida {
     std::uint64_t handle;      // o x0 que o guest passa
-    std::uint32_t cmd_id;      // o word1 do request
-    std::uint32_t hz;          // cadencia medida (arredondada)
-    std::uint32_t envios;      // na janela do LOGK (~15 s)
-    std::uint32_t req_w0;      // o desc medido
-    std::uint32_t msg[4];      // W2..W5 (a forma mais comum; W2/W3 mudam por
-                               // chamada — o token de 981f1, a tag de a01f0)
+    const char*   servico;     // fixado pelo nome no GetService (LOGR)
+    const char*   interface_;  // a interface no topo da sessao
+    std::uint32_t w0;          // o Header0 dominante da rotina
+    std::uint32_t metodo_id;   // o MethodId CMIF dominante
+    std::uint32_t hz;          // cadencia medida (LOGK, jitter de ~15 s)
+    std::uint32_t envios;      // na janela do LOGK
 };
 
-constexpr CmdMedida kMedidas[] = {
-    {0x981f1ull, 0x10u,  58u, 866u, 0x01000006u,
-     {0x00006a0cu, 0xd9b8b480u, 0x00000001u, 0x00000000u}},
-    {0xa01f0ull, 0xC0Bu, 18u, 264u, 0x01110006u,
-     {0x00283000u, 0x0fffe588u, 0x00000000u, 0x00000000u}},
+constexpr SessaoMedida kSessoes[] = {
+    {0x981f1ull, "fsp-srv", "nn::fssrv::sf::IFileSystemProxy (domain)",
+     0x01000006u, 0x00000000u /* Read */, 58u, 866u},
+    {0xa01f0ull, "nvdrv", "nv: Open/Ioctl/QueryEvent (tabela NV services)",
+     0x01110006u, 0x00000001u /* Ioctl */, 18u, 264u},
 };
-constexpr int kNumMedidas = 2;
-
-// ---------------------------------------------------------------------------
-// Os stamps CMIF, medidos nas OUTRAS sessoes do mesmo run: os prints
-// `[ipc ] #33` de handles como 0x101fe/0x181fd (o trafego do boot e de
-// outras threads, ~184 sends no LOGK) tem nos W4 os stamps `SFCI`
-// (0x49434653 — bytes "SFCI", o site do request) e `SFCO` (0x4f434653 —
-// bytes "SFCO", o stamp documentado do lado da resposta; medido tambem
-// em requests de outras sessoes, POR CONFIRMAR). E' o formato CMIF
-// (nn::sf::cmif) do sdk da Nintendo, ver em Switchbrew ("IPC
-// Marshalling") e no Ryujinx.
-//
-// Nas DUAS irma (0x981f1/0xa01f0) nenhum stamp aparece nos W0..W5: ou o
-// stamp delas fica alem da janela de 24 bytes que o on_trap le', ou o
-// corpo delas usa outra familia do formato. Pista por fechar.
-// ---------------------------------------------------------------------------
+constexpr int kNumSessoes = 2;
 
 // ---------------------------------------------------------------------------
-// Os candidatos por comando. TODOS NAO-CONFIRMADOS (confianca 0): servem
-// para orientar a proxima sessao, nao para decidir caminhos no despachante.
-//
-// Como fechar o id amanha (checklist):
-//
-//   1. desc do request: o word0 ja' esta' medido inteiro (0x01000006 vs
-//      0x01110006) — falta abrir a secao: o delta 0x00110000 (os bits 16
-//      e 20) tem contas no formato HIPC (counts de statics/buffers);
-//      confirmar em Switchbrew fecha o item;
-//   2. quem abre a sessao: os dois handles nascem cedo no boot (servem
-//      primeiro em [svc #234] e [svc #274] do LOGK) — o nome do servico
-//      do CreateSession que devolveu 0x981f1 e 0xa01f0 fecha o SERVICO;
-//   3. com o servico fechado, bater o id de comando na tabela publica
-//      (Switchbrew por servico; Ryujinx como segunda fonte) e deixar o
-//      resultado CONFIRMAR no header com a fonte citada no comentario.
+// Os MethodId por sessao, com a fonte citada. Tudo CONFIRMADO contra as
+// duas fontes publicas (Switchbrew hoje) e os atendimentos medidos no
+// Eden da board — nada aqui e' palpite.
 // ---------------------------------------------------------------------------
-struct CmdCandidato {
-    const char* servico;   // interface candidata
-    const char* observ;    // porque e' candidata (a pista medida)
-    const char* fonte;     // onde confirmar
+struct MetodoMedido {
+    std::uint32_t id;
+    const char*   nome;
+    const char*   onde;      // a medida que o fechou
 };
 
-// cmd 0x10 (16) @ 58 Hz: uma leitura por frame. A cadencia ~58 Hz e'
-// a pista mais forte: estados por frame tendem para input/display.
-// Candidatos DENTRO dessa cadencia (PONTO ABERTO: os W4/W5 da rotina,
-// {1, 0}, nao fechem decoder nenhum ainda):
-constexpr CmdCandidato kCandidatos0x10[] = {
-    {"hid/IAppletResource", "poll por frame em cima do shared memory",
-     "Switchbrew: HID services"},
-    {"hid/IHidSystemServer", "estado por frame",
-     "Switchbrew: HID services"},
-    {"vi/IApplicationDisplayService", "poll de estado de display",
-     "Switchbrew: VI services"},
-    {"am/ILibraryAppletAccessor", "estado de applet",
-     "Switchbrew: AM services"},
+constexpr MetodoMedido kMetodosFspSrv[] = {
+    {0x00000000u, "IFile::Read / IStorage::Read (por dominio, obj 2/3)",
+     "LOGQ/LOGR: 182 sends; Eden imprime `comando 0 (Read)`; Switchbrew "
+     "Filesystem services: IStorage cmds 0 = Read"},
+    {0x000003EDu, "IFileSystemProxy GetGlobalAccessLogMode",
+     "LOGR: 3 sends no arranque da sessao; Switchbrew: IFileSystemProxy 1005 "
+     "= GetGlobalAccessLogMode"},
+    {0x000000C8u, "IFileSystemProxy OpenDataStorageByCurrentProcess",
+     "LOGR: 3 sends no arranque da sessao; Eden serve IStorage depois; "
+     "Switchbrew: IFileSystemProxy 200 = OpenDataStorageByCurrentProcess"},
 };
-constexpr int kNumCandidatos0x10 = 4;
+constexpr int kNumMetodosFspSrv = 3;
 
-// cmd 0xC0B (3079) @ 18 Hz: id ALTO. Em tabelas do vendor, ids acima de
-// 0x0400 aparecem mais em interfaces de applet/servicos internos. A tag
-// {283000|282000|202000|82000} no W2 (4 valores em rotacao) e' a parte
-// mais estranha do corpo medido — sem decoder ainda.
-constexpr CmdCandidato kCandidatos0xC0B[] = {
-    {"appletAE/IAppletAccessor", "id alto de applet",
-     "Switchbrew: AppletAE services"},
-    {"am/ILibraryAppletAccessor", "id alto de applet",
-     "Switchbrew: AM services"},
-    {"hid/IHidServer", "id alto possivel na interface de introspeccao",
-     "Switchbrew: HID services"},
+constexpr MetodoMedido kMetodosNvDrv[] = {
+    {0x00000001u, "Ioctl",
+     "LOGR: `nvdrv: comando 1 (Ioctl)` 128x; Switchbrew NV services"},
+    {0x00000000u, "Open",
+     "LOGR: `nvdrv: comando 0 (Open)` 4x"},
+    {0x00000004u, "QueryEvent",
+     "LOGR: `nvdrv: comando 4 (QueryEvent)` 2x"},
+    {0x00000002u, "Close",
+     "LOGN: MethodId 2 no corpo; tabela NV services = 2 Close"},
 };
-constexpr int kNumCandidatos0xC0B = 3;
+constexpr int kNumMetodosNvDrv = 4;
 
 // ---------------------------------------------------------------------------
 // Como o despachante deve consumir este mapa (padrao do codigo):
-//   - o cmd_id do request cruza kMedidas[] por (handle, cmd_id): quando
-//     bater, a trap ganha uma etiqueta curta para o log (o handle e a
-//     cadencia esperada) sem nenhum caminho de despacho novo;
-//   - os candidatos ficam FORA da logica: nenhuma decision com
-//     confianca==0 dentro do despachante — servem de anotacao no log
-//     ate' uma sessao confirmar.
+//   - o (handle, w0) do request cruza kSessoes[]: quando bater, a trap
+//     ganha a etiqueta (servico + MethodId esperado) no log, sem nenhum
+//     caminho de despacho novo;
+//   - a leitura completa do request (dominio/params) exige os 96 bytes
+//     que o on_trap ja' le (tests/boot_trace.cpp: o print `[ipc ] #33`
+//     de 24 words).
 // ---------------------------------------------------------------------------
 
 }  // namespace hsvc
