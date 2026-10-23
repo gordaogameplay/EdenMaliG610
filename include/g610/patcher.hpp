@@ -46,11 +46,13 @@ struct PatchReport {
     // 0 e o guest faultar a ler o TLS, o patch não foi aplicado.
     std::uint64_t tpidrro_to_tpidr = 0;
 
-    // Quantas vezes `MRS <Xt>, CNTPCT_EL0` foi reescrito em
-    // `MRS <Xt>, CNTVCT_EL0`. O `cntpct_el0` e' o contador fisico, que so o
-    // EL1 le; o `cntvct_el0` e' o virtual, que o Linux expoe. Ver
-    // `instructions.hpp`.
-    std::uint64_t cntpct_to_cntvct = 0;
+    // As leituras do guest aos registos do temporizador — `CNTFRQ`, `CNTPCT`
+    // e `CNTVCT` — passam a `brk #(0x40|Rt)`. O handler do host responde com
+    // ticks de 19,2 MHz desde o arranque do guest; a escala e' a que o
+    // proprio SDK fixa em `GetSystemTickFrequency`. Ver `instructions.hpp`.
+    std::uint64_t mrs_cntfrq_to_trap = 0;
+    std::uint64_t mrs_cntpct_to_trap = 0;
+    std::uint64_t mrs_cntvct_to_trap = 0;
     std::uint64_t msr_seen        = 0;
     std::uint64_t exclusives_seen = 0;
     std::uint32_t first_svc       = 0;

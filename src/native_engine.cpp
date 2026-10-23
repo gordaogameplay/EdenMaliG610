@@ -1311,6 +1311,32 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
 
         const std::uint32_t number = (insn >> 5) & 0xFFFF;
 
+        // **O relogio do guest** — as leituras de CNTFRQ/CNTPCT/CNTVCT
+        // viram `brk #(0x40|Rt)` no patcher. O SDK da Nintendo pede o tick
+        // ao `cntfrq_el0` (`GetSystemTick` e' literalmente `mrs`, medido em
+        // 0x83ab4fd0), que no board devolve 24_000_000 CONSTANTE — e o
+        // "agora" do TimerEvent congelou: a parede do `WaitTimerEvent`
+        // reentria 712 vezes de 5 ms sem chegar ao prazo
+        // `ConvertToTimeSpan(24_000_000) + 5e6 = 1_255_000_000` (o x23 das
+        // traps e a C do board dizem o mesmo).
+        //
+        // Aqui o host responde com ticks de 19,2 MHz — a escala fixa que o
+        // proprio SDK usa em `GetSystemTickFrequency` — desde a primeira
+        // leitura: `ns * 192 / 10000` = ns por 52,083 ns/tick. Com isto o
+        // "agora" avanca em nanosegundos reais e os prazos vencem.
+        //
+        // Caminho curto: sem print (a leitura e' frequente) e sem despacho.
+        // A estatica da epoca inicializa uma vez so' e thread-safe por
+        // construcao (C++11).
+        if (number >= 0x40 && number < 0x60) {
+            const std::uint64_t agora = g_hooks.tel->time_now();
+            static const std::uint64_t epoca = agora;
+            uc->uc_mcontext.regs[number - 0x40] =
+                (agora - epoca) * 192 / 10000;
+            uc->uc_mcontext.pc = pc + 4;
+            return;
+        }
+
         if (number == kBrkForceStop) {
             // Paragem pedida pelo tracer (um spin de código que não levanta
             // traps). Sai pelo mesmo caminho dos restantes.
@@ -1351,9 +1377,15 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         // Numa thread de guest, cada trap e' uma pista: e' o unico registo
         // do que o guest esta' a fazer la dentro.
         if (st != nullptr) {
+            // x22 = ponteiro do TickManager interno (levado no WaitTimerEvent),
+            // x23 = o valor bruto do "mrs" logo antes do leito e x24 = a foto do
+            // contador do evento: os tres invertem (ou confirmam) um "agora"
+            // congelado. A base do print em x28 fica como ancoragem antiga.
             std::fprintf(stderr,
                          "[thrd] trap #%u pc=0x%llx sp=0x%llx x0=0x%llx x1=0x%llx "
-                         "x2=0x%llx x3=0x%llx x7=0x%llx x19=0x%llx x28=0x%llx\n",
+                         "x2=0x%llx x3=0x%llx x7=0x%llx x19=0x%llx "
+                         "x20=0x%llx x21=0x%llx x22=0x%llx x23=0x%llx "
+                         "x24=0x%llx x28=0x%llx\n",
                          number, (unsigned long long)pc,
                          (unsigned long long)uc->uc_mcontext.sp,
                          (unsigned long long)uc->uc_mcontext.regs[0],
@@ -1362,7 +1394,37 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
                          (unsigned long long)uc->uc_mcontext.regs[3],
                          (unsigned long long)uc->uc_mcontext.regs[7],
                          (unsigned long long)uc->uc_mcontext.regs[19],
+                         (unsigned long long)uc->uc_mcontext.regs[20],
+                         (unsigned long long)uc->uc_mcontext.regs[21],
+                         (unsigned long long)uc->uc_mcontext.regs[22],
+                         (unsigned long long)uc->uc_mcontext.regs[23],
+                         (unsigned long long)uc->uc_mcontext.regs[24],
                          (unsigned long long)uc->uc_mcontext.regs[28]);
+            // **Cadeia de chamados** (env `G610_TRAP_FP=1`): x30 e' o retorno
+            // do stub (o site que chamou o servico) e os pares [x29]/[x29+8]
+            // dao a cadeia de frames do chamador — o mesmo esquema do
+            // `G610_SVC_SIGNAL_FP`, mas do lado da espera. Leve: 3 leituras
+            // de 16 bytes por trap, so' com o env posto.
+            static const bool trap_fp = std::getenv("G610_TRAP_FP") != nullptr;
+            if (trap_fp) {
+                const std::uint64_t fp = uc->uc_mcontext.regs[29];
+                constexpr std::uint64_t largura = 0x200000ull;
+                constexpr std::uint64_t topo = 0x800000000ull;
+                std::uint64_t f[6] = {0, 0, 0, 0, 0, 0};
+                const bool ok = fp >= largura && fp < topo &&
+                                g_hooks.svc->read_guest(fp, f, 2 * sizeof f[0]);
+                if (ok && f[0] >= largura && f[0] < topo)
+                    (void)g_hooks.svc->read_guest(f[0], f + 2, 2 * sizeof f[0]);
+                if (ok && f[2] >= largura && f[2] < topo)
+                    (void)g_hooks.svc->read_guest(f[2], f + 4, 2 * sizeof f[0]);
+                std::fprintf(stderr,
+                             "[thrd] trap cadeia #%u x30=0x%llx lvl1=0x%llx "
+                             "lvl2=0x%llx lvl3=0x%llx\n",
+                             number,
+                             (unsigned long long)uc->uc_mcontext.regs[30],
+                             (unsigned long long)f[1], (unsigned long long)f[3],
+                             (unsigned long long)f[5]);
+            }
         }
 
         // Despachar o serviço: argumentos em x0-x5, resultado em x0.

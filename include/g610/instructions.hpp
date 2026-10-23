@@ -121,47 +121,66 @@ static_assert(MRS{0xD53BE020}.rt() == 0, "Rt = 0");
 static_assert(MRS{0xD53BE020}.sysreg() == 0x5F01, "CNTPCT_EL0 = 0x5F01");
 
 // ---------------------------------------------------------------------------
-// MRS <Xt>, CNTPCT_EL0  ->  MRS <Xt>, CNTVCT_EL0
+// Leituras do guest ao temporizador do ARM — CNTFRQ / CNTPCT / CNTVCT
 //
-// **E' o mesmo bit que o do `TPIDRRO_EL0`.** O `sysreg` do MRS esta nos
-// bits [20:5], e os dois pares differem no bit 0 do `sysreg` — ou seja, no
-// bit 5 da instrucao:
+// Os tres, pelo `sysreg` empacotado em bits [20:5]:
 //
-//     MRS Xt, TPIDRRO_EL0 = 0x5E01   ->  MRS Xt, TPIDR_EL0 = 0x5E00
-//     MRS Xt, CNTPCT_EL0  = 0x5F01   ->  MRS Xt, CNTVCT_EL0 = 0x5F00
+//     0x5F00  CNTFRQ_EL0  — a frequencia. CONSTANTE (no board: 24_000_000).
+//     0x5F01  CNTPCT_EL0  — o contador fisico; ilegal no EL0 (SIGILL, medido).
+//     0x5F02  CNTVCT_EL0  — o contador virtual do Linux, decorre do ARRANQUE
+//                           DO BOARD, a 24 MHz no nosso host.
 //
-// Um bit, nos dois casos, e por isso que ha **uma** regra e nao duas.
+// **O SDK da Nintendo pede o tick a `cntfrq_el0`.** Medido: `GetSystemTick`
+// sao duas instrucoes (`mrs x0, cntfrq_el0; ret`, no nnSdk em 0x83ab4fd0) e
+// `GetSystemTickFrequency` devolve 19_200_000 fixo, em linha. A escala das
+// conversoes e' fixa; as leituras de tick tem de avancar NELA.
 //
-// ## Porque o `CNTPCT_EL0` nao serve
+// Correr nativamente nao serve: aqui o `cntfrq` devolve a frequencia, nao um
+// contador, e o "agora" do SDK congela. Medicao do sintoma (a parede do
+// Pokemon Shield): `x23 = 0x16e3600 = 24_000_000` constante nas traps do
+// `WaitTimerEvent`; `ConvertToTimeSpan(24_000_000)` = 1_250_000_000
+// constante; prazo = 1_255_000_000; `deadline <= agora` nunca e' verdade.
 //
-// O `cntpct_el0` e' o contador **fisico** do temporizador, e so e' legivel a
-// partir do EL1. O `cntvct_el0` e' o contador **virtual**, e o Linux
-// expoe-o ao EL0 (e' o que `clock_gettime` usa).
+// Reescrever para `cntvct` (o molde antigo) tampouco: o `cntvct` do board
+// corre desde o arranque do board, a 24 MHz, e a escala que o SDK aplica a
+// frente e' 19,2 MHz — os prazos criados por uma fonte e medidos por outra
+// nao se encontram. O Eden upstream tem servidor proprio para o facto
+// (`nce/patcher.cpp:134-144`, `WriteCntpctHandler`, o valor multiplicado
+// host->Switch): aqui a casa toma trap e responde com a escala fixa.
 //
-// O Eden faz a mesma coisa (`nce/patcher.cpp:134-144`,
-// `WriteCntpctHandler`), e ainda multiplica o valor por um factor para o
-// converter de ticks do host para ticks do Switch. **A escala nao e' feita
-// aqui**, e a razao esta escrita em `patcher.cpp`: o que o jogo faz com o
-// valor e' medir tempo e semear um gerador aleatorio, e para as duas
-// coisas o que importa e' que o contador seja **monotonico** — e o
-// `cntvct_el0` e'.
-//
-// A medicao que trouxe aqui: o SDK da Nintendo le o contador com
-// `mrs x0, cntpct_el0` (em 0x82d22fd0) e o motor respondeu "instrucao
-// ilegal do guest".
+// Logo: **trap ao host**, `brk #(0x40|Rt)`. O Rt viagem no imediato (o
+// handler do host aloja o resultado nele) e a resposta sao ticks de 19,2 MHz
+// desde o arranque do guest: uma unica fonte de "agora", na escala que o
+// proprio SDK fixa, para o guest inteiro.
+[[nodiscard]] constexpr bool is_mrs_cntfrq(std::uint32_t insn) noexcept {
+    return MRS{insn}.verify() && MRS{insn}.sysreg() == 0x5F00;
+}
 [[nodiscard]] constexpr bool is_mrs_cntpct(std::uint32_t insn) noexcept {
     return MRS{insn}.verify() && MRS{insn}.sysreg() == 0x5F01;
 }
-
-// `MRS <Xt>, CNTPCT_EL0` em `MRS <Xt>, CNTVCT_EL0`, sem tocar em Rt.
-[[nodiscard]] constexpr std::uint32_t cntpct_to_cntvct(std::uint32_t insn) noexcept {
-    return is_mrs_cntpct(insn) ? (insn & ~0x20u) : insn;
+[[nodiscard]] constexpr bool is_mrs_cntvct(std::uint32_t insn) noexcept {
+    return MRS{insn}.verify() && MRS{insn}.sysreg() == 0x5F02;
 }
 
-static_assert(cntpct_to_cntvct(0xD53BE020u) == 0xD53BE000u,
-              "MRS X0, CNTPCT_EL0 -> MRS X0, CNTVCT_EL0");
-static_assert(cntpct_to_cntvct(0xD53BE021u) == 0xD53BE001u,
-              "Rt preservado na conversao do contador");
+// `mrs x{Rt}, cnt*` em `brk #(0x40|Rt)`. A banda 0x40..0x5F e' propria: nao
+// toca nos BRK de SVC (0..31) nem nos marcadores da casa (0xFFFC/0xFFFD).
+[[nodiscard]] constexpr std::uint32_t mrs_tick_to_brk(std::uint32_t insn) noexcept {
+    return (is_mrs_cntfrq(insn) || is_mrs_cntpct(insn) || is_mrs_cntvct(insn))
+               ? (0xD4200000u | ((0x40u | (insn & 0x1Fu)) << 5))
+               : insn;
+}
+
+static_assert(is_mrs_cntfrq(0xD53BE000u), "MRS X0, CNTFRQ_EL0");
+static_assert(is_mrs_cntpct(0xD53BE020u), "MRS X0, CNTPCT_EL0");
+static_assert(is_mrs_cntvct(0xD53BE040u), "MRS X0, CNTVCT_EL0");
+static_assert(!is_mrs_cntfrq(0xD53BE020u) && !is_mrs_cntvct(0xD53BE000u),
+              "os tres registos distinguem-se pelo op2");
+static_assert(mrs_tick_to_brk(0xD53BE000u) == 0xD4200800u,
+              "MRS X0, CNTFRQ -> BRK #0x40");
+// Site medido no WaitTimerEvent: `mrs x23, cntfrq` (0x83ab2718 do nnSdk,
+// bytes 0xD53BE017). brk #(0x40|23) = brk #0x57.
+static_assert(mrs_tick_to_brk(0xD53BE017u) == 0xD4200AE0u,
+              "MRS X23, CNTFRQ -> BRK #0x57");
 
 // MRS <Xt>, TPIDRRO_EL0  ->  MRS <Xt>, TPIDR_EL0
 // ---------------------------------------------------------------------------

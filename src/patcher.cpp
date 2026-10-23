@@ -28,7 +28,9 @@ std::string PatchReport::summary() const {
       << "hints -> NOP       : " << hints_nop << "\n"
       << "MRS / MSR vistos   : " << mrs_seen << " / " << msr_seen << "\n"
       << "MRS TPIDRRO->TPIDR : " << tpidrro_to_tpidr << "\n"
-      << "MRS CNTPCT->CNTVCT : " << cntpct_to_cntvct << "\n"
+      << "MRS temporiz->trap : cntfrq " << mrs_cntfrq_to_trap
+      << ", cntpct " << mrs_cntpct_to_trap
+      << ", cntvct " << mrs_cntvct_to_trap << "\n"
       << "exclusivos vistos  : " << exclusives_seen << "\n";
     return o.str();
 }
@@ -69,15 +71,17 @@ bool StaticPatcher::patch_word(std::uint32_t& insn, PatchSite& site) {
         // a largura é a mesma, e o valor que o guest quer é precisamente o
         // que `TPIDR_EL0` devolve — desde que o motor instale lá a base do
         // TLS do guest. Ver `NativeEngine`.
-        // `MRS <Xt>, CNTPCT_EL0` -> `MRS <Xt>, CNTVCT_EL0`.
-        //
-        // O `cntpct_el0` e' o contador fisico, que so o EL1 le; o
-        // `cntvct_el0` e' o virtual, que o Linux expoe. O Eden faz o mesmo
-        // (`nce/patcher.cpp:134-144`). Sem isto, o SDK da Nintendo morre
-        // com "instrucao ilegal" no `mrs x0, cntpct_el0` (medido em
-        // 0x82d22fd0).
-        if (arm::MRS{insn}.verify() && arm::is_mrs_cntpct(insn)) {
-            insn = arm::cntpct_to_cntvct(insn);
+        // Os registos do temporizador do ARM viram **trap** ao host, nao
+        // corre nativo: o `cntfrq` aqui devolve a frequencia (24_000_000
+        // constante — o "agora" do SDK congela e o `WaitTimerEvent` da
+        // parede nao vence, medido), e os contadores tem epoca do board,
+        // estranha a escala 19,2 MHz que o SDK fixa de dentro. Ver o bloco
+        // de comentarios em `instructions.hpp`: trap `brk #(0x40|Rt)`, o Rt
+        // viagem no imediato e o handler responde com ticks do guest.
+        if (arm::MRS{insn}.verify() &&
+            (arm::is_mrs_cntfrq(insn) || arm::is_mrs_cntpct(insn) ||
+             arm::is_mrs_cntvct(insn))) {
+            insn = arm::mrs_tick_to_brk(insn);
             site.after = insn;
             return true;
         }
@@ -148,11 +152,20 @@ bool StaticPatcher::patch(std::vector<std::uint8_t>& image,
             changed = true;
             ++report_.hints_nop;
         } else if (changed) {
-            // Distingue o patch de TLS do patch de SVC pelo encoding original.
-            if (arm::is_mrs_tpidrro(site.before)) {
+            // Distingue o patch pelo encoding original: os registos do
+            // temporizador (as traps 0x40|Rt do relogio do guest), o TLS,
+            // e por fim os SVC.
+            if (arm::is_mrs_cntfrq(site.before) ||
+                arm::is_mrs_cntpct(site.before) ||
+                arm::is_mrs_cntvct(site.before)) {
+                if (arm::is_mrs_cntfrq(site.before))
+                    ++report_.mrs_cntfrq_to_trap;
+                else if (arm::is_mrs_cntpct(site.before))
+                    ++report_.mrs_cntpct_to_trap;
+                else
+                    ++report_.mrs_cntvct_to_trap;
+            } else if (arm::is_mrs_tpidrro(site.before)) {
                 ++report_.tpidrro_to_tpidr;
-            } else if (arm::is_mrs_cntpct(site.before)) {
-                ++report_.cntpct_to_cntvct;
             } else {
                 ++report_.svc_patched;
                 if (!report_.saw_any_svc) {

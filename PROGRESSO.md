@@ -5778,3 +5778,77 @@ estado correcto, nao um sintoma; nenhuma cobertura nova em
 [0, 0xC0000000) e' necessaria para a emulacao. O instrumento fica
 (env-gated) para runs futuros: o dia em que o guest mapear essa
 zona, o dump da mesa prova de graca.
+
+## A parede do WaitTimerEvent era um relogio congelado - e a trap 0x40|Rt abriu-a (medido, 22/10)
+### A medida (LOG20 + a C do board + o desmonte)
+O run vivo (Pokemon Shield) parava na parede: a thread do SDK reentria
+`WaitTimerEvent` 712 vezes de 5 ms e o prazo nunca vence; a casa mata aos
+45 s (EXIT=139 de sempre, LOG17).
+
+- **LOG20** (o print das traps ampliado com x20..x24): nas esperas da
+  parede (`trap #28`, `x2=0x38005`) o **`x23 = 0x16e3600 = 24_000_000`
+  CONSTANTE** - o valor bruto do `mrs` e `x24 = 0x0` (o contador do
+  evento, `+0x14`, nunca incrementou).
+- **O valor fecha a aritmetica do objecto**: `ConvertToTimeSpan(24_000_000)`
+  com a escala fixa do `TickManager` (52,083 ns/tick) = 1_250_000_000;
+  prazo = 1_250_000_000 + 5_000_000 = **1_255_000_000** = o valor de
+  `+0x20` medido no dump do objecto (0x4ACDC7C0). "Now" constante igual ao
+  prazo menos 5 ms: nunca vence.
+- **`.`_O desmonte fecha a fonte_**: `nn::os::GetSystemTick` (rel
+  0x327fd0, 8 bytes) = `mrs x0, cntfrq_el0; ret` e
+  `nn::os::GetSystemTickFrequency` = constante 19_200_000 em linha. O SDK
+  da Nintendo pede o tick ao registo da FREQUENCIA, e as conversoes usam
+  escala fixa de 19,2 MHz.
+- **`.`_A medida de C no board_**: `mrs cntfrq_el0` = 24_000_000 (so a
+  frequencia); `mrs cntvct_el0` avanca a 24,0 MHz desde o arranque do
+  BOARD. No Switch o registo tem outra semantica (o Eden upstream tem
+  `WriteCntpctHandler` que traduz host->Switch); o guest corre nativo e
+  le o board sem intermediario.
+- **`.`_A pista escondida no patcher_**: o rewrite antigo
+  `CNTPCT->CNTVCT` fazia `insn & ~0x20` e os `static_assert` fixavam
+  `0xD53BE020 -> 0xD53BE000` — que e' **CNTFRQ (op2=0)**, nao CNTVCT
+  (op2=2 = 0xD53BE040). Quem lia o contador fisico era enviado,
+  silenciosamente, para a leitura da frequencia: a mesma doenca.
+
+### O fix
+As tres leituras do guest ao temporizador - `CNTFRQ` (sysreg 0x5F00),
+`CNTPCT` (0x5F01), `CNTVCT` (0x5F02) - passam a `brk #(0x40|Rt)` no
+patcher (o Rt viagem no imediato; banda 0x40..0x5F propria, fora dos BRK
+de SVC 0..31 e dos marcadores 0xFFFC/0xFFFD). O handler da trap responde
+com **ticks de 19,2 MHz desde a primeira leitura do guest** (`ns * 192 /
+10000`), a escala fixa do proprio SDK. Fonte unica de "agora", sem print
+nem despacho (a leitura e' frequente). O report passa a ter
+`mrs_cnt{frq,pct,vct}_to_trap` (e o nome antigo `cntpct_to_cntvct` sai,
+porque fixava o erro com o rotulo errado). 121 verificacoes do teste
+central, 0 falhas.
+
+### A medida depois do fix (LOG22, 60 s)
+- **O `x23` avanca** na parede: `0x1777d78` -> `0x177826a` (+1.266 ticks
+  ~= +66 us entre esperas) - 24,6 M ticks ~= 1,28 s reais. O `x3` conta
+  para baixo (`0x4866f3` -> `0x4765ca` -> `0x464aca`): o prazo esta a ser
+  alcancado a serio.
+- **158 disparos** do objecto da parede (`Sinal origem lvl1=0x8065a630
+  dono=0xd9c2c1f0`) e 158 acordias (`sinal pendente`). O `x30=0x83ab2798`
+  dos sinais = o fire-path do proprio `WaitTimerEvent` - a rota
+  notify-on: marca `+0x12 = 1` e posta na cv pela `InternalCV::Signal`;
+  o contador `+0x14` NAO incrementa nessa rota (o ++ so existe na rota
+  notify-off: desmonte em 0x83ab27a8), por isso `x24 = 0` passa a ser o
+  estado correcto.
+- **`.`_O boot passou a parede_**: no diff dos conjuntos LOG17-LOG22
+  aparece inteira a fase NVDRV que nenhum run alcancou: `BindChannel`
+  (fd=5/6), `SubmitGPFIFO` com `flags=0x104 kickoff=1` (tres kicks),
+  syncpoints alocados e avancados (o syncpoint 2 ate' 3), `ZCullBind`,
+  `CtrlEventRegister` e `CtrlEventWait: syncpt_id=2 threshold=3` - a
+  espera no fence da GPU, com o threshold ja alcancado.
+- O fim do run = EXIT=139 da casa aos 60 s; nos ultimos 575 linhas o laco
+  de 5 ms da thread do timer pulsa ate ao fim (o terminador do run, nao
+  um bloqueio novo).
+
+### Conclusao
+A parede nao era de semaforo nem de cv: era **de relogio**. O SDK inteiro
+fecha o "agora" na leitura de `cntfrq_el0`, que no board devolve a
+frequencia fixa (24_000_000) - um "agora" congelado em 1,25 s para
+sempre. Com a trap `0x40|Rt` o guest tem ticks de 19,2 MHz desde a sua
+epoca, as conversoes batem certo, o `WaitTimerEvent` vence e o boot
+alcanca a fase de GPU (canal vivo, kickoffs, syncpoints, fence) que
+nenhum run anterior viu.

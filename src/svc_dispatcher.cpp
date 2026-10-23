@@ -2104,6 +2104,35 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
         }
     }
 
+    // **Cadeia de chamados do lado da espera** (env `G610_SVC_WAIT_FP=1`):
+    // o mesmo esquema do `G610_SVC_SIGNAL_FP`: [x29] = fp do chamador,
+    // [x29+8] = lr; sobe tres niveis. Barato (3 leituras de 16 bytes por
+    // espera) e so' com o env posto. Medida LOG15: a lane da parede
+    // (0xd9c2c22c, ~5 ms) sobe para `WaitTimerEvent` no sdk e para
+    // `main+0x65A630` — quem chama e' o "armador do re-espera"; a cadeia
+    // distingue a lane da parede da lane da bomba (que espera ∞).
+    static const bool trace_wait_fp = std::getenv("G610_SVC_WAIT_FP") != nullptr;
+    if (trace_wait_fp) {
+        constexpr std::uint64_t largura = 0x200000ull;
+        constexpr std::uint64_t topo = 0x800000000ull;
+        const std::uint64_t fp = ctx.gpr[29];
+        std::uint64_t f[6] = {0, 0, 0, 0, 0, 0};
+        const bool ok = fp >= largura && fp < topo &&
+                        read_guest(fp, f, 2 * sizeof f[0]);
+        if (ok && f[0] >= largura && f[0] < topo)
+            (void)read_guest(f[0], f + 2, 2 * sizeof f[0]);
+        if (ok && f[2] >= largura && f[2] < topo)
+            (void)read_guest(f[2], f + 4, 2 * sizeof f[0]);
+        std::fprintf(stderr,
+                     "[svc] WaitProcessWideKeyAtomic cadeia cv=0x%llx tag=0x%x "
+                     "x30=0x%llx lvl1=0x%llx lvl2=0x%llx lvl3=0x%llx\n",
+                     static_cast<unsigned long long>(cv_key), tag,
+                     static_cast<unsigned long long>(ctx.gpr[30]),
+                     static_cast<unsigned long long>(f[1]),
+                     static_cast<unsigned long long>(f[3]),
+                     static_cast<unsigned long long>(f[5]));
+    }
+
     if (std::getenv("IA_IPC_TRACE") != nullptr) {
         std::fprintf(stderr,
                      "[svc] WaitProcessWideKeyAtomic addr=0x%llx cv=0x%llx tag=0x%x "

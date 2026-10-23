@@ -530,6 +530,9 @@ bool GuestProgram::patch_all(std::string& error) {
         patch_report_.hints_nop += pr.hints_nop;
         patch_report_.mrs_seen += pr.mrs_seen;
         patch_report_.tpidrro_to_tpidr += pr.tpidrro_to_tpidr;
+        patch_report_.mrs_cntfrq_to_trap += pr.mrs_cntfrq_to_trap;
+        patch_report_.mrs_cntpct_to_trap += pr.mrs_cntpct_to_trap;
+        patch_report_.mrs_cntvct_to_trap += pr.mrs_cntvct_to_trap;
         patch_report_.msr_seen += pr.msr_seen;
         patch_report_.exclusives_seen += pr.exclusives_seen;
         if (!patch_report_.saw_any_svc && pr.saw_any_svc) {

@@ -609,6 +609,15 @@ void test_instructions() {
     // MRS/MSR
     check(MRS{0xD53BE020}.verify(), "MRS X0, CNTPCT_EL0");
     check(MRS{0xD53BE020}.sysreg() == 0x5F01, "CNTPCT_EL0 = 0x5F01");
+    check(is_mrs_cntfrq(0xD53BE000), "CNTFRQ_EL0 = 0x5F00");
+    check(is_mrs_cntvct(0xD53BE040), "CNTVCT_EL0 = 0x5F02");
+    check(!is_mrs_cntfrq(0xD53BE040) && !is_mrs_cntvct(0xD53BE000),
+          "os tres registos se distinguem");
+    // O fix da parede: o tick do guest vem do host, o Rt viagem na trap.
+    check(mrs_tick_to_brk(0xD53BE000) == 0xD4200800,
+          "MRS X0, CNTFRQ -> BRK #0x40");
+    check(mrs_tick_to_brk(0xD53BE017) == 0xD4200AE0,
+          "MRS X23, CNTFRQ (site medida em 0x83ab2718) -> BRK #0x57");
     check(MSR{0xD51BD040}.verify(), "MSR TPIDR_EL0, X0");
     check(MSR{0xD51BD040}.sysreg() == 0x5E82, "TPIDR_EL0 = 0x5E82");
 
@@ -637,7 +646,7 @@ void test_patcher() {
     tel.set_live_console(false);
     g610::StaticPatcher p(tel);
 
-    // Uma pequena "imagem" com SVC, YIELD e código normal.
+    // Uma pequena "imagem" com SVC, YIELD, MRS de tick e código normal.
     std::vector<std::uint8_t> image(64, 0);
     const std::uint32_t words[] = {
         0xAA0003E0,        // MOV X0, X0        -> nativa
@@ -646,6 +655,7 @@ void test_patcher() {
         0xF9400000,        // LDR X0,[X0]       -> nativa
         0xD4000061,        // SVC #3            -> BRK
         0xD65F03C0,        // RET               -> nativa
+        0xD53BE017,        // MRS X23, CNTFRQ   -> BRK #0x57 (o Rt na trap)
     };
     std::memcpy(image.data(), words, sizeof(words));
 
@@ -654,7 +664,7 @@ void test_patcher() {
     check(p.patch(image, 0, sizeof(words), rep, err),
           "patcher aceita uma região válida");
 
-    std::uint32_t out[6];
+    std::uint32_t out[7];
     std::memcpy(out, image.data(), sizeof(words));
 
     check(out[0] == 0xAA0003E0, "instrução nativa fica intacta");
@@ -663,11 +673,13 @@ void test_patcher() {
     check(out[3] == 0xF9400000, "LDR fica intacto");
     check(out[4] == 0xD4200060, "SVC #3 virou BRK #3");
     check(out[5] == 0xD65F03C0, "RET fica intacto");
+    check(out[6] == 0xD4200AE0, "MRS X23, CNTFRQ virou BRK #0x57");
 
     check(rep.svc_patched == 2, "dois SVC reescritos");
     check(rep.hints_nop == 1, "um hint neutralizado");
     check(rep.saw_any_svc, "o patcher viu SVC");
     check(rep.first_svc == 6, "primeiro SVC é o #6");
+    check(rep.mrs_cntfrq_to_trap == 1, "um MRS CNTFRQ virou trap");
 
     // Limites inválidos têm de ser recusados, não gerar um crash.
     {
