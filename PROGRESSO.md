@@ -6028,3 +6028,61 @@ sobrevivente). Tres causas independentes, medidas uma a uma:
   resultado; se algum caminho persistir, etiqueta `[parag]`.
 - O traco G610_OBJ_TRACE pode ficar desligado de vez; o parche SKIP e'
   sempre-on (barato: 3 loads + orr).
+
+## 23/10 noite - o steady-state do jogo (medido, LOGE1/E2/E3)
+
+A ronda passo-4 fechou com rc=0 x4, mas o run padrao morria aos ~4 s
+e o "fim" era o sampler do tracer (4.º tick -> force_stop), nao o guest.
+LOGE1 (G610_EXIT_TRACE=1) confirma: "parou por: alarme de seguranca",
+pc=0x83b0bb3c, zero pedidos de ExitProcess. A etiqueta [exit] (em
+native_engine.cpp) nunca dispara nos runs padrao.
+
+### O que foi feito
+
+- `src/native_engine.cpp`: g_run_start_ns (atomico, lido fora do handler) +
+  etiqueta [exit] gated por G610_EXIT_TRACE (pc/sp/x30/fp/tls/svc_calls/t).
+- `tests/boot_trace.cpp`: IA_HEARTBEAT=1 -> batimento por segundo no on_alarm
+  (delta do histograma de SVC via ::write); IA_WAIT_TRACE=1 -> retrato do
+  WaitSynchronization 0x18 (janelas de 16 bytes dos dois ponteiros + handles
+  novos); G610_KEEP_ALIVE=<seg> -> manter vivo apos saida limpa.
+- `src/services/nvdrv.cpp`: G610_PB_DUMP=<ficheiro> -> despejo completo do
+  pushbuffer (ate' 64 KiB) a cada SubmitGPFIFO.
+- `src/services/applet_oe.cpp`: experimento (deve_estar_sinalizado() sempre
+  true; mensagens {1, 15}) — resultado negativo (ver abaixo).
+
+### Medidas
+
+- LOGE1 (4.5 s, rc=0): sampler força a saida; sem ExitProcess.
+- LOGE2 (120 s, rc=124): steady-state estável a 630 SVC/s (Wait 400 +
+  Signal 200 + WaitSync 30), 119 batimentos, sem crash, sem progressao.
+  [janela] em 0x9C800000 toda a zeros; pushbuffer com comandos (classes
+  0xB197 GR3D, 0xB1C0 GR2D, 0xB0B5, 0xA140, 0x902D) e metodos 69-73,
+  84-85, 131, 133-134, 164, 171, 178, 187, 192, 195-196, 221, 467,
+  479, 489-490, 545, 640-857, 890, 896-958, 982-1024, 1075-1106,
+  1150-1300, 1348-1453, 1509-1731, 2272-2434, 3352-3627; nenhum
+  FenceAction (0x1D) nem SemaphoreTrigger (0x07).
+- LOGE3 (60 s): o portao do titulo e' o WaitSynchronization sobre o handle
+  0x000401f9 (evento do applet), 30/s, timeout 0.
+
+### Conclusao
+
+O steady-state e' estavel mas o jogo nao desenha (a janela compositora fica
+a zeros) — o proximo muro e' a decodificacao dos comandos da GPU, que
+decide se ha' imagem. A GPU ja' tem tradutor (MaxwellTranslator) e MME
+(901 envios por submissao), mas zero DrawCommands: o jogo so' configura
+estado (metodos 69-73, 84-85, ...), nunca chama DrawBegin/DrawEnd
+(1413/1414) nem Clear/DrawTexture — o desenho esta' bloqueado por uma
+causa logica (a medir: qual thread e em que).
+
+### Commits da sessao
+
+- b3c5410 Abre o steady-state do jogo (IA_STOP_SAMPLES=0) e mede-o
+- fa89bc6 Experimento: applet event sempre sinalizado + mensagens 1+15
+
+### Proximo passo
+
+Medir qual thread bloqueia e em que (instrumento do thread no heartbeat),
+e usar o Eden original (vendor/eden) como referencia para a sequencia real
+de desenho (draw_manager.cpp: DrawBegin/DrawEnd, macro_hle.cpp: HLE macros).
+A imagem real requer a decodificacao da GPU (Clear/DrawTexture) e a ligacao
+do rasterizer a' janela do compositor — estimativa 1-2 dias.
