@@ -22,6 +22,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <unordered_map>
 #include <sched.h>
 #include <thread>
 #include <vector>
@@ -2294,9 +2295,43 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
                    d->second != ArbitrationBoard::DespertaAguarda;
         };
 
+        static const bool trace_wait_hz = std::getenv("G610_SVC_WAIT_HZ") != nullptr;
+        const auto inicio = std::chrono::steady_clock::now();
+        // **Fase desperta** (`G610_SVC_WAIT_HZ=1`): o tempo real decaído
+        // desde a ultima entrada nesta mesma cv. LOG31 mediu a parede
+        // (TimerEvent 0xd9c2c22c) num run de 1,6 s (4000 traps): 157
+        // esperas com `real` ~4,8 ms (soma 0,75 s) e `desde` ~5 ms —
+        // a parede reentra logo a seguir a acordar; o resto do run e'
+        // o boot e a cauda de "sinal pendente" (sem sono).
+        static std::mutex portica_hz_;
+        static std::unordered_map<std::uint64_t,
+            std::chrono::steady_clock::time_point> ultima_hz_;
+        std::uint64_t desde = 0;
+        if (trace_wait_hz) {
+            std::chrono::steady_clock::time_point anterior;
+            {
+                std::lock_guard<std::mutex> beleira(portica_hz_);
+                auto it = ultima_hz_.find(cv_key);
+                if (it != ultima_hz_.end()) {
+                    anterior = it->second;
+                    it->second = inicio;
+                    desde = std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(inicio - anterior).count();
+                } else {
+                    ultima_hz_.emplace(cv_key, inicio);
+                }
+            }
+        }
         if (timeout > 0) {
-            const auto prazo = std::chrono::steady_clock::now() +
-                               std::chrono::nanoseconds(timeout);
+            // **Medida do sono** (`G610_SVC_WAIT_HZ=1`): quanto o
+            // `wait_until` dorme de facto contra o prazo pedido. A parede
+            // do TimerEvent dorme ~4,8 ms e dispara a ~200 Hz na sua
+            // janela activa (LOG31: 157 esperas com `desde` ~5 ms em
+            // 0,78 s de janela) — se a espera real for de ordens acima
+            // do prazo, o sono e' o culpado e nao o guest. Leitura de
+            // relogio ja' feita nos mercados desta funcao; aqui so' o
+            // print das duas pontas.
+            const auto prazo = inicio + std::chrono::nanoseconds(timeout);
             // Predic-versão do wait_until: devolve o VALOR FINAL do
             // predicado. Se o sinal entrou no último instante, o
             // predicado final é o que conta — a mesma arbitragem de quem
@@ -2327,6 +2362,18 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
                 g_arbiter.desperta.erase(token);
                 dispatch_owner_set(token);
                 (void)dispatch_owner_claim();
+                if (trace_wait_hz) {
+                    const auto dur = std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                  inicio).count();
+                    std::fprintf(stderr,
+                                 "[svc] TimedWait TIMEOUT cv=0x%llx tag=0x%x "
+                                 "pedido=%lld real=%lld desde=%llu\n",
+                                 static_cast<unsigned long long>(cv_key),
+                                 tag, static_cast<long long>(timeout),
+                                 static_cast<long long>(dur),
+                                 static_cast<unsigned long long>(desde));
+                }
                 return Result::TimedOut;
             }
         } else {
@@ -2386,6 +2433,18 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
 
         acordei_com = g_arbiter.desperta.at(token);
         g_arbiter.desperta.erase(token);
+        if (trace_wait_hz && timeout > 0) {
+            const auto dur = std::chrono::duration_cast<
+                std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                          inicio).count();
+            std::fprintf(stderr,
+                         "[svc] TimedWait ACORDEI cv=0x%llx tag=0x%x "
+                         "pedido=%lld real=%lld desde=%llu\n",
+                         static_cast<unsigned long long>(cv_key),
+                         tag, static_cast<long long>(timeout),
+                         static_cast<long long>(dur),
+                         static_cast<unsigned long long>(desde));
+        }
     }
 
     // Sucesso ⇒ o SignalImpl escreveu o MEU tag na palavra: mutex em mão,
