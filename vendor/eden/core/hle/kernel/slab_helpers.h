@@ -10,6 +10,9 @@
 #include "vendor/eden/core/hle/kernel/k_auto_object_container.h"
 #include "vendor/eden/core/hle/kernel/k_kernel_core_bridge.h"  // PONTE
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace Kernel {
 
 template <class Derived>
@@ -105,6 +108,13 @@ public:
         Derived* obj = Allocate(kernel);
         if (obj != nullptr) {
             KAutoObject::Create(obj);
+            // **Traço da casa** (a cisma do 139):_printa cada `Create` de
+            // objecto do kernel — com o traço do container vemos, num
+            // corrida, o REUSO completo: criação → registro → destruição →
+            // criação NO MESMO endereço (o construtor aponta o hook a
+            // zero e o container tem o slot do nó velho — o walk cai).
+            if (std::getenv("G610_OBJ_TRACE") != nullptr)
+                std::fprintf(stderr, "[obj] CRIADO %p\n", (void*)obj);
         }
         return obj;
     }
@@ -182,6 +192,16 @@ public:
         Derived* obj = Allocate(kernel);
         if (obj != nullptr)
             KAutoObject::Create(obj);
+        else
+            return nullptr;
+        // **Traço da casa** (a cisma do 139): grava cada `Create` de objecto
+        // de kernel registrado no container — com o traço do container
+        // (k_auto_object_container.cpp) vemos numa corrida o REUSO
+        // completo: criação → registro → destruição → criação NO MESMO
+        // ENDEREÇO (o construtor põe o hook do nó a zero, e o slot da
+        // raiz da árvore continua a apontar-lhe: o walk cai = o core).
+        if (std::getenv("G610_OBJ_TRACE") != nullptr)
+            std::fprintf(stderr, "[obj] CRIADO %p\n", (void*)obj);
         return obj;
     }
 
