@@ -120,6 +120,21 @@ static std::string g_scratch;
 static volatile int g_samples = 0;
 static volatile std::uint64_t g_sample_pc = 0;
 
+// O numero de paragem e' parametrizavel (`IA_STOP_SAMPLES`, default 4):
+// o boot de um jogo chega a fases que so' existem depois do 4 sample
+// (o laco de render do titulo, LOG34), e sem a janela aberta o tracer
+// corta o run no mesmo morro. 0 desarma a paragem por completo (o
+// `timeout` do shell e o relatorio continuam como rede de seguranca).
+//
+// A leitura corre em contexto normal (inicializacao estatica, antes do
+// main instalar qualquer handler) e nao dentro do on_alarm: getenv/
+// strtoul nao sao async-signal-safe e o primeiro disparo do alarme
+// (~1 s) fzia o strtoul morrer dentro do contexto de thread de guest
+// (LOG37/39/40/42: SIGSEGV em 0x2841060000000a; 0 samples impressos).
+static const unsigned long g_stop_samples =
+    [] { const char* s = ::getenv("IA_STOP_SAMPLES");
+         return s == nullptr ? 4ul : ::strtoul(s, nullptr, 0); }();
+
 // O ultimo `SendSyncRequest`: o buffer do pedido (x1) e o da resposta (x3).
 //
 // A resposta do servico vai para x3, no espaco do guest. E' ai que o SDK le
@@ -138,18 +153,12 @@ void on_alarm(int, siginfo_t*, void* raw) {
     g_sample_pc = pc;
     ++g_samples;
 
-    // Na ultima amostragem, PARAR o guest. Um spin de codigo nao levanta
-    // traps, e sem isto o programa nunca mais sai: o relatorio (que e' onde
-    // esta' o unico rasto do que aconteceu) nunca e' impresso.
-    //
-    // O numero de paragem e' parametrizavel (`IA_STOP_SAMPLES`, default 4):
-    // o boot de um jogo chega a fases que so' existem depois do 4 sample
-    // (o laco de render do titulo, LOG34), e sem a janela aberta o tracer
-    // corta o run no mesmo morro. 0 desarma a paragem por completo (o
-    // `timeout` do shell e o relatorio continuam como rede de seguranca).
-    static const unsigned long g_stop_samples =
-        [] { const char* s = ::getenv("IA_STOP_SAMPLES");
-             return s == nullptr ? 4ul : ::strtoul(s, nullptr, 0); }();
+    // O g_stop_samples e' lido uma vez em contexto normal (acima): a sua
+    // leitura inicializante (getenv+strtoul) NAO pode correr dentro do
+    // handler — e' async-signal-unsafe. Medida LOG42: o 1o on_alarm do run
+    // (aos ~1 s) entrava no strtoul com o contexto de thread de guest e
+    // fazia morrer o processo com SIGSEGV em 0x2841060000000a dentro do
+    // __isoc23_strtoul (por isso os runs que faultam tinham 0 samples).
     if (g_stop_samples != 0 && g_samples >= g_stop_samples) {
         // Parar o guest: salta para uma rotina que faz BRK, que o motor
         // trata como saida. Sem isto o programa nunca mais volta ao host e o
