@@ -96,10 +96,43 @@ Com `G610_TRAP_LIMIT=0 IA_STOP_SAMPLES=0` (LOG36, run de 30,08 s ate o
   pendente + ~865 da bomba), `#29` 5.710 (um fire por dormida), `#33`
   911, `#27` 857, `#26` 26.
 
+- **A janela do tracer aberta**: `IA_STOP_SAMPLES` no `on_alarm`
+  (`f276204`, medido LOG36/LOG38).
+- **O fault de ~1,58 s achou a raiz e saiu** (`fae2c48`): o `SIGSEGV`
+  em `0x2841060000000a` morava no `__isoc23_strtoul` da glibc, chamado
+  do init do `g_stop_samples` DENTRO do `on_alarm` — a leitura de env
+  (getenv+strtoul) no contexto do 1o alarmo, que aterrava na thread de
+  guest a meio do pedido nvdrv (`pc=0x804527ec x19=0xc2be7030` no
+  sample 1 de hoje; nos runs faultados esse sample nunca imprimia:
+  0 samples + morte aos ~1,58 s = o init*tombou*). Icou a leitura para
+  context normal (estatica do TU): ANTES 4/5 corridas rc=139; AGORA
+  6/6 rc=124 (4 s cada, 3 samples cada, fault=0).
+- **O spin de ~200 kHz tem cadeia completa** (`f276204` + LOGI, 40 s,
+  39 samples com caminhada de frames): leaf mrs (0x83ab4fd4) ←
+  conversora sdk 0x83b4fb0c (site) ← **laco sdk 0x83ba3a08** (espera
+  com contador partilhado: `ldr w8,[x26] / cmp w8,w25 / b.mi`,
+  leitura de "agora" por `blr [x27+0x40]` e `bl 0x83ba1120` por
+  iteracao; x19=0x82774110 = o objecto) ← main `0x8054e570`
+  (despacho por funcao-apontador `blr [0x8249a460]`, x1=-1) ←
+  `0x80541080` ← `0x80447554` (calls por vtable +0x48/+0x310). O
+  custo = 4.753.000 leituras do relogio em 30 s (~200k/s no handler
+  do mrs): o proximo dilema = tornar o trap do relogio barato ou
+  cortar o laco do guest.
+- **As SendSyncRequest de 30 Hz sao 2 sessoes irmas** (LOGK/LOGL,
+  prints `[ipc ] #33` no on_trap do tracer, 1135 envios em 12 s):
+  `0x981f1` cmd **0x10** (856/15 s = 57 Hz) e `0xa01f0` cmd **0xc0b**
+  (246/15 s = 16 Hz), aos vizinhos de handle 0x1f0/0x1f1 (mesma
+  CreateSession). TODAS passam pelo site sdk `x30=0x83ae9c44` (a
+  wrapper com cache de sessao por `tpidr_el0`: o teste `cmp x9,x1`
+  nunca acerta, 1135/1135 pelo ramo lento — aberto: e' design do
+  guest ou o nosso tpidr esta' errado). Nome do servico ainda
+  sem simbolo no SDK (readd "laco de render de 30 Hz": DESDIZIDO por
+  enquanto — devem apontar para sessoes do jogo, 57+16 Hz).
+
 Commits da secao: `5057ac1` (o ritmo do relogio, 19,2 MHz medido),
-`aa2580f` (a cadencia da parede com `pedido`/`real`/`desde`), e o que
-abre a janela (o `IA_STOP_SAMPLES` no `on_alarm`, com `tests/boot_trace.cpp`)
-e o diario (este).
+`aa2580f` (a cadencia da parede com `pedido`/`real`/`desde`), `b16730e`
+(a janela IA_STOP_SAMPLES + o diario), `f276204` (x2/x30 no sample +
+a cadeia do spin), `fae2c48` (o fault do alarmo pela raiz).
 
 ## Onde paramos ontem (22/10, arquivo)
 
