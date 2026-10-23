@@ -385,3 +385,22 @@ commit `d95f1b0` no header).
   lado G610: as traps de 58/18 Hz continuam a caminho da thread
   fast-path — saber QUE servico pede cada trap fecha o despacho por
   tabela (o proximo passo de `src/native_engine.cpp`).
+
+---
+
+## 8. O desligamento fechou (23/10, noite) - o motor parou de morrer
+
+Os tres desligamentos da ronda `wip/passo-4-thread` fecharam com medida
+(rc=0 em 4 corridas a 40 s): o observador do tracer sem heap no handler
+(rc=134 do `double free`), a paragem das threads de guest com join de
+teto (o 139/133 do teardown) e o guarda do walk no container de
+objectos do kernel (o segfault do `Unregister` no no de reuso do slab).
+A materia completa (casas, medias e commits `28858bd`/`043ecb4`/
+`e529e6d`) esta' na seccao final de 23/10 a noite do `PROGRESSO.md`.
+
+Para o lado TLS deste doc nada muda: as threads de guest continuam com
+o mesmo `sigsetjmp`/`siglongjmp` por slot (o passo 1); a paragem nova
+so' ENCAMINHA pela recovery que ja' existia (o mesmo `siglongjmp`), e as
+etiquetas + contagem ao vivo do observador passaram a operacoes sem
+heap - o handler ganhou tempo, nao mudou os caminhos.
+
