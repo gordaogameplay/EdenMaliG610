@@ -166,11 +166,27 @@ void on_alarm(int, siginfo_t*, void* raw) {
         uc->uc_mcontext.pc = reinterpret_cast<std::uint64_t>(&force_stop);
     }
     if (g_samples <= 2 || g_stop_samples == 0) {
-        char b[208];
+        char b[416];
+        // Caminhada de frames a partir do x29: *(x29+8) = o sitio de
+        // retorno do chamador de cima (prologo stp x29, x30). So' derefs
+        // directos (nada de biblioteca em contexto de sinal).
+        std::uint64_t lr1 = 0, lr2 = 0, lr3 = 0, lr4 = 0;
+        std::uint64_t fp = uc->uc_mcontext.regs[29];
+        for (int nivel = 0; nivel < 4 && fp != 0; ++nivel) {
+            const auto* f = reinterpret_cast<const volatile std::uint64_t*>(fp);
+            const std::uint64_t ret = f[1];
+            if (nivel == 0) lr1 = ret;
+            else if (nivel == 1) lr2 = ret;
+            else if (nivel == 2) lr3 = ret;
+            else { lr4 = ret; break; }
+            fp = f[0];
+            if (fp == 0 || (fp & 7) != 0) break;
+        }
         const int k = std::snprintf(
             b, sizeof b,
             "[sample %d] pc=0x%llx x0=0x%llx x1=0x%llx x2=0x%llx x19=0x%llx "
-            "x29=0x%llx x30=0x%llx sp=0x%llx\n",
+            "x29=0x%llx x30=0x%llx sp=0x%llx lr1=0x%llx lr2=0x%llx "
+            "lr3=0x%llx lr4=0x%llx\n",
             g_samples, (unsigned long long)pc,
             (unsigned long long)uc->uc_mcontext.regs[0],
             (unsigned long long)uc->uc_mcontext.regs[1],
@@ -178,7 +194,9 @@ void on_alarm(int, siginfo_t*, void* raw) {
             (unsigned long long)uc->uc_mcontext.regs[19],
             (unsigned long long)uc->uc_mcontext.regs[29],
             (unsigned long long)uc->uc_mcontext.regs[30],
-            (unsigned long long)uc->uc_mcontext.sp);
+            (unsigned long long)uc->uc_mcontext.sp,
+            (unsigned long long)lr1, (unsigned long long)lr2,
+            (unsigned long long)lr3, (unsigned long long)lr4);
         ssize_t w = ::write(2, b, (size_t)k);
         (void)w;
     }
@@ -283,6 +301,23 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
                 std::printf("        arg[%d] \"%s\"  data=0x%llx\n", a, nome,
                             (unsigned long long)data);
             }
+        }
+    }
+    // As barras de SendSyncRequest: servico em x0, mensagem em x1.
+    // LOG36: 911 `SendSyncRequest` (30/s), sempre deste stub
+    // (0x83b0bb64), com os handles 0x981f1 e 0xa01f0. Os primeiros u32
+    // da mensagem dizem o comando do servico — com isso o laco de 30 Hz
+    // deixa de ser um palpite.
+    if (number == 0x21 && g_mem != nullptr) {
+        std::uint8_t mh[24];
+        std::string e2;
+        if (g_mem->read(ctx.x[1], mh, sizeof mh, e2)) {
+            std::uint32_t mh32[6];
+            std::memcpy(mh32, mh, sizeof mh32);
+            std::printf(
+                "[ipc ] #33 handle=%llx msg=%08x %08x %08x %08x %08x %08x\n",
+                (unsigned long long)ctx.x[0], mh32[0], mh32[1], mh32[2],
+                mh32[3], mh32[4], mh32[5]);
         }
     }
    // Endereços de retorno do guest na stack, para seguir de onde veio o
