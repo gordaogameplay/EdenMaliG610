@@ -5950,3 +5950,81 @@ sempre. Com a trap `0x40|Rt` o guest tem ticks de 19,2 MHz desde a sua
 epoca, as conversoes batem certo, o `WaitTimerEvent` vence e o boot
 alcanca a fase de GPU (canal vivo, kickoffs, syncpoints, fence) que
 nenhum run anterior viu.
+
+---
+
+## 23/10 a noite - o fechamento da ronda `wip/passo-4-thread`
+
+A ronda "abrir o jogo" fechou os dois desligamentos que matavam todos os
+runs no fim (o shutdown do motor), o do meio e o do fim, cada uma com
+core na mao e commit proprio.
+
+### O que estava morto
+
+O run padrao (40 s na board) terminava num de tres codigos: rc=134
+(abort do glibc), rc=139 (segfault) e rc=133 (SIGTRAP de thread
+sobrevivente). Tres causas independentes, medidas uma a uma:
+
+1. **rc=134, o double free do observer** (`tests/boot_trace.cpp`,
+   commit `28858bd`): o `g_calls.push_back` do observador (malloc/free
+   que realoca) corria no signal handler em TODAS as threads de guest.
+   O core LOGG mostrava o pedaco ja' livre no unsorted bin no instante
+   do segundo free e tres traces todas em
+   `svc_wait_process_wide_key_atomic`. Fix: nada de heap no handler -
+   tabela pre-computada de nomes, anel fixo de 120 em ordem, contadores
+   por opcode atomicos. Medida: LOGX1/2/3, as tres chegam ao fim.
+
+2. **o teardown contra threads vivas** (commit `043ecb4`): as threads
+   de guest nasciam `.detach()` e ninguem as juntava - o desligamento
+   (`~NativeEngine -> ~SvcDispatcher -> ~EdenSystem -> ~ServerManager`
+   -> `~KEvent`) destruia objectos kernel CONCORRENTE com elas. Fix:
+   flag de paragem (leita no fim de cada despaco dispatch), predicados
+   das 3 esperas do quadro de arbitragem sem o `.at(token)` (que
+   lancava out_of_range quando quem acorda e' a paragem), registo de
+   `std::thread` em vez de `.detach()`, join com teto de 3 s chamado
+   de `~NativeEngine` ANTES de desarmar os handlers; o join DRENA
+   SEMPRE o vector (o contador os zera, mas os objectos std::thread
+   ficam JOINABLE e o ~vector no exit dos staticos chamava
+   std::terminate = rc=134 NOVO medido em LOGZ2/Z3 com bt em
+   ~vector<std::thread>). Medida: LOGX4/5/6 - as tres threads guest saem
+   sozinhas ("[thrd] a thread de guest parou" x3 por corrida), o rc=133
+   nao voltou.
+
+3. **o walk do container** (commit `e529e6d`): com as threads fora,
+   restava o segfault no `KAutoObjectWithListContainer::Unregister`
+   (LOGY7). O core mostra: o slot da raiz da arvore aponta para o no de
+   um KEvent e os TRES ponteiros do no (o set_base_hook do boost,
+   obj+0x10/0x18/0x20) estao a zero - no nao ligado; o plano do KEvent
+   ja' foi re-usado (o traco G610_OBJ_TRACE=1 mostra o mesmo endereco
+   0xaaab...8ab90 REGistado 27 vezes numa corrida so'). O erase de no'
+   que nao existe colapsa (ldr x5, [x1, #16] com x1 = 0). Fix da casa:
+   no vendor, Unregister com os tres ponteiros do no a zero = SKIP do
+   erase; o no legitimamente ligado tem SEMPRE um deles nao-nulo. O
+   traco de Create (slab_helpers.h) so' com env.
+
+### A medida de fechamento
+
+- LOGY8/9/10 (40 s, SEM traco): **rc=0 nas tres** - o 139 do desligar
+  morreu. O summary do fim igual nas tres (`[boot] fim`, 21 servicos,
+  SendSyncRequest 1323/1323/1323).
+- LOGZ5 (com traco G610_OBJ_TRACE=1): rc=0 tambem; 120 CRIADO + 45
+  SKIP numa corrida.
+
+### Commits da ronda (para o push, pendente autorizacao)
+
+- `b70300a` histograma dos envios MME; `69bf53a` custo por trap (90 ns);
+  `72a814f` etiqueta por tabela das sessoes irma; `28858bd` o observador
+  sem heap; `043ecb4` a paragem das threads; `e529e6d` o walk do
+  container.
+
+### Deixas proximas (nao nesta ronda)
+
+- O no' estranho do container vem da banalidade: plano de slab de
+  kernel re-usado e registado com fichas employer/destroy cruzadas - se
+  amanha tornar regular (cada run), convem achar o ciclo criador
+  exato; hoje o SKIP guarda a arvore.
+- As esperas do quadro saem por `Result::TimedOut` na paragem: sem
+  side-effect teste - mas o guest no reboot real do jogo pode ver o
+  resultado; se algum caminho persistir, etiqueta `[parag]`.
+- O traco G610_OBJ_TRACE pode ficar desligado de vez; o parche SKIP e'
+  sempre-on (barato: 3 loads + orr).
