@@ -296,11 +296,92 @@ o endereco e solidificar o conteudo.
 | TLS base da principal do guest | idem (o cmp x9,x1 acerta com x9 vivo) | 0x88000000 |
 | sites de mrs-tls no dump | scan local (capstone) | 52 tpidr, 0 tpidrro |
 | acesso direto na base | scan local (primeira instr apos o mrs) | +0x1F8 (32x), +0x1F0 (4x), +0x000 (1x) |
-| cadencia com | LOGK `[ipc ]` | 0x981f1 cmd 0x10 @ 58 Hz (866 envios em ~15 s), 0xa01f0 cmd 0xc0b @ 18 Hz (264 envios) |
+| cadencia com | LOGK `[ipc ]` | 0x981f1 (rotina @ 58 Hz; 866 envios em ~15 s), 0xa01f0 (@ 18 Hz; 264 envios). O "cmd 0x10/0xC0B" destas linhas e' o Header1 do request (RawCount/ReceiveListCount) — veja a secao 7, NAO id de comando |
 | contas do `[ipc ] #33` | LOGK | 1319 no run: 866 + 264 = as duas irma; ~184 de outras sessoes |
-| corpos de msg | LOGK `[ipc ] #33` | 981f1: [01000006][0010][token var][0xd9b9xxxx][1][0]; a01f0: [01110006][c0b][tag {283000|282000|202000|82000}][0fffe5xx][0][0]; so' a chamada de setup difere (os pares {0,0xE}/{6,12} do diario = os W4/W5 dela, nao resposta) |
+| corpos de msg | LOGK `[ipc ] #33` | 981f1: [01000006][0010][size var][addr var][1][0]; a01f0: [01110006][c0b][tag {283000|282000|202000|82000}][0fffe5xx][0][0] — a leitura correta destas palavras esta' na secao 7: o W2/W3 de 981f1 sao o MapData do C-buf (size+addr) e o W2 de a01f0 e' o MapData com os bits attr/addr36/size-hi/addr32; o W1 e' Header1 em ambos |
 | stamps CMIF | LOGK `[ipc ] #33` das outras sessoes | W4 = `SFCI` (0x49434653) nas requests de 0x101fe/0x181fd... e `SFCO` (0x4f434653) no mesmo lugar; nas duas irma nada nos W0..W5 (stamp alem da janela de 24 bytes ou outra familia) — Switchbrew "IPC Marshalling" (nn::sf::cmif) |
+| nomes de servico das irma | LOGR `[eden:W] Service::SM: GetService: nome lido` (23/10) | 0x981f1 = `fsp-srv` (GetService linha 1667; handles 881f3/901f2/981f1 nascem em 1743-1831), 0xa01f0 = `nvdrv` (GetService linha 2156; a01f0 nasce na 2194) |
+| MethodId das rotinas | LOGQ/LOGR `[ipc ] #33` com 24 words (23/10) + Switchbrew | 981f1: 0 = IFile/IStorage::Read por dominio (obj 2/3), arranque com 1005 = GetGlobalAccessLogMode e 200 = OpenDataStorageByCurrentProcess; a01f0: {1 Ioctl, 0 Open, 4 QueryEvent}; 0x101fe = lm: 1 SetLogLevel |
 
 Pecas ainda por verificar (marcadas no texto): a origem exata do x1
-(secao 2), o spec de fora com link do wiki (secao 3), o comportamento do
-run longo (secao 4).
+(secao 2). Resolvidas agora: o spec de fora (a pagina HIPC do
+Switchbrew, wikitexto lido em 23/10 — secao 7); o comportamento do run
+longo (LOGQ/LOGR de 23/10: o run com NSP corre 40 s e as duas irma
+pulam ate' ao fim — os corpos na secao 7).
+
+---
+
+## 7. As sessoes irma fechadas (23/10, tarde): fsp-srv e nvdrv
+
+O abertura desta secao corrige a leitura das sessoes de LOGK e fecha
+o quem-e'-quem com medidas e fontes publicas.
+
+### 7.1 O que o "cmd 0x10/0xC0B" era (correcao)
+
+Os prints do LOGK apenas alcancavam 6 words do request. O W1 medido era
+`0x00000010` em 981f1 e `0x00000C0B` em a01f0 — e o diario leu isso como
+id de comando. NAO e': o W1 e' o Header1 do formato HIPC
+(Switchbrew "HIPC", wikitexto lido em 23/10; a pagina antiga
+"IPC_Marshalling" redireciona a ele) e os seus bits sao RawCount
+(0-9) + ReceiveListCount (10-13): 0x10 = raw de 16 words; 0xC0B = raw
+de 11 words + ReceiveListCount 3. O id de comando mora no CmifInHeader
+dentro do raw, que os 24 bytes nao alcancavam. Com o tracer de 24 words
+(LOGQ/LOGR, commit `175d84a`) o MethodId ficou visivel pela primeira
+vez.
+
+Tambem a "tag em rotacao {283000|282000|202000|82000}" do W2 de a01f0
+tem leitura em vez: e' MapData do descritor (pacotes de 12 bytes:
+size, addr, tag — os bits 0-1 attr, 2-4 addr36, 24-27 size-hi,
+28-31 addr32; HipcAutoSelect cria o par send-NULL + pointer-real, o
+que explica os valores com byte baixo 00/01). E o W2/W3 de 981f1 = o
+size/addr do C-buf do read (nao "token").
+
+### 7.2 As tres correntes do fechamento
+
+| corrente | medida | resultado |
+|---|---|---|
+| nome pelo sm: | `[eden:W] Service::SM: GetService: nome lido` (LOGR) | fsp-srv linha 1667 -> handles 0x881f3/0x901f2/0x981f1 nascem em 1743-1831; nvdrv linha 2156 -> 0xa01f0 nasce na 2194. O nome NAO fica na mesa do dsp (`service_name_for_tracer` devolve vazio) |
+| atendimento | `[eden:W] Service: ...: comando N` concordando por handle | 981f1: `IStorage: comando 0 (Read)` 473x (tem_domain=1); a01f0: `nvdrv: comando 1 (Ioctl)` 128x, `comando 0 (Open)` 4x, `comando 4 (QueryEvent)` 2x |
+| MethodId x tabela publica | corpos de 24 words (LOGQ/LOGR) x Switchbrew "Filesystem services" e "NV services" | 981f1: dominio {kind=1, InRawSize=32, obj {2\|3}} + CmifIn {SFCI, ver 1, **0 = Read**, token} + {option, offset u64, size} + C-buf do tamanho do read; arranque (3 sends): **1005 GetGlobalAccessLogMode**, **200 OpenDataStorageByCurrentProcess**. a01f0: **1 Ioctl / 0 Open / 4 QueryEvent**. 101fe = lm: 1 = SetLogLevel |
+
+As tres descem no header `include/horizon_services_map.h` (commit
+`d95f1b0`), que passa de candidatos (confianca 0) a' medidas fechadas.
+
+### 7.3 O formato medido, verbatim (24 words do LOGQ)
+
+981f1, rotina (182 dos 327 sends):
+
+    msg=01000006 00000010 000000f94 0a2c7150 10000001
+        00000000 00000000 00000000
+        00200001 00000003 00000000 00000000
+        49434653 00000001 00000000 00000000
+        00000000 5ebd5850 00000002 00000f94
+        00000000 00000000 00000000 00000000
+
+Leitura: W0 = Header0 (ReceiveCount=1); W1 = Header1 (raw 16 words);
+W2-W4 = MapData do C-buf (0xf94 bytes em 0x10a2c7150, attr=1);
+W5-W7 = pad; W8 = dominio {kind=1, objs=0, InRawSize=32}; W9 =
+TargetObjectId 3; W10/W11 = reserve/token; 0x30..0x3F = CmifIn
+{SFCI, ver 1, MethodId 0 = Read, token 0}; 0x40..0x4F = params
+{option=0, offset=0x2'5EBD5850, size=0xf94} (o offset bate com a
+familia 0x22D853950 que o Eden imprime; o size = o do MapData).
+
+a01f0, rotina (MethodId 1 = Ioctl): PointerData + SendData = o par
+HipcAutoSelect; raw de 11 words com CmifIn a 0x20 {SFCI, ver 1, 1
+Ioctl, 0}.
+
+Chamadas de arranque de 981f1 (3 sends): dominio {kind=1, InRawSize=16,
+obj 1} + CmifIn {SFCI, ver 1, {1005|200}, 0}; a cauda ['SFCI'][1] fica
+dentro dos 12 words do raw e esta' medida mas sem interpretacao
+decidida (nao interfere na etiqueta; os corpos completos ficam no
+commit `d95f1b0` no header).
+
+### 7.4 O que isto muda no proximo passo
+
+- As etiquetas do on_trap podem passar a usar (handle, W0, MethodId)
+  de kSessoes/kMetodosFspSrv/kMetodosNvDrv — sem logica nova de
+  despacho, so' etiqueta.
+- O fsp-srv do Eden ja' serve o Read (473x medidos); o que falta e' o
+  lado G610: as traps de 58/18 Hz continuam a caminho da thread
+  fast-path — saber QUE servico pede cada trap fecha o despacho por
+  tabela (o proximo passo de `src/native_engine.cpp`).

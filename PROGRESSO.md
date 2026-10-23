@@ -118,26 +118,35 @@ Com `G610_TRAP_LIMIT=0 IA_STOP_SAMPLES=0` (LOG36, run de 30,08 s ate o
   custo = 4.753.000 leituras do relogio em 30 s (~200k/s no handler
   do mrs): o proximo dilema = tornar o trap do relogio barato ou
   cortar o laco do guest.
-- **As SendSyncRequest varias sao 2 sessoes irma + o trafego de boot**
-  (prints `[ipc ] #33` do on_trap; recontagem do LOGK de hoje:
-  `0x981f1` cmd **0x10** = 866 envios em ~15 s = 58 Hz e `0xa01f0`
-  cmd **0xc0b** = 264 = 18 Hz; mais ~184 sends de outras sessoes no
-  mesmo run, aos vizinhos de handle 0x1f0/0x1f1 = mesma
-  CreateSession). TODAS passam pelo site sdk `x30=0x83ae9c44` (a
-  wrapper com cache de sessao por `tpidr_el0`): o teste `cmp x9,x1`
-  acerta 1135/1135 — o RAMO RAPIDO em todas. Prova: as prints `[svc]`
-  mostram `x30=0x83ae9c44` sem excecao, e 0x83ae9c44 e' o return-site
-  do `bl` que so' existe no ramo rapido; o ramo lento deixaria
-  0x83ae9c38 (nota de ontem, corrigida — detalhe no
-  DOC_TLS_INVESTIGACAO.md, secao 0). `x1` no brk = 0x88000000 = o
-  cookie = a TLS base. Nome do servico ainda sem simbolo no SDK
-  (readd "laco de render de 30 Hz": DESDIZIDO por enquanto — devem
-  apontar para sessoes do jogo, 58+18 Hz).
+- **As SendSyncRequest varias sao 2 sessoes irma + o trafego de boot**,
+  e A IDENTIDADE DELAS ESTA' FECHADA (23/10, tarde): `0x981f1` =
+  **fsp-srv** (sessao com dominio; rotina @ 58 Hz = IFile/IStorage::Read,
+  MethodId 0, por dominio TargetObjectId {2|3}, com C-buf do tamanho do
+  read; arranque = 1005 GetGlobalAccessLogMode + 200
+  OpenDataStorageByCurrentProcess) e `0xa01f0` = **nvdrv** (@ 18 Hz;
+  MethodId {1 Ioctl, 0 Open, 4 QueryEvent}; PointerData = o par
+  HipcAutoSelect). O "cmd 0x10/0xC0B" do LOGK = ERRO de leitura: era o
+  Header1 (RawCount 16 / raw 11 + ReceiveListCount 3), nao id de
+  comando — o id mora no CmifIn dentro do raw e os 6 words antigos nao
+  alcancavam; o tracer de 24 words (`175d84a`) fechou. Os NOMES vieram
+  dos dumps do proprio sm: (`[eden:W] Service::SM: GetService: nome
+  lido`: fsp-srv linha 1667 do LOGR -> os handles 881f3/901f2/981f1
+  nascem em 1743-1831; nvdrv linha 2156 -> a01f0 na 2194); o
+  atendimento concorda (IStorage Read 473x tem_domain=1; nvdrv Ioctl
+  128x, Open 4x, QueryEvent 2x) e os MethodIds batem nas tabelas
+  Switchbrew ("Filesystem services", "NV services", a pagina "HIPC"
+  lida crua). TODAS seguem pelo site sdk `x30=0x83ae9c44` (o RAMO
+  RAPIDO em 1135/1135, prova no DOC_TLS_INVESTIGACAO.md, secao 0), e
+  `x1` = 0x88000000 = o cookie = a TLS base. Mapa fechado em
+  `include/horizon_services_map.h` (`d95f1b0`); leitura completa no
+  DOC_TLS_INVESTIGACAO.md, secao 7.
 
 Commits da secao: `5057ac1` (o ritmo do relogio, 19,2 MHz medido),
 `aa2580f` (a cadencia da parede com `pedido`/`real`/`desde`), `b16730e`
 (a janela IA_STOP_SAMPLES + o diario), `f276204` (x2/x30 no sample +
-a cadeia do spin), `fae2c48` (o fault do alarmo pela raiz).
+a cadeia do spin), `fae2c48` (o fault do alarmo pela raiz), `175d84a`
+(o tracer de 24 words + nome por sessao nova), `d95f1b0` (as irma
+fechadas: fsp-srv e nvdrv no mapa).
 
 ## Onde paramos ontem (22/10, arquivo)
 
