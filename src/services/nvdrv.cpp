@@ -1936,6 +1936,32 @@ private:
             Despejar(g_endereco_do_buffer, 128, "pushbuffer");
         }
 
+        // **O despejo completo do pushbuffer** (`G610_PB_DUMP=<ficheiro>`):
+        // a cada SubmitGPFIFO escreve a região do canal (limitada a 64 KiB)
+        // em modo append, com um cabeçalho por submissão (endereço, tamanho,
+        // num_entries, flags). É o instrumento da decodificação da GPU: o
+        // log só tem 64 bytes por submissão (o suficiente para ver que
+        // existe), e a decodificação exige o buffer inteiro.
+        if (const char* dump_pb = std::getenv("G610_PB_DUMP")) {
+            constexpr std::uint64_t kTeto = 64 * 1024;
+            const std::uint64_t tam = std::min(g_tamanho_do_buffer, kTeto);
+            std::vector<std::uint8_t> buf(static_cast<std::size_t>(tam), 0);
+            if (tam > 0 && LerDoGuest(g_endereco_do_buffer, buf.data(),
+                                     static_cast<std::size_t>(tam))) {
+                static std::uint32_t n_pb = 0;
+                ++n_pb;
+                std::FILE* f = std::fopen(dump_pb, "ab");
+                if (f != nullptr) {
+                    std::uint64_t cabec[4] = {params.address, params.num_entries,
+                                               params.flags, g_tamanho_do_buffer};
+                    std::fwrite(&n_pb, sizeof n_pb, 1, f);
+                    std::fwrite(cabec, sizeof cabec, 1, f);
+                    std::fwrite(buf.data(), 1, buf.size(), f);
+                    std::fclose(f);
+                }
+            }
+        }
+
         // A native window: o diagnostico de "o jogo desenhou?".
         DespejarJanelaDoCompositor();
 

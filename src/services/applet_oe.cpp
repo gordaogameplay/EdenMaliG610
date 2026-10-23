@@ -215,7 +215,12 @@ struct EstadoDoApplet {
     // applet entra em primeiro plano, e o SDK (que espera do evento de
     // inter-processo) prossegue.
     bool deve_estar_sinalizado() const {
-        return !mensagens.empty() || (notificar_foco && foco_mudou);
+        // **O evento fica sinalizado para sempre** (teste: o applet event
+        // 0x000401f9 e' o que o jogo espera; se ficar sinalizado, o
+        // WaitSynchronization devolve sucesso e o loop de mensagens nao
+        // bloqueia. Se o jogo comecar a desenhar (DrawBegin/DrawEnd 1413/
+        // 1414 no pushbuffer), o portao era este.)
+        return true;
     }
 
     // **A mudanca de foco** — o `m_has_focus_state_changed` do Eden.
@@ -1454,6 +1459,13 @@ public:
         // pedir `ReceiveMessage` sem parar, e a unica mensagem que o
         // `am` entrega no arranque e' esta.
         estado_ = std::make_shared<EstadoDoApplet>();
+
+        // Experimento: empurra AMBAS as mensagens de arranque (ChangeIntoForeground
+        // (1) e FocusStateChanged (15)) em vez de so' a segunda. Se o jogo
+        // comecar a desenhar (DrawBegin/DrawEnd 1413/1414 no pushbuffer), o
+        // portao e' a mensagem que faltava.
+        estado_->mensagens.push_back(1);   // ChangeIntoForeground
+        estado_->mensagens.push_back(15);  // FocusStateChanged
 
         // O evento do sistema. E' o que o `GetEventHandle` devolve, e e'
         // sinalizado quando a mensagem e' empurrada.
