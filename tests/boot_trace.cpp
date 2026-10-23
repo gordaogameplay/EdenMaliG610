@@ -36,6 +36,7 @@
 #include <ucontext.h>
 
 #include "g610/guest_program.hpp"
+#include "g610/horizon_services_map.h"
 #include "g610/services/binder.hpp"
 #include "g610/guest_memory.hpp"
 #include "g610/native_engine.hpp"
@@ -340,6 +341,55 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
                     std::printf(
                         "[ipc ] sessao nova handle=%llx nome=%s\n",
                         (unsigned long long)hnd, nome.c_str());
+                }
+            }
+            // **A etiqueta por tabela** (`g610::hsvc`): o par (handle, W0)
+            // cruza kSessoes[] e o envio ganha o nome do servico + o
+            // MethodId medido, sem nenhum caminho de despacho novo. A
+            // posicao do MethodId no corpo depende do shape (medido,
+            // doc do header): raw com descritores empurra o CMIF.
+            {
+                const char* tag = nullptr;
+                std::uint32_t pos_metodo = ~0u;
+                for (std::int32_t i = 0; i < g610::hsvc::kNumSessoes; ++i) {
+                    const auto& s = g610::hsvc::kSessoes[i];
+                    if (hnd == s.handle && mh32[0] == s.w0) {
+                        tag = s.servico;
+                        // raw 0x8.. (descritores 0 ou Ptr+Send par): CMIF
+                        // a 0x20; com C-buf (Receive=1 MapData 12 bytes):
+                        // CMIF a 0x30.
+                        switch (s.w0) {
+                        case 0x01000006u:
+                            pos_metodo = 14;  // W14 = @0x30 + 8
+                            break;
+                        default:
+                            pos_metodo = 10;  // W10 = @0x20 + 8
+                            break;
+                        }
+                        break;
+                    }
+                }
+                if (tag != nullptr && pos_metodo < 24u) {
+                    std::uint32_t metodo = mh32[pos_metodo];
+                    // O MethodId do CMIF: na rotina (b) o CmifIn fica
+                    // depois do dominio (InRawSize 32-largo): W14; na
+                    // rotina (a)/nvdrv: W10.
+                    const char* nome_m = nullptr;
+                    if (hnd == g610::hsvc::kSessoes[0].handle) {
+                        for (std::int32_t j = 0;
+                             j < g610::hsvc::kNumMetodosFspSrv; ++j)
+                            if (g610::hsvc::kMetodosFspSrv[j].id == metodo)
+                                nome_m = g610::hsvc::kMetodosFspSrv[j].nome;
+                    } else {
+                        for (std::int32_t j = 0;
+                             j < g610::hsvc::kNumMetodosNvDrv; ++j)
+                            if (g610::hsvc::kMetodosNvDrv[j].id == metodo)
+                                nome_m = g610::hsvc::kMetodosNvDrv[j].nome;
+                    }
+                    std::printf(
+                        "[ipc ] #33 handle=%llx etq=%s method=0x%x%s\n",
+                        (unsigned long long)ctx.x[0], tag, metodo,
+                        nome_m != nullptr ? "" : " (novo no mapa)");
                 }
             }
             std::printf(

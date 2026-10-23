@@ -189,6 +189,9 @@ constexpr MetodoMedido kMetodosNvDrv[] = {
      "LOGR: `nvdrv: comando 4 (QueryEvent)` 2x"},
     {0x00000002u, "Close",
      "LOGN: MethodId 2 no corpo; tabela NV services = 2 Close"},
+    {0x00000005u, "MapSharedMem",
+     "LOGT2 (23/10): method=0x5 no run (1x); tabela NV services = 5 "
+     "MapSharedMem"},
 };
 constexpr int kNumMetodosNvDrv = 4;
 
