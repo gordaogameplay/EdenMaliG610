@@ -41,6 +41,25 @@ extern "C" void g610_run_guest(std::uint64_t entry, std::uint64_t arg,
 
 namespace g610 {
 
+// ── A paragem das threads de guest no fim do run ──────────────────────────
+//
+// As threads de guest nascem DETACHED (`svc_start_thread`, o std::thread
+// nasce e solta) e a destruição do motor nunca as juntou. O core do
+// 139 medido (23/10, LOGX3) mostra o efeito: `main` tinha de
+// `Kernel::KAutoObjectWithListContainer::Unregister` (a via
+// `~ServerManager → KEvent::Destroy`) enquanto as THREE threads de guest
+// AINDA espera em `svc_wait_process_wide_key_atomic` — a lista de
+// objectos kernel anda-me embaixo dos pés e o walk parcialmente
+// removido = segfault. E mesmo depois delas saírem, uma thread remanes-
+// cente trapava com os handlers restaurados → SIGTRAP (rc=133).
+//
+// A mecanica: a flag de paragem (checada no fim de cada despacho e no
+// predicado das esperas do quadro) + o `siglongjmp` de retorno,
+// mestrado mesmo caminho dos faults; main espera-as com teto.
+void guest_threads_parar();
+void guest_threads_aguardar(int teto_segundos);
+bool guest_threads_paragem_ativa();
+
 // ── O dono do despacho, partilhado com o SVC que precisa estacionar ───────
 //
 // O SvcDispatcher é serializado por um dono atómico (`g_dispatch_owner` em

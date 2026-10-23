@@ -485,6 +485,16 @@ NativeEngine::NativeEngine(tel::Telemetry& tel, SvcDispatcher& svc)
 NativeEngine::~NativeEngine() {
     if (!hooks_.armed)
         return;
+    // **A paragem ANTES do desarmamento** (o core do rc=139):
+    // `main` chega ao fim, os objectos kernel (~EdenSystem →
+    // ~ServerManager → Unregister) são destruídos SEGUIDO — e as
+    // threads de guest (detached, o StartThread) ainda esperavam nos
+    // services. O despachão desperta as esperas do quadro, cada uma
+    // sai pela recuperação no próximo despacho e o join do registo
+    // confirma as saídas; SÓ depois os handlers restaurados (que eram
+    // o SIGTRAP-do-final medido, rc=133, para a thread que sobrevivia).
+    guest_threads_parar();
+    guest_threads_aguardar(3);
     ::sigaction(SIGTRAP, &g_old_trap, nullptr);
     ::sigaction(SIGSEGV, &g_old_segv, nullptr);
     ::sigaction(SIGBUS, &g_old_bus, nullptr);
@@ -1538,6 +1548,20 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             *ts.fault_sp = static_cast<std::uint64_t>(uc->uc_mcontext.sp);
             *ts.fault_addr = 0;
             *ts.faulted = true;
+            uc->uc_mcontext.sp = rec_sp;
+            uc->uc_mcontext.pc = g_hooks.recovery_pc;
+            return;
+        }
+        // **A paragem do fim do run** (`guest_threads_parar`, o core do
+        // 139): se a flag de paragem foi posta (o ~NativeEngine a
+        // desdobra no fim), a thread NÃO regressa ao guest: sai pela
+        // recuperação (o siglongjmp que encerra o run desta thread),
+        // porque o main vai destruir os objectos kernel que ela ainda
+        // usaria (~EdenSystem → ~ServerManager) — é o segfault medido
+        // no core e, sem esta rota, a thread que acordava com os
+        // handlers já desarmados dava o SIGTRAP do rc=133.
+        if (guest_threads_paragem_ativa()) {
+            *ts.last = TrapKind::Breakpoint;
             uc->uc_mcontext.sp = rec_sp;
             uc->uc_mcontext.pc = g_hooks.recovery_pc;
             return;

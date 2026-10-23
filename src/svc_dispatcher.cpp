@@ -1664,6 +1664,22 @@ Result SvcDispatcher::svc_get_current_processor_number(SvcContext& ctx) {
 //
 // A thread que o SDK cria aqui e' do proprio SDK (o entry point medido esta
 // no `subsdk1`), e o jogo continua depois dela.
+// ── A paragem das threads de guest no fim do run (o 139/133 do core) ──────
+//
+// Medido (core do 23/10, LOGX3): o fim do run (rc=139) destruiu objectos
+// kernel (a via `~ServerManager → KEvent::Destroy → Unregister`) mientras
+// as threads guest AINDA vivas esperavam em
+// `svc_wait_process_wide_key_atomic` — e uma trapava com os handlers JÁ
+// restaurados (rc=133). Os objectos vivem aqui; as funções da mecânica —
+// `guest_threads_parar`, o `guest_threads_aguardar` e o predicado das
+// esperas do quadro — vão mais abaixo, no quadro da arbitragem, porque
+// o despertar das esperas passa pelo `g_arbiter`.
+static std::atomic<bool> g_paragem_presente{false};
+static std::atomic<int>  g_guests_vivos{0};
+static std::mutex        g_thread_mux;
+static std::vector<std::thread> g_threads;
+static std::condition_variable g_thread_termiou;
+
 Result SvcDispatcher::svc_create_thread(SvcContext& ctx) {
     const std::uint64_t out_handle = ctx.x[0];
     const std::uint64_t entry       = ctx.x[1];
@@ -1777,9 +1793,25 @@ Result SvcDispatcher::svc_start_thread(SvcContext& ctx) {
             const std::uint64_t arg   = object->thread_arg;
             const std::uint64_t stack = object->thread_stack;
             const std::uint64_t tls   = object->thread_tls;
-            std::thread([entry, arg, stack, tls]() {
+            // O objecto std::thread fica no REGISTO (g610 no quadro da
+            // paragem): o fim do run precisa de o JUNTAR — o `.detach`
+            // velho deixava thread de guest para sempre sem dono,
+            // vivas ao ~EdenSystem (core do 139, ver o bloco da
+            // `ArbitrationBoard`).
+            std::thread t([entry, arg, stack, tls]() {
+                g_guests_vivos.fetch_add(1, std::memory_order_release);
                 NativeEngine::run_guest_thread(entry, arg, stack, tls);
-            }).detach();
+                const int restam = g_guests_vivos.fetch_sub(
+                    1, std::memory_order_acq_rel) - 1;
+                if (restam <= 0 && guest_threads_paragem_ativa()) {
+                    std::lock_guard<std::mutex> lock(g_thread_mux);
+                    g_thread_termiou.notify_all();
+                }
+            });
+            {
+                std::lock_guard<std::mutex> lock(g_thread_mux);
+                g_threads.push_back(std::move(t));
+            }
             if (std::getenv("IA_IPC_TRACE") != nullptr) {
                 std::fprintf(stderr,
                              "[svc] StartThread handle=0x%x entry=0x%llx arg=0x%llx "
@@ -1893,6 +1925,85 @@ constexpr std::uint32_t kArbWaitMask = 0x40000000u;  // HandleWaitMask, svc_comm
 
 } // namespace
 
+bool guest_threads_paragem_ativa() {
+    return g_paragem_presente.load(std::memory_order_acquire);
+}
+
+void guest_threads_parar() {
+    if (g_paragem_presente.exchange(true, std::memory_order_acq_rel))
+        return;
+    // Acorda TODAS as esperas do quadro: com a flag posta, o predicado
+    // delas atinge false e a volta delas vai pelo fim da fila — o
+    // handler vê a flag e encaminha para a recuperação.
+    {
+        std::lock_guard<std::mutex> lock(g_arbiter.gate);
+        g_arbiter.wake.notify_all();
+    }
+}
+
+void guest_threads_aguardar(int teto_segundos) {
+    const auto prazo = std::chrono::steady_clock::now() +
+                       std::chrono::seconds(teto_segundos);
+    // **Drenar o vector SEMPRE** — não só quando o contador > 0. Medido
+    // (LOGZ2, 23/10): o while velho (`g_guests_vivos > 0`) saía antes de
+    // juntar: a thread conta o *saída* (counter→0) mas o objeto `std::
+    // thread` continua JOINABLE no registo — o destrutor estático do
+    // vector chamava std::terminate ("terminate called without an
+    // active exception", rc=134).
+    for (;;) {
+        std::vector<std::thread> copia;
+        {
+            std::lock_guard<std::mutex> lock(g_thread_mux);
+            copia.swap(g_threads);
+        }
+        for (auto& t : copia) {
+            if (!t.joinable())
+                continue;   // já juntada nesta volta ou antes
+            if (std::chrono::steady_clock::now() < prazo)
+                t.join();
+            else {
+                // Teto estourado: DESLIGAR O OBJETO JOINABLE — a thread
+                // continua presa (o duelo do fim do run): no exit do
+                // processo um thread detached morre sem o terminate.
+                t.detach();
+            }
+        }
+        // Os juntados/desligados NÃO voltam para o g_threads — cada ciclo
+        // é fechado com o vector vazio.
+        if (g_guests_vivos.load(std::memory_order_acquire) > 0) {
+            // Há quem não tenha parado (ou esteja a nascer): à espera de
+            // incrementos ou saídos em OUTRO ciclo; pequenas pausas até
+            // ao teto: o gets_aiti devolva quando o prazo estoura — o
+            // snapshot seguinte drena o objecto novo.
+            if (std::chrono::steady_clock::now() >= prazo) {
+                const int rem = g_guests_vivos.load(std::memory_order_acquire);
+                std::fprintf(stderr,
+                             "[parag] teto de %d s estourou: %d thread(s) de "
+                             "guest ainda viva(s) no fim do run\n",
+                             teto_segundos, rem);
+                // Uma última drenagem: os objetos que ficaram no registo
+                // (recém-nascidos ou voltados) SÃO desligados aqui — sem
+                // terminate no exit.
+                std::vector<std::thread> dreno;
+                {
+                    std::lock_guard<std::mutex> lock(g_thread_mux);
+                    dreno.swap(g_threads);
+                }
+                for (auto& t : dreno)
+                    if (t.joinable())
+                        t.detach();
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        // Contador a zero: TODAS pararam. Sair quando o registo está
+        // drenado (cada ciclo esvazia-o).
+        if (g_threads.empty())
+            break;
+    }
+}
+
 Result SvcDispatcher::svc_arbitrate_lock(SvcContext& ctx) {
     const std::uint32_t handle = static_cast<std::uint32_t>(ctx.x[0]);
     const std::uint64_t addr   = ctx.x[1];
@@ -1963,10 +2074,18 @@ Result SvcDispatcher::svc_arbitrate_lock(SvcContext& ctx) {
         g_arbiter.fila[addr].push_back({tag, token});
         dispatch_owner_vacate();
         g_arbiter.wake.wait(lock, [&] {
+            if (guest_threads_paragem_ativa())
+                return true;
             const auto d = g_arbiter.desperta.find(token);
             return d != g_arbiter.desperta.end() &&
                    d->second != ArbitrationBoard::DespertaAguarda;
         });
+        // (a paragem acorda as duas esperas; sair sem `.at` — ver a
+        // nota na rota da cv.)
+        if (guest_threads_paragem_ativa()) {
+            g_arbiter.desperta.erase(token);
+            return Result::TimedOut;
+        }
         acordei_com = g_arbiter.desperta.at(token);
         g_arbiter.desperta.erase(token);
     }
@@ -2290,6 +2409,8 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
         dispatch_owner_vacate();
 
         const auto dono_acordou = [&] {
+            if (guest_threads_paragem_ativa())
+                return true;
             const auto d = g_arbiter.desperta.find(token);
             return d != g_arbiter.desperta.end() &&
                    d->second != ArbitrationBoard::DespertaAguarda;
@@ -2431,6 +2552,15 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
             }
         }
 
+        // A PARAGEM pode ser o que acordou (predicado ✓ sem entrega
+        // nenhuma em `desperta`): sair limpo e voltar pelo fim — o
+        // handler re-encaminha para a recuperação. Sem o check, o
+        // `.at(token)` seguinte lançava (out_of_range) e a thread
+        // morria no std::terminate em vez de sair.
+        if (guest_threads_paragem_ativa()) {
+            g_arbiter.desperta.erase(token);
+            return Result::TimedOut;
+        }
         acordei_com = g_arbiter.desperta.at(token);
         g_arbiter.desperta.erase(token);
         if (trace_wait_hz && timeout > 0) {
