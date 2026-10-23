@@ -51,7 +51,58 @@ Quando uma hipótese é refutada, escreve-se. A lista está em
 
 ---
 
-## Onde paramos hoje (22/10)
+## Onde paramos hoje (23/10)
+
+**A duracao dos runs antigos era fantasia. Toda a medida temporal anterior
+(60/70/45 s) era a janela de dois guardas do tracer, e o que passava dela
+nao existia**:
+
+1. `G610_TRAP_LIMIT` (boot_trace.cpp) — parava o run ao acertar 4000 traps
+   (LOG25-33: run de **1,62 s**, deterministico).
+2. O alarme `on_alarm` (`setitimer` 1 s) — ao 4 sample redireciona o PC do
+   guest para `force_stop()` (`brk #0xFFFC`): LOG34 = **4,57 s**; a
+   mensagem "alarme de seguranca — o guest ficou preso em codigo" e'
+   o texto generico do ramo `limit_hit`, nao a verdade do fim.
+
+Com `G610_TRAP_LIMIT=0 IA_STOP_SAMPLES=0` (LOG36, run de 30,08 s ate o
+`timeout` do shell rc=124, 37.853 linhas) o guest corre sem abortar:
+
+- **A parede do TimerEvent (0xd9c2c22c, tag 0x38005) bate certo a longo
+  prazo**: 4.848 esperas com `pedido` ~4,59 ms, `real` ~5,86 ms
+  (soma 28,39 s) e `desde` ~6 ms (soma 29,23 s = a janela do primeiro ao
+  ultimo sono; o run todo a partir de ~0,7 s). Cadencia **166 Hz**
+  (nao 2,3 Hz: essa figura vinha da janela de 1,6 s dos runs curtos).
+  Cada sono e' seguida por 1 `sinal pendente` (4849) e por um fire
+  proprio (um `trap #29` por dormida, ver o mix abaixo), e
+  `ACORDEI = 0`: a parede
+  nunca acorda por sinal de outrem — continua no laco de timer service.
+- **A latencia de acordar mediu-se**: `real - pedido` = ~1,27 ms em
+  carga (LOG31: ~0,2 ms em corrida curta). Cada ciclo do TimerEvent
+  perde com isso ~20% do periodo que o jogo pediu (5 ms).
+- **O spin de tick a ~200 kHz**: o `simclock` contou **4.753.000
+  leituras** do relogio (4753 prints × 1000). As primeiras 1000
+  leituras acabam aos 6,00 s (o boot, ~167 Hz); dada a 6,0 s ate o fim o
+  ritmo e de **~200 leituras por ms (~200 kHz, uma cada 5 us)**. O
+  sample 27 apanhou o spin a executar `nn::os::GetSystemTick`
+  (`pc=0x83ab4fd4`, o `ret` do `mrs x0, cntfrq_el0`; `x19=0x82774110`).
+  O consumidor desse spin e' o alvo seguinte — o suspeito e' a thread
+  `0x28004`, a unica das 6 SDK threads que nunca espera em cv (LOG24).
+- **911 `SendSyncRequest` em 30 s (~30 Hz)**, todos de `wire=/0x83b0bb64`
+  (o stub do svc), com dois services: `x0=0x981f1` (pedido grande,
+  `x23` ~0x25e...) e `x0=0xa01f0` (pedidos de 0x8/0x20/0x28 bytes,
+  `x24` =_service offsets). Cheiro de laco de render a 30 fps ainda por
+  identificar por service.
+- O mix de traps do run longo: `#28` 10.562 (parede 4.848 sono + 4.849
+  pendente + ~865 da bomba), `#29` 5.710 (um fire por dormida), `#33`
+  911, `#27` 857, `#26` 26.
+
+Commits da secao: `5057ac1` (o ritmo do relogio, 19,2 MHz medido),
+`aa2580f` (a cadencia da parede com `pedido`/`real`/`desde`), e o que
+abre a janela (o `IA_STOP_SAMPLES` no `on_alarm`, com `tests/boot_trace.cpp`)
+e o diario (este).
+
+## Onde paramos ontem (22/10, arquivo)
+
 
 O jogo corre **240 s de relógio** sem abortar nos serviços: fonte servida,
 `hid` e `csrng` do próprio jogo passam, as 6+ SDK threads correm por

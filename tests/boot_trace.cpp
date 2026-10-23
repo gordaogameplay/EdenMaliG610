@@ -141,13 +141,22 @@ void on_alarm(int, siginfo_t*, void* raw) {
     // Na ultima amostragem, PARAR o guest. Um spin de codigo nao levanta
     // traps, e sem isto o programa nunca mais sai: o relatorio (que e' onde
     // esta' o unico rasto do que aconteceu) nunca e' impresso.
-    if (g_samples >= 4) {
+    //
+    // O numero de paragem e' parametrizavel (`IA_STOP_SAMPLES`, default 4):
+    // o boot de um jogo chega a fases que so' existem depois do 4 sample
+    // (o laco de render do titulo, LOG34), e sem a janela aberta o tracer
+    // corta o run no mesmo morro. 0 desarma a paragem por completo (o
+    // `timeout` do shell e o relatorio continuam como rede de seguranca).
+    static const unsigned long g_stop_samples =
+        [] { const char* s = ::getenv("IA_STOP_SAMPLES");
+             return s == nullptr ? 4ul : ::strtoul(s, nullptr, 0); }();
+    if (g_stop_samples != 0 && g_samples >= g_stop_samples) {
         // Parar o guest: salta para uma rotina que faz BRK, que o motor
         // trata como saida. Sem isto o programa nunca mais volta ao host e o
         // relatorio — o unico rasto do que aconteceu — nunca e' impresso.
         uc->uc_mcontext.pc = reinterpret_cast<std::uint64_t>(&force_stop);
     }
-    if (g_samples <= 2) {
+    if (g_samples <= 2 || g_stop_samples == 0) {
         char b[208];
         const int k = std::snprintf(
             b, sizeof b,
