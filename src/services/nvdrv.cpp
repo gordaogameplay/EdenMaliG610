@@ -2280,6 +2280,34 @@ private:
                   tradutor_.commands_dropped_feature(), tradutor_.macro_passos(),
                   tradutor_.macro_envios(), erro.empty() ? "" : (" — " + erro));
 
+        // Instrumento do passo 1: QUE metodos o microcode envia. Os
+        // 901 envios medidos com 0 comandos so' decidem com os ids na
+        // mao — os 16 mais frequentes, em hexa, com as vezes.
+        {
+            const auto& envios = tradutor_.envio_ids();
+            if (!envios.empty()) {
+                std::vector<std::pair<std::uint32_t, std::uint32_t>> ordem(
+                    envios.begin(), envios.end());
+                std::sort(ordem.begin(), ordem.end(),
+                          [](const auto& a, const auto& b) {
+                              if (a.second != b.second)
+                                  return a.second > b.second;
+                              return a.first < b.first;
+                          });
+                std::string linha2;
+                char tmp3[64];
+                for (std::size_t i = 0; i < ordem.size() && i < 16; ++i) {
+                    std::snprintf(tmp3, sizeof tmp3, "%s0x%x x%u",
+                                  linha2.empty() ? "" : " ", ordem[i].first,
+                                  ordem[i].second);
+                    linha2 += tmp3;
+                }
+                LOG_DEBUG(Service_NVDRV,
+                          "SubmitGPFIFO: envios de macro: n={} ids: {}",
+                          envios.size(), linha2);
+            }
+        }
+
         // ── O instrumento dos parámetros do blob (o ambiente:
         // `G610_VA_DUMP`) ────────────────────────────────────────────────
         //

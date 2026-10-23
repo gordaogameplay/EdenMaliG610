@@ -175,6 +175,16 @@ public:
     std::uint64_t macro_passos() const { return macro_passos_; }
     std::uint64_t macro_envios() const { return macro_envios_; }
 
+    // O histograma dos envios das macros na ULTIMA `translate`: metodo ->
+    // quantas vezes o `Send` as entregou. Instrumento do passo 1: o
+    // "0 comandos traduzidos" com 901 envios so' se decide com os ids na
+    // mao (se um deles for o draw_end/1413 e' um bug da maquina; se for
+    // setup, o jogo nao comecou a desenhar). Zerado no comeco de cada
+    // `translate`, como o `falcon_vas()`.
+    const std::unordered_map<std::uint32_t, std::uint32_t>& envio_ids() const {
+        return envio_ids_;
+    }
+
     // Os endereços que as macros entregaram ao `falcon[4]` na ÚLTIMA
     // `translate` (zerado no início dela). É a medição do que o blob
     // da chamada de firmware 4 recebe: no run vivo, o nvdrv lê a
@@ -197,6 +207,9 @@ private:
     // `mme::Interpretador`; aquí somado entre execuções).
     std::uint64_t    macro_passos_ = 0;
     std::uint64_t    macro_envios_ = 0;
+    // O histograma por metodo dos `Send` das macros na translate corrente
+    // (zerada no começo dela; a vista publica acima).
+    std::unordered_map<std::uint32_t, std::uint32_t> envio_ids_;
     // Os VAs entregues ao `falcon[4]` na translate corrente (zerada no
     // começo dela; a ordem do recebimento preservada, sem deduplicar —
     // a contagem por submit também é medida).

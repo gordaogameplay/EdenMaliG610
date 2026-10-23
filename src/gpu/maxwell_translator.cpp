@@ -128,6 +128,7 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
     out.clear();
     error.clear();
     falcon_vas_.clear();
+    envio_ids_.clear();
 
     // A leitura de palavra — a mesma da `palavra` da `pushbuffer.cpp`,
     // porque o buffer pode não estar alinhado (vindo de um vector do
@@ -328,6 +329,10 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
             // O `Send` — o `maxwell3d.CallMethod(endereco, valor, true)`:
             // o método volta ao mesmo caminho do motor (é por aqui que
             // a macro manda desenhar).
+            // Instrumento do passo 1: por quem o microcode envia. O
+            // "0 comandos traduzidos" com 901 envios decide-se com esta
+            // contagem no log (o id = o endereco do `CallMethod`).
+            ++envio_ids_[endereco];
             std::uint32_t v = valor;
             chamada_metodo(endereco, &v, 1, true);
         },
