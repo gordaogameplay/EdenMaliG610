@@ -160,12 +160,15 @@ void on_alarm(int, siginfo_t*, void* raw) {
         char b[208];
         const int k = std::snprintf(
             b, sizeof b,
-            "[sample %d] pc=0x%llx x0=0x%llx x1=0x%llx x19=0x%llx x29=0x%llx sp=0x%llx\n",
+            "[sample %d] pc=0x%llx x0=0x%llx x1=0x%llx x2=0x%llx x19=0x%llx "
+            "x29=0x%llx x30=0x%llx sp=0x%llx\n",
             g_samples, (unsigned long long)pc,
             (unsigned long long)uc->uc_mcontext.regs[0],
             (unsigned long long)uc->uc_mcontext.regs[1],
+            (unsigned long long)uc->uc_mcontext.regs[2],
             (unsigned long long)uc->uc_mcontext.regs[19],
             (unsigned long long)uc->uc_mcontext.regs[29],
+            (unsigned long long)uc->uc_mcontext.regs[30],
             (unsigned long long)uc->uc_mcontext.sp);
         ssize_t w = ::write(2, b, (size_t)k);
         (void)w;
