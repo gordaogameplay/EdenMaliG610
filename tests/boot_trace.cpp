@@ -115,6 +115,8 @@ static g610::GuestMemory* g_mem = nullptr;
 // quando o guest aborta. Sem simbolos, achar quem chamou a funcao que
 // abortou e a unica forma de saber o que falhou.
 static const g610::GuestProgram* g_prog = nullptr;
+// Vista do despachante para o print de nome por handle no block #33.
+static g610::SvcDispatcher* g_svc = nullptr;
 static std::string g_scratch;
 
 static volatile int g_samples = 0;
@@ -309,15 +311,45 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
     // da mensagem dizem o comando do servico — com isso o laco de 30 Hz
     // deixa de ser um palpite.
     if (number == 0x21 && g_mem != nullptr) {
-        std::uint8_t mh[24];
+        // 96 bytes: os 24 de cima, nos corpos com raw oni grande, nao
+        // alcancam nem o MethodId. 24 words cobrem o CmifInHeader e a
+        // carga nos shapes com Pointer+Send a 0x8.
+        std::uint8_t mh[96];
         std::string e2;
         if (g_mem->read(ctx.x[1], mh, sizeof mh, e2)) {
-            std::uint32_t mh32[6];
+            std::uint32_t mh32[24];
             std::memcpy(mh32, mh, sizeof mh32);
+            // O nome mora na mesa do despachante, e construir std::string
+            // DENTRO do handler por envio e' o caminho de corrupcao que
+            // IA_NOOB existia para cortar (doc acima). Fica so' na primeira
+            // vez que um handle aparece — uma alocacao por sessao nova.
+            const std::uint32_t hnd = static_cast<std::uint32_t>(ctx.x[0]);
+            static std::uint32_t vistos[64] = {0};
+            constexpr std::size_t kVistosTam = sizeof vistos / sizeof vistos[0];
+            bool novo = hnd != 0;
+            std::size_t furo = kVistosTam;
+            for (std::size_t i = 0; i < kVistosTam; ++i) {
+                if (vistos[i] == hnd) { novo = false; break; }
+                if (vistos[i] == 0) { furo = i; break; }
+            }
+            if (novo && furo < kVistosTam) {
+                vistos[furo] = hnd;
+                if (g_svc != nullptr) {
+                    const std::string nome =
+                        g_svc->service_name_for_tracer(hnd);
+                    std::printf(
+                        "[ipc ] sessao nova handle=%llx nome=%s\n",
+                        (unsigned long long)hnd, nome.c_str());
+                }
+            }
             std::printf(
-                "[ipc ] #33 handle=%llx msg=%08x %08x %08x %08x %08x %08x\n",
-                (unsigned long long)ctx.x[0], mh32[0], mh32[1], mh32[2],
-                mh32[3], mh32[4], mh32[5]);
+                "[ipc ] #33 handle=%llx msg=%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                (unsigned long long)ctx.x[0],
+                mh32[0], mh32[1], mh32[2], mh32[3], mh32[4], mh32[5],
+                mh32[6], mh32[7], mh32[8], mh32[9], mh32[10], mh32[11],
+                mh32[12], mh32[13], mh32[14], mh32[15], mh32[16],
+                mh32[17], mh32[18], mh32[19], mh32[20], mh32[21],
+                mh32[22], mh32[23]);
         }
     }
    // Endereços de retorno do guest na stack, para seguir de onde veio o
@@ -1378,6 +1410,7 @@ int main(int argc, char** argv) {
     }
 
     g610::SvcDispatcher svc(tel);
+    g_svc = &svc;
     svc.bind_memory(&prog.memory());
     svc.set_heap_base(g610::layout::kHeapBase);
     svc.set_heap_size(g610::layout::kHeapSize);

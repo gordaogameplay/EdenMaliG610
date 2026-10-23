@@ -610,6 +610,13 @@ public:
     std::uint64_t unmap_memory_calls() const noexcept { return unmap_memory_calls_; }
     std::uint64_t query_memory_calls() const noexcept { return query_memory_calls_; }
 
+    // Vista apenas de leitura para o tracer (tests/boot_trace.cpp): o nome
+    // do servico que um handle de sessao serve. Consulta pura da mesa de
+    // objectos (sessao -> porta-mae -> nome); nada muda de estado.
+    std::string service_name_for_tracer(std::uint32_t handle) const {
+        return service_name_for_handle(handle);
+    }
+
 private:
     // Cada grupo devolve Result; o resultado é escrito em ctx.ret.
     Result svc_set_heap_size(SvcContext&);
