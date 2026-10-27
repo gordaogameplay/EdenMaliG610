@@ -54,6 +54,13 @@ public:
     // `OnSessionEvent` directamente depois de `SendSyncRequest` enfileirar o
     // pedido. Devolve `ResultNotFound` quando nada está pendente.
     Result ProcessPendingSynchronously();
+    // Verifica se uma `KServerSession` já está registada neste `ServerManager`.
+    bool HasSession(Kernel::KServerSession* server_session) const noexcept;
+    // Regista uma sessão órfã (não criada via `ConnectToNamedPort`) para que
+    // o pump síncrono possa atendê-la.
+    Result RegisterOrphanSession(Kernel::KServerSession* server_session);
+    // Verifica se esta `ServerManager` é a dona de uma `KServerPort`.
+    bool OwnsPort(const Kernel::KServerPort* server_port) const noexcept;
     // O manager é possuído sem thread de loop pelo executor nativo. O
     // destructor não pode esperar em m_stopped quando não existe loop para o
     // sinalizar.

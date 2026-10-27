@@ -659,7 +659,7 @@ Result SvcDispatcher::svc_send_sync_request(SvcContext& ctx) {
         // descrições — o mesmo valor que o resto do despachante devolve.
         ctx.ret     = static_cast<std::uint64_t>(Result::InvalidHandle);
         ctx.has_ret = true;
-        return Result::Success;
+        return Result::InvalidHandle;
     }
 
     // `SendSyncRequest(handle, buffer, size)` e `SendSyncRequestLight`.

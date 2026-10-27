@@ -213,6 +213,16 @@ public:
         return object_list_;
     }
 
+    // Itera sobre todos os objectos registados via `RegisterKernelObject`
+    // (todos os `KAutoObject` criados). Útil para encontrar sessoes órfãs.
+    template <typename Func>
+    void ForEachRegisteredObject(Func&& func) {
+        std::lock_guard<std::mutex> lk(registered_objects_mutex_);
+        for (auto* obj : registered_objects_) {
+            func(*obj);
+        }
+    }
+
     KernelTimer& HardwareTimer() { return hardware_timer_; }
     const KernelTimer& HardwareTimer() const { return hardware_timer_; }
 

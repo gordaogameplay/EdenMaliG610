@@ -115,6 +115,13 @@ enum class Svc : std::uint32_t {
     SendAsyncRequestWithUserBuffer = 0x23,
     GetProcessId         = 0x24,
     GetThreadId          = 0x25,
+    // 0x26 (`Break`): o stub do ABI chama-o para MORRER — no hardware o
+    // processo não regressa. Quando dispara, cai no `default` (o Result
+    // `Unsupported` 0x40 vai para x0) e o guest fica no `b self` do stub
+    // (`sdk 0x8390d1e8`) — o sampler prende-se nele. Sem handler: um
+    // Break NUMA corrida verde é fatal e é exatamente o que se quer ver.
+    // O dump de evidência (payload + cadeia de frames) foi retirado com a
+    // verde da runP (23/10) — re-ciclar com gate novo se aparecer.
     Break                = 0x26,
     OutputDebugString    = 0x27,
     ReturnFromException  = 0x28,
@@ -123,6 +130,16 @@ enum class Svc : std::uint32_t {
     FlushDataCache       = 0x2B,
     MapPhysicalMemory    = 0x2C,
     UnmapPhysicalMemory  = 0x2D,
+    // O arbiter de endereços (Eden, `svc/svc_address_arbiter.cpp`). O mutex
+    // do nn::os constrói-se sobre estes dois SVC — **medido** no módulo sdk:
+    // o Lock (0x83ab1c60) chama `WaitForAddress(word, WaitIfEqual, 1, -1)` e
+    // o Unlock (0x83ab1ad0) acorda com `SignalToAddress(word,
+    // SignalAndModifyByWaitingCountIfEqual, 1, 1)`. Sem o par, o lock lento
+    // do SDK recebe "não implementado" no x0 (`Unsupported` = 0x40) e o jogo
+    // aborta com `Break(payload 0x40)` — exactamente o que a runL de 23/10
+    // mostrou (o quadro `sdk 0x83ab1dc4` é o fim do `Lock`).
+    WaitForAddress  = 0x34,
+    SignalToAddress = 0x35,
 };
 
 
@@ -187,6 +204,11 @@ enum class Result : std::uint32_t {
     // `ResultInvalidPriority` do Eden (`kernel/svc_results.h:25`): modulo
     // Kernel (1), descricao 112.
     InvalidPriority       = 1 | (112 << 9),
+    // `ResultInvalidEnumValue` do Eden (`kernel/svc_results.h:33`): módulo
+    // Kernel (1), descricao 120. O arbiter (0x34/0x35) devolve-o quando o
+    // ArbitrationType/SignalType sai da enumeracao — é o unico Result
+    // restante do par que o guest consulta.
+    InvalidEnumValue      = (120u << 9) | 1u,
 };
 
 // Contexto de um SVC. x0–x5 são os argumentos (o kernel do Switch passa-os
@@ -345,6 +367,12 @@ public:
     // sinal tem de ser o do endereço.
     static void AcordarFutexNoEndereco(std::uint64_t endereco);
 
+    // Acorda um waiter de cada fila de ArbitrateLock (mutex) e de cada
+    // cv_fila com waiters. Usado para romper deadlocks onde o dono de um
+    // mutex está estacionado numa cv, ou onde um sinal foi enviado para
+    // uma cv sem waiters enquanto threads esperam em outra cv.
+    void DespertarUmWaiterDeCadaFilaDeMutexECvs();
+
     // Liga o espaço de endereçamento do guest.
     //
     // Sem isto, os SVC que recebem um endereço do guest (MapMemory,
@@ -373,6 +401,8 @@ public:
     // `KObjectName` e o `KClientSession` do Eden. Ver `vendor/eden/README.md`.
     bool attach_eden(std::uint64_t pid, std::uint64_t tid);
     bool eden_attached() const noexcept { return eden_ != nullptr; }
+    // Processa IPC pendente no EdenSystem deste dispatcher (usado por hooks static via g_dispatcher_atual).
+    void ProcessPendingIpcPendente();
 
     // O handle da thread principal, no espaço de handles do Eden.
     //
@@ -568,6 +598,27 @@ public:
     // é a mesma que na leitura.
     bool write_guest(std::uint64_t addr, const void* src, std::size_t size);
 
+    // Compara-e-troca uma palavra u32 do guest. O `esperado` é o valor
+    // que se via na leitura; a troca passa por ATOMICIDADE na memória do
+    // guest (o par LL/SC equivalente ao `__atomic_compare_exchange_n`
+    // que o `svc_wait_for_address` já usa no decremento).
+    //
+    // **Porquê**: o guest corre nativo e os loops de mutex/cv do SDK
+    // escrevem a MESMA palavra com pares LL/SC em paralelo. Uma escrita
+    // cega (`write_guest`) pode sobrescrever uma troca que o SDK fez no
+    // meio — e gerar estado fantasma (dono|waiters sem dono real): foi
+    // o congelamento da runL (svc #912, word 0x400081ff órfã).
+    bool cas_word_guest(std::uint64_t addr, std::uint32_t esperado,
+                        std::uint32_t novo);
+
+    // Escreve uma palavra do guest com CAS por tentativa (até 16). O
+    // `novo` é a DECISÃO do quadro (a fila já foi consumida antes) —
+    // nunca derivada da re-leitura: se a palavra mudou entretanto
+    // (acionamento do LL/SC do guest no meio), re-ler e trocar de novo.
+    // A reserva, esgotadas as trocas, é a escrita cega (liveness).
+    // Devolve false só se a memória deixou de estar acessível.
+    bool escrita_atomica_word(std::uint64_t addr, std::uint32_t novo);
+
     // Repõe o estado de execução para um novo arranque.
     //
     // Sem isto, um `exited_` que ficou a true de uma execução anterior
@@ -633,6 +684,14 @@ private:
     Result svc_arbitrate_lock(SvcContext&);
     Result svc_arbitrate_unlock(SvcContext&);
 
+    // Arbiter de endereços (0x34/0x35). Semântica do Eden
+    // (svc/svc_address_arbiter.cpp → k_address_arbiter.cpp): o waiter é
+    // validado contra o valor lido e estacionado na fila do ENDEREÇO; o
+    // signal escreve o valor que o tipo manda e desperta até `count`
+    // waiters. É o par que o mutex do nn::os usa para acordar.
+    Result svc_wait_for_address(SvcContext&);
+    Result svc_signal_to_address(SvcContext&);
+
     Result svc_exit_process(SvcContext&);
     Result svc_close_handle(SvcContext&);
     Result svc_control_memory(SvcContext&);
@@ -642,6 +701,7 @@ private:
     Result svc_connect_port(SvcContext&);
     Result svc_get_process_id(SvcContext&);
     Result svc_map_memory(SvcContext&);
+
     Result svc_unmap_memory(SvcContext&);
     Result svc_map_shared_memory(SvcContext&);
     Result svc_create_transfer_memory(SvcContext&);

@@ -65,6 +65,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <cctype>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <memory>
 #include <string>
 #include <vector>
@@ -118,10 +121,62 @@ ChavesConsole& As_Chaves() {
     return chaves;
 }
 
+// Procura um `.nsp` num directorio. Devolve o caminho completo do primeiro
+// ficheiro encontrado, ou `""`.
+static std::string ProcurarNspEm(const std::string& dir) {
+    if (dir.empty()) return "";
+    DIR* d = ::opendir(dir.c_str());
+    if (!d) return "";
+    std::string resultado;
+    struct dirent* e;
+    while ((e = ::readdir(d)) != nullptr) {
+        std::string nome = e->d_name;
+        if (nome.size() < 4) continue;
+        std::string suf = nome.substr(nome.size() - 4);
+        for (auto& c : suf) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (suf != ".nsp") continue;
+        std::string completo = dir + "/" + nome;
+        struct stat st{};
+        if (::stat(completo.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+            resultado = completo;
+            break;
+        }
+    }
+    ::closedir(d);
+    return resultado;
+}
+
 // O caminho do `.nsp` do utilizador (ou `""`).
+//
+// **Auto-descoberta**: se `G610_NSP` nao estiver marcado, procura-se num
+// conjunto de directorios habituais, como ja' se faz para as chaves. Isto
+// permite que o motor arranque com RomFS mesmo quando o utilizador so'
+// passa o directorio do ExeFS.
 std::string O_CaminhoDoNsp() {
     if (const char* v = std::getenv("G610_NSP"); v != nullptr && v[0] != 0) {
-        return v;
+        std::string s = v;
+        struct stat st{};
+        if (::stat(s.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+            const std::string achado = ProcurarNspEm(s);
+            if (!achado.empty()) return achado;
+        }
+        return s;
+    }
+    // Directorios candidatos.
+    const char* home = std::getenv("HOME");
+    std::vector<std::string> candidatos;
+    if (home != nullptr) {
+        candidatos.push_back(std::string(home) + "/piDroid/roms");
+        candidatos.push_back(std::string(home) + "/roms");
+        candidatos.push_back(std::string(home) + "/piDroid");
+    }
+    candidatos.push_back("/home/emuos/piDroid/roms");
+    for (const auto& c : candidatos) {
+        const std::string achado = ProcurarNspEm(c);
+        if (!achado.empty()) {
+            LOG_INFO(Service_FS, "fsp-srv: NSP auto-descoberto em '{}'", achado);
+            return achado;
+        }
     }
     return "";
 }
@@ -185,9 +240,9 @@ bool AbrirORomfs() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // O erro do Eden para "o caminho não existe": módulo `FS` (2),
-// descrição 2 (`PathNotFound`).
+// descrição 1 (`ResultPathNotFound`, ver Eden `core/file_sys/errors.h`).
 Result PathNotFound() {
-    return Result{ErrorModule::FS, 2};
+    return Result{ErrorModule::FS, 1};
 }
 
 // O caminho de um ficheiro vem num **ponteiro** (o `FileSys::Sf::Path` do
@@ -926,14 +981,16 @@ private:
     // chaves — o armazenamento e' vazio, e o jogo aborta ao abrir um
     // ficheiro (medido: `nn::fs::OpenFile`).
     void OpenDataStorageByCurrentProcess(HLERequestContext& ctx) {
-        if (AbrirORomfs()) {
-            LOG_DEBUG(Service_FS, "fsp-srv::OpenDataStorageByCurrentProcess: {} bytes",
-                      O_Romfs().Tamanho());
-        } else {
+        if (!AbrirORomfs()) {
             LOG_WARNING(Service_FS,
-                        "fsp-srv::OpenDataStorageByCurrentProcess: vazio (sem 'G610_NSP' ou "
-                        "sem 'G610_KEYS')");
+                        "fsp-srv::OpenDataStorageByCurrentProcess: sem RomFS — "
+                        "o armazenamento de dados nao existe (PathNotFound)");
+            ResponseBuilder rb{ctx, 2};
+            rb.Push(PathNotFound());
+            return;
         }
+        LOG_DEBUG(Service_FS, "fsp-srv::OpenDataStorageByCurrentProcess: {} bytes",
+                  O_Romfs().Tamanho());
         ResponseBuilder rb{ctx, 2, 0, 1};
         rb.Push(ResultSuccess);
         rb.PushIpcInterface<IStorage>(ctx, std::make_shared<IStorage>(system));

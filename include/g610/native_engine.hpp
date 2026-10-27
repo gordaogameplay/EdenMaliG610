@@ -157,6 +157,21 @@ struct GuestThreadState {
     // estrutura depois de cada SVC.
     std::uint64_t platform_reg     = 0;
 
+    // Registos guardados quando a thread fica bloqueada em
+    // `WaitProcessWideKeyAtomic` (espera sem fim sem sinal pendente).
+    // Permite ao motor trocar de thread de guest num modelo de thread de
+    // host único: ao invés de bloquear o host para sempre, guarda o
+    // contexto desta thread e passa para outra que possa fazer progresso.
+    std::uint64_t saved_gpr[31] = {0};   // x0-x30
+    std::uint64_t saved_sp      = 0;
+    std::uint64_t saved_pc      = 0;
+    bool          have_saved_ctx = false;
+
+    // Identificador da cv que esta thread esta a esperar (0 = nao esta a
+    // esperar). Usado por `SignalProcessWideKey` para saber que thread
+    // despertar.
+    std::uint64_t waiting_on_cv = 0;
+
     // O ponto de regresso ao host desta thread, e a stack onde a recuperacao
     // de faults corre. A stack e' propria porque a do guest pode estar
     // corrompida - e o regresso tem de ser para a frame desta thread.

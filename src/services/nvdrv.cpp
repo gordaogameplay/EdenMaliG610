@@ -67,6 +67,7 @@
 
 #include "g610/gpu/maxwell_translator.hpp"
 #include "g610/gpu/pushbuffer.hpp"
+#include "g610/gpu/draw_consumer.hpp"
 #include "g610/services/binder.hpp"
 #include "g610/svc_dispatcher.hpp"
 #include "g610/services/nvmap_registry.hpp"
@@ -493,6 +494,14 @@ struct IoctlFreeSpace {
     std::uint32_t page_size;
 };
 static_assert(sizeof(IoctlFreeSpace) == 16, "tamanho errado");
+
+// O `UnmapBuffer` (raw `0xC0084105`, nvhost-as-gpu 'A' nr 5): 8 bytes,
+// um u64 com o VA do mapeamento a desmarcar. Medido (runK): entrada
+// = `00 80 d7 c2 00 00 00 00` — 0xC2D78000.
+struct IoctlUnmapBuffer {
+    std::uint64_t va;
+};
+static_assert(sizeof(IoctlUnmapBuffer) == 8, "tamanho errado");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // As outras structs de ioctl que o guest pede.
@@ -1638,6 +1647,34 @@ private:
         RespostaOk(ctx);
     }
 
+    // 0x41/0x05: `UnmapBuffer` — desmapear um buffer da faixa AS.
+    //
+    // **Medido** (`NV_IOCTL_DUMP`, runK): raw=0xC0084105 (len=0x8,
+    // `_IOWR`, tipo 'A', nr 5) e a entrada = `00 80 d7 c2 00 00 00 00`
+    // — u64 = **0xC2D78000**, exactamente o VA que o `MapBufferEx`
+    // tinha acabado de devolver. É a desmapear do mapeamento que o
+    // guest cria por trabalho de ÁUDIO: cria+aloca+map+unmap+free — e
+    // a resposta `NotImplemented` desta chamada fez o jogo abortar com
+    // `SetTerminateResult(0x2A2)` + `svcBreak` (`svc-break] FATAL`,
+    // runH/runI/runJ: payload 0, cadeia de frames pelo sink do log do
+    // SDK).
+    //
+    // **Semantics** (upstream, nvhost_as_gpu): remove o mapeamento da
+    // faixa AS. O motor nativo mapeia por identidade — a remoção é
+    // registral (a `mapeamentos_`), e a resposta mantém o padrão do
+    // Eden: params de volta + `NvResult::Success`.
+    void UnmapBuffer(HLERequestContext& ctx) {
+        IoctlUnmapBuffer params{};
+        LerEntrada(ctx, params);
+
+        LOG_DEBUG(Service_NVDRV, "UnmapBuffer: va=0x{:X}", params.va);
+
+        mapeamentos_.erase(static_cast<std::uint64_t>(params.va));
+
+        EscreverSaida(ctx, params);
+        RespostaOk(ctx);
+    }
+
     // 0x41/0x01: `BindChannel` — ligar o canal do `nvhost-gpu` ao
     // memory manager da GPU.
     //
@@ -1921,6 +1958,18 @@ private:
         if (lido > 0)
             std::memcpy(&params, entrada.data(), lido);
 
+        static std::atomic<std::uint64_t> gpfifo_n{0};
+        const auto gpfifo_seq = gpfifo_n.fetch_add(1);
+        if (std::getenv("IA_THREAD_TRACE") != nullptr &&
+            (gpfifo_seq < 64 || gpfifo_seq % 500 == 0)) {
+            std::fprintf(stderr,
+                         "[gpu] SubmitGPFIFO #%llu address=0x%llx entradas=%u flags=0x%x kickoff=%d\n",
+                         static_cast<unsigned long long>(gpfifo_seq),
+                         static_cast<unsigned long long>(params.address),
+                         params.num_entries, params.flags,
+                         cabecalhos_no_endereco ? 1 : 0);
+        }
+
         LOG_DEBUG(Service_NVDRV,
                   "canal: SubmitGPFIFO: address=0x{:X} entradas={} flags=0x{:X} kickoff={}",
                   params.address, params.num_entries, params.flags,
@@ -2165,12 +2214,20 @@ private:
         // semáforos e a **fence**. E a fence é o que diz ao jogo "o
         // trabalho acabou" — sem ela, o jogo fica à espera para sempre
         // (foi o que se mediu).
+        std::uint64_t rs_endereco = 0;
         {
             gpu::PushBufferReader leitor;
             // O estado do canal (o `Puller::Regs` do upstream).
             std::uint64_t sem_endereco = 0;
             std::uint32_t sem_sequencia = 0;
             std::uint32_t fence_acao = 0;
+            // O `report_semaphore` do Maxwell 3D (método 0x6C0 = 1728).
+            // O upstream (`maxwell_3d.cpp`, `ProcessQueryGet`) escreve o
+            // payload no endereço quando a operação é Release/ReportOnly
+            // e o relatório é `Payload`. Sem isto o guest fica à espera
+            // de um valor que nunca chega.
+            std::uint32_t rs_payload = 0;
+            std::uint32_t rs_query = 0;
 
             // A contagem por metodo: e' a unica forma de dizer o que esta
             // dentro do push buffer sem adivinhar. Os metodos do canal
@@ -2221,6 +2278,44 @@ private:
                         }
                         break;
                     }
+                    case 1728: // ReportSemaphore.AddressHigh
+                        rs_endereco = (rs_endereco & 0xFFFFFFFFull) |
+                                      (static_cast<std::uint64_t>(m.argument) << 32);
+                        break;
+                    case 1729: // ReportSemaphore.AddressLow
+                        rs_endereco = (rs_endereco & 0xFFFFFFFF00000000ull) | m.argument;
+                        break;
+                    case 1730: // ReportSemaphore.Payload
+                        rs_payload = m.argument;
+                        break;
+                    case 1731: { // ReportSemaphore.Query (dispara a operação)
+                        rs_query = m.argument;
+                        const std::uint32_t op = rs_query & 0x3u;
+                        const std::uint32_t report = (rs_query >> 23) & 0x1Fu;
+                        const std::uint32_t short_query = (rs_query >> 28) & 0x1u;
+                        // Release (0) ou ReportOnly (2), relatório Payload (0).
+                        if ((op == 0 || op == 2) && report == 0 && rs_endereco != 0) {
+                            if (short_query != 0) {
+                                if (EscreverNoGuest(rs_endereco, &rs_payload, sizeof rs_payload)) {
+                                    SvcDispatcher::AcordarFutexNoEndereco(rs_endereco);
+                                    LOG_DEBUG(Service_NVDRV,
+                                              "SubmitGPFIFO: report semaphore (curto) escrito em "
+                                              "0x{:X} = {}",
+                                              rs_endereco, rs_payload);
+                                }
+                            } else {
+                                std::uint64_t payload64 = rs_payload;
+                                if (EscreverNoGuest(rs_endereco, &payload64, sizeof payload64)) {
+                                    SvcDispatcher::AcordarFutexNoEndereco(rs_endereco);
+                                    LOG_DEBUG(Service_NVDRV,
+                                              "SubmitGPFIFO: report semaphore (longo) escrito em "
+                                              "0x{:X} = {}",
+                                              rs_endereco, rs_payload);
+                                }
+                            }
+                        }
+                        break;
+                    }
                     case gpu::canal::FenceValue:
                         // O valor da fence do canal.
                         break;
@@ -2242,6 +2337,8 @@ private:
                         break;
                     }
                 });
+
+
 
             LOG_DEBUG(Service_NVDRV,
                       "SubmitGPFIFO: {} métodos no push buffer ({} descartados)", metodos,
@@ -2305,6 +2402,21 @@ private:
                   pushbuffer.size(), n, tradutor_.commands_unknown(),
                   tradutor_.commands_dropped_feature(), tradutor_.macro_passos(),
                   tradutor_.macro_envios(), erro.empty() ? "" : (" — " + erro));
+
+        // Executa os comandos desenhados — enviados ao `RasterizerG610`,
+        // a implementacao da `VideoCore::RasterizerInterface` da casa.
+        // A execucao e' sincrona (nao ha thread de GPU separada), o que
+        // e' o mesmo que o Eden faz: o trabalho termina quando a
+        // submissao e' aceite e o syncpoint sobe.
+        g610::gpu::processar_draw_comandos(comandos, this,
+                                           &NvDrv::EscreverNoGuestWrapper,
+                                           &NvDrv::SinalizaFenceWrapper);
+        gpu_draws_exec_ += comandos.size();
+        if (!comandos.empty()) {
+            LOG_DEBUG(Service_NVDRV,
+                      "canal: SubmitGPFIFO: {} comandos executados no rasterizador",
+                      comandos.size());
+        }
 
         // Instrumento do passo 1: QUE metodos o microcode envia. Os
         // 901 envios medidos com 0 comandos so' decidem com os ids na
@@ -2435,6 +2547,12 @@ private:
                                              static_cast<unsigned long long>(ba->first));
                             }
                         }
+                        // Se o VA nao for coberto pelo mapa, tenta-se a
+                        // leitura directa no espaco do guest (alguns VAs
+                        // baixos sao RAM do guest sem mapeamento nvmap).
+                        if (!coberto) {
+                            cpu = va;
+                        }
                         // A janela adaptativa: a inteira, e se o piso
                         // do guest não tiver a pagina toda, encolhe (o
                         // buraco do mapa nao para a medida).
@@ -2547,16 +2665,42 @@ private:
             // exactamente o mesmo.
             if (canal->fence_id >= 0) {
                 const std::uint32_t id = static_cast<std::uint32_t>(canal->fence_id);
-                // **O incremento zero deixa o syncpoint quieto** — e o
-                // "MaxExt" do upstream significa que o valor nunca
-                // **desce**.
-                if (incremento != 0) {
-                    syncpoints_.Incrementar(id, incremento);
+                // **Conclusão síncrona da submissão.**
+                //
+                // O upstream só avança o syncpoint quando o GPU executa o
+                // trabalho (ou quando `fence_increment`/`increment_value`
+                // o pedem). Aqui o trabalho é executado de seguida, no
+                // `SubmitGPFIFO` — por isso a submissão tem de sinalizar a
+                // sua conclusão. Se o incremento pedido pelas flags for
+                // zero (caso `fence_wait` + `suppress_wfi`, o caso comum
+                // das submissões de render), avança-se por 1: é o mínimo
+                // que faz o `CtrlEventWait` correspondente disparar e o
+                // thread de render sair do spin. Um incremento zero
+                // deixaria o syncpoint mudo e o jogo à espera para sempre.
+                if (incremento == 0) {
+                    incremento = 1;
                 }
+                syncpoints_.Incrementar(id, incremento);
                 canal->fence_valor = syncpoints_.Valor(id);
                 LOG_DEBUG(Service_NVDRV,
                           "canal: syncpoint {} Advanced para {} ({} submissões)",
                           canal->fence_id, canal->fence_valor, canal->submissoes);
+
+                // **A GPU terminou.** O driver tem de acordar o guest que
+                // esteja à espera da conclusão da submissão GPU. O sinal
+                // vai para o endereço do semáforo de reporte (rs_endereco),
+                // que é onde o guest escreve o payload de conclusão.
+                // Nada de "acordar todos": apenas os waiters neste endereço
+                // são despertos (sem varredura de filas de cv não relacionadas).
+                if (rs_endereco != 0)
+                    SvcDispatcher::AcordarFutexNoEndereco(rs_endereco);
+
+                // Após a conclusão da GPU, processar IPCs pendentes — um
+                // deles pode sinalizar a cv que alguma thread espera
+                // (RegistarTrabalhoGpu é normalmente chamado apenas pelo
+                // FenceAction, mas este push buffer não tem FenceAction;
+                // o syncpoint avança aqui independentemente).
+                SvcDispatcher::RegistarTrabalhoGpu();
             }
 
             // A fence de saída — o par (syncpoint, valor **actual**).
@@ -2967,8 +3111,30 @@ private:
     // do guest). E' por ai que o jogo sabe que o trabalho da GPU
     // acabou.
     bool EscreverNoGuest(std::uint64_t endereco, const void* origem, std::size_t tamanho) {
+        if (endereco == 0xd9c2c228ull) {
+            std::fprintf(stderr, "[nvwatch] EscreverNoGuest 0x%llx size=%zu\n", (unsigned long long)endereco, tamanho);
+        }
         auto& memoria = Kernel::GetCurrentMemory(system.Kernel());
         return memoria.WriteBlock(static_cast<Common::ProcessAddress>(endereco), origem, tamanho);
+    }
+
+    // Wrappers estaticos para os callbacks do RasterizerG610 (passados
+    // via `processar_draw_comandos` em `draw_consumer.cpp`). Recebem
+    // `contexto` = `this` do NvDrv.
+    static bool EscreverNoGuestWrapper(void* contexto, std::uint64_t endereco,
+                                       const void* origem, std::size_t tamanho) {
+        return static_cast<NvDrv*>(contexto)->EscreverNoGuest(endereco, origem, tamanho);
+    }
+
+    static void SinalizaFenceWrapper(void* contexto, std::uint32_t syncpoint) {
+        auto* d = static_cast<NvDrv*>(contexto);
+        if (auto* canal = d->CanalDoFd()) {
+            if (canal->fence_id >= 0) {
+                const std::uint32_t id =
+                    static_cast<std::uint32_t>(canal->fence_id);
+                d->syncpoints_.Incrementar(id, 1);
+            }
+        }
     }
 
     // O ioctl comum aos três comandos.
@@ -3089,6 +3255,9 @@ private:
                     return;
                 case 0x3:
                     FreeSpace(ctx);
+                    return;
+                case 0x5:
+                    UnmapBuffer(ctx);
                     return;
                 case 0x6:
                     MapBufferEx(ctx);
@@ -3338,6 +3507,12 @@ private:
     // O **tradutor** Maxwell -> Vulkan da casa (`src/gpu/`). É ele que
     // consome o push buffer que o guest submete.
     g610::gpu::MaxwellTranslator tradutor_{g610::tel::Telemetria()};
+    // Contador de comandos de desenho executados (a "emissăo equivalente"
+    // para PanVK/Mali-G610). Os `DrawCommand` sao encaminhados para o
+    // `RasterizerG610` via `processar_draw_comandos` (em
+    // `src/gpu/draw_consumer.cpp`, o unico TU que inclui
+    // `rasterizer_g610.hpp` e nao entra em conflito com `memory_bridge.h`).
+    std::uint64_t gpu_draws_exec_ = 0;
     Kernel::KEvent* evento_ = nullptr;
     // O espaço de endereços virtual que o guest pediu para a GPU (o
     // `AllocAsEx`). Fica registado para o log e para o caminho da GPU.

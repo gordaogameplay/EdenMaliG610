@@ -22,6 +22,7 @@
 #include "g610/eden_bridge.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <stdexcept>
 #include <cstdlib>
@@ -34,11 +35,14 @@
 #include "vendor/eden/core/hle/kernel/k_client_port.h"
 #include "vendor/eden/core/hle/kernel/k_client_session.h"
 #include "vendor/eden/core/hle/kernel/k_handle_table.h"
+#include "vendor/eden/core/hle/kernel/k_kernel_core_bridge.h"
 #include "vendor/eden/core/hle/kernel/k_light_condition_variable.h"
 #include "vendor/eden/core/hle/kernel/k_light_lock.h"
 #include "vendor/eden/core/hle/kernel/k_object_name.h"
 #include "vendor/eden/core/hle/kernel/k_process_bridge.h"
 #include "vendor/eden/core/hle/kernel/k_resource_limit.h"
+#include "vendor/eden/core/hle/kernel/k_server_port.h"
+#include "vendor/eden/core/hle/kernel/k_server_session.h"
 #include "vendor/eden/core/hle/kernel/k_session.h"
 #include "vendor/eden/core/hle/kernel/svc_results.h"
 #include "vendor/eden/core/hle/service/apm/apm.h"
@@ -265,26 +269,115 @@ void ::Core::System::RunServer(
 }
 
 auto ::Core::System::ProcessPendingSynchronously() -> ::Result {
-    bool progresso = false;
-    for (std::size_t i = 0; i < servidores_.size(); ++i) {
-        const auto& servidor = servidores_[i];
-        const Result resultado = servidor->ProcessPendingSynchronously();
+    // O pump deve iterar até encontrar trabalho ou esgotar as tentativas.
+    // Um único passe pode não ser suficiente quando um pedido acaba de ser
+    // enfileirado por `SendSyncRequest` e o servidor ainda não o processou.
+    bool progresso_total = false;
+    constexpr std::size_t max_passes = 64;
+    static std::atomic<std::uint64_t> pump_n{0};
+    const auto pump_seq = pump_n.fetch_add(1);
+    for (std::size_t pass = 0; pass < max_passes; ++pass) {
+        bool progresso = false;
+        for (std::size_t i = 0; i < servidores_.size(); ++i) {
+            const auto& servidor = servidores_[i];
+            const Result resultado = servidor->ProcessPendingSynchronously();
+            if (std::getenv("IA_IPC_TRACE") != nullptr &&
+                (pump_seq < 32 || pump_seq % 100 == 0))
+                std::fprintf(stderr,
+                             "[ipc] pump #%llu pass=%zu servidor=%zu/%zu Result=%u (progresso=%d)\n",
+                             static_cast<unsigned long long>(pump_seq),
+                             pass,
+                             i,
+                             servidores_.size(),
+                             static_cast<unsigned>(resultado.GetInnerValue()),
+                             resultado == ResultSuccess ? 1 : 0);
+            if (resultado == Kernel::ResultNotFound)
+                continue;
+            if (R_FAILED(resultado))
+                return resultado;
+            progresso = true;
+            progresso_total = true;
+        }
+        if (servidores_.empty())
+            break;
+    }
+
+    // ── Sessões órfãs ──────────────────────────────────────────────────────
+    //
+    // Algumas `KServerSession` são criadas fora do fluxo `ConnectToNamedPort`
+    // (via `sm:GetService` → `CreateSession`), pelo seu `KServerPort` não
+    // pertence a nenhum `ServerManager`. O pump acima não as encontra, e o
+    // pedido fica enfileirado para sempre. Aqui varremos todos os
+    // `KServerSession` do contentor de objectos do kernel e, para cada um
+    // sinalizado que não esteja já registado, procuramos o `ServerManager`
+    // dono da sua porta e registamo-lo como órfão.
+    if (!servidores_.empty()) {
+        if (std::getenv("IA_IPC_TRACE") != nullptr)
+            std::fprintf(stderr, "[ipc] orphan scan: servidores=%zu\n", servidores_.size());
+        auto& kernel = this->Kernel();
+        size_t kss_count = 0, signaled_count = 0, orphan_count = 0;
+        kernel.ForEachRegisteredObject([&](Kernel::KAutoObject& obj) {
+            auto* server_session = dynamic_cast<Kernel::KServerSession*>(&obj);
+            if (!server_session)
+                return;
+            kss_count++;
+            if (!server_session->IsSignaled(kernel))
+                return;
+            signaled_count++;
+            // Já está registado em algum ServerManager?
+            bool ja_registado = false;
+            for (const auto& srv : servidores_) {
+                if (srv->HasSession(server_session)) {
+                    ja_registado = true;
+                    break;
+                }
+            }
+            if (!ja_registado) {
+                orphan_count++;
+                if (std::getenv("IA_IPC_TRACE") != nullptr) {
+                    std::fprintf(stderr,
+                                 "[ipc]   ORFÃO sessao=%p sinalizada, a registar\n",
+                                 static_cast<const void*>(server_session));
+                }
+                // Caminho: KServerSession -> KSession -> KClientPort -> KPort -> KServerPort
+                auto* ksession = server_session->GetParent();
+                if (!ksession)
+                    return;
+                auto* client_port = ksession->GetParent();
+                if (!client_port)
+                    return;
+                auto* kport = client_port->GetParent();
+                if (!kport)
+                    return;
+                auto* server_port = &kport->GetServerPort();
+                // Encontrar o ServerManager dono desta porta.
+                for (auto& servidor : servidores_) {
+                    if (!servidor->OwnsPort(server_port))
+                        return;
+                    // Registar como órfão e processar imediatamente.
+                    if (R_SUCCEEDED(servidor->RegisterOrphanSession(server_session))) {
+                        const Result resultado = servidor->ProcessPendingSynchronously();
+                        if (resultado == ResultSuccess) {
+                            progresso_total = true;
+                            if (std::getenv("IA_IPC_TRACE") != nullptr)
+                                std::fprintf(stderr,
+                                             "[ipc]   ORFÃO sessao=%p processada com sucesso\n",
+                                             static_cast<const void*>(server_session));
+                        }
+                    }
+                    break;
+                }
+            }
+        });
         if (std::getenv("IA_IPC_TRACE") != nullptr)
             std::fprintf(stderr,
-                         "[ipc] pump servidor=%zu/%zu Result=%u (progresso=%d)\n",
-                         i,
-                         servidores_.size(),
-                         static_cast<unsigned>(resultado.GetInnerValue()),
-                         resultado == ResultSuccess ? 1 : 0);
-        if (resultado == Kernel::ResultNotFound)
-            continue;
-        if (R_FAILED(resultado))
-            return resultado;
-        progresso = true;
+                         "[ipc] orphan scan: kss=%zu sinalizados=%zu orfaos=%zu\n",
+                         kss_count, signaled_count, orphan_count);
     }
+
     if (servidores_.empty() && std::getenv("IA_IPC_TRACE") != nullptr)
         std::fprintf(stderr, "[ipc] pump SEM SERVIDORES registados (RunServer não correu)\n");
-    return progresso ? ResultSuccess : Kernel::ResultNotFound;
+    return progresso_total ? ResultSuccess : Kernel::ResultNotFound;
 }
 
 void Kernel::KThreadQueueWithoutEndWait::EndWait(KernelCore&, KThread*, Result) {}
@@ -332,7 +425,7 @@ void Kernel::KThreadQueueWithoutEndWait::EndWait(KernelCore&, KThread*, Result) 
 // seria um `m_tag` que ninguém mais consegue ler.
 void Kernel::KLightLock::Lock() {
     const auto cur = reinterpret_cast<uintptr_t>(GetCurrentThreadPointer(m_kernel));
-    m_tag.store(cur, std::memory_order_acquire);
+    m_tag.store(cur, std::memory_order_release);
 }
 
 void Kernel::KLightLock::Unlock() {
@@ -858,10 +951,34 @@ bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_ha
                      static_cast<unsigned long long>(
                          Kernel::GetCurrentThread(kernel).GetTlsAddress()));
     }
+
     // A referência ao pai: o pai tem de sobreviver ao pedido. Sem este
     // `KScopedAutoObject` a sessão pode ser destruída a meio e o pedido
     // escreve para memória morta.
     Kernel::KScopedAutoObject<Kernel::KAutoObject> pai{kernel, sessao->GetParent()};
+
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        if (pai.IsNotNull()) {
+            std::fprintf(stderr, "[ipc]   pai=%p tipo_pai=%s\n",
+                         static_cast<const void*>(pai.GetPointerUnsafe()), pai->GetTypeName());
+            // O KSession tem GetParent() -> KClientPort*
+            const auto* ksession = dynamic_cast<const Kernel::KSession*>(pai.GetPointerUnsafe());
+            if (ksession) {
+                const auto* client_port = ksession->GetParent();
+                if (client_port) {
+                    std::fprintf(stderr, "[ipc]   client_port=%p\n",
+                                 static_cast<const void*>(client_port));
+                    const auto* kport = client_port->GetParent();
+                    if (kport) {
+                        std::fprintf(stderr, "[ipc]   kport=%p nome=0x%llx server_port=%p\n",
+                                     static_cast<const void*>(kport),
+                                     static_cast<unsigned long long>(kport->GetName()),
+                                     static_cast<const void*>(&kport->GetServerPort()));
+                    }
+                }
+            }
+        }
+    }
     if (pai.IsNull()) {
         if (std::getenv("IA_IPC_TRACE") != nullptr)
             std::fprintf(stderr,

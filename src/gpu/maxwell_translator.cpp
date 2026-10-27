@@ -333,6 +333,12 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
             // "0 comandos traduzidos" com 901 envios decide-se com esta
             // contagem no log (o id = o endereco do `CallMethod`).
             ++envio_ids_[endereco];
+            // Instrumentação temporária: verificar envios para 1401-1417
+            if (endereco >= 1401 && endereco <= 1417) {
+                std::fprintf(stderr,
+                    "[MME_DRAW_TRACE] endereco=0x%x (%d) valor=0x%x envios_antes=%d\n",
+                    endereco, endereco, valor, static_cast<int>(envio_ids_[endereco]) - 1);
+            }
             std::uint32_t v = valor;
             chamada_metodo(endereco, &v, 1, true);
         },

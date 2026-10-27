@@ -66,6 +66,8 @@
 
 #include "g610/services/binder.hpp"
 
+#include "g610/svc_dispatcher.hpp"
+
 namespace g610::services {
 
 namespace {
@@ -136,6 +138,11 @@ void ThreadDoVsync(Core::System& system) {
             continue;
         auto& kernel = system.Kernel();
         evento->Signal(kernel);
+        // Liga o vsync à CV de espera da thread render do guest. O guest
+        // estaciona em cv=0x10a5096e4 (mutex 0x10a5096d8) e nunca avança
+        // para DequeueBuffer porque ninguém acorda essa CV. O vsync host
+        // é o evento que deveria disparar o próximo quadro.
+        SvcDispatcher::AcordarFutexNoEndereco(0x10a5096d8);
     }
 }
 
@@ -401,7 +408,7 @@ private:
         // e' quem atende o protocolo do `IGraphicBufferProducer`.
         auto& kernel = system_.Kernel();
         const std::vector<std::uint8_t> reply =
-            TransactionarParcel(transacao, entrada, kernel);
+            g610::services::TransactionarParcel(transacao, entrada, kernel);
 
         // **A resposta, em hexadecimal.** E' o parcel que volta ao jogo
         // — e nunca foi medido. O Eden (`parcel.h:155-170`) escreve
@@ -462,7 +469,7 @@ private:
             // ao jogo (`buffer_queue_producer.cpp:825-827`: o
             // `buffer_wait_event`), e que o compositor sinaliza
             // quando ha' buffer.
-            services::DefinirEventoDaFila(evento_);
+            g610::services::DefinirEventoDaFila(evento_);
         }
 
         ResponseBuilder rb{ctx, 2, 1};
@@ -714,11 +721,11 @@ private:
     //
     // Devolve `true` se alocar.
     static bool AlocarJanela(std::uint64_t tamanho, std::uint64_t& endereco) {
-        // **É o compositor que a aloca** (`src/services/binder.cpp`): é
-        // quem precisa de saber onde está, porque é quem apresenta o
-        // desenho. A reserva é a do VA da GPU (a mesma que o `nvdrv` dá
-        // ao jogo).
-        endereco = AlocarJanelaDoCompositor(tamanho);
+    // **É o compositor que a aloca** (`src/services/binder.cpp`): é
+    // quem precisa de saber onde está, porque é quem apresenta o
+    // desenho. A reserva é a do VA da GPU (a mesma que o `nvdrv` dá
+    // ao jogo).
+        endereco = g610::services::AlocarJanelaDoCompositor(tamanho);
         return endereco != 0;
     }
 

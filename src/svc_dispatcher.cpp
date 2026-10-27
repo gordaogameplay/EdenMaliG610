@@ -40,6 +40,22 @@ volatile bool g_esperar_pelo_rtld = false;
 // O endereco a vigiar.
 std::uint64_t g_endereco_do_watchpoint = 0;
 
+// ── Troca coopérativa de threads (definido em native_engine.cpp) ────────
+extern ucontext_t* g_dispatch_uc;
+extern std::atomic<std::uint64_t> g_switch_to_tls;
+extern std::unordered_map<std::uint64_t, std::uint64_t> g_cv_waiter_thread;
+extern GuestThreadState* find_ready_guest_thread(std::uint64_t current_tls);
+extern void mark_ready_threads_on_cv(std::uint64_t cv_key);
+extern std::uint64_t read_thread_pointer();
+extern GuestThreadState* find_guest_thread_state(std::uint64_t tp);
+
+// Mapeia o token de espera (dispatch_owner_itself) para o GuestThreadState,
+// para que SignalProcessWideKey saiba que thread despertar.
+extern std::unordered_map<std::uint64_t, GuestThreadState*> g_token_to_thread;
+
+// Mapeia cv_key para a thread de guest que esta a espera nessa cv.
+extern std::unordered_map<std::uint64_t, std::uint64_t> g_cv_waiter_thread;
+
 // **Ler o global do jogo** — o handler de sinais e' estatico
 // e nao alcanca o dispatcher.
 bool LerGlobalDoJogo(std::uint64_t* valor) {
@@ -140,6 +156,91 @@ bool SvcDispatcher::write_guest(std::uint64_t addr, const void* src,
     return mem_->write(addr, src, size, g_err_scratch);
 }
 
+bool SvcDispatcher::cas_word_guest(std::uint64_t addr, std::uint32_t esperado,
+                                   std::uint32_t novo) {
+    // **Rasto de palavras**: cada troca na memória do guest fica nos
+    // registros — o `0x00020000` da word do mutex 0xd8 (runCAS0/1-5)
+    // não impresso por NINGUÉM, então o estado só se vê por aqui.
+    static const bool rasto = std::getenv("IA_WORD_TRACE") != nullptr;
+    static std::size_t cas_n = 0;
+    //
+    // **PADRÃO CEGO** — o valor (`novo`) entra INCONDICIONALMENTE na
+    // memória, como o `write_guest` sempre fez. Medido (runBLIND vs
+    // runCAS0-5, 25/10): com o CAS ativo o runs ESTANCAM sempre no
+    // svc #402-407 com o word do mutex 0x10a5096d8 órfão (`0x00020000`
+    // e depois `0x40020000` — dono-fantasma que nenhuma fila conhece),
+    // escrito por código do próprio guest entre a nossa liberação do
+    // parque e o próximo SVC. Com a escrita cega o fluxo corre sã:
+    // svc #933+, DLOCK/ACORDEI ciclando, a família de palavras sã
+    // (0x0/0x00020003/0x000081ff/0x400081ff/0x40020003). O permitido
+    // de escrita cega é matar é o estado medido mais estávo — o braço
+    // CAS fica atrás de `IA_CAS=1` para a experiência futura.
+    static const bool cas_ativo = std::getenv("IA_CAS") != nullptr;
+    if (!cas_ativo) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const bool ok = write_guest(addr, &novo, sizeof novo);
+        if (rasto)
+            std::fprintf(stderr,
+                         "[word] BLIND n=%zu addr=0x%llx esp=0x%x novo=0x%x %s\n",
+                         cas_n, static_cast<unsigned long long>(addr), esperado,
+                         novo, ok ? "ok" : "falhou");
+        ++cas_n;
+        if (!ok)
+            return false;
+        return true;
+    }
+    if (mem_ == nullptr)
+        return false;
+    std::uint8_t* p = mem_->host_pointer(addr, sizeof esperado);
+    if (p == nullptr)
+        return false;
+    std::uint32_t e = esperado;  // mutável: em falha o CAS escreve o atual
+    const bool ok = __atomic_compare_exchange_n(p, &e, novo, false,
+                                                __ATOMIC_SEQ_CST,
+                                                __ATOMIC_SEQ_CST);
+    if (rasto && (cas_n < 6144 || cas_n % 1000 == 0))
+        std::fprintf(stderr,
+                     "[word] CAS n=%zu addr=0x%llx esp=0x%x novo=0x%x %s\n",
+                     cas_n, static_cast<unsigned long long>(addr), esperado,
+                     novo, ok ? "ok" : (e == esperado ? "retry" : "erased"));
+    ++cas_n;
+    return ok;
+}
+
+bool SvcDispatcher::escrita_atomica_word(std::uint64_t addr,
+                                         std::uint32_t novo) {
+    // Com o braço CAS desligado (o padrão, ver `cas_word_guest`) isto é
+    // EXACTAMENTE a escrita cega anterior: fence seq_cst + `write_guest`.
+    // Com `IA_CAS=1` volta o ciclo comparar-e-trocar com re-leituras.
+    static const bool cas_ativo = std::getenv("IA_CAS") != nullptr;
+    if (!cas_ativo)
+        return cas_word_guest(addr, 0, novo) ? true : false;
+    std::uint32_t observado = 0;
+    if (!read_guest(addr, &observado, sizeof observado))
+        return false;
+    for (int tenta = 0; tenta < 16; ++tenta) {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (cas_word_guest(addr, observado, novo))
+            return true;
+        // A palavra mudou no meio (o guest escreveu): re-ler e trocar de
+        // novo — o `novo` é do quadro, não da leitura repetida.
+        if (!read_guest(addr, &observado, sizeof observado))
+            return false;
+    }
+    // Esgotadas as trocas (um circuito rival azarado a longo): a escrita
+    // cega é o comportamento de reserva — mantém liveness.
+    static std::size_t fall_n = 0;
+    if (std::getenv("IA_WORD_TRACE") != nullptr &&
+        (fall_n < 512 || fall_n % 100 == 0))
+        std::fprintf(stderr,
+                     "[word] FALLBACK n=%zu addr=0x%llx velho=0x%x novo=0x%x\n",
+                     fall_n, static_cast<unsigned long long>(addr), observado,
+                     novo);
+    ++fall_n;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    return write_guest(addr, &novo, sizeof novo);
+}
+
 namespace {
 
 bool safe_copy_string(SvcDispatcher& d, std::uint64_t guest_addr, std::string& out,
@@ -218,6 +319,8 @@ std::string to_string(Svc s) {
     case Svc::ArbitrateLock:           return "ArbitrateLock";
     case Svc::ArbitrateUnlock:         return "ArbitrateUnlock";
     case Svc::WaitProcessWideKeyAtomic: return "WaitProcessWideKeyAtomic";
+    case Svc::WaitForAddress:          return "WaitForAddress";
+    case Svc::SignalToAddress:         return "SignalToAddress";
     }
     return "Svc#" + std::to_string(static_cast<std::uint32_t>(s));
 }
@@ -453,6 +556,8 @@ void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
     case Svc::ArbitrateUnlock:      r = svc_arbitrate_unlock(ctx); break;
     case Svc::WaitProcessWideKeyAtomic: r = svc_wait_process_wide_key_atomic(ctx); break;
     case Svc::SignalProcessWideKey: r = svc_signal_process_wide_key(ctx); break;
+    case Svc::WaitForAddress:       r = svc_wait_for_address(ctx); break;
+    case Svc::SignalToAddress:      r = svc_signal_to_address(ctx); break;
     default:                        r = svc_unsupported(ctx);    break;
     }
 
@@ -1885,8 +1990,25 @@ struct ArbitrationBoard {
         std::uint64_t token;  // dono do despacho largado
     };
 
-    std::mutex gate;
-    std::condition_variable wake;
+    // Espera do arbiter de ENDEREÇOS (0x34/0x35). O Eden guarda-a na
+    // `m_tree` própria (`KAddressArbiter`, k_address_arbiter.h:26-33) —
+    // uma tree POR PROCESSO, distinta da de mutex de handle e das cv's: um
+    // `SignalToAddress` NÃO acorda quem estacionou por `ArbitrateLock` nem
+    // por `WaitProcessWideKeyAtomic`. As namespaces separam-se com uma
+    // fila própria, por endereço; sem tag — o Unlock não escreve um tag do
+    // chamador: o word é do protocolo do SDK, escrito pelo tipo de sinal.
+    struct AddressWaiter {
+        std::uint64_t token;  // identidade de despertar (o quadro)
+    };
+    std::map<std::uint64_t, std::vector<AddressWaiter>> arb_fila;
+
+    // **Diagnóstico da paragem (runL)**: gate cronometrado + rasto do
+    // dono. O `timed_mutex` deixa cada aquisição medir-se: passando de
+    // 1 s, o registador quadrado imprime QUEM esperou e QUEM estava com
+    // o gate em mão — o dono eterno é o último a entrar e não sair.
+    std::timed_mutex gate;
+    std::condition_variable_any wake;
+    std::atomic<const char*> gate_dono{nullptr};
     std::map<std::uint64_t, std::vector<Waiter>> fila;
 
     // Fila das condition variables, por cv_key (0x1C/0x1D). Sistema próprio
@@ -1909,6 +2031,31 @@ struct ArbitrationBoard {
 };
 
 ArbitrationBoard g_arbiter;
+
+// ── Diagnóstico do gate (runL: 0% CPU, congelado em svc #912) ─────────────
+// Toda aquisição do gate passa por aqui com um RÓTULO. Se a espera passa
+// de 1 s, o [gaten] diz que thread esperou e quem tinha o gate — a
+// lealdade do rasto vale mesmo com o `store` relaxado: um ponteiro
+// `const char*` para literal.
+static void quadro_entrar(std::unique_lock<std::timed_mutex>& lock,
+                          const char* quem) {
+    if (lock.try_lock_for(std::chrono::seconds(1))) {
+        g_arbiter.gate_dono.store(quem, std::memory_order_relaxed);
+        return;
+    }
+    std::fprintf(stderr,
+                 "[gaten] %s: gate ocupado >1s dono=%s\n",
+                 quem, g_arbiter.gate_dono.load(std::memory_order_relaxed));
+    lock.lock();
+    g_arbiter.gate_dono.store(quem, std::memory_order_relaxed);
+}
+
+// Bandeira do rasto de threads (a convenção dos [thrd]), fixada no
+// primeiro uso — os prints de diagnóstico usam-na.
+inline bool atr() {
+    static const bool sim = std::getenv("IA_THREAD_TRACE") != nullptr;
+    return sim;
+}
 
 // Os sinais **pendentes**: um `signal` que chegou antes do `wait`.
 //
@@ -1936,7 +2083,9 @@ void guest_threads_parar() {
     // delas atinge false e a volta delas vai pelo fim da fila — o
     // handler vê a flag e encaminha para a recuperação.
     {
-        std::lock_guard<std::mutex> lock(g_arbiter.gate);
+        std::unique_lock<std::timed_mutex> lock(g_arbiter.gate,
+                                                std::defer_lock);
+        quadro_entrar(lock, "stop");
         g_arbiter.wake.notify_all();
     }
 }
@@ -2031,7 +2180,9 @@ Result SvcDispatcher::svc_arbitrate_lock(SvcContext& ctx) {
     // perante o unlocker (que também corre sob o gate). É o papel do
     // scheduler lock global no Eden.
     {
-        std::unique_lock<std::mutex> lock(g_arbiter.gate);
+        std::unique_lock<std::timed_mutex> lock(g_arbiter.gate,
+                                                std::defer_lock);
+        quadro_entrar(lock, "0x1a");
 
         std::uint32_t word = 0;
         if (!read_guest(addr, &word, sizeof word))
@@ -2072,6 +2223,54 @@ Result SvcDispatcher::svc_arbitrate_lock(SvcContext& ctx) {
         // fila" deixaria de o dizer.
         g_arbiter.desperta[token] = ArbitrationBoard::DespertaAguarda;
         g_arbiter.fila[addr].push_back({tag, token});
+
+        // **Diagnóstico (runL)**: só pode imprimir se o lock estacionou
+        // DE FATO. Imprimo o `word` LIDO, a fila deste ENDEREÇO (não a
+        // global), e a fila de CV's que apontam para este mutex — se o
+        // dono (word) estiver dormindo num CV, o protocolo do mutex
+        // dependia DELE para desbloquear, e a cadeia é a briga.
+        static std::size_t lock_n = 0;
+        if (atr() && (lock_n++ < 128 || lock_n % 1000 == 0)) {
+            std::size_t this_fila = 0;
+            if (const auto f = g_arbiter.fila.find(addr);
+                f != g_arbiter.fila.end())
+                this_fila = f->second.size();
+            std::uint16_t cv_esperando = 0;
+            for (const auto& [k, fila] : g_arbiter.cv_fila)
+                for (const auto& w : fila)
+                    if (w.addr == addr)
+                        cv_esperando++;
+            std::fprintf(stderr,
+                         "[thrd] LPAUSA token=0x%llx addr=0x%llx tag=0x%x "
+                         "word=0x%x fila_endereco=%zu cvs_apontando=%u\n",
+                         static_cast<unsigned long long>(token),
+                         static_cast<unsigned long long>(addr), tag, word,
+                         this_fila, cv_esperando);
+            // **A vizinhança do mutex** (o `0x20000` do runCAS0/1 não sai
+            // de nenhum print — o oeste e o leste da palavra podem dizer
+            // DE ONDE ele veio: o SDK enche a estrutura à volta).
+            if (std::getenv("IA_WORD_TRACE") != nullptr) {
+                for (std::uint64_t o = 0x40; o >= 4; o -= 4) {
+                    std::uint32_t v = 0;
+                    if (read_guest(addr - o, &v, sizeof v))
+                        std::fprintf(stderr,
+                                     "  [viz] -0x%02llx 0x%llx = 0x%08x\n",
+                                     static_cast<unsigned long long>(o),
+                                     static_cast<unsigned long long>(addr - o),
+                                     v);
+                }
+                for (std::uint64_t o = 4; o <= 0x40; o += 4) {
+                    std::uint32_t v = 0;
+                    if (read_guest(addr + o, &v, sizeof v))
+                        std::fprintf(stderr,
+                                     "  [viz] +0x%02llx 0x%llx = 0x%08x\n",
+                                     static_cast<unsigned long long>(o),
+                                     static_cast<unsigned long long>(addr + o),
+                                     v);
+                }
+            }
+        }
+
         dispatch_owner_vacate();
         g_arbiter.wake.wait(lock, [&] {
             if (guest_threads_paragem_ativa())
@@ -2086,6 +2285,11 @@ Result SvcDispatcher::svc_arbitrate_lock(SvcContext& ctx) {
             g_arbiter.desperta.erase(token);
             return Result::TimedOut;
         }
+        if (atr() && (lock_n < 128 || lock_n % 1000 == 0))
+            std::fprintf(stderr,
+                         "[thrd] LACORDEI token=0x%llx acordei=%d\n",
+                         static_cast<unsigned long long>(token),
+                         static_cast<int>(acordei_com));
         acordei_com = g_arbiter.desperta.at(token);
         g_arbiter.desperta.erase(token);
     }
@@ -2114,15 +2318,19 @@ Result SvcDispatcher::svc_arbitrate_unlock(SvcContext& ctx) {
     std::uint64_t waker   = 0;
 
     {
-        std::lock_guard<std::mutex> lock(g_arbiter.gate);
+        std::unique_lock<std::timed_mutex> lock(g_arbiter.gate,
+                                                std::defer_lock);
+        quadro_entrar(lock, "0x1b");
+        // A palavra ATUAL entra-fed para o CAS final (o Eden :132-137).
+        std::uint32_t palavra = 0;
+        if (!read_guest(addr, &palavra, sizeof palavra))
+            return Result::InvalidCurrentMemory;
         if (std::getenv("IA_IPC_TRACE") != nullptr) {
-            std::uint32_t prev = 0;
-            (void)read_guest(addr, &prev, sizeof prev);
             const auto it = g_arbiter.fila.find(addr);
             const std::size_t na_fila =
                 it == g_arbiter.fila.end() ? 0 : it->second.size();
             std::fprintf(stderr, "[arb] unlock addr=0x%llx palavra=0x%x na_fila=%zu\n",
-                         static_cast<unsigned long long>(addr), prev, na_fila);
+                         static_cast<unsigned long long>(addr), palavra, na_fila);
         }
         const auto it = g_arbiter.fila.find(addr);
         if (it != g_arbiter.fila.end() && !it->second.empty()) {
@@ -2137,12 +2345,26 @@ Result SvcDispatcher::svc_arbitrate_unlock(SvcContext& ctx) {
             // O despertar sai do quadro agora: `EndWait(ResultSuccess)`.
             // O waiter lê isto no seu predicado e verifica que saiu da fila.
             g_arbiter.desperta[waker] = ArbitrationBoard::DespertaSucesso;
+            // **Diagnóstico (runL)**: cada transferencia de dono pelo
+            // unlock — a corrente que faz o mutex andar.
+            if (atr())
+                std::fprintf(stderr,
+                             "[thrd] DLOCK waker=0x%llx addr=0x%llx next=0x%x "
+                             "mais_waiters=%d\n",
+                             static_cast<unsigned long long>(waker),
+                             static_cast<unsigned long long>(addr), next,
+                             more_waiters ? 1 : 0);
         }
         // Eden :132-137: fence seq_cst antes do write; e o write é
         // INCONDICIONAL — unlock sem waiters escreve 0 (cabeça livre). O
         // rtld/jogo leem isto via CAS rápida própria no próximo lock.
+        //
+        // **A escrita é CAS-guardada** (a lição da runL): a troca cega
+        // pode sobrescrever uma mudança que o loop LL/SC do guest fez no
+        // meio — sobrevivência de dono fantasma. O `next` é a decisão do
+        // quadro; a re-leitura interna repõe o valor visto.
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (!write_guest(addr, &next, sizeof next))
+        if (!escrita_atomica_word(addr, next))
             return Result::InvalidCurrentMemory;
     }
 
@@ -2307,283 +2529,599 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
         }
     }
 
-    // **Havia um sinal pendente nesta cv?** (o `signal` chegou antes do
-    // `wait` — ver a nota de `g_cv_pendente`.)
-    {
-        std::lock_guard<std::mutex> lock(g_arbiter.gate);
-        const auto it = g_cv_pendente.find(cv_key);
-        if (it != g_cv_pendente.end()) {
-            g_cv_pendente.erase(it);
-            std::fprintf(stderr,
-                         "[svc] WaitProcessWideKeyAtomic: sinal pendente na cv 0x%llx\n",
-                         static_cast<unsigned long long>(cv_key));
-            ctx.ret     = 0;
-            ctx.has_ret = true;
-            ctx.x[1]    = 0;
-            return Result::Success;
-        }
-    }
+    // **A espera verdadeira, no modelo do ArbitrateLock/WaitForAddress** —
+    // a thread física PARKA dentro do SVC e larga o dono do despacho.
+    //
+    // O que este SVC faz no Eden (KConditionVariable::Wait,
+    // k_condition_variable.cpp:271-331), tudo sob o scheduler lock —
+    // aqui, sob o `g_arbiter.gate`:
+    //
+    //   1. sinal pendente (`g_cv_pendente`): consumido antes — o `signal`
+    //      que chegou quando ninguém estava registado é desta fila;
+    //   2. "Remove waiter thread" (:285-292): o PRIMEIRO waiter
+    //      estacionado no endereço do MUTEX sai da fila e torna-se o
+    //      próximo dono — next_value = tag dele (+ máscara se houver
+    //      mais), `EndWait(Success)` dele;
+    //   3. escreve 1 (HasWaiterFlag) na PALAVRA do cv_key, fence seq_cst
+    //      (:304-311);
+    //   4. escreve next_value no endereço do mutex (:313-317);
+    //   5. timeout == 0 → ResultTimedOut DEPOIS do handshake (:319),
+    //      SEM estacionar;
+    //   6. timeout != 0: regista (tag, addr, token) na fila do cv e dorme
+    //      (:324-331) — o despertar é do SignalImpl (0x1D), que transfere
+    //      o mutex ANTES de acordar (o `Success` devolve o mutex já em
+    //      mão). Nada de re-lock no caminho de despertar.
+    //
+    // **Identidade**: `read_thread_pointer()` NÃO serve o despacho — o
+    // trampolim troca o TPIDR_EL0 para o do host ANTES de chamar o
+    // handler, por isso `find_guest_thread_state` nunca casava (medido:
+    // BLOCK=0/SWITCH=0 em toda a corrida — as lanes rodavam em user-space
+    // a queimar traps sem nunca bloquear). O token em curso
+    // (`dispatch_owner_itself()`) é a identidade das outras esperas do
+    // quadro — e é o que se larga ao estacionar.
+    //
+    // **O que NÃO se faz aqui**: não se guarda gpr/pc e não se marca
+    // `waiting_on_cv`/`g_switch_to_tls` — a troca coopérativa por contexto
+    // salvo REEXECUTARIA código de guest depois do estacionamento (a
+    // thread fotográfica estacionada é VIVA: acorda pelo quadro). O
+    // `mark_ready_threads_on_cv` do sinal continua, e encontra ZERO
+    // thread com `waiting_on_cv` — os estacionados são por con-di-var,
+    // não pela troca.
 
-    // Eden :20-21: R_UNLESS(!IsKernelAddress(address), InvalidCurrentMemory) e
-    // alinhamento sizeof(s32) → InvalidAddress. (IsKernelAddress não se
-    // aplica a este guest: o espaço do processo não cruza a metade kernel.)
-    if (addr == 0 || (addr & 3) != 0)
-        return Result::InvalidAddress;
-
+    // O resultado que o entregador escreveu no quadro (Desperta*). Nível
+    // da função porque o pós-wait o usa.
+    std::uint8_t acordei_com = ArbitrationBoard::DespertaAguarda;
     std::uint64_t token = 0;
-    std::uint8_t  acordei_com = ArbitrationBoard::DespertaAguarda;
-    {
-        std::unique_lock<std::mutex> lock(g_arbiter.gate);
+    // Quem levou o mutex NESTE Wait (a fila do mutex tinha alguém): acorda
+    // FORA do gate, como o `ArbitrateUnlock` faz.
+    std::vector<std::uint64_t> wakers;
 
-        // ── (1) o mutex passa ao próximo waiter do ENDEREÇO ──
-        // A MESMA transacção do ArbitrateUnlock, mas conduzida pela thread
-        // da cv: sou o dono em curso e pop o primeiro da minha fila.
-        //
-        // **E o próximo dono tem de ser ACORDADO.** O Eden faz isto em
-        // `KConditionVariable::Wait` (`k_condition_variable.cpp:285-292`):
-        //
-        //     KThread* next_owner_thread = cur_thread->RemoveUserWaiterByKey(...);
-        //     if (next_owner_thread != nullptr) {
-        //         next_value = next_owner_thread->GetAddressKeyValue();
-        //         next_owner_thread->EndWait(ResultSuccess);   // <-- ACORDA
-        //     }
-        //
-        // Sem o `EndWait` — e portanto sem o nosso `notify` — o próximo
-        // dono fica **marcado** como entregue e **dorme para sempre**.
-        //
-        // **Medido** (`boot_p6o.log`): o `SignalProcessWideKey` encontrava
-        // o waiter (`count=1`) e não acordava ninguém (`acordados=0`); as
-        // threads do guest acabavam todas paradas à espera do mesmo
-        // mutex, e o jogo não avançava. Era este o `notify` em falta.
-        std::uint32_t next = 0;
-        bool acordou_proximo = false;
-        const auto fila_it = g_arbiter.fila.find(addr);
-        if (fila_it != g_arbiter.fila.end() && !fila_it->second.empty()) {
-            const ArbitrationBoard::Waiter w = fila_it->second.front();
-            fila_it->second.erase(fila_it->second.begin());
-            if (fila_it->second.empty())
-                g_arbiter.fila.erase(fila_it);
-            const bool mais = g_arbiter.fila.count(addr) != 0;
-            next = w.tag | (mais ? kArbWaitMask : 0u);
-            g_arbiter.desperta[w.token] = ArbitrationBoard::DespertaSucesso;
-            acordou_proximo = true;
+    {
+        std::unique_lock<std::timed_mutex> lock(g_arbiter.gate,
+                                                std::defer_lock);
+        quadro_entrar(lock, "0x1c");
+
+        // **Sinal pendente** (o `signal` chegou antes do `wait`): consome
+        // e devolve Success — o mesmo acordo que os runs velhos tinham.
+        // (Sob o gate: qualquer `signal` posterior já nos encontra
+        // registados na fila — sem janela de sinal perdido entre o teste
+        // e o registo.)
+        {
+            const auto it = g_cv_pendente.find(cv_key);
+            if (it != g_cv_pendente.end()) {
+                g_cv_pendente.erase(it);
+                std::fprintf(stderr,
+                             "[svc] WaitProcessWideKeyAtomic: sinal pendente na cv 0x%llx\n",
+                             static_cast<unsigned long long>(cv_key));
+                ctx.ret     = 0;
+                ctx.has_ret = true;
+                ctx.x[1]    = 0;
+                return Result::Success;
+            }
         }
 
-        // ── (2)+(3) a ORDEM está medida no Eden: bandeira do cv_key
-        // primeiro, fence seq_cst, e SÓ ENTÃO a palavra do mutex ──
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        const std::uint32_t um = 1;  // HasWaiterFlag (:308)
-        if (!write_guest(cv_key, &um, sizeof um))
-            return Result::InvalidCurrentMemory;
-        if (!write_guest(addr, &next, sizeof next))
-            return Result::InvalidCurrentMemory;  // Eden (:316)
-
-        // O próximo dono acorda **aqui**, com o gate tomado.
-        //
-        // É o que o Eden faz: o `EndWait` está dentro do scheduler lock.
-        // E é seguro: o predicado (`desperta[token]`) já está escrito
-        // ANTES do `notify`, por isso quem ainda não chegou ao `wait()`
-        // re-avalia o predicado quando tiver o gate — e quem já está a
-        // dormir éaccordado pelo próprio `notify`.
-        if (acordou_proximo)
-            g_arbiter.wake.notify_all();
-
-        // ── (4) timeout == 0: TimedOut pós-release, sem dormir ──
-        if (timeout == 0)
-            return Result::TimedOut;
-
-        // ── (5) marca na fila da cv e dorme ──
+        // Estacionar sem despacho em curso não é possível nesta estrutura —
+        // o wait chega de dentro da trap. Se algum dia chegar 0, é bug a
+        // registar, não semântica a burlar.
         token = dispatch_owner_itself();
         if (token == 0)
             return Result::InvalidState;
 
+        // O despertar passa pelo QUADRO: regista-se ANTES de largar o
+        // dono, e quem entrega (o SignalImpl) escreve o código do
+        // resultado. Registo e entrega correm ambos sob o gate — sem
+        // corrida de lost-wake (é o papel do scheduler lock no Eden).
         g_arbiter.desperta[token] = ArbitrationBoard::DespertaAguarda;
-        g_arbiter.cv_fila[cv_key].push_back({tag, addr, token});
-        if (std::getenv("IA_IPC_TRACE") != nullptr && cv_key >= 0x100000000ull &&
-            cv_key < 0x200000000ull) {
-            std::fprintf(stderr, "[arb] registado cv=0x%llx tag=0x%x fila=%zu token=0x%llx\n",
-                         static_cast<unsigned long long>(cv_key), tag,
-                         g_arbiter.cv_fila[cv_key].size(),
-                         static_cast<unsigned long long>(token));
-        }
-        dispatch_owner_vacate();
 
-        const auto dono_acordou = [&] {
-            if (guest_threads_paragem_ativa())
-                return true;
-            const auto d = g_arbiter.desperta.find(token);
-            return d != g_arbiter.desperta.end() &&
-                   d->second != ArbitrationBoard::DespertaAguarda;
-        };
+        // Registo na fila do cv — a MESMA entrada que o SignalImpl capita
+        // e pova. Para timeout == 0 não há registo (upstream :324: a tree
+        // só recebe quem dorme).
+        const bool dorme = timeout != 0;
+        if (dorme)
+            g_arbiter.cv_fila[cv_key].push_back({tag, addr, token});
 
-        static const bool trace_wait_hz = std::getenv("G610_SVC_WAIT_HZ") != nullptr;
-        const auto inicio = std::chrono::steady_clock::now();
-        // **Fase desperta** (`G610_SVC_WAIT_HZ=1`): o tempo real decaído
-        // desde a ultima entrada nesta mesma cv. LOG31 mediu a parede
-        // (TimerEvent 0xd9c2c22c) num run de 1,6 s (4000 traps): 157
-        // esperas com `real` ~4,8 ms (soma 0,75 s) e `desde` ~5 ms —
-        // a parede reentra logo a seguir a acordar; o resto do run e'
-        // o boot e a cauda de "sinal pendente" (sem sono).
-        static std::mutex portica_hz_;
-        static std::unordered_map<std::uint64_t,
-            std::chrono::steady_clock::time_point> ultima_hz_;
-        std::uint64_t desde = 0;
-        if (trace_wait_hz) {
-            std::chrono::steady_clock::time_point anterior;
-            {
-                std::lock_guard<std::mutex> beleira(portica_hz_);
-                auto it = ultima_hz_.find(cv_key);
-                if (it != ultima_hz_.end()) {
-                    anterior = it->second;
-                    it->second = inicio;
-                    desde = std::chrono::duration_cast<
-                        std::chrono::nanoseconds>(inicio - anterior).count();
-                } else {
-                    ultima_hz_.emplace(cv_key, inicio);
-                }
-            }
-        }
-        if (timeout > 0) {
-            // **Medida do sono** (`G610_SVC_WAIT_HZ=1`): quanto o
-            // `wait_until` dorme de facto contra o prazo pedido. A parede
-            // do TimerEvent dorme ~4,8 ms e dispara a ~200 Hz na sua
-            // janela activa (LOG31: 157 esperas com `desde` ~5 ms em
-            // 0,78 s de janela) — se a espera real for de ordens acima
-            // do prazo, o sono e' o culpado e nao o guest. Leitura de
-            // relogio ja' feita nos mercados desta funcao; aqui so' o
-            // print das duas pontas.
-            const auto prazo = inicio + std::chrono::nanoseconds(timeout);
-            // Predic-versão do wait_until: devolve o VALOR FINAL do
-            // predicado. Se o sinal entrou no último instante, o
-            // predicado final é o que conta — a mesma arbitragem de quem
-            // faz EndWait primeiro no Eden.
-            if (!g_arbiter.wake.wait_until(lock, prazo, dono_acordou)) {
-                // Prazo sob o gate, ninguém entregou. Sai do QUADRO para
-                // sempre: posso estar na fila da cv OU, se o Signal já me
-                // moveu, na fila do dono (a tree do Eden desmonta a espera
-                // no cancel do timer; aqui a remoção é por token nas duas
-                // filas).
-                if (auto cv = g_arbiter.cv_fila.find(cv_key);
-                    cv != g_arbiter.cv_fila.end()) {
-                    auto& fila = cv->second;
-                    for (auto w = fila.begin(); w != fila.end(); ++w)
-                        if (w->token == token) { fila.erase(w); break; }
-                    if (fila.empty())
-                        g_arbiter.cv_fila.erase(cv);
-                }
-                for (auto f = g_arbiter.fila.begin(); f != g_arbiter.fila.end();) {
-                    auto& fila = f->second;
-                    for (auto w = fila.begin(); w != fila.end(); ++w)
-                        if (w->token == token) { fila.erase(w); break; }
-                    if (fila.empty())
-                        f = g_arbiter.fila.erase(f);
-                    else
-                        ++f;
-                }
-                g_arbiter.desperta.erase(token);
-                dispatch_owner_set(token);
-                (void)dispatch_owner_claim();
-                if (trace_wait_hz) {
-                    const auto dur = std::chrono::duration_cast<
-                        std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
-                                                  inicio).count();
-                    std::fprintf(stderr,
-                                 "[svc] TimedWait TIMEOUT cv=0x%llx tag=0x%x "
-                                 "pedido=%lld real=%lld desde=%llu\n",
-                                 static_cast<unsigned long long>(cv_key),
-                                 tag, static_cast<long long>(timeout),
-                                 static_cast<long long>(dur),
-                                 static_cast<unsigned long long>(desde));
-                }
-                return Result::TimedOut;
-            }
-        } else {
-            // Negativo: espera sem fim.
-            //
-            // **Com uma rede de segurança.** Medido: o jogo perde um
-            // sinal (o `signal` chega *antes* do `wait` — no Eden os
-            // dois são serializados pelo scheduler lock, e o nosso quadro
-            // não os serializa nessa janela). Com a espera a expirar, o
-            // guest re-avalia o seu predicado e volta a esperar — que é
-            // o que uma *cv* bem usada faz.
-            //
-            // `IA_WAIT_MS` desliga a rede (espera infinita, como o Eden).
-            //
-            // **O prazo é só para diagnóstico** (`IA_WAIT_MS`). Com ele,
-            // o *waiter* desiste e sai da fila — e o sinal que chegava
-            // depois já não tinha ninguém para acordar (medido: o
-            // *worker* do jogo ficou à espera para sempre, e o jogo
-            // parou num "limite de traps").
-            //
-            // A espera normal é **sem fim**, como no Eden ✓ — e as
-            // perdas de sinal estão cobertas pelo "sinal pendente" e
-            // pelo signal que acorda o *waiter*.
-            const char* prazo_ms = std::getenv("IA_WAIT_MS");
-            bool expirou = false;
-            if (prazo_ms != nullptr) {
-                expirou = !g_arbiter.wake.wait_for(
-                    lock, std::chrono::milliseconds(std::atoi(prazo_ms)), dono_acordou);
-            } else {
-                g_arbiter.wake.wait(lock, dono_acordou);
-            }
-            if (expirou) {
-                // Expirou: sai da fila (como o caminho do prazo).
-                if (auto cv = g_arbiter.cv_fila.find(cv_key);
-                    cv != g_arbiter.cv_fila.end()) {
-                    auto& fila = cv->second;
-                    for (auto w = fila.begin(); w != fila.end(); ++w)
-                        if (w->token == token) { fila.erase(w); break; }
-                    if (fila.empty())
-                        g_arbiter.cv_fila.erase(cv);
-                }
-                for (auto f = g_arbiter.fila.begin(); f != g_arbiter.fila.end();) {
-                    auto& fila = f->second;
-                    for (auto w = fila.begin(); w != fila.end(); ++w)
-                        if (w->token == token) { fila.erase(w); break; }
-                    if (fila.empty())
-                        f = g_arbiter.fila.erase(f);
-                    else
-                        ++f;
-                }
-                g_arbiter.desperta.erase(token);
-                dispatch_owner_set(token);
-                (void)dispatch_owner_claim();
-                return Result::TimedOut;
+        // ── "Remove waiter thread" — a fila do MUTEX ─────────────────
+        // O PRIMEIRO waiter do mutex torna-se o próximo dono; fila vazia
+        // ⇒ a palavra passa a 0 (cabeça livre).
+        std::uint32_t next_value = 0;
+        {
+            const auto it = g_arbiter.fila.find(addr);
+            if (it != g_arbiter.fila.end() && !it->second.empty()) {
+                const ArbitrationBoard::Waiter w = it->second.front();
+                it->second.erase(it->second.begin());
+                if (it->second.empty())
+                    g_arbiter.fila.erase(it);
+                // Eden :122 — `if (has_waiters) next_value |= HandleWaitMask`.
+                const bool mais = g_arbiter.fila.count(addr) != 0;
+                next_value = w.tag | (mais ? kArbWaitMask : 0u);
+                // `EndWait(ResultSuccess)` do novo dono.
+                g_arbiter.desperta[w.token] =
+                    ArbitrationBoard::DespertaSucesso;
+                wakers.push_back(w.token);
             }
         }
 
-        // A PARAGEM pode ser o que acordou (predicado ✓ sem entrega
-        // nenhuma em `desperta`): sair limpo e voltar pelo fim — o
-        // handler re-encaminha para a recuperação. Sem o check, o
-        // `.at(token)` seguinte lançava (out_of_range) e a thread
-        // morria no std::terminate em vez de sair.
-        if (guest_threads_paragem_ativa()) {
+        // **A entrega vai COM o despertar.** O waiter popado já saiu da
+        // fila e, no Eden, EndWait dele acontece DENTRO do scheduler
+        // lock (a thread já fica pronta). Aqui o notify saía só DEPOIS
+        // do MEU próprio park — e se eu (A) estacionar antes de um
+        // desperta meu que só o waiter entregue pode produzir, a
+        // lógica trava: A parqueia, B entregue (`desperta[B]=1`) dorme
+        // sem notify — ninguém unlock, ninguém sinaliza (medida
+        // eden_arb.log tick 1-5: word=0x81ff, desperta[0x1]=1, fila=0,
+        // o produtor parou). O notify sob o gate repete o padrão do
+        // `ArbitrateUnlock` (DLOCK: desperta + notify) e do
+        // `guest_threads_parar`; quem for acordado sem ter o que
+        // fazer apenas re-avalia o predicado e volta a dormir.
+        if (!wakers.empty())
+            g_arbiter.wake.notify_all();
+
+        // ── HasWaiterFlag na palavra do cv_key ────────────────────────
+        bool estacionado = true;
+        {
+            const std::uint32_t um = 1;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (!escrita_atomica_word(cv_key, um)) {
+                // A palavra não está mapeada: a espera não se regista no
+                // guest — o resultado é o par do SignalImpl :247
+                // (`EndWait(ResultInvalidCurrentMemory)`).
+                g_arbiter.desperta[token] =
+                    ArbitrationBoard::DespertaInvalido;
+                estacionado = false;
+            }
+        }
+
+        // ── next_value no endereço do mutex ──────────────────────────
+        // (O caminho do unlock do Eden escreve com o mesmo fence — a
+        // ordem palavra→desperto é o que o protocolo do SDK lê.)
+        // **CAS-guardada**: o dono que se entrega tem de CHUMBAR a troca
+        // que o próprio SDK fez no meio (a lição da runL).
+        {
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            (void)escrita_atomica_word(addr, next_value);
+        }
+
+        static std::size_t park_n = 0;
+        if (std::getenv("IA_THREAD_TRACE") != nullptr &&
+            (park_n++ < 64 || park_n % 1000 == 0)) {
+            std::fprintf(stderr,
+                         "[thrd] PARK token=0x%llx cv=0x%llx sp=0x%llx pc=0x%llx "
+                         "tag=0x%x addr=0x%llx timeout=%lld\n",
+                         static_cast<unsigned long long>(token),
+                         static_cast<unsigned long long>(cv_key),
+                         static_cast<unsigned long long>(ctx.sp),
+                         static_cast<unsigned long long>(ctx.gpr[30]),
+                         tag,
+                         static_cast<unsigned long long>(addr),
+                         static_cast<long long>(timeout));
+        }
+
+        if (timeout == 0) {
+            // Eden :319 — ResultTimedOut DEPOIS do release, sem
+            // estacionar. O despacho JÁ é desta thread (nunca largado
+            // neste caminho): devolver directo.
             g_arbiter.desperta.erase(token);
+            lock.unlock();
+            if (!wakers.empty())
+                g_arbiter.wake.notify_all();
             return Result::TimedOut;
         }
+
+        if (estacionado) {
+            dispatch_owner_vacate();
+            const auto dono_acordou = [&] {
+                if (guest_threads_paragem_ativa())
+                    return true;
+                const auto d = g_arbiter.desperta.find(token);
+                return d != g_arbiter.desperta.end() &&
+                       d->second != ArbitrationBoard::DespertaAguarda;
+            };
+
+            if (timeout > 0) {
+                // HOS: prazo relativo em nanosegundos. (Tampa longe do
+                // overflow do relógio; ninguém espera 10 dias.)
+                const std::int64_t teto = timeout < (1LL << 56)
+                                              ? timeout : (1LL << 56);
+                const auto prazo = std::chrono::steady_clock::now() +
+                                   std::chrono::nanoseconds(teto);
+                if (!g_arbiter.wake.wait_until(lock, prazo, dono_acordou)) {
+                    // Prazo estourou. A entrega pode ter acontecido no
+                    // MESMO instante (notify contra o prazo): o quadro é a
+                    // verdade — preferir o resultado REAL da entrega, um
+                    // `TimedOut` aqui estragava o protocolo do mutex (o
+                    // sinalizador já lá escreveu o nosso tag).
+                    const auto d = g_arbiter.desperta.find(token);
+                    if (d == g_arbiter.desperta.end() ||
+                        d->second == ArbitrationBoard::DespertaAguarda) {
+                        // Timeout verdadeiro: sair da fila do cv — a tree
+                        // do Eden desmonta a espera no cancelamento do
+                        // timer; aqui a remoção é por token.
+                        if (auto cv = g_arbiter.cv_fila.find(cv_key);
+                            cv != g_arbiter.cv_fila.end()) {
+                            auto& fila = cv->second;
+                            for (auto w = fila.begin(); w != fila.end(); ++w)
+                                if (w->token == token) {
+                                    fila.erase(w);
+                                    break;
+                                }
+                            if (fila.empty())
+                                g_arbiter.cv_fila.erase(cv);
+                        }
+                        g_arbiter.desperta.erase(token);
+                        lock.unlock();
+                        if (!wakers.empty())
+                            g_arbiter.wake.notify_all();
+                        dispatch_owner_set(token);
+                        (void)dispatch_owner_claim();
+                        return Result::TimedOut;
+                    }
+                    // Entrega no instante do prazo: seguir como entrega
+                    // (abaixo). NÃO sair da fila — o sinalizador já nos
+                    // povou fora dela.
+                }
+            } else {
+                // timeout negativo: espera SEM FIM, como a ABI manda e a
+                // cv da parede passa (`x3 = 0xffffffffffffffff`). O
+                // `wait` recebe o predicado: a paragem (o fim de run) e a
+                // entrega ambos acordam.
+                g_arbiter.wake.wait(lock, dono_acordou);
+            }
+        }
+
+        // A paragem pode ser o que acordou (o fim de run) — como no Lock:
+        // sair limpo, a recuperação segue no próximo despacho.
+        if (guest_threads_paragem_ativa()) {
+            if (auto cv = g_arbiter.cv_fila.find(cv_key);
+                cv != g_arbiter.cv_fila.end()) {
+                auto& fila = cv->second;
+                for (auto w = fila.begin(); w != fila.end(); ++w)
+                    if (w->token == token) {
+                        fila.erase(w);
+                        break;
+                    }
+                if (fila.empty())
+                    g_arbiter.cv_fila.erase(cv);
+            }
+            g_arbiter.desperta.erase(token);
+            lock.unlock();
+            if (!wakers.empty())
+                g_arbiter.wake.notify_all();
+            dispatch_owner_set(token);
+            (void)dispatch_owner_claim();
+            return Result::TimedOut;
+        }
+
+        if (atr() && (park_n < 128 || park_n % 1000 == 0))
+            std::fprintf(stderr,
+                         "[thrd] ACORDEI token=0x%llx cv=0x%llx acordei=%d\n",
+                         static_cast<unsigned long long>(token),
+                         static_cast<unsigned long long>(cv_key),
+                         static_cast<int>(acordei_com));
         acordei_com = g_arbiter.desperta.at(token);
         g_arbiter.desperta.erase(token);
-        if (trace_wait_hz && timeout > 0) {
-            const auto dur = std::chrono::duration_cast<
-                std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
-                                          inicio).count();
-            std::fprintf(stderr,
-                         "[svc] TimedWait ACORDEI cv=0x%llx tag=0x%x "
-                         "pedido=%lld real=%lld desde=%llu\n",
-                         static_cast<unsigned long long>(cv_key),
-                         tag, static_cast<long long>(timeout),
-                         static_cast<long long>(dur),
-                         static_cast<unsigned long long>(desde));
-        }
     }
 
-    // Sucesso ⇒ o SignalImpl escreveu o MEU tag na palavra: mutex em mão,
-    // como o `Success` de fim de espera do Eden devolve a posse (:220).
-    // A thread volta ao despacho como o ArbitrateLock faz ao acordar.
+    // Voltar a tomar o despacho para terminar o SVC — idêntico ao Lock: se
+    // o teto de spin expirar (dono agarrado por muito tempo), a thread
+    // segue na mesma: a janela sem dono é o preço do caso degenerado.
     dispatch_owner_set(token);
     (void)dispatch_owner_claim();
+    // O novo dono do mutex estacionado acorda FORA do gate.
+    if (!wakers.empty())
+        g_arbiter.wake.notify_all();
+
+    // Falha de memória entregue pelo entregador: o Eden devolve
+    // InvalidCurrentMemory. `Success` devolve o mutex JÁ em mão — o
+    // sinalizador escreveu o nosso tag na palavra ANTES de despertar
+    // (Eden: WriteToUser, depois EndWait), nada a re-escrever aqui.
     if (acordei_com != ArbitrationBoard::DespertaSucesso)
         return Result::InvalidCurrentMemory;
+    ctx.ret     = 0;
+    ctx.has_ret = true;
+    ctx.x[1]    = 0;
+    return Result::Success;
+}
+
+// ── 0x34: WaitForAddress ──────────────────────────────────────────────────
+//
+// Eden: `svc_wait_for_address` (svc/svc_address_arbiter.cpp:44-76) →
+// `KAddressArbiter::WaitIfLessThan/WaitIfEqual` (k_address_arbiter.cpp:242-322).
+//
+// **E' o SVC no quadro do abort da runL** (`Break(payload 0x40)` com o
+// `sdk 0x83ab1dc4` no fim da cadeia): o `SdkMutexType::Lock` do nn::os —
+// medido no módulo (0x83ab1c60; wrapper svc `0x83b0bc34`) — chama
+// `WaitForAddress(&word, WaitIfEqual=2, value=1, timeout)` e ACEITA SÓ
+// `Success` e `InvalidState` (0xFA01, prog. 0x83ab1d64); qualquer outro
+// Result — incluído o `Unsupported` que o motor devolvia — vai para
+// `SetTerminateResult` + `Break`. O timeout do caminho do mutex é sempre
+// `-1` (`x20 = #-1`, prog. 0x83ab1c84); timeouts finitos existem noutros
+// chamadores do nn::os e são respeitados abaixo.
+//
+// Semântica por tipo (`ArbitrationType`, svc_types.h:73-77):
+//   0 WaitIfLessThan             — lê s32; word >= value ⇒ InvalidState;
+//   1 DecrementAndWaitIfLessThan — lê s32; word < value ⇒ DECREMENTA
+//                                  (RMW atómico, o monitor é o hardware)
+//                                  e espera; senão InvalidState;
+//   2 WaitIfEqual                — lê s32; word != value ⇒ InvalidState.
+// Validado ⇒ estaciona na fila do ENDEREÇO até um SignalToAddress (0x35)
+// — o Eden, dentro do scheduler lock, lê, valida e insere na tree numa
+// janela só; aqui a janela é o `g_arbiter.gate`, e a LEITURA entra nela:
+// fora dela, cai a corrida "sinal perdido" já medida na cv (o 0x35
+// escreve o word e desperta sob o MESMO gate).
+Result SvcDispatcher::svc_wait_for_address(SvcContext& ctx) {
+    const std::uint64_t addr    = ctx.x[0];
+    const std::uint32_t tipo    = static_cast<std::uint32_t>(ctx.x[1]);
+    const std::int32_t  valor   = static_cast<std::int32_t>(ctx.x[2]);
+    const std::int64_t  timeout = static_cast<std::int64_t>(ctx.x[3]);
+
+    // Eden :51-53 — alinhamento sizeof(s32) → InvalidAddress; enum →
+    // InvalidEnumValue. (IsKernelAddress não se aplica: o processo não
+    // cruza a metade kernel.)
+    if (addr == 0 || (addr & 3) != 0)
+        return Result::InvalidAddress;
+    if (tipo > 2)
+        return Result::InvalidEnumValue;
+
+    // O token EM CURSO (= o do ArbitrateLock): é o que se larga ao
+    // estacionar e a identidade de despertar do quadro.
+    const std::uint64_t token = dispatch_owner_itself();
+
+    // **A janela atómica de leitura**: sob o gate — ver cabeçalho.
+    std::unique_lock<std::timed_mutex> lock(g_arbiter.gate, std::defer_lock);
+    quadro_entrar(lock, "0x34");
+
+    std::uint32_t word = 0;
+    if (!read_guest(addr, &word, sizeof word))
+        return Result::InvalidCurrentMemory;  // Eden :57 R_THROW
+
+    bool esperar = false;
+    if (tipo == 1) {
+        // DecrementAndWaitIfLessThan — Eden `DecrementIfLessThan`
+        // (k_address_arbiter.cpp:41-69): exclusive-read, se < value
+        // exclusive-store value-1, repetindo o par até alcançar.
+        // O monitor exclusivo é o HARDWARE (o guest corre nativo); do
+        // lado de cá o par load/store exclusivo equivalente é um
+        // compare-exchange no byte do guest — a reserva é memória do
+        // host, e `host_pointer` é o `GetPointer` do Eden.
+        if (mem_ == nullptr)
+            return Result::InvalidCurrentMemory;
+        std::uint8_t* p = mem_->host_pointer(addr, sizeof word);
+        if (p == nullptr)
+            return Result::InvalidCurrentMemory;
+        for (;;) {
+            std::uint32_t bruto = 0;
+            std::memcpy(&bruto, p, sizeof bruto);
+            const std::int32_t atual = static_cast<std::int32_t>(bruto);
+            if (atual >= valor) {
+                // Eden :55-63 — ClearExclusive + *out = current; o teste
+                // `user_value >= value` manda InvalidState (o mesmo teste
+                // de WaitIfLessThan).
+                esperar = false;
+                break;
+            }
+            const std::uint32_t novo =
+                static_cast<std::uint32_t>(atual - 1);
+            std::uint32_t esperado = bruto;  // mutável: o CAS escreve lá o
+                                             // valor visto em caso de falha
+            if (__atomic_compare_exchange_n(
+                    p, &esperado, novo, false,
+                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+                esperar = true;
+                break;
+            }
+            // Perdeu o exclusive: o Eden repete o conjugado inteiro —
+            // re-ler e re-verificar (o word pode ter passado o valor).
+        }
+    } else if (tipo == 2) {
+        // WaitIfEqual — Eden :364-371: ler sob o lock e testar a
+        // igualdade EXACTA.
+        esperar = static_cast<std::int32_t>(word) == valor;
+    } else {
+        // WaitIfLessThan — Eden :305-311 (sem decremento; só lê).
+        esperar = static_cast<std::int32_t>(word) < valor;
+    }
+
+    if (!esperar) {
+        // Eden :309/:373 — R_THROW(ResultInvalidState) imediatamente, sem
+        // estacionar. É o Result que o SDK TOLERA (0xFA01): "verificámos,
+        // não calha".
+        return Result::InvalidState;
+    }
+    if (timeout == 0) {
+        // Eden :319/:381 — R_THROW(ResultTimedOut) DEPOIS do teste (o
+        // pedido é "esperar, mas com prazo zero").
+        return Result::TimedOut;
+    }
+
+    // ── Estacionar: Eden :32-34 — `SetAddressArbiter` + `m_tree.insert`,
+    // e dormir. O despertar é do 0x35.
+    g_arbiter.arb_fila[addr].push_back({token});
+    g_arbiter.desperta[token] = ArbitrationBoard::DespertaAguarda;
+    dispatch_owner_vacate();
+
+    const auto dono_acordou = [&] {
+        if (guest_threads_paragem_ativa())
+            return true;
+        const auto d = g_arbiter.desperta.find(token);
+        return d != g_arbiter.desperta.end() &&
+               d->second != ArbitrationBoard::DespertaAguarda;
+    };
+
+    if (timeout > 0) {
+        const auto prazo = std::chrono::steady_clock::now() +
+                           std::chrono::nanoseconds(timeout);
+        if (!g_arbiter.wake.wait_until(lock, prazo, dono_acordou)) {
+            // Prazo estourou: sair da fila do ENDEREÇO (a tree do Eden
+            // desmonta a espera no cancel do timer; aqui a remoção é por
+            // token — o sinal pode já ter registado entrega, mas o woken
+            // não reclamou: o `.at(token)` iria deitar fora a entrega e
+            // o signaler perde um waiter contado. O Eden resolve por o
+            // `EndWait` acontecer em UM lado só; nós largamos a entrega —
+            // o waiter sai TimedOut e re-avalia o seu predicado.
+            if (auto arb = g_arbiter.arb_fila.find(addr);
+                arb != g_arbiter.arb_fila.end()) {
+                auto& fila = arb->second;
+                for (auto w = fila.begin(); w != fila.end(); ++w)
+                    if (w->token == token) { fila.erase(w); break; }
+                if (fila.empty())
+                    g_arbiter.arb_fila.erase(arb);
+            }
+            g_arbiter.desperta.erase(token);
+            dispatch_owner_set(token);
+            (void)dispatch_owner_claim();
+            return Result::TimedOut;
+        }
+    } else {
+        // Timeout negativo: espera SEM FIM, como a ABI manda e o SDK
+        // passa (`x20 = #-1`). O `wait` recebe o predicado: a paragem
+        // (o fim de run) e a entrega ambos acordam.
+        g_arbiter.wake.wait(lock, dono_acordou);
+    }
+
+    // A paragem pode ser o que acordou (predicado ✓ sem entrega): o fim
+    // de run. Sair limpo — o handler re-encaminha para a recuperação.
+    if (guest_threads_paragem_ativa()) {
+        g_arbiter.desperta.erase(token);
+        dispatch_owner_set(token);
+        (void)dispatch_owner_claim();
+        return Result::TimedOut;
+    }
+
+    const auto acordei = g_arbiter.desperta.find(token);
+    if (acordei == g_arbiter.desperta.end() ||
+        acordei->second != ArbitrationBoard::DespertaSucesso) {
+        g_arbiter.desperta.erase(token);
+        dispatch_owner_set(token);
+        (void)dispatch_owner_claim();
+        return Result::InvalidCurrentMemory;
+    }
+    g_arbiter.desperta.erase(token);
+    lock.unlock();
+
+    // A espera acabou em SUCESSO. O word já foi escrito pelo signaler
+    // (o tipo de sinal manda) — o Eden não re-verifica o word à saída:
+    // `EndWait(ResultSuccess)` e regresso directo.
+    dispatch_owner_set(token);
+    (void)dispatch_owner_claim();
+    return Result::Success;
+}
+
+// ── 0x35: SignalToAddress ─────────────────────────────────────────────────
+//
+// Eden: `svc_signal_to_address` (svc/svc_address_arbiter.cpp:79-100) →
+// `KAddressArbiter::Signal*` (k_address_arbiter.cpp:90-240).
+//
+// **Medido no módulo sdk** — o `SdkMutexType::Unlock` (0x83ab1ad0, wrapper
+// svc `0x83b0bc3c`) acorda com dois tipos:
+//   • word==1 → `SignalToAddress(word, SignalAndModifyByWaiting-
+//     CountIfEqual=2, value=1, count=1)` (prog. 0x83ab1b40-0x83ab1b50);
+//   • build não flagada: `SignalToAddress(word, SignalAndIncrementIf-
+//     Equal=1, value=1, count=-1)` (prog. 0x83ab1bac-0x83ab1bbc).
+// E aceita de novo só Success/InvalidState (0xFA01): InvalidState = "o
+// word não é o valor esperado" ⇒ o unlock RECOMEÇA (prog. 0x83ab1b5c,
+// 0x83ab1bc8) — por isso o Result tem de ser o EXACTO da ABI.
+//
+// Modelo de valor (`SignalType`, svc_types.h:67-71):
+//   0 Signal                    — sem acesso ao word; desperta até count;
+//   1 SignalAndIncrementIfEqual — word != value ⇒ InvalidState; senão
+//                                 word = value+1 e desperta até count;
+//   2 SignalAndModifyByWaitingCountIfEqual — word != value ⇒ InvalidState;
+//                                 senão novo = f(waiters, count) e desperta.
+// f, medida no Eden (`SignalAndModifyByWaitingCountIfEqual` :140-179), com
+// w = waiters estacionados no endereço:
+//   • count <= 0 (todos): w > 0 → value-2; w = 0 → value+1;
+//   • count > 0: w = 0 → value+1; 0 < w <= count → value-1; w > count →
+//     value (o "novo" IGUAL ao value não escreve — o Eden só lê).
+// `count <= 0` no despertar significa TODOS (`count <= 0 || num_waiters <
+// count`, :93/:118/:184).
+Result SvcDispatcher::svc_signal_to_address(SvcContext& ctx) {
+    const std::uint64_t addr  = ctx.x[0];
+    const std::uint32_t tipo  = static_cast<std::uint32_t>(ctx.x[1]);
+    const std::int32_t  valor = static_cast<std::int32_t>(ctx.x[2]);
+    const std::int32_t  count = static_cast<std::int32_t>(ctx.x[3]);
+
+    if (addr == 0 || (addr & 3) != 0)
+        return Result::InvalidAddress;
+    if (tipo > 2)
+        return Result::InvalidEnumValue;
+
+    // Os tokens a acordar — o notify é FORA do gate (o precedente das
+    // restantes sincronizações).
+    std::vector<std::uint64_t> acordados;
+
+    {
+        std::unique_lock<std::timed_mutex> lock(g_arbiter.gate,
+                                                std::defer_lock);
+        quadro_entrar(lock, "0x35");
+
+        std::uint32_t word = 0;
+        if (tipo != 0 && !read_guest(addr, &word, sizeof word))
+            return Result::InvalidCurrentMemory;
+
+        std::int32_t novo_valor = 0;
+        if (tipo == 1) {
+            if (static_cast<std::int32_t>(word) != valor)
+                return Result::InvalidState;  // Eden :129 R_UNLESS(user==value)
+            novo_valor = valor + 1;
+        } else if (tipo == 2) {
+            if (static_cast<std::int32_t>(word) != valor)
+                return Result::InvalidState;
+            // A CONTA dos waiters é o CONTEÚDO da fila: quem está
+            // estacionado no endereço NO MOMENTO do sinal, sob o MESMO
+            // lock em que o word é escrito — a janela atómica é esta.
+            const auto w = g_arbiter.arb_fila.find(addr);
+            const std::size_t waiters =
+                (w == g_arbiter.arb_fila.end()) ? 0 : w->second.size();
+            if (count <= 0)
+                novo_valor = (waiters > 0) ? valor - 2 : valor + 1;
+            else if (waiters == 0)
+                novo_valor = valor + 1;
+            else if (waiters <= static_cast<std::size_t>(count))
+                novo_valor = valor - 1;
+            else
+                novo_valor = valor;
+        }
+
+        if (novo_valor != static_cast<std::int32_t>(word) && tipo != 0) {
+            // Eden :166-171/:224-227 — `UpdateIfEqual` escreve; sem
+            // escrita quando o novo é igual (o caminho `ReadFromUser`).
+            // A barreira vem antes da escrita, como nas restantes
+            // sincronizações do motor.
+            //
+            // **CAS-guardada** (a lição da runL): o decremento cego pode
+            // sobrescrever um passo LL/SC que o SDK do guest fez no meio
+            // deste SVC — a re-leitura interna repõe o valor rival e a
+            // troca repete. O `novo` é a DECISÃO do quadro (o waiters=
+            // já foi consumido), nunca derivada da re-leitura.
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            const std::uint32_t novo = static_cast<std::uint32_t>(novo_valor);
+            if (!escrita_atomica_word(addr, novo))
+                return Result::InvalidCurrentMemory;  // Eden :226 R_UNLESS
+        }
+
+        // ── EndWait(ResultSuccess) até `count` (count <= 0 ⇒ todos).
+        auto it = g_arbiter.arb_fila.find(addr);
+        if (it == g_arbiter.arb_fila.end())
+            return Result::Success;  // Eden: tree vazia ⇒ SUCCEED (:90-101)
+        std::size_t quero = (count <= 0)
+                                ? it->second.size()
+                                : std::min<std::size_t>(
+                                      static_cast<std::size_t>(count),
+                                      it->second.size());
+        for (std::size_t i = 0; i < quero; ++i) {
+            const std::uint64_t token = it->second.front().token;
+            it->second.erase(it->second.begin());
+            // Eden :97-99/:126/:187 — `EndWait(ResultSuccess)`.
+            g_arbiter.desperta[token] = ArbitrationBoard::DespertaSucesso;
+            acordados.push_back(token);
+        }
+        if (it->second.empty())
+            g_arbiter.arb_fila.erase(it);
+    }
+
+    if (!acordados.empty())
+        g_arbiter.wake.notify_all();
+
     return Result::Success;
 }
 
@@ -2703,7 +3241,9 @@ Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
     std::size_t acordados = 0;
 
     {
-        std::lock_guard<std::mutex> lock(g_arbiter.gate);
+        std::unique_lock<std::timed_mutex> lock(g_arbiter.gate,
+                                                std::defer_lock);
+        quadro_entrar(lock, "0x1d");
 
         const auto cv = g_arbiter.cv_fila.find(cv_key);
         const std::size_t total = (cv == g_arbiter.cv_fila.end())
@@ -2741,11 +3281,23 @@ Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
                              static_cast<unsigned long long>(w.addr), prev, w.tag,
                              prev == 0 ? "acorda (dono)" : "mexe para a fila do mutex");
             }
-            if (prev == 0) {
-                // :217-220 — prev_tag == Svc::InvalidHandle: a palavra
-                // passa ao waiter e ele acorda JÁ dono.
+            // **Entrega do sinal** (o `UpdateLockAtomic` do Eden). Um
+            // ÚNICO ciclo cobre os dois caminhos e resolve a troca
+            // perdida contra o LL/SC do guest:
+            //   - prev == 0: CAS(0 → tag) — o waiter acorda JÁ dono
+            //     (`SignalImpl :217-220`);
+            //   - prev != 0: CAS(observado → observado|0x40000000) sobre
+            //     o VALOR ATUAL — o waiter vai para a fila do dono e só
+            //     o `ArbitrateUnlock` do dono o acorda (:222-236).
+            //
+            // **Por que tantos CAS**: a escrita cega sobrescrevia uma
+            // troca feita pelo SDK no meio — e a palavra podia ficar
+            // `dono|waiters` SEM dono real (o congelamento da runL, svc
+            // #912: o worker estacionou sobre 0x400081ff órfã e dormiu
+            // para sempre enquanto o main esperava o sinal dele).
+            const auto entrega_acorda_dono = [&] {
                 std::atomic_thread_fence(std::memory_order_seq_cst);
-                if (write_guest(w.addr, &w.tag, sizeof w.tag))
+                if (cas_word_guest(w.addr, prev, w.tag))
                     g_arbiter.desperta[w.token] =
                         ArbitrationBoard::DespertaSucesso;
                 else
@@ -2753,52 +3305,25 @@ Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
                         ArbitrationBoard::DespertaInvalido;
                 ++acordados;
                 wakers.push_back(w.token);
-            } else {
-                // ── Existe dono — o upstream NAO acorda ───────────────
-                //
-                // O upstream (`k_condition_variable.cpp:222-236`) e'
-                // o `SignalImpl`: com o mutex ocupado, o `prev_tag`
-                // nao e' `InvalidHandle` — e o `EndWait` **nao** e'
-                // chamado. O waiter fica a espera e passa a fila
-                // do **dono** (`owner_thread->AddWaiter(thread)`).
-                //
-                // **O `ArbitrateUnlock`** — o `SignalToAddress`
-                // (`k_condition_variable.cpp:113-151`) — e' o que passa
-                // o mutex ao proximo e o **acorda**.
-                //
-                // **A casa acordava na mesma** e **dava-lhe o
-                // mutex** — o que **roubava o mutex ao dono**.
-                // O log mostra: `[arb] signal cv=0x10a2c7844 mutex=0x10a2c7838
-                // palavra=0x81ff tag=0x20003 -> mexe para a fila do mutex`
-                // — o mutex estava ocupado (`0x81ff`) e o
-                // waiter foi **acordado na mesma**.
-                //
-                // A consequencia: o dono do mutex (a thread de render)
-                // perde-o — e a cadeia de cv's do jogo nunca
-                // mais avanca. O jogo trava e o watchdog aborta
-                // (`SetTerminateResult modulo=2 desc=3005`).
-                //
-                // **O que se escreve** — o upstream
-                // (`k_condition_variable.cpp:217-220`):
-                //
-                //     if (prev_tag == Svc::InvalidHandle) {
-                //         thread->EndWait(ResultSuccess);   // <- so' aqui
-                //     } else {
-                //         owner_thread->AddWaiter(thread);   // <- espera
-                //     }
-                //
-                // A palavra do mutex fica — o upstream
-                // (`UpdateLockAtomic`) faz `value = expected |
-                // HandleWaitMask` — ou seja, o valor antigo **com o
-                // bit de "ha waiters"**.
+            };
+            for (int tenta = 0;; ++tenta) {
+                if (prev == 0) {
+                    entrega_acorda_dono();
+                    break;
+                }
                 const std::uint32_t novo = prev | kArbWaitMask;
                 std::atomic_thread_fence(std::memory_order_seq_cst);
-                if (write_guest(w.addr, &novo, sizeof novo)) {
+                if (cas_word_guest(w.addr, prev, novo)) {
                     // **O waiter NAO acorda** — vai para a fila do
                     // mutex, e so' o `ArbitrateUnlock` do dono o acorda
                     // (o upstream).
                     g_arbiter.fila[w.addr].push_back({w.tag, w.token});
-                } else {
+                    break;
+                }
+                // A troca caiu (o SDK correu no meio): re-ler a palavra
+                // e REPETIR — o caminho livre/em-fila re-decide sobre o
+                // valor ATUAL, nunca na leitura velha.
+                if (!read_guest(w.addr, &prev, sizeof prev)) {
                     // Sem acesso a memoria — o upstream
                     // (`k_condition_variable.cpp:243`):
                     // `thread->EndWait(ResultInvalidCurrentMemory)`.
@@ -2806,6 +3331,16 @@ Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
                         ArbitrationBoard::DespertaInvalido;
                     ++acordados;
                     wakers.push_back(w.token);
+                    break;
+                }
+                if (tenta >= 16) {
+                    // Reserva degenerada (o rival nunca solta a palavra):
+                    // entrega pela fila do dono e a palavra com reserva.
+                    const std::uint32_t dele = prev | kArbWaitMask;
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    (void)escrita_atomica_word(w.addr, dele);
+                    g_arbiter.fila[w.addr].push_back({w.tag, w.token});
+                    break;
                 }
             }
         }
@@ -2831,6 +3366,16 @@ Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
             std::atomic_thread_fence(std::memory_order_seq_cst);
             (void)write_guest(cv_key, &zero, sizeof zero);
         }
+    }
+
+    // Marca como prontas apenas as threads que esperavam nesta cv.
+    mark_ready_threads_on_cv(cv_key);
+
+    if (std::getenv("IA_THREAD_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[thrd] SIGNAL cv=0x%llx count=%d acordados=%zu pendente=%zu\n",
+                     static_cast<unsigned long long>(cv_key), count, acordados,
+                     g_cv_pendente.size());
     }
 
     if (!wakers.empty())
@@ -2867,6 +3412,8 @@ std::uint64_t SvcDispatcher::random_u64() {
     return v;
 }
 
+// A SVC desconhecida. O `Unsupported` não é um Result HOS: é a marca do
+// motor — ver o comentário de `Result::Unsupported` no cabeçalho.
 Result SvcDispatcher::svc_unsupported(SvcContext&) {
     return Result::Unsupported;
 }
@@ -2892,6 +3439,14 @@ Result SvcDispatcher::svc_unsupported(SvcContext&) {
 // `k_condition_variable.cpp:209-220`): a palavra do mutex passa a zero
 // (liberta) e o *waiter* acorda **já dono** — por isso é preciso
 // escrever na memória do guest, e não só tocar no token.
+void g610::SvcDispatcher::ProcessPendingIpcPendente() {
+    // Helper não-estático: permite que hooks static (RegistarTrabalhoGpu,
+    // DespertarCvWaitersDoGuest) alcancem o EdenSystem do dispatcher corrente
+    // através de `g_dispatcher_atual`.
+    if (eden_)
+        eden_->ProcessPendingSynchronously();
+}
+
 void g610::SvcDispatcher::RegistarTrabalhoGpu() {
     // **Sem sinal proprio** — o sinal e' o do `KEvent`.
     //
@@ -2899,53 +3454,298 @@ void g610::SvcDispatcher::RegistarTrabalhoGpu() {
     // metodo de canal que incrementa a fence). Mas ja' nao ha flag
     // para ler: o `KEvent` ja' foi sinalizado, e o
     // `WaitSynchronization` do guest ve-o.
+    //
+    // Quando o syncpoint da GPU avanca, threads de guest podem estar
+    // bloqueadas em cv's esperando a conclusao do trabalho. Em vez de
+    // acordar todas (que causa busy round-robin sem progresso),
+    // tentamos processar IPCs pendentes — um deles pode sinalizar
+    // a cv que alguma thread espera.
+    if (g_dispatcher_atual)
+        g_dispatcher_atual->ProcessPendingIpcPendente();
 }
 
 void g610::SvcDispatcher::AcordarFutexNoEndereco(std::uint64_t endereco) {
     if (endereco == 0)
         return;
-    std::unique_lock<std::mutex> lock(g_arbiter.gate);
+    std::unique_lock<std::timed_mutex> lock(g_arbiter.gate, std::defer_lock);
+    quadro_entrar(lock, "gpu-wake");
+    bool acordou = false;
     const auto cv = g_arbiter.cv_fila.find(endereco);
-    if (cv == g_arbiter.cv_fila.end() || cv->second.empty())
-        return;
-    const ArbitrationBoard::CvWaiter w = cv->second.front();
-    cv->second.erase(cv->second.begin());
-    if (cv->second.empty())
-        g_arbiter.cv_fila.erase(cv);
-                // A palavra do mutex passa a zero (liberta) e o waiter acorda
-    // **dono** — o Eden, `SignalImpl` (`k_condition_variable.cpp:209-220`).
-    const std::uint32_t zero = 0;
-    (void)g_dispatcher_atual->write_guest(w.addr, &zero, sizeof zero);
-    g_arbiter.desperta[w.token] = ArbitrationBoard::DespertaSucesso;
+    if (cv != g_arbiter.cv_fila.end() && !cv->second.empty()) {
+        const ArbitrationBoard::CvWaiter w = cv->second.front();
+        cv->second.erase(cv->second.begin());
+        if (cv->second.empty())
+            g_arbiter.cv_fila.erase(cv);
+        // A palavra do mutex passa a zero (liberta) e o waiter acorda
+        // **dono** — o Eden, `SignalImpl` (`k_condition_variable.cpp:209-220`).
+        // **CAS-guardada** (a lição da runL): a escrita cega podia
+        // sobrescrever um passo LL/SC do SDK no meio — a reserva
+        // degenerada da `escrita_atomica_word` mantém liveness.
+        (void)g_dispatcher_atual->escrita_atomica_word(w.addr, 0);
+        g_arbiter.desperta[w.token] = ArbitrationBoard::DespertaSucesso;
+        acordou = true;
+    }
+
+    // **E o arbiter de endereços (0x34)**. O driver escreve o VALOR do
+    // semáforo e desperta quem estava a olhar para o endereço — o
+    // equivalente de `SignalToAddress(addr, Signal, value, todos)` do
+    // Eden (`puller.cpp` — ProcessSemaphoreTriggerMethod). Sem isto, um
+    // waiter do 0x34 estacionado numa fence do GPU dorme para sempre: a
+    // cv e a árvore do arbiter não partilham namespace (`KAddressArbiter`
+    // é distinta de `KConditionVariable`), por isso cada fila acorda a
+    // sua.
+    if (auto arb = g_arbiter.arb_fila.find(endereco);
+        arb != g_arbiter.arb_fila.end() && !arb->second.empty()) {
+        while (!arb->second.empty()) {
+            const std::uint64_t token = arb->second.front().token;
+            arb->second.erase(arb->second.begin());
+            g_arbiter.desperta[token] = ArbitrationBoard::DespertaSucesso;
+        }
+        g_arbiter.arb_fila.erase(arb);
+        acordou = true;
+    }
+
     lock.unlock();
-    g_arbiter.wake.notify_all();
+    if (acordou)
+        g_arbiter.wake.notify_all();
 }
 
 void g610::SvcDispatcher::DespertarCvWaitersDoGuest() {
     if (g_dispatcher_atual == nullptr)
         return;
 
-    std::unique_lock<std::mutex> lock(g_arbiter.gate);
-    std::size_t acordados = 0;
-    for (auto& [cv_key, fila] : g_arbiter.cv_fila) {
-        (void)cv_key;
-        while (!fila.empty()) {
-            const ArbitrationBoard::CvWaiter w = fila.front();
-            fila.erase(fila.begin());
+    // Quando o trabalho da GPU conclui, despertamos todas as threads de
+    // guest bloqueadas em cv's para que re-avaliem os seus predicados.
+    // Em vez de acordar todas (busy round-robin), processamos IPCs
+    // pendentes — um deles pode sinalizar a cv que alguma thread espera.
+    if (g_dispatcher_atual)
+        g_dispatcher_atual->ProcessPendingIpcPendente();
+    g_arbiter.wake.notify_all();
+}
 
-            // Liberta o mutex: a palavra tem de estar a zero para o
-            // waiter acordar dono.
+// **Acorda um waiter de cada fila de ArbitrateLock (mutex).**
+// Usado para romper deadlocks onde o dono de um mutex está estacionado
+// numa cv e ninguém o acorda. Cada fila de mutex acorda o seu primeiro
+// waiter, que retoma o despacho e pode avançar.
+// Não limpa as filas inteiras — só solta um por endereço para evitar
+// tempestade de despertares.
+void g610::SvcDispatcher::DespertarUmWaiterDeCadaFilaDeMutexECvs() {
+    bool acordou = false;
+    for (auto it = g_arbiter.fila.begin(); it != g_arbiter.fila.end();) {
+        auto& fila = it->second;
+        if (fila.empty()) {
+            ++it;
+            continue;
+        }
+        const ArbitrationBoard::Waiter w = fila.front();
+        const std::uint64_t addr = it->first;
+        fila.erase(fila.begin());
+        if (fila.empty())
+            it = g_arbiter.fila.erase(it);
+        else
+            ++it;
+
+        const bool mais = g_arbiter.fila.count(addr) != 0;
+        const std::uint32_t next = w.tag | (mais ? kArbWaitMask : 0u);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        (void)escrita_atomica_word(addr, next);
+        g_arbiter.desperta[w.token] = ArbitrationBoard::DespertaSucesso;
+        acordou = true;
+    }
+
+    // Acorda TODOS os waiters de cada cv_fila. Cada thread acordado
+    // reavalia a sua predicada de espera — se ainda nao estiver satisfeita,
+    // estaciona de novo. Isto rompe deadlocks onde um sinal foi enviado
+    // para uma cv sem waiters enquanto threads esperam em outras cv's.
+    for (auto it = g_arbiter.cv_fila.begin(); it != g_arbiter.cv_fila.end();) {
+        auto& cvfila = it->second;
+        while (!cvfila.empty()) {
+            const ArbitrationBoard::CvWaiter w = cvfila.front();
+            cvfila.erase(cvfila.begin());
+
             const std::uint32_t zero = 0;
-            (void)g_dispatcher_atual->write_guest(w.addr, &zero, sizeof zero);
-
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            (void)escrita_atomica_word(it->first, zero);
             g_arbiter.desperta[w.token] = ArbitrationBoard::DespertaSucesso;
-            ++acordados;
+            acordou = true;
+        }
+        it = g_arbiter.cv_fila.erase(it);
+    }
+
+    if (acordou)
+        g_arbiter.wake.notify_all();
+}
+
+// **Dump do quadro de arbitração** (g610_dump_arbiter) — chamado do tracer
+// (um por tick do alarme e antes do relatório final).
+//
+// Por que existe: a fila do run mistura as threads (prints entre si) e os
+// prints por chamada são limitados (`park_n % 1000`); sem o quadro no
+// MOMENTO do congelamento a leitura fica na hipótese. O quadro dá: os
+// waiters de mutex (fila), os waiters de cv (cv_fila), o canal de
+// desperta e as PALAVRAS guest (mutex/cv) — o estado impossível "dono
+// parca na cv" torna-se visível na hora, não por inferência.
+//
+// Limites: sem alocação, snprintf+::write (padrão do dump por thread);
+// NÃO TOMA o gate — try_lock: se o interessado interrompeu o dono —
+// os mapas podem estar em transição e não percorremos; despeja só as
+// palavras. No contexto normal (fim do run) o gate está livre: dump
+// completo.
+// Escrita em 2 sem (void)-cast (GCC ignora o cast para warn_unused_result).
+static inline void esc2(const void* dado, std::size_t tam) {
+    const ssize_t w = ::write(2, dado, tam);
+    (void)w;
+}
+
+extern "C" void g610_dump_arbiter() {
+    char b[192];
+
+    // Palavras de referência (o par de render e o par da bomba) — leitura
+    // barata e segura (mapa de memória do guest).
+    struct Par { std::uint64_t addr; const char* nome; };
+    static const Par par[4] = {
+        {0x10a5096d8, "mutex.render"},
+        {0x10a5096e4, "cv.render"},
+        {0x10a52c308, "mutex.bomba"},
+        {0x10a52c314, "cv.bomba"},
+    };
+    for (const auto& p : par) {
+        std::uint32_t w = 0;
+        const bool ok = g_dispatcher_atual != nullptr &&
+                        g_dispatcher_atual->read_guest(p.addr, &w, sizeof w);
+        int k = std::snprintf(
+            b, sizeof b, "[arb] word %s 0x%llx = 0x%x%s\n", p.nome,
+            (unsigned long long)p.addr, ok ? w : 0, ok ? "" : " (sem leitura)");
+        esc2(b, std::size_t(k));
+    }
+
+    // Janela da fila de render (x20+0x300..0x340: a cabeça/cauda e a
+    // vizinhanca) — um quadro por tick: se o produtor mexe, aparece aqui.
+    if (g_dispatcher_atual != nullptr) {
+        std::uint8_t janela[0x40] = {};
+        const bool ok = g_dispatcher_atual->read_guest(
+            0x10a509660, janela, sizeof janela);
+        if (ok) {
+            char linha[320];
+            std::size_t n = 0;
+            n = static_cast<std::size_t>(
+                std::snprintf(linha, sizeof linha, "[arb] janela.render:"));
+            for (std::size_t o = 0; o < sizeof janela; o += 4) {
+                std::uint32_t d = 0;
+                std::memcpy(&d, janela + o, sizeof d);
+                n += static_cast<std::size_t>(std::snprintf(
+                    linha + n, sizeof(linha) - n, " %08x", d));
+                if (n + 5 >= sizeof(linha))
+                    break;
+            }
+            n += static_cast<std::size_t>(
+                std::snprintf(linha + n, sizeof(linha) - n, "\n"));
+            esc2(linha, n);
+        } else {
+            esc2("[arb] janela.render: sem leitura\n", 27);
         }
     }
 
-    if (acordados > 0) {
-        std::fprintf(stderr, "[gpu] a GPU terminou: %zu waiter(s) acordados\n", acordados);
-        g_arbiter.wake.notify_all();
+    // As outras janelas de interesse (a sentinela da fila, a fila
+    // cruzada +0x310/+0x318 e o contexto do submitter dono+0x138) —
+    // a mesma regra: um quadro por tick, para ver o produtor mexer.
+    if (g_dispatcher_atual != nullptr) {
+        struct Janela { std::uint64_t base; const char* nome; };
+        static const Janela jan[3] = {
+            {0x10a509cd0, "sentinela"},
+            {0x10a2c29e8, "cruzada"},
+            {0x10a2c6ef0, "dono"},
+        };
+        for (const auto& j : jan) {
+            std::uint8_t janela[0x40] = {};
+            const bool ok = g_dispatcher_atual->read_guest(
+                j.base, janela, sizeof janela);
+            if (!ok) {
+                char vazio[64];
+                const int kv = std::snprintf(
+                    vazio, sizeof vazio, "[arb] janela.%s: sem leitura\n",
+                    j.nome);
+                esc2(vazio, std::size_t(kv));
+                continue;
+            }
+            char linha[320];
+            std::size_t n = std::snprintf(
+                linha, sizeof linha, "[arb] janela.%s:", j.nome);
+            for (std::size_t o = 0; o < sizeof janela; o += 4) {
+                std::uint32_t d = 0;
+                std::memcpy(&d, janela + o, sizeof d);
+                n += std::snprintf(linha + n, sizeof(linha) - n,
+                                   " %08x", d);
+                if (n + 5 >= sizeof(linha))
+                    break;
+            }
+            n += std::snprintf(linha + n, sizeof(linha) - n, "\n");
+            esc2(linha, n);
+        }
+    }
+
+    // Sob try_lock: a travessia dos mapas. Falhou ⇒ só palavras.
+    bool guardado = g_arbiter.gate.try_lock();
+
+    int k = std::snprintf(b, sizeof b,
+                          "[arb] quadro gate=%s fila=%zu cv=%zu desperta=%zu "
+                          "pendente=%zu\n",
+                          guardado ? "TOMADO (para o dump)" : "ocupado",
+                          guardado ? g_arbiter.fila.size() : std::size_t(0),
+                          guardado ? g_arbiter.cv_fila.size() : std::size_t(0),
+                          guardado ? g_arbiter.desperta.size() : std::size_t(0),
+                          guardado ? g_cv_pendente.size() : std::size_t(0));
+    esc2(b, std::size_t(k));
+
+    if (guardado) {
+        std::size_t n = 0;
+        for (const auto& [addr, fila] : g_arbiter.fila) {
+            std::uint32_t w = 0;
+            const bool ok = g_dispatcher_atual != nullptr &&
+                            g_dispatcher_atual->read_guest(addr, &w, sizeof w);
+            int kk = std::snprintf(
+                b, sizeof b, "[arb] fila 0x%llx (%zu) word=0x%x:",
+                (unsigned long long)addr, fila.size(), ok ? w : 0);
+            esc2(b, std::size_t(kk));
+            for (std::size_t i = 0;
+                 i < fila.size() && i < 8; ++i) {
+                kk = std::snprintf(b, sizeof b, " {0x%x,0x%llx}",
+                                   fila[i].tag,
+                                   (unsigned long long)fila[i].token);
+                esc2(b, std::size_t(kk));
+            }
+            esc2("\n", 1);
+            if (++n >= 8) break;
+        }
+
+        n = 0;
+        for (const auto& [cv_key, fila] : g_arbiter.cv_fila) {
+            int kk = std::snprintf(
+                b, sizeof b, "[arb] cv 0x%llx (%zu):",
+                (unsigned long long)cv_key, fila.size());
+            esc2(b, std::size_t(kk));
+            for (std::size_t i = 0;
+                 i < fila.size() && i < 8; ++i) {
+                kk = std::snprintf(
+                    b, sizeof b, " {0x%x,addr=0x%llx,0x%llx}",
+                    fila[i].tag, (unsigned long long)fila[i].addr,
+                    (unsigned long long)fila[i].token);
+                esc2(b, std::size_t(kk));
+            }
+            esc2("\n", 1);
+            if (++n >= 8) break;
+        }
+
+        n = 0;
+        for (const auto& [tok, cod] : g_arbiter.desperta) {
+            int kk = std::snprintf(
+                b, sizeof b, "[arb] desperta 0x%llx = %u\n",
+                (unsigned long long)tok, (unsigned)cod);
+            esc2(b, std::size_t(kk));
+            if (++n >= 8) { esc2("[arb] desperta (...)\n", 18); break; }
+        }
+
+        g_arbiter.gate.unlock();
     }
 }
 

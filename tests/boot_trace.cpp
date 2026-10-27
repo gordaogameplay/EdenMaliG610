@@ -160,6 +160,9 @@ static volatile std::uint64_t g_sample_pc = 0;
 // O dump por thread (definido em native_engine.cpp).
 extern "C" void g610_dump_threads();
 
+// O dump do quadro de arbitração (definido em svc_dispatcher.cpp).
+extern "C" void g610_dump_arbiter();
+
 // O numero de paragem e' parametrizavel (`IA_STOP_SAMPLES`, default 4):
 // o boot de um jogo chega a fases que so' existem depois do 4 sample
 // (o laco de render do titulo, LOG34), e sem a janela aberta o tracer
@@ -262,6 +265,13 @@ void on_alarm(int, siginfo_t*, void* raw) {
         int kc = std::snprintf(cab, sizeof cab, "[thr %d]\n", g_samples);
         ::write(2, cab, static_cast<std::size_t>(kc));
         g610_dump_threads();
+    }
+
+    // **O quadro de arbitração** por tick — quem está em fila (mutex), quem
+// está em cv e as PALAVRAS guest: o estado real da fila é o relológico
+// do congelamento (a fila do run mistura as threads e os per-chamadas).
+    if (g_thread_trace) {
+        g610_dump_arbiter();
     }
 
 
@@ -1322,6 +1332,27 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
         (void)w;
     }
 
+    // **O rasto de palavras** — o mutex 0x10a5096d8 e a sua cv-key
+    // 0x10a5096e4 muda de dono ENTRE os SVCs. O valor por linha é a
+    // descendência exata do `0x20000` do runCAS0/1: a linha onde ele
+    // aparece pela primeira vez é o serviço que o deixou passar.
+    static const bool rasto_palavras =
+        std::getenv("IA_WORD_TRACE") != nullptr;
+    if (rasto_palavras && g_mem != nullptr) {
+        std::uint32_t dw = 0, e0w = 0, e4w = 0;
+        if (g_mem->read(0x10a5096d8, &dw, sizeof dw, g_scratch) &&
+            g_mem->read(0x10a5096e0, &e0w, sizeof e0w, g_scratch) &&
+            g_mem->read(0x10a5096e4, &e4w, sizeof e4w, g_scratch)) {
+            char wb[96];
+            const int wk =
+                std::snprintf(wb, sizeof wb,
+                              "[mwr ] d8=0x%08x e0=0x%08x e4=0x%08x\n",
+                              dw, e0w, e4w);
+            ssize_t wq = ::write(2, wb, (size_t)wk);
+            (void)wq;
+        }
+    }
+
     // gpr[] e não x[]: x[] tem 6 entradas e x[18] seria memória a mais.
     char b[320];
     const int k = std::snprintf(b, sizeof b,
@@ -2118,6 +2149,10 @@ int main(int argc, char** argv) {
     // da GPU é o caminho do desenho.
     g610::services::DespejarJanelaDoCompositor();
     g610::services::VarrerRegiaoDoCanalDoCompositor();
+    if (g_thread_trace) {
+        std::printf("\n[arb] quadro final do congelamento:\n");
+        g610_dump_arbiter();
+    }
     std::printf("\n══════ resultado ══════\n");
     std::printf("  parou por   : %s\n",
                 r.error.empty() ? "(sem erro)" : r.error.c_str());

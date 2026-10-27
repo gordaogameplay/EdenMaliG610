@@ -337,6 +337,22 @@ Result ServerManager::LoopProcessImpl() {
     R_SUCCEED();
 }
 
+bool ServerManager::HasSession(Kernel::KServerSession* server_session) const noexcept {
+    for (auto& session : m_sessions) {
+        if (session.GetNativeHandle() == server_session)
+            return true;
+    }
+    return false;
+}
+
+bool ServerManager::OwnsPort(const Kernel::KServerPort* server_port) const noexcept {
+    for (auto& server : m_servers) {
+        if (server.GetNativeHandle() == server_port)
+            return true;
+    }
+    return false;
+}
+
 Result ServerManager::ProcessPendingSynchronously() {
     auto& kernel = m_system.Kernel();
 
@@ -417,6 +433,42 @@ Result ServerManager::ProcessPendingSynchronously() {
             R_SUCCEED();
         R_THROW(Kernel::ResultNotFound);
     }
+}
+
+Result ServerManager::RegisterOrphanSession(Kernel::KServerSession* server_session) {
+    // Caminho: KServerSession -> KSession -> KClientPort -> KPort -> KServerPort
+    auto* ksession = server_session->GetParent();
+    if (!ksession)
+        R_THROW(Kernel::ResultInvalidState);
+
+    auto* client_port = ksession->GetParent();
+    if (!client_port)
+        R_THROW(Kernel::ResultInvalidState);
+
+    auto* kport = client_port->GetParent();
+    if (!kport)
+        R_THROW(Kernel::ResultInvalidState);
+
+    auto* server_port = &kport->GetServerPort();
+
+    // Só registramos se esta ServerManager é a dona da porta.
+    if (!this->OwnsPort(server_port))
+        R_THROW(Kernel::ResultNotFound);
+
+    // Encontrar o Port wrapper que detém esta KServerPort e obter o handler.
+    SessionRequestHandlerPtr handler;
+    for (auto& server : m_servers) {
+        if (server.GetNativeHandle() == server_port) {
+            handler = server.CreateHandler();
+            break;
+        }
+    }
+
+    auto manager = std::make_shared<SessionRequestManager>(m_system.Kernel(), *this);
+    if (handler)
+        manager->SetSessionHandler(std::move(handler));
+    R_TRY(this->RegisterSession(server_session, std::move(manager)));
+    R_SUCCEED();
 }
 
 Result ServerManager::OnPortEvent(Port* server) {

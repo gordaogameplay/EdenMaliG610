@@ -17,3 +17,6 @@ build/
 *.nca
 *.cnmt.nca
 *.cnmt.xml
+
+# Python bytecode (gerado)
+__pycache__/

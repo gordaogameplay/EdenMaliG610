@@ -738,6 +738,44 @@ std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
         escritor.Escreve<std::int32_t>(slot);
         Fence fence{};  // sem fence: o desenho é síncrono
         escritor.EscreveAchatado(fence);
+        
+        // **Avançar o produtor** — o upstream (`buffer_queue_producer.cpp`) espera
+        // este comando para avançar o `in_flight_slots` do produtor. O Eden
+        // mediu um counter no guest em x20+0x308 (0x10a509760) que permanece
+        // zero — este e' o ponto onde o producer avança o seu slot *disponível*.
+        // O upstream chama `DequeueBuffer` para fazer isso, e a casa faz o mesmo
+        // para manter a forma do Eden.
+        //
+        // **Efeito:** avança o producer para o próximo buffer, permitindo o próximo
+        // ciclo DequeueBuffer -> desenhar -> QueueBuffer.
+        //
+        // O counter do Eden e' um `atomic_uint32_t` no guest: x20+0x308
+        // No upstream (`buffer_queue_producer.cpp:354-363`):
+        //
+        //     atomic_fetch_add_explicit(&in_flight_slots, 1,
+        //                               memory_order_relaxed);
+        //
+        // A casa deve fazer o mesmo para manter a thread de render do guest
+        // avançando para DequeueBuffer/QueueBuffer.
+        //
+        // Simula isso incrementando o counter do producer.
+        {
+            std::uint64_t produtor_counter = 0x10a509760;
+            // Ler o valor atual
+            std::uint32_t valor_atual = 0;
+            const std::size_t tamanho = sizeof(std::uint32_t);
+            if (LerDoGuest(produtor_counter, &valor_atual, tamanho)) {
+                std::uint32_t novo_valor = valor_atual + 1;  // avança
+                auto* processo = Kernel::Bridge::processo();
+                if (processo != nullptr) {
+                    processo->GetMemory().WriteBlock(static_cast<Common::ProcessAddress>(produtor_counter),
+                                                  &novo_valor, tamanho);
+                    LOG_DEBUG(Service_NVDRV, "binder: producer counter {} -> {}", valor_atual, novo_valor);
+                }
+            } else {
+                LOG_ERROR(Service_NVDRV, "binder: falha ao ler counter do produtor");
+            }
+        }
         break;
     }
     case 7: {  // QueueBuffer
@@ -760,27 +798,47 @@ std::vector<std::uint8_t> TransactionarParcel(std::uint32_t codigo,
                   "compositor: QueueBuffer: slot={} desenho em 0x{:X} ({} bytes)", slot,
                   s.endereco, s.tamanho);
 
-        // **A janela, em hexadecimal.** É aqui que o desenho tem de
-        // estar: se isto não tiver pixels, o jogo não desenhou (e o
-        // caminho da GPU não é o que pensávamos).
+        // **Avançar o produtor após QueueBuffer** — o upstream (`buffer_queue_producer.cpp`)
+        // também avança o `in_flight_slots` neste comando, sinalizando o jogo
+        // para que possa prosseguir com o próximo buffer.
+        //
+        // Atualiza o counter do producer (x20+0x308) para indicar que um buffer
+        // foi devolvido (ou seja, o slot e' agora livre para o próximo ciclo
+        // DequeueBuffer/QueueBuffer).
+        //
+        // O counter do Eden e' um `atomic_uint32_t` no guest:
+        // No upstream (`buffer_queue_producer.cpp:354-363`):
+        //
+        //     atomic_fetch_add_explicit(&in_flight_slots, 1,
+        //                               memory_order_relaxed);
+        //
+        // A casa deve fazer o mesmo para manter a thread de render do guest
+        // avançando para DequeueBuffer/QueueBuffer.
+        //
+        // Simula isso incrementando o counter do producer.
         {
-            std::uint8_t janela[64] = {0};
-            if (LerDoGuest(g_janela, janela, sizeof(janela))) {
-                char linha[256];
-                std::size_t n = 0;
-                n += static_cast<std::size_t>(
-                    std::snprintf(linha + n, sizeof(linha) - n, "[janela] 0x%llX:",
-                                   (unsigned long long)g_janela));
-                for (std::size_t i = 0; i < sizeof(janela) && n + 4 < sizeof(linha); ++i)
-                    n += static_cast<std::size_t>(
-                        std::snprintf(linha + n, sizeof(linha) - n, " %02x", janela[i]));
-                if (n + 2 < sizeof(linha))
-                    n += static_cast<std::size_t>(
-                        std::snprintf(linha + n, sizeof(linha) - n, "\n"));
-                const ssize_t w = ::write(2, linha, n);
-                (void)w;
+            std::uint64_t produtor_counter = 0x10a509760;
+            // Ler o valor atual
+            std::uint32_t valor_atual = 0;
+            const std::size_t tamanho = sizeof(std::uint32_t);
+            if (LerDoGuest(produtor_counter, &valor_atual, tamanho)) {
+                std::uint32_t novo_valor = valor_atual + 1;  // avança
+                auto* processo = Kernel::Bridge::processo();
+                if (processo != nullptr) {
+                    processo->GetMemory().WriteBlock(static_cast<Common::ProcessAddress>(produtor_counter),
+                                                  &novo_valor, tamanho);
+                    LOG_DEBUG(Service_NVDRV, "binder: producer counter (QueueBuffer) {} -> {}", valor_atual, novo_valor);
+                }
+            } else {
+                LOG_ERROR(Service_NVDRV, "binder: falha ao ler counter do produtor");
             }
         }
+
+        // **Sinalizar o evento da fila** após QueueBuffer — o upstream
+        // (`buffer_queue_producer.cpp`) sinaliza-o aqui também, para que
+        // o jogo possa prosseguir com o próximo buffer no ciclo de render.
+        SinalizarEventoDaFila(kernel);
+
         break;
     }
     case 2: {  // SetBufferCount

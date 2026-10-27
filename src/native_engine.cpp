@@ -15,8 +15,23 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <unordered_map>
 #include <unistd.h>
 #include <ucontext.h>
+
+#if defined(__aarch64__)
+#  define G610_MCTX_REGS(ctx)   (ctx).uc_mcontext.regs
+#  define G610_MCTX_PC(ctx)     (ctx).uc_mcontext.pc
+#  define G610_MCTX_SP(ctx)     (ctx).uc_mcontext.sp
+#  define G610_MCTX_REG(ctx, i) (ctx).uc_mcontext.regs[i]
+#elif defined(__x86_64__)
+#  define G610_MCTX_REGS(ctx)   (ctx).uc_mcontext.gregs
+#  define G610_MCTX_PC(ctx)     (ctx).uc_mcontext.gregs[REG_RIP]
+#  define G610_MCTX_SP(ctx)     (ctx).uc_mcontext.gregs[REG_RSP]
+#  define G610_MCTX_REG(ctx, i) (ctx).uc_mcontext.gregs[i]
+#else
+#  error "Unsupported architecture for mcontext access"
+#endif
 
 // ---------------------------------------------------------------------------
 // O estado das threads de guest: uma TABELA fixa, nao um `__thread`
@@ -257,14 +272,14 @@ inline bool emulate_tls_read(ucontext_t* uc, std::uint64_t pc,
             continue;
 
         const std::size_t reg = insn & 0x1Fu;
-        if (reg >= 32 || uc->uc_mcontext.regs[reg] != 0)
+        if (reg >= 32 || G610_MCTX_REG(*uc, reg) != 0)
             continue;
 
         // O TLS emulado é o DA THREAD que faultou (o seu slot da tabela),
         // nunca o da principal — o passo 1 usava `g_hooks.guest_tls`.
-        uc->uc_mcontext.regs[reg] =
+        G610_MCTX_REG(*uc, reg) =
             st != nullptr ? st->guest_tls : g_hooks.guest_tls;
-        uc->uc_mcontext.pc = at + 4;
+        G610_MCTX_PC(*uc) = at + 4;
         return true;
     }
     return false;
@@ -482,6 +497,34 @@ namespace {
 thread_local std::uint64_t t_dispatch_in_flight = 0;
 
 } // namespace
+
+// ── Símbolos declarados extern em svc_dispatcher.cpp ────────────────────────
+// São necessários para ligar; implementação mínima sem comportamento.
+
+std::atomic<std::uint64_t> g_switch_to_tls{0};
+ucontext_t* g_dispatch_uc = nullptr;
+std::unordered_map<std::uint64_t, std::uint64_t> g_cv_waiter_thread;
+std::unordered_map<std::uint64_t, GuestThreadState*> g_token_to_thread;
+
+void mark_ready_threads_on_cv(std::uint64_t cv_key) {
+    for (auto& slot : g_thread_slots) {
+        if (!slot.in_use.load(std::memory_order_acquire))
+            continue;
+        if (slot.st.waiting_on_cv == cv_key)
+            slot.st.waiting_on_cv = 0;
+    }
+}
+
+GuestThreadState* find_ready_guest_thread(std::uint64_t current_tls) {
+    (void)current_tls;
+    for (auto& slot : g_thread_slots) {
+        if (!slot.in_use.load(std::memory_order_acquire))
+            continue;
+        if (slot.st.waiting_on_cv == 0)
+            return &slot.st;
+    }
+    return nullptr;
+}
 
 std::uint64_t dispatch_owner_itself() {
     return t_dispatch_in_flight;
@@ -1253,7 +1296,7 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         return; // nunca devia acontecer: handlers não instalados
 
     auto* uc = static_cast<ucontext_t*>(raw);
-    const auto pc = static_cast<std::uint64_t>(uc->uc_mcontext.pc);
+    const auto pc = static_cast<std::uint64_t>(G610_MCTX_PC(*uc));
 
     // O estado que isto ACTUALIZA é o de quem faultou: uma thread de guest
     // registada escreve no SEU slot — nunca sobrescreve o relatório de outra
@@ -1288,7 +1331,7 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
     }
 
     if (g_hooks.trapper != nullptr)
-        g_hooks.trapper(sig, pc, static_cast<std::uint64_t>(uc->uc_mcontext.sp),
+        g_hooks.trapper(sig, pc, static_cast<std::uint64_t>(G610_MCTX_SP(*uc)),
                         g_hooks.trapper_user);
 
     // Limite de traps. POR THREAD: cada uma tem a sua contagem, e um guest
@@ -1298,8 +1341,8 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
     if (g_hooks.trap_limit != 0 && *ts.traps >= g_hooks.trap_limit) {
         *ts.limit_hit = true;
         *ts.last = TrapKind::Breakpoint;
-        uc->uc_mcontext.sp = rec_sp;
-        uc->uc_mcontext.pc = g_hooks.recovery_pc;
+        G610_MCTX_SP(*uc) = rec_sp;
+        G610_MCTX_PC(*uc) = g_hooks.recovery_pc;
         return;
     }
 
@@ -1311,8 +1354,8 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             (unsigned long long)pc,
             info ? info->si_addr : nullptr,
             info ? info->si_code : 0,
-            (unsigned long long)uc->uc_mcontext.regs[0],
-            (unsigned long long)uc->uc_mcontext.regs[1],
+            (unsigned long long)G610_MCTX_REG(*uc, 0),
+            (unsigned long long)G610_MCTX_REG(*uc, 1),
             (int)g_hooks.armed,
             (unsigned long long)g_watch_pagina);
         ssize_t w = ::write(2, b, (size_t)k); (void)w;
@@ -1391,7 +1434,7 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         if (number >= 0x40 && number < 0x60) {
             const std::uint64_t agora = g_hooks.tel->time_now();
             static const std::uint64_t epoca = agora;
-            uc->uc_mcontext.regs[number - 0x40] =
+            G610_MCTX_REG(*uc, number - 0x40) =
                 (agora - epoca) * 192 / 10000;
             // **Medida do relogio** (`G610_TRAP_CLOCK=1`): a cada 1000
             // leituras imprime o real_ns decorrido e os ticks que o trap
@@ -1443,7 +1486,7 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
                                      static_cast<double>(ns_real));
                 }
             }
-            uc->uc_mcontext.pc = pc + 4;
+            G610_MCTX_PC(*uc) = pc + 4;
             return;
         }
 
@@ -1452,8 +1495,8 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             // traps). Sai pelo mesmo caminho dos restantes.
             *ts.last = TrapKind::Breakpoint;
             *ts.limit_hit = true;
-            uc->uc_mcontext.sp = rec_sp;
-            uc->uc_mcontext.pc = g_hooks.recovery_pc;
+            G610_MCTX_SP(*uc) = rec_sp;
+            G610_MCTX_PC(*uc) = g_hooks.recovery_pc;
             return;
         }
 
@@ -1464,8 +1507,8 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             // protector sobre a stack do guest.
             *ts.last = TrapKind::Breakpoint;
             *ts.guest_returned = true;
-            uc->uc_mcontext.sp = rec_sp;
-            uc->uc_mcontext.pc = g_hooks.recovery_pc;
+            G610_MCTX_SP(*uc) = rec_sp;
+            G610_MCTX_PC(*uc) = g_hooks.recovery_pc;
             return;
         }
 
@@ -1479,9 +1522,9 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
                          "[main] trap #%u pc=0x%llx brk=%u x0=0x%llx x1=0x%llx "
                          "x2=0x%llx\n",
                          number, (unsigned long long)pc, number,
-                         (unsigned long long)uc->uc_mcontext.regs[0],
-                         (unsigned long long)uc->uc_mcontext.regs[1],
-                         (unsigned long long)uc->uc_mcontext.regs[2]);
+                         (unsigned long long)G610_MCTX_REG(*uc, 0),
+                         (unsigned long long)G610_MCTX_REG(*uc, 1),
+                         (unsigned long long)G610_MCTX_REG(*uc, 2));
         }
 
         // Numa thread de guest, cada trap e' uma pista: e' o unico registo
@@ -1497,19 +1540,19 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
                          "x20=0x%llx x21=0x%llx x22=0x%llx x23=0x%llx "
                          "x24=0x%llx x28=0x%llx\n",
                          number, (unsigned long long)pc,
-                         (unsigned long long)uc->uc_mcontext.sp,
-                         (unsigned long long)uc->uc_mcontext.regs[0],
-                         (unsigned long long)uc->uc_mcontext.regs[1],
-                         (unsigned long long)uc->uc_mcontext.regs[2],
-                         (unsigned long long)uc->uc_mcontext.regs[3],
-                         (unsigned long long)uc->uc_mcontext.regs[7],
-                         (unsigned long long)uc->uc_mcontext.regs[19],
-                         (unsigned long long)uc->uc_mcontext.regs[20],
-                         (unsigned long long)uc->uc_mcontext.regs[21],
-                         (unsigned long long)uc->uc_mcontext.regs[22],
-                         (unsigned long long)uc->uc_mcontext.regs[23],
-                         (unsigned long long)uc->uc_mcontext.regs[24],
-                         (unsigned long long)uc->uc_mcontext.regs[28]);
+                         (unsigned long long)G610_MCTX_SP(*uc),
+                         (unsigned long long)G610_MCTX_REG(*uc, 0),
+                         (unsigned long long)G610_MCTX_REG(*uc, 1),
+                         (unsigned long long)G610_MCTX_REG(*uc, 2),
+                         (unsigned long long)G610_MCTX_REG(*uc, 3),
+                         (unsigned long long)G610_MCTX_REG(*uc, 7),
+                         (unsigned long long)G610_MCTX_REG(*uc, 19),
+                         (unsigned long long)G610_MCTX_REG(*uc, 20),
+                         (unsigned long long)G610_MCTX_REG(*uc, 21),
+                         (unsigned long long)G610_MCTX_REG(*uc, 22),
+                         (unsigned long long)G610_MCTX_REG(*uc, 23),
+                         (unsigned long long)G610_MCTX_REG(*uc, 24),
+                         (unsigned long long)G610_MCTX_REG(*uc, 28));
             // **Cadeia de chamados** (env `G610_TRAP_FP=1`): x30 e' o retorno
             // do stub (o site que chamou o servico) e os pares [x29]/[x29+8]
             // dao a cadeia de frames do chamador — o mesmo esquema do
@@ -1517,7 +1560,7 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             // de 16 bytes por trap, so' com o env posto.
             static const bool trap_fp = std::getenv("G610_TRAP_FP") != nullptr;
             if (trap_fp) {
-                const std::uint64_t fp = uc->uc_mcontext.regs[29];
+                const std::uint64_t fp = G610_MCTX_REG(*uc, 29);
                 constexpr std::uint64_t largura = 0x200000ull;
                 constexpr std::uint64_t topo = 0x800000000ull;
                 std::uint64_t f[6] = {0, 0, 0, 0, 0, 0};
@@ -1531,7 +1574,7 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
                              "[thrd] trap cadeia #%u x30=0x%llx lvl1=0x%llx "
                              "lvl2=0x%llx lvl3=0x%llx\n",
                              number,
-                             (unsigned long long)uc->uc_mcontext.regs[30],
+                             (unsigned long long)G610_MCTX_REG(*uc, 30),
                              (unsigned long long)f[1], (unsigned long long)f[3],
                              (unsigned long long)f[5]);
             }
@@ -1540,18 +1583,18 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         // Despachar o serviço: argumentos em x0-x5, resultado em x0.
         SvcContext c{};
         for (int i = 0; i < 6; ++i)
-            c.x[i] = uc->uc_mcontext.regs[i];
+            c.x[i] = G610_MCTX_REG(*uc, i);
         for (int i = 0; i < 31; ++i)
-            c.gpr[i] = uc->uc_mcontext.regs[i];
+            c.gpr[i] = G610_MCTX_REG(*uc, i);
         c.pc = pc;
-        c.sp = static_cast<std::uint64_t>(uc->uc_mcontext.sp);
+        c.sp = static_cast<std::uint64_t>(G610_MCTX_SP(*uc));
 
         // O observer ve o contexto ANTES do dispatch, para poder registar o
         // que o guest pediu. Se registasse depois, veria o resultado em x0 e
         // não saberia o que foi pedido — que é a informação útil.
         if (g_hooks.observer != nullptr)
             g_hooks.observer(number, c, pc,
-                             static_cast<std::uint64_t>(uc->uc_mcontext.sp),
+                             static_cast<std::uint64_t>(G610_MCTX_SP(*uc)),
                              g_hooks.observer_user);
 
         const auto t0 = g_hooks.tel->time_now();
@@ -1595,11 +1638,11 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             // nem `svc_time_ns`: o serviço não correu.
             *ts.last = TrapKind::GuestFault;
             *ts.fault_pc = pc;
-            *ts.fault_sp = static_cast<std::uint64_t>(uc->uc_mcontext.sp);
+            *ts.fault_sp = static_cast<std::uint64_t>(G610_MCTX_SP(*uc));
             *ts.fault_addr = 0;
             *ts.faulted = true;
-            uc->uc_mcontext.sp = rec_sp;
-            uc->uc_mcontext.pc = g_hooks.recovery_pc;
+            G610_MCTX_SP(*uc) = rec_sp;
+            G610_MCTX_PC(*uc) = g_hooks.recovery_pc;
             return;
         }
         // **A paragem do fim do run** (`guest_threads_parar`, o core do
@@ -1612,8 +1655,8 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         // handlers já desarmados dava o SIGTRAP do rc=133.
         if (guest_threads_paragem_ativa()) {
             *ts.last = TrapKind::Breakpoint;
-            uc->uc_mcontext.sp = rec_sp;
-            uc->uc_mcontext.pc = g_hooks.recovery_pc;
+            G610_MCTX_SP(*uc) = rec_sp;
+            G610_MCTX_PC(*uc) = g_hooks.recovery_pc;
             return;
         }
         *ts.svc_time_ns +=
@@ -1635,8 +1678,8 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         // Por isso x0 NÃO é copiado de `c.x`. Quem devolve um valor escreve
         // em `ctx.ret`.
         for (int i = 1; i < 6; ++i)
-            uc->uc_mcontext.regs[i] = c.x[i];
-        uc->uc_mcontext.regs[0] = c.ret;
+            G610_MCTX_REG(*uc, i) = c.x[i];
+        G610_MCTX_REG(*uc, 0) = c.ret;
 
         // Repõe x18. O `ret` do guest clobbera o platform register, e o
         // próximo SVC que verificar a canary encontraria um valor diferente
@@ -1644,7 +1687,7 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         // de guest tem a sua (o Eden gera um por thread em
         // `ResetThreadContext64`).
         if (*ts.platform_reg != 0)
-            uc->uc_mcontext.regs[18] = *ts.platform_reg;
+            G610_MCTX_REG(*uc, 18) = *ts.platform_reg;
 
         *ts.last = TrapKind::SvcCall;
 
@@ -1674,23 +1717,23 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
                     "fp=0x%llx tls=0x%llx svc_calls=%llu t=%.3fs\n",
                     g_hooks.svc->exit_code(),
                     (unsigned long long)pc,
-                    (unsigned long long)uc->uc_mcontext.sp,
-                    (unsigned long long)uc->uc_mcontext.regs[30],
-                    (unsigned long long)uc->uc_mcontext.regs[29],
+                    (unsigned long long)G610_MCTX_SP(*uc),
+                    (unsigned long long)G610_MCTX_REG(*uc, 30),
+                    (unsigned long long)G610_MCTX_REG(*uc, 29),
                     (unsigned long long)(st != nullptr ? st->guest_tls
                                                        : g_hooks.guest_tls),
                     (unsigned long long)*ts.svc_calls, seg);
                 const ssize_t wb = ::write(2, b, static_cast<std::size_t>(kb));
                 (void)wb;
             }
-            uc->uc_mcontext.sp = rec_sp;
-            uc->uc_mcontext.pc = g_hooks.recovery_pc;
+            G610_MCTX_SP(*uc) = rec_sp;
+            G610_MCTX_PC(*uc) = g_hooks.recovery_pc;
             return;
         }
 
         // Saltar o BRK. O kernel honra esta escrita — medido em
         // tests/probe_ucontext.cpp.
-        uc->uc_mcontext.pc = pc + 4;
+        G610_MCTX_PC(*uc) = pc + 4;
         return;
     }
 
@@ -1738,17 +1781,17 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
                                   "x8=0x%llx x11=0x%llx x12=0x%llx dest=0x%llx\n",
                                   (unsigned long long)endereco_do_fault,
                                   (unsigned long long)pc,
-                                  (unsigned long long)uc->uc_mcontext.regs[8],
-                                  (unsigned long long)uc->uc_mcontext.regs[11],
-                                  (unsigned long long)uc->uc_mcontext.regs[12],
-                                  (unsigned long long)(uc->uc_mcontext.regs[12] +
-                                                      uc->uc_mcontext.regs[8]));
+                                  (unsigned long long)G610_MCTX_REG(*uc, 8),
+                                  (unsigned long long)G610_MCTX_REG(*uc, 11),
+                                  (unsigned long long)G610_MCTX_REG(*uc, 12),
+                                  (unsigned long long)(G610_MCTX_REG(*uc, 12) +
+                                                      G610_MCTX_REG(*uc, 8)));
             for (int i = 0; i < 8; ++i) {
                 n += std::snprintf(b + n, sizeof(b) - n, " x%d=0x%llx", i,
-                                   (unsigned long long)uc->uc_mcontext.regs[i]);
+                                   (unsigned long long)G610_MCTX_REG(*uc, i));
             }
             n += std::snprintf(b + n, sizeof(b) - n, " x30=0x%llx\n",
-                               (unsigned long long)uc->uc_mcontext.regs[30]);
+                               (unsigned long long)G610_MCTX_REG(*uc, 30));
             ssize_t w = ::write(2, b, (size_t)n);
             (void)w;
             // A pagina volta a ser de leitura-escrita — para o guest
@@ -1758,8 +1801,8 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             // actual ainda nao aconteceu).
             ArmarWatchpointNoProximoTrap();
             // O guest repete a instrucao.
-            uc->uc_mcontext.pc = pc;
-            uc->uc_mcontext.sp = static_cast<std::uint64_t>(uc->uc_mcontext.sp);
+            G610_MCTX_PC(*uc) = pc;
+            G610_MCTX_SP(*uc) = static_cast<std::uint64_t>(G610_MCTX_SP(*uc));
             return;
         }
 
@@ -1774,8 +1817,8 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
                     n += std::snprintf(b + n, sizeof(b) - n,
                                        "  pc-0x%x: %08x  x0=0x%llx x8=0x%llx "
                                        "tpidrro=0x%llx\n", 4 * i, w,
-                                       (unsigned long long)uc->uc_mcontext.regs[0],
-                                       (unsigned long long)uc->uc_mcontext.regs[8],
+                                       (unsigned long long)G610_MCTX_REG(*uc, 0),
+                                       (unsigned long long)G610_MCTX_REG(*uc, 8),
                                        (unsigned long long)read_thread_pointer());
                 }
             }
@@ -1825,10 +1868,10 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         // re-executar a mesma instrução entraria em ciclo até o processo ser
         // morto, engolindo o stack trace — o pior diagnóstico possível.
         *ts.fault_pc = pc;
-        *ts.fault_sp = static_cast<std::uint64_t>(uc->uc_mcontext.sp);
+        *ts.fault_sp = static_cast<std::uint64_t>(G610_MCTX_SP(*uc));
         *ts.fault_addr = reinterpret_cast<std::uint64_t>(info->si_addr);
         for (int i = 0; i < 22; ++i) {
-            (*ts.fault_regs)[i] = uc->uc_mcontext.regs[i];
+            (*ts.fault_regs)[i] = G610_MCTX_REG(*uc, i);
         }
         *ts.faulted  = true;
 
@@ -1842,13 +1885,13 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             for (int i = 0; i < 8; ++i) {
                 n += static_cast<std::size_t>(
                     std::snprintf(linha + n, sizeof(linha) - n, " x%d=0x%llx", i,
-                                   (unsigned long long)uc->uc_mcontext.regs[i]));
+                                   (unsigned long long)G610_MCTX_REG(*uc, i)));
             }
             n += static_cast<std::size_t>(
                 std::snprintf(linha + n, sizeof(linha) - n, " x19=0x%llx x20=0x%llx x21=0x%llx",
-                               (unsigned long long)uc->uc_mcontext.regs[19],
-                               (unsigned long long)uc->uc_mcontext.regs[20],
-                               (unsigned long long)uc->uc_mcontext.regs[21]));
+                               (unsigned long long)G610_MCTX_REG(*uc, 19),
+                               (unsigned long long)G610_MCTX_REG(*uc, 20),
+                               (unsigned long long)G610_MCTX_REG(*uc, 21)));
             if (n + 2 < sizeof(linha))
                 n += static_cast<std::size_t>(
                     std::snprintf(linha + n, sizeof(linha) - n, "\n"));
@@ -1856,8 +1899,8 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             (void)w;
         }
 
-        uc->uc_mcontext.sp = rec_sp;
-        uc->uc_mcontext.pc = g_hooks.recovery_pc;
+        G610_MCTX_SP(*uc) = rec_sp;
+        G610_MCTX_PC(*uc) = g_hooks.recovery_pc;
         return;
     }
 
@@ -1875,17 +1918,17 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
                 "[alarme] o guest esta preso em pc=0x%llx x0=0x%llx x1=0x%llx "
                 "x2=0x%llx x19=0x%llx\n",
                 (unsigned long long)pc,
-                (unsigned long long)uc->uc_mcontext.regs[0],
-                (unsigned long long)uc->uc_mcontext.regs[1],
-                (unsigned long long)uc->uc_mcontext.regs[2],
-                (unsigned long long)uc->uc_mcontext.regs[19]);
+                (unsigned long long)G610_MCTX_REG(*uc, 0),
+                (unsigned long long)G610_MCTX_REG(*uc, 1),
+                (unsigned long long)G610_MCTX_REG(*uc, 2),
+                (unsigned long long)G610_MCTX_REG(*uc, 19));
             const ssize_t w = ::write(2, b, (size_t)k);
             (void)w;
         }
         *ts.limit_hit = true;
         *ts.last = TrapKind::Breakpoint;
-        uc->uc_mcontext.sp = rec_sp;
-        uc->uc_mcontext.pc = g_hooks.recovery_pc;
+        G610_MCTX_SP(*uc) = rec_sp;
+        G610_MCTX_PC(*uc) = g_hooks.recovery_pc;
         return;
     }
 
@@ -1898,9 +1941,9 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         *ts.last = TrapKind::Breakpoint;
         *ts.illegal_insn = true;
         *ts.fault_pc = pc;
-        *ts.fault_sp = static_cast<std::uint64_t>(uc->uc_mcontext.sp);
-        uc->uc_mcontext.sp = rec_sp;
-        uc->uc_mcontext.pc = g_hooks.recovery_pc;
+        *ts.fault_sp = static_cast<std::uint64_t>(G610_MCTX_SP(*uc));
+        G610_MCTX_SP(*uc) = rec_sp;
+        G610_MCTX_PC(*uc) = g_hooks.recovery_pc;
         return;
     }
 

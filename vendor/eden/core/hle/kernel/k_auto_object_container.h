@@ -30,6 +30,16 @@ public:
     void Unregister(KAutoObjectWithList* obj);
     size_t GetOwnedCount(KProcess* owner);
 
+    /// Itera sobre todos os objetos registados, chamando `func` para cada um.
+    /// Seguro para leitura concorrente (segura o lock interno).
+    template <typename Func>
+    void ForEach(Func&& func) {
+        KScopedSpinLock lk(m_lock);
+        for (auto& obj : m_object_list) {
+            func(obj);
+        }
+    }
+
 private:
     KSpinLock m_lock;
     ListType m_object_list;
