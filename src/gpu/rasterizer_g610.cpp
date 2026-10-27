@@ -3,7 +3,9 @@
 // EdenMaliG610 — o renderizador da casa (a implementação da
 // `RasterizerInterface` do upstream).
 #include "g610/gpu/rasterizer_g610.hpp"
+#include "g610/gpu/vulkan_backend.hpp"
 
+#include <cstdio>
 #include <cstring>
 
 #include "vendor/eden/common/logging.h"
@@ -49,8 +51,10 @@ AceleraDMAVazio& dma_vazio() {
 
 }  // namespace
 
-RasterizerG610::RasterizerG610(EscreveNoGuest escreve, SinalizaFence sinaliza)
-    : escreve_(std::move(escreve)), sinaliza_(std::move(sinaliza)) {}
+RasterizerG610::RasterizerG610(EscreveNoGuest escreve, SinalizaFence sinaliza,
+                               std::shared_ptr<VulkanBackend> backend)
+    : escreve_(std::move(escreve)), sinaliza_(std::move(sinaliza)),
+      backend_(std::move(backend)) {}
 
 // ── Os comandos de desenho ───────────────────────────────────────────────────
 
@@ -71,6 +75,23 @@ void RasterizerG610::DrawTexture() {
 void RasterizerG610::Clear(u32 layer_count) {
     ++contadores_.clears;
     (void)layer_count;
+
+    // Integração mínima: se houver backend Vulkan inicializado, executa
+    // um clear real e registra o resultado. Uma falha do backend NÃO é
+    // mascarada pelo contador (o log distingue chamada vs. execução vs.
+    // validação de pixels).
+    if (!backend_)
+        return;
+    auto res = backend_->clear_image();
+    if (res.ok) {
+        std::fprintf(stderr,
+                     "[RasterizerG610::Clear] Vulkan clear OK: %u pixels verificados, 0 mismatches\n",
+                     res.pixels_checked);
+    } else {
+        std::fprintf(stderr,
+                     "[RasterizerG610::Clear] Vulkan clear FALHOU: %s (checked=%u mismatched=%u)\n",
+                     res.error.c_str(), res.pixels_checked, res.pixels_mismatched);
+    }
 }
 
 void RasterizerG610::DispatchCompute() {

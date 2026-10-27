@@ -101,6 +101,7 @@ add_library(g610_core STATIC
   src/gpu/macro_mme.cpp
   src/gpu/pushbuffer.cpp
   src/gpu/rasterizer_g610.cpp
+  src/gpu/vulkan_backend.cpp
   src/gpu/draw_consumer.cpp
   src/patcher.cpp
   src/native_engine.cpp
@@ -400,6 +401,11 @@ if(VULKAN_LIB)
   add_executable(g610_gpu_exec tests/test_gpu_exec.cpp)
   target_link_libraries(g610_gpu_exec PRIVATE g610_core ${VULKAN_LIB})
   add_test(NAME gpu_exec COMMAND g610_gpu_exec)
+
+  # Teste de integração: RasterizerG610::Clear() -> backend Vulkan real.
+  add_executable(g610_rasterizer_clear tests/test_rasterizer_clear.cpp)
+  target_link_libraries(g610_rasterizer_clear PRIVATE g610_core ${VULKAN_LIB})
+  add_test(NAME rasterizer_clear COMMAND g610_rasterizer_clear)
 endif()
 
 # Teste de input: prova que a pilha SDL2 + evdev + mapeamento funciona.

@@ -31,6 +31,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <span>
 #include <utility>
 #include <vector>
@@ -38,6 +39,8 @@
 #include "video_core/rasterizer_interface.h"
 
 namespace g610::gpu {
+
+class VulkanBackend;
 
 // O renderizador da casa.
 //
@@ -72,7 +75,8 @@ public:
         std::function<bool(std::uint64_t endereco, const void* dados, std::size_t tamanho)>;
     using SinalizaFence = std::function<void(std::uint32_t syncpoint)>;
 
-    explicit RasterizerG610(EscreveNoGuest escreve = {}, SinalizaFence sinaliza = {});
+    explicit RasterizerG610(EscreveNoGuest escreve = {}, SinalizaFence sinaliza = {},
+                            std::shared_ptr<VulkanBackend> backend = nullptr);
 
     // ── A interface do upstream ───────────────────────────────────────────
     void Draw(bool is_indexed, u32 instance_count) override;
@@ -141,7 +145,12 @@ public:
 private:
     EscreveNoGuest escreve_;
     SinalizaFence sinaliza_;
+    std::shared_ptr<VulkanBackend> backend_;
     Contadores contadores_{};
+
+public:
+    // Acesso ao backend (para testes/diagnóstico).
+    const std::shared_ptr<VulkanBackend>& backend() const noexcept { return backend_; }
 };
 
 }  // namespace g610::gpu
