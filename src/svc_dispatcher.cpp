@@ -2405,6 +2405,20 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
     const std::uint32_t tag     = static_cast<std::uint32_t>(ctx.x[2]);
     const std::int64_t  timeout = static_cast<std::int64_t>(ctx.x[3]);
 
+    static const char* trace_sync = std::getenv("G610_TRACE_SYNC");
+    static std::atomic<std::uint64_t> seq_wait{0};
+    if (trace_sync != nullptr) {
+        const std::uint64_t s = seq_wait.fetch_add(1);
+        if (s < 200 || s % 50 == 0) {
+            std::fprintf(stderr,
+                         "[trace-sync] WAIT seq=%llu cv=0x%llx tag=0x%x timeout=%lld guest_pc=0x%llx\n",
+                         (unsigned long long)s,
+                         (unsigned long long)cv_key, tag,
+                         (long long)timeout,
+                         (unsigned long long)ctx.pc);
+        }
+    }
+
     // **Instrumento leve — Parede 2**: a evolucao do predicate da parede.
     // `G610_CV_DUMP=base,key` (ex.: `0xd9c2c200,0xd9c2c22c`): a cada wait
     // da chave `key`, le 0x30 bytes em `base` e despeja-as. As primeiras
@@ -3144,6 +3158,19 @@ Result SvcDispatcher::svc_signal_to_address(SvcContext& ctx) {
 Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
     const std::uint64_t cv_key = ctx.x[0] & ~std::uint64_t{3};
     const auto count = static_cast<std::int32_t>(ctx.x[1]);
+
+    static const char* trace_sync = std::getenv("G610_TRACE_SYNC");
+    static std::atomic<std::uint64_t> seq_sig{0};
+    if (trace_sync != nullptr) {
+        const std::uint64_t s = seq_sig.fetch_add(1);
+        if (s < 200 || s % 50 == 0) {
+            std::fprintf(stderr,
+                         "[trace-sync] SIGNAL seq=%llu cv=0x%llx count=%d guest_pc=0x%llx\n",
+                         (unsigned long long)s,
+                         (unsigned long long)cv_key, count,
+                         (unsigned long long)ctx.pc);
+        }
+    }
 
     // **Instrumento leve — Parede 2** (a produtora das cv's do jogo). O
     // `IA_IPC_TRACE` despeja codigo e stack por chamada e fica fora das
