@@ -107,6 +107,12 @@ struct DrawCommand {
     std::uint32_t base_vertex    = 0;
     std::uint32_t group_x = 1, group_y = 1, group_z = 1;
 
+    // Dados do stream de vértices (Maxwell `vertex_streams[0]`), capturados
+    // do registo 0x1C00..0x1C02 quando presentes. 0 = não capturado.
+    // **Ainda não são lidos da memória do guest** — ver ETAPA 4.
+    std::uint64_t vertex_base_va = 0;
+    std::uint32_t vertex_stride  = 0;
+
     // Onde vivem os shaders, já convertidos para SPIR-V.
     std::uint32_t vertex_shader   = 0;
     std::uint32_t fragment_shader = 0;

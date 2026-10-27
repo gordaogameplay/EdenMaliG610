@@ -21,7 +21,7 @@ namespace g610::gpu {
 // O mesmo número é o `MacroRegistersStart` do upstream ✓: os métodos
 // >= 0xE00 não são registos — são os gatilhos das macros MME.
 namespace {
-constexpr std::size_t kMaxRegistos = 0xE00;
+constexpr std::size_t kMaxRegistos = 0x2010;
 // O alinhamento do push buffer: o fluxo de métodos são palavras de 32
 // bits ✓ (o upstream: `Tegra::CommandHeader` ✓).
 constexpr std::size_t kWord = 4;
@@ -292,6 +292,18 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
             c.index_first = index_first;
             c.vertex_count = indexado ? 0 : vertex_count;
             c.base_vertex = regs[gpu::maxwell3d::global_base_vertex_index];
+            // Captura o stream de vértices 0 (registo 0x1C00..0x1C02), se
+            // o push buffer o tiver escrito. Ainda não se lê da memória do
+            // guest — é apenas o VA bruto para a etapa seguinte.
+            if (0x1C02 < regs.size()) {
+                const std::uint32_t vs0 = regs[0x1C00];
+                c.vertex_stride = vs0 & 0xFFF;
+                if (vs0 & (1u << 12)) {
+                    const std::uint32_t hi = regs[0x1C01];
+                    const std::uint32_t lo = regs[0x1C02];
+                    c.vertex_base_va = (static_cast<std::uint64_t>(hi) << 32) | lo;
+                }
+            }
             c.instance_count = instance_count != 0 ? instance_count : 1;
             c.est_triangles = static_cast<std::uint64_t>(
                                   indexado ? c.index_count : c.vertex_count) / 3;
