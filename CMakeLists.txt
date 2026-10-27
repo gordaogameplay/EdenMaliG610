@@ -416,6 +416,9 @@ if(VULKAN_LIB)
   target_link_libraries(g610_vertex_attributes PRIVATE g610_core)
   add_test(NAME vertex_attributes COMMAND g610_vertex_attributes)
 
+  add_executable(g610_gpfifo_inspect tests/test_gpfifo_inspect.cpp)
+  target_link_libraries(g610_gpfifo_inspect PRIVATE g610_core)
+
   add_executable(g610_integrated_draw tests/test_integrated_draw.cpp)
   target_link_libraries(g610_integrated_draw PRIVATE g610_core ${VULKAN_LIB})
   add_test(NAME integrated_draw COMMAND g610_integrated_draw)
