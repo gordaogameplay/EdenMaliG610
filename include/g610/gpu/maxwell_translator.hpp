@@ -93,6 +93,22 @@ namespace g610::gpu {
 // cabeçalho do método traz esse ID nos bits 0..12 ✓ (ver
 // `g610/gpu/pushbuffer.hpp` ✓).
 // ---------------------------------------------------------------------------
+// Atributo de vértice decodificado (Maxwell `vertex_attrib_format`).
+// ---------------------------------------------------------------------------
+struct VertexAttributeDesc {
+    bool enabled = false;
+    std::uint32_t buffer = 0;        // stream index
+    std::uint32_t offset = 0;        // byte offset no vértice
+    std::uint32_t size_enum = 0;     // Size
+    std::uint32_t type_enum = 0;     // Type
+    bool constant = false;
+    bool bgra = false;
+    std::uint32_t component_count = 0;
+    std::uint32_t size_bytes = 0;
+    std::uint32_t stream_stride = 0;
+};
+
+// ---------------------------------------------------------------------------
 // Um comando já traduzido.
 // ---------------------------------------------------------------------------
 struct DrawCommand {
@@ -112,6 +128,13 @@ struct DrawCommand {
     // **Ainda não são lidos da memória do guest** — ver ETAPA 4.
     std::uint64_t vertex_base_va = 0;
     std::uint32_t vertex_stride  = 0;
+
+    // Atributos decodificados (apenas os habilitados).
+    std::vector<VertexAttributeDesc> attributes;
+
+    // Topologia: 0 = não determinada.
+    std::uint32_t topology_raw = 0;
+    std::uint32_t primitive_topology_control_raw = 0;
 
     // Onde vivem os shaders, já convertidos para SPIR-V.
     std::uint32_t vertex_shader   = 0;

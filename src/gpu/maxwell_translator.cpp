@@ -295,15 +295,57 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
             // Captura o stream de vértices 0 (registo 0x1C00..0x1C02), se
             // o push buffer o tiver escrito. Ainda não se lê da memória do
             // guest — é apenas o VA bruto para a etapa seguinte.
-            if (0x1C02 < regs.size()) {
-                const std::uint32_t vs0 = regs[0x1C00];
+            if (0x702 < regs.size()) {
+                const std::uint32_t vs0 = regs[0x700];
                 c.vertex_stride = vs0 & 0xFFF;
                 if (vs0 & (1u << 12)) {
-                    const std::uint32_t hi = regs[0x1C01];
-                    const std::uint32_t lo = regs[0x1C02];
+                    const std::uint32_t hi = regs[0x701];
+                    const std::uint32_t lo = regs[0x702];
                     c.vertex_base_va = (static_cast<std::uint64_t>(hi) << 32) | lo;
                 }
             }
+            // Decodifica os atributos de vértice (registos 0x458..0x477,
+            // byte offset 0x1160, 4 bytes por registo).
+            for (std::uint32_t i = 0; i < 32 && (0x458 + i) < regs.size(); ++i) {
+                const std::uint32_t raw = regs[0x458 + i];
+                const std::uint32_t size_enum = (raw >> 21) & 0x3F;
+                if (size_enum == 0) continue; // Invalid / desabilitado
+                VertexAttributeDesc a;
+                a.enabled = true;
+                a.buffer = raw & 0x1F;
+                a.constant = (raw >> 6) & 0x1;
+                a.offset = (raw >> 7) & 0x3FFF;
+                a.size_enum = size_enum;
+                a.type_enum = (raw >> 27) & 0x7;
+                a.bgra = (raw >> 31) & 0x1;
+                // stride do stream de origem (0x700 + buffer*4)
+                const std::size_t vs_reg = 0x700 + static_cast<std::size_t>(a.buffer) * 4;
+                if (vs_reg < regs.size()) a.stream_stride = regs[vs_reg] & 0xFFF;
+                // component_count e size_bytes
+                switch (size_enum) {
+                case 0x01: a.component_count = 4; a.size_bytes = 16; break; // R32G32B32A32
+                case 0x02: a.component_count = 3; a.size_bytes = 12; break; // R32G32B32
+                case 0x03: a.component_count = 4; a.size_bytes = 8; break;  // R16G16B16A16
+                case 0x04: a.component_count = 2; a.size_bytes = 8; break;  // R32G32
+                case 0x05: a.component_count = 3; a.size_bytes = 6; break;  // R16G16B16
+                case 0x0A: case 0x33: a.component_count = 4; a.size_bytes = 4; break; // R8G8B8A8 / X8B8G8R8
+                case 0x0F: a.component_count = 2; a.size_bytes = 4; break;  // R16G16
+                case 0x12: a.component_count = 1; a.size_bytes = 4; break;  // R32
+                case 0x13: a.component_count = 3; a.size_bytes = 3; break;  // R8G8B8
+                case 0x18: case 0x32: a.component_count = 2; a.size_bytes = 2; break; // R8G8 / G8R8
+                case 0x1B: a.component_count = 1; a.size_bytes = 2; break;  // R16
+                case 0x1D: case 0x34: a.component_count = 1; a.size_bytes = 1; break; // R8 / A8
+                case 0x30: a.component_count = 4; a.size_bytes = 4; break;  // A2B10G10R10
+                case 0x31: a.component_count = 3; a.size_bytes = 4; break;  // B10G11R11
+                default: a.component_count = 1; a.size_bytes = 0; break;
+                }
+                c.attributes.push_back(a);
+            }
+
+            // Topologia: captura os registos relevantes (raw).
+            if (0x652 < regs.size()) c.primitive_topology_control_raw = regs[0x652];
+            if (0x65C < regs.size()) c.topology_raw = regs[0x65C] & 0xFFFF;
+
             c.instance_count = instance_count != 0 ? instance_count : 1;
             c.est_triangles = static_cast<std::uint64_t>(
                                   indexado ? c.index_count : c.vertex_count) / 3;
