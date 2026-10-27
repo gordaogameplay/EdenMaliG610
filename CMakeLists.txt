@@ -406,6 +406,11 @@ if(VULKAN_LIB)
   add_executable(g610_rasterizer_clear tests/test_rasterizer_clear.cpp)
   target_link_libraries(g610_rasterizer_clear PRIVATE g610_core ${VULKAN_LIB})
   add_test(NAME rasterizer_clear COMMAND g610_rasterizer_clear)
+
+  # Teste de pipeline gráfico Vulkan real: triângulo offscreen + readback.
+  add_executable(g610_vulkan_pipeline tests/test_vulkan_pipeline.cpp)
+  target_link_libraries(g610_vulkan_pipeline PRIVATE g610_core ${VULKAN_LIB})
+  add_test(NAME vulkan_pipeline COMMAND g610_vulkan_pipeline)
 endif()
 
 # Teste de input: prova que a pilha SDL2 + evdev + mapeamento funciona.

@@ -150,7 +150,8 @@ bool VulkanBackend::create_image(std::string& error) {
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -450,6 +451,509 @@ ClearResult VulkanBackend::clear_image() {
     result.ok = (mismatched == 0);
     if (!result.ok) {
         result.error = "pixels não correspondem à cor de clear";
+    }
+    return result;
+}
+
+PipelineDrawResult VulkanBackend::draw_triangle(const std::vector<char>& vert_spv,
+                                               const std::vector<char>& frag_spv) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    PipelineDrawResult result;
+    if (!ready_) {
+        result.error = "backend não inicializado";
+        return result;
+    }
+    if (vert_spv.empty() || frag_spv.empty()) {
+        result.error = "SPIR-V vazio";
+        return result;
+    }
+
+    // Image view (cria se necessário — reutiliza a imagem existente).
+    VkImageView view = VK_NULL_HANDLE;
+    VkImageViewCreateInfo ivci{};
+    ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    ivci.image = image_;
+    ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    ivci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    ivci.subresourceRange.levelCount = 1;
+    ivci.subresourceRange.layerCount = 1;
+    VkResult r = vkCreateImageView(device_, &ivci, nullptr, &view);
+    if (r != VK_SUCCESS) {
+        result.error = "vkCreateImageView falhou";
+        return result;
+    }
+
+    // Render pass: clear para preto, store.
+    VkAttachmentDescription att{};
+    att.format = VK_FORMAT_R8G8B8A8_UNORM;
+    att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    att.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+    VkAttachmentReference ref{};
+    ref.attachment = 0;
+    ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &ref;
+
+    VkSubpassDependency deps[2]{};
+    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass = 0;
+    deps[0].srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    deps[0].srcAccessMask = 0;
+    deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    deps[1].srcSubpass = 0;
+    deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    deps[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+    VkRenderPassCreateInfo rpci{};
+    rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rpci.attachmentCount = 1;
+    rpci.pAttachments = &att;
+    rpci.subpassCount = 1;
+    rpci.pSubpasses = &sub;
+    rpci.dependencyCount = 2;
+    rpci.pDependencies = deps;
+    VkRenderPass rp = VK_NULL_HANDLE;
+    r = vkCreateRenderPass(device_, &rpci, nullptr, &rp);
+    if (r != VK_SUCCESS) {
+        vkDestroyImageView(device_, view, nullptr);
+        result.error = "vkCreateRenderPass falhou";
+        return result;
+    }
+
+    VkFramebufferCreateInfo fbci{};
+    fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fbci.renderPass = rp;
+    fbci.attachmentCount = 1;
+    fbci.pAttachments = &view;
+    fbci.width = kW;
+    fbci.height = kH;
+    fbci.layers = 1;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    r = vkCreateFramebuffer(device_, &fbci, nullptr, &fb);
+    if (r != VK_SUCCESS) {
+        vkDestroyRenderPass(device_, rp, nullptr);
+        vkDestroyImageView(device_, view, nullptr);
+        result.error = "vkCreateFramebuffer falhou";
+        return result;
+    }
+
+    // Shader modules.
+    VkShaderModuleCreateInfo smci{};
+    smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smci.codeSize = vert_spv.size();
+    smci.pCode = reinterpret_cast<const std::uint32_t*>(vert_spv.data());
+    VkShaderModule vs = VK_NULL_HANDLE;
+    r = vkCreateShaderModule(device_, &smci, nullptr, &vs);
+    if (r != VK_SUCCESS) {
+        vkDestroyFramebuffer(device_, fb, nullptr);
+        vkDestroyRenderPass(device_, rp, nullptr);
+        vkDestroyImageView(device_, view, nullptr);
+        result.error = "vkCreateShaderModule (vert) falhou";
+        return result;
+    }
+    smci.codeSize = frag_spv.size();
+    smci.pCode = reinterpret_cast<const std::uint32_t*>(frag_spv.data());
+    VkShaderModule fs = VK_NULL_HANDLE;
+    r = vkCreateShaderModule(device_, &smci, nullptr, &fs);
+    if (r != VK_SUCCESS) {
+        vkDestroyShaderModule(device_, vs, nullptr);
+        vkDestroyFramebuffer(device_, fb, nullptr);
+        vkDestroyRenderPass(device_, rp, nullptr);
+        vkDestroyImageView(device_, view, nullptr);
+        result.error = "vkCreateShaderModule (frag) falhou";
+        return result;
+    }
+
+    // Vertex buffer com 3 vértices (triângulo).
+    float verts[6] = {-0.5f, -0.5f, 0.5f, -0.5f, 0.0f, 0.5f};
+    VkBuffer vbo = VK_NULL_HANDLE;
+    VkBufferCreateInfo vbc{};
+    vbc.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    vbc.size = sizeof(verts);
+    vbc.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    vbc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    r = vkCreateBuffer(device_, &vbc, nullptr, &vbo);
+    if (r != VK_SUCCESS) {
+        vkDestroyBuffer(device_, vbo, nullptr);
+        vkDestroyShaderModule(device_, fs, nullptr);
+        vkDestroyShaderModule(device_, vs, nullptr);
+        vkDestroyFramebuffer(device_, fb, nullptr);
+        vkDestroyRenderPass(device_, rp, nullptr);
+        vkDestroyImageView(device_, view, nullptr);
+        result.error = "vkCreateBuffer falhou";
+        return result;
+    }
+    VkMemoryRequirements vreq{};
+    vkGetBufferMemoryRequirements(device_, vbo, &vreq);
+    std::uint32_t vmt = find_memory_type(vreq.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (vmt == UINT32_MAX) vmt = find_memory_type(vreq.memoryTypeBits, 0);
+    VkMemoryAllocateInfo vmai{};
+    vmai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    vmai.allocationSize = vreq.size;
+    vmai.memoryTypeIndex = vmt;
+    VkDeviceMemory vmem = VK_NULL_HANDLE;
+    r = vkAllocateMemory(device_, &vmai, nullptr, &vmem);
+    if (r != VK_SUCCESS) {
+        vkDestroyBuffer(device_, vbo, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+        vkDestroyBuffer(device_, vbo, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+    vkDestroyBuffer(device_, vbo, nullptr);
+    vkDestroyShaderModule(device_, fs, nullptr);
+        vkDestroyShaderModule(device_, vs, nullptr);
+        vkDestroyFramebuffer(device_, fb, nullptr);
+        vkDestroyRenderPass(device_, rp, nullptr);
+        vkDestroyImageView(device_, view, nullptr);
+        result.error = "vkAllocateMemory (vbo) falhou";
+        return result;
+    }
+    vkBindBufferMemory(device_, vbo, vmem, 0);
+    void* vp = nullptr;
+    r = vkMapMemory(device_, vmem, 0, sizeof(verts), 0, &vp);
+    if (r != VK_SUCCESS || vp == nullptr) {
+        vkFreeMemory(device_, vmem, nullptr);
+        vkDestroyBuffer(device_, vbo, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+        vkDestroyBuffer(device_, vbo, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+    vkDestroyBuffer(device_, vbo, nullptr);
+    vkDestroyShaderModule(device_, fs, nullptr);
+        vkDestroyShaderModule(device_, vs, nullptr);
+        vkDestroyFramebuffer(device_, fb, nullptr);
+        vkDestroyRenderPass(device_, rp, nullptr);
+        vkDestroyImageView(device_, view, nullptr);
+        result.error = "vkMapMemory (vbo) falhou";
+        return result;
+    }
+    std::memcpy(vp, verts, sizeof(verts));
+    vkUnmapMemory(device_, vmem);
+
+    // Pipeline layout (sem descriptors).
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    VkPipelineLayout pl = VK_NULL_HANDLE;
+    r = vkCreatePipelineLayout(device_, &plci, nullptr, &pl);
+    if (r != VK_SUCCESS) {
+        vkFreeMemory(device_, vmem, nullptr);
+        vkDestroyBuffer(device_, vbo, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+    vkDestroyBuffer(device_, vbo, nullptr);
+    vkDestroyShaderModule(device_, fs, nullptr);
+        vkDestroyShaderModule(device_, vs, nullptr);
+        vkDestroyFramebuffer(device_, fb, nullptr);
+        vkDestroyRenderPass(device_, rp, nullptr);
+        vkDestroyImageView(device_, view, nullptr);
+        result.error = "vkCreatePipelineLayout falhou";
+        return result;
+    }
+
+    // Graphics pipeline.
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fs;
+    stages[1].pName = "main";
+
+    VkVertexInputBindingDescription vib{};
+    vib.binding = 0;
+    vib.stride = 2 * sizeof(float);
+    vib.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputAttributeDescription via{};
+    via.location = 0;
+    via.binding = 0;
+    via.format = VK_FORMAT_R32G32_SFLOAT;
+    via.offset = 0;
+
+    VkPipelineVertexInputStateCreateInfo vis{};
+    vis.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vis.vertexBindingDescriptionCount = 1;
+    vis.pVertexBindingDescriptions = &vib;
+    vis.vertexAttributeDescriptionCount = 1;
+    vis.pVertexAttributeDescriptions = &via;
+
+    VkPipelineInputAssemblyStateCreateInfo ias{};
+    ias.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ias.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkViewport vp2{0.f, 0.f, float(kW), float(kH), 0.f, 1.f};
+    VkRect2D scissor{{0, 0}, {kW, kH}};
+    VkPipelineViewportStateCreateInfo vps{};
+    vps.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vps.viewportCount = 1;
+    vps.pViewports = &vp2;
+    vps.scissorCount = 1;
+    vps.pScissors = &scissor;
+
+    VkPipelineRasterizationStateCreateInfo ras{};
+    ras.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    ras.polygonMode = VK_POLYGON_MODE_FILL;
+    ras.cullMode = VK_CULL_MODE_NONE;
+    ras.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    ras.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo msa{};
+    msa.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    msa.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cbs{};
+    cbs.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cbs.attachmentCount = 1;
+    cbs.pAttachments = &cba;
+
+    VkGraphicsPipelineCreateInfo gpci{};
+    gpci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gpci.stageCount = 2;
+    gpci.pStages = stages;
+    gpci.pVertexInputState = &vis;
+    gpci.pInputAssemblyState = &ias;
+    gpci.pViewportState = &vps;
+    gpci.pRasterizationState = &ras;
+    gpci.pMultisampleState = &msa;
+    gpci.pColorBlendState = &cbs;
+    gpci.layout = pl;
+    gpci.renderPass = rp;
+    gpci.subpass = 0;
+
+    VkPipeline pipe = VK_NULL_HANDLE;
+    r = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipe);
+    if (r != VK_SUCCESS) {
+        vkDestroyPipelineLayout(device_, pl, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+        vkDestroyBuffer(device_, vbo, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+    vkDestroyBuffer(device_, vbo, nullptr);
+    vkDestroyShaderModule(device_, fs, nullptr);
+        vkDestroyShaderModule(device_, vs, nullptr);
+        vkDestroyFramebuffer(device_, fb, nullptr);
+        vkDestroyRenderPass(device_, rp, nullptr);
+        vkDestroyImageView(device_, view, nullptr);
+        result.error = "vkCreateGraphicsPipelines falhou";
+        return result;
+    }
+
+    // Command buffer.
+    VkCommandBufferAllocateInfo cbai{};
+    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbai.commandPool = command_pool_;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    r = vkAllocateCommandBuffers(device_, &cbai, &cmd);
+    if (r != VK_SUCCESS) {
+        // cleanup
+        vkDestroyPipeline(device_, pipe, nullptr);
+        vkDestroyPipelineLayout(device_, pl, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+        vkDestroyBuffer(device_, vbo, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+    vkDestroyBuffer(device_, vbo, nullptr);
+    vkDestroyShaderModule(device_, fs, nullptr);
+        vkDestroyShaderModule(device_, vs, nullptr);
+        vkDestroyFramebuffer(device_, fb, nullptr);
+        vkDestroyRenderPass(device_, rp, nullptr);
+        vkDestroyImageView(device_, view, nullptr);
+        result.error = "vkAllocateCommandBuffers falhou";
+        return result;
+    }
+
+    VkCommandBufferBeginInfo cbbi{};
+    cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    r = vkBeginCommandBuffer(cmd, &cbbi);
+    if (r != VK_SUCCESS) {
+        vkFreeCommandBuffers(device_, command_pool_, 1, &cmd);
+        vkDestroyPipeline(device_, pipe, nullptr);
+        vkDestroyPipelineLayout(device_, pl, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+        vkDestroyBuffer(device_, vbo, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+    vkDestroyBuffer(device_, vbo, nullptr);
+    vkDestroyShaderModule(device_, fs, nullptr);
+        vkDestroyShaderModule(device_, vs, nullptr);
+        vkDestroyFramebuffer(device_, fb, nullptr);
+        vkDestroyRenderPass(device_, rp, nullptr);
+        vkDestroyImageView(device_, view, nullptr);
+        result.error = "vkBeginCommandBuffer falhou";
+        return result;
+    }
+
+    VkClearValue cv{};
+    cv.color.float32[0] = 0.f;
+    cv.color.float32[1] = 0.f;
+    cv.color.float32[2] = 0.f;
+    cv.color.float32[3] = 1.f;
+    VkRenderPassBeginInfo rpbi{};
+    rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rpbi.renderPass = rp;
+    rpbi.framebuffer = fb;
+    rpbi.renderArea = {{0, 0}, {kW, kH}};
+    rpbi.clearValueCount = 1;
+    rpbi.pClearValues = &cv;
+    vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    const VkDeviceSize off = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo, &off);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRenderPass(cmd);
+
+    // transition finalLayout (TRANSFER_SRC_OPTIMAL) already; copy.
+    VkBufferImageCopy cpy{};
+    cpy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    cpy.imageSubresource.layerCount = 1;
+    cpy.imageExtent = {kW, kH, 1};
+    vkCmdCopyImageToBuffer(cmd, image_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback_, 1, &cpy);
+
+    r = vkEndCommandBuffer(cmd);
+    if (r != VK_SUCCESS) {
+        vkFreeCommandBuffers(device_, command_pool_, 1, &cmd);
+        // cleanup omitted for brevity but continue to release
+        result.error = "vkEndCommandBuffer falhou";
+        // fall through to cleanup below via early return after partial cleanup
+        vkDestroyPipeline(device_, pipe, nullptr);
+        vkDestroyPipelineLayout(device_, pl, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+        vkDestroyBuffer(device_, vbo, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+    vkDestroyBuffer(device_, vbo, nullptr);
+    vkDestroyShaderModule(device_, fs, nullptr);
+        vkDestroyShaderModule(device_, vs, nullptr);
+        vkDestroyFramebuffer(device_, fb, nullptr);
+        vkDestroyRenderPass(device_, rp, nullptr);
+        vkDestroyImageView(device_, view, nullptr);
+        return result;
+    }
+
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VkFence fence = VK_NULL_HANDLE;
+    r = vkCreateFence(device_, &fci, nullptr, &fence);
+    if (r != VK_SUCCESS) {
+        vkFreeCommandBuffers(device_, command_pool_, 1, &cmd);
+        vkDestroyPipeline(device_, pipe, nullptr);
+        vkDestroyPipelineLayout(device_, pl, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+        vkDestroyBuffer(device_, vbo, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+    vkDestroyBuffer(device_, vbo, nullptr);
+    vkDestroyShaderModule(device_, fs, nullptr);
+        vkDestroyShaderModule(device_, vs, nullptr);
+        vkDestroyFramebuffer(device_, fb, nullptr);
+        vkDestroyRenderPass(device_, rp, nullptr);
+        vkDestroyImageView(device_, view, nullptr);
+        result.error = "vkCreateFence falhou";
+        return result;
+    }
+
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    r = vkQueueSubmit(queue_, 1, &si, fence);
+    if (r != VK_SUCCESS) {
+        vkDestroyFence(device_, fence, nullptr);
+        vkFreeCommandBuffers(device_, command_pool_, 1, &cmd);
+        vkDestroyPipeline(device_, pipe, nullptr);
+        vkDestroyPipelineLayout(device_, pl, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+        vkDestroyBuffer(device_, vbo, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+    vkDestroyBuffer(device_, vbo, nullptr);
+    vkDestroyShaderModule(device_, fs, nullptr);
+        vkDestroyShaderModule(device_, vs, nullptr);
+        vkDestroyFramebuffer(device_, fb, nullptr);
+        vkDestroyRenderPass(device_, rp, nullptr);
+        vkDestroyImageView(device_, view, nullptr);
+        result.error = "vkQueueSubmit falhou";
+        return result;
+    }
+    r = vkWaitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX);
+    vkDestroyFence(device_, fence, nullptr);
+    vkFreeCommandBuffers(device_, command_pool_, 1, &cmd);
+    if (r != VK_SUCCESS) {
+        vkDestroyPipeline(device_, pipe, nullptr);
+        vkDestroyPipelineLayout(device_, pl, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+        vkDestroyBuffer(device_, vbo, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+    vkDestroyBuffer(device_, vbo, nullptr);
+    vkDestroyShaderModule(device_, fs, nullptr);
+        vkDestroyShaderModule(device_, vs, nullptr);
+        vkDestroyFramebuffer(device_, fb, nullptr);
+        vkDestroyRenderPass(device_, rp, nullptr);
+        vkDestroyImageView(device_, view, nullptr);
+        result.error = "vkWaitForFences falhou";
+        return result;
+    }
+
+    // Readback.
+    void* p = nullptr;
+    r = vkMapMemory(device_, readback_memory_, 0, kW * kH * 4, 0, &p);
+    if (r != VK_SUCCESS) {
+        vkDestroyPipeline(device_, pipe, nullptr);
+        vkDestroyPipelineLayout(device_, pl, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+        vkDestroyBuffer(device_, vbo, nullptr);
+        vkFreeMemory(device_, vmem, nullptr);
+    vkDestroyBuffer(device_, vbo, nullptr);
+    vkDestroyShaderModule(device_, fs, nullptr);
+        vkDestroyShaderModule(device_, vs, nullptr);
+        vkDestroyFramebuffer(device_, fb, nullptr);
+        vkDestroyRenderPass(device_, rp, nullptr);
+        vkDestroyImageView(device_, view, nullptr);
+        result.error = "vkMapMemory falhou";
+        return result;
+    }
+    const unsigned char* px = static_cast<const unsigned char*>(p);
+    std::uint32_t checked = 0, red = 0, bg = 0, other = 0;
+    for (std::uint32_t i = 0; i < kW * kH; ++i) {
+        unsigned char rr = px[i*4+0], gg = px[i*4+1], bb = px[i*4+2], aa = px[i*4+3];
+        ++checked;
+        if (rr > 200 && gg < 50 && bb < 50) ++red;
+        else if (rr < 20 && gg < 20 && bb < 20) ++bg;
+        else ++other;
+    }
+    vkUnmapMemory(device_, readback_memory_);
+
+    // Cleanup.
+    vkDestroyPipeline(device_, pipe, nullptr);
+    vkDestroyPipelineLayout(device_, pl, nullptr);
+    vkFreeMemory(device_, vmem, nullptr);
+    vkDestroyBuffer(device_, vbo, nullptr);
+    vkDestroyShaderModule(device_, fs, nullptr);
+    vkDestroyShaderModule(device_, vs, nullptr);
+    vkDestroyFramebuffer(device_, fb, nullptr);
+    vkDestroyRenderPass(device_, rp, nullptr);
+    vkDestroyImageView(device_, view, nullptr);
+
+    result.pixels_checked = checked;
+    result.pixels_red = red;
+    result.pixels_background = bg;
+    result.pixels_other = other;
+    result.ok = (red > 0 && bg > 0 && other == 0);
+    if (!result.ok) {
+        result.error = "pixels inesperados (red=" + std::to_string(red) +
+                       " bg=" + std::to_string(bg) + " other=" + std::to_string(other) + ")";
     }
     return result;
 }

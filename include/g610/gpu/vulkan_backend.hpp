@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 #include <vulkan/vulkan.h>
 
 namespace g610::gpu {
@@ -20,6 +21,15 @@ struct ClearResult {
     bool ok = false;
     std::uint32_t pixels_checked = 0;
     std::uint32_t pixels_mismatched = 0;
+    std::string error;
+};
+
+struct PipelineDrawResult {
+    bool ok = false;
+    std::uint32_t pixels_checked = 0;
+    std::uint32_t pixels_red = 0;
+    std::uint32_t pixels_background = 0;
+    std::uint32_t pixels_other = 0;
     std::string error;
 };
 
@@ -44,6 +54,12 @@ public:
     // Executa um clear real (cor conhecida) e verifica os pixels por
     // readback. Thread-safe.
     ClearResult clear_image();
+
+    // Executa um pipeline gráfico real: desenha um triângulo (SPIR-V
+    // fornecido pelo chamador) sobre a imagem offscreen e verifica os
+    // pixels por readback. Thread-safe.
+    PipelineDrawResult draw_triangle(const std::vector<char>& vert_spv,
+                                    const std::vector<char>& frag_spv);
 
     // Cor usada no clear (para diagnóstico).
     static constexpr float kR = 0.25f;
