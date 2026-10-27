@@ -342,9 +342,19 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
                 c.attributes.push_back(a);
             }
 
-            // Topologia: captura os registos relevantes (raw).
+            // Topologia: resolve conforme upstream UpdateTopology().
             if (0x652 < regs.size()) c.primitive_topology_control_raw = regs[0x652];
             if (0x65C < regs.size()) c.topology_raw = regs[0x65C] & 0xFFFF;
+            if (c.primitive_topology_control_raw == 1) { // UseSeparateState
+                const std::uint32_t to = c.topology_raw;
+                if (to == 1) { c.topology = 0; c.topology_known = true; } // Points
+                else if (to == 2) { c.topology = 1; c.topology_known = true; } // Lines
+                else if (to == 3) { c.topology = 3; c.topology_known = true; } // LineStrip
+                else if (to == 4 || to == 5 || (to >= 0xA && to <= 0xD)) { c.topology = to; c.topology_known = true; }
+                else { c.topology_known = false; } // None or unknown
+            } else {
+                c.topology_known = false; // UseInBeginMethods: nao rastreado
+            }
 
             c.instance_count = instance_count != 0 ? instance_count : 1;
             c.est_triangles = static_cast<std::uint64_t>(

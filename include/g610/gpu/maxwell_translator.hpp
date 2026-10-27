@@ -135,6 +135,8 @@ struct DrawCommand {
     // Topologia: 0 = não determinada.
     std::uint32_t topology_raw = 0;
     std::uint32_t primitive_topology_control_raw = 0;
+    bool topology_known = false;
+    std::uint32_t topology = 0; // PrimitiveTopology value when known
 
     // Onde vivem os shaders, já convertidos para SPIR-V.
     std::uint32_t vertex_shader   = 0;

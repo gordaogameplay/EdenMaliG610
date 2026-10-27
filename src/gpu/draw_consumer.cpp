@@ -32,7 +32,8 @@ void processar_draw_comandos(std::vector<DrawCommand>& comandos, void* contexto,
 
     for (auto& cmd : comandos) {
         rasterizer.AnotaDesenho(cmd.vertex_count, cmd.index_count, cmd.indexado,
-                                cmd.vertex_base_va, cmd.vertex_stride);
+                                cmd.vertex_base_va, cmd.vertex_stride,
+                                cmd.attributes, cmd.topology_known, cmd.topology);
         rasterizer.Draw(cmd.indexado, cmd.instance_count);
     }
 }

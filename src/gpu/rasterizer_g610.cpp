@@ -116,6 +116,55 @@ bool RasterizerG610::ler_do_guest(std::uint64_t src, void* dst, std::size_t size
     return le_(src, dst, size);
 }
 
+bool RasterizerG610::desenhar_integrado(const std::vector<char>& vert_spv,
+                                        const std::vector<char>& frag_spv) {
+    if (!backend_) { std::fprintf(stderr, "[integrado] sem backend\n"); return false; }
+    if (!topology_known_ultimo) { std::fprintf(stderr, "[integrado] topologia desconhecida\n"); return false; }
+    if (va_vertices_ultimo == 0 || stride_vertices_ultimo == 0 || vertices_ultimo == 0) {
+        std::fprintf(stderr, "[integrado] stream de vertices invalido\n"); return false;
+    }
+    if (attributes_ultimo.empty()) { std::fprintf(stderr, "[integrado] sem atributos\n"); return false; }
+    const auto& a0 = attributes_ultimo[0];
+    if (!a0.enabled) { std::fprintf(stderr, "[integrado] atributo 0 desabilitado\n"); return false; }
+    if (a0.type_enum != 7) { std::fprintf(stderr, "[integrado] tipo nao-Float (type=%u)\n", a0.type_enum); return false; }
+    if (a0.component_count < 2) { std::fprintf(stderr, "[integrado] componentes < 2\n"); return false; }
+    if (a0.size_bytes == 0) { std::fprintf(stderr, "[integrado] size_bytes=0\n"); return false; }
+
+    // Validacao de tamanho e overflow.
+    constexpr std::size_t kMaxBytes = 64 * 1024 * 1024;
+    if (vertices_ultimo > kMaxBytes / (stride_vertices_ultimo ? stride_vertices_ultimo : 1)) {
+        std::fprintf(stderr, "[integrado] overflow\n"); return false;
+    }
+    const std::size_t total = static_cast<std::size_t>(vertices_ultimo) * stride_vertices_ultimo;
+    if (total > kMaxBytes) { std::fprintf(stderr, "[integrado] buffer demasiado grande\n"); return false; }
+
+    // Leitura segura.
+    std::vector<std::uint8_t> raw(total);
+    if (!ler_do_guest(va_vertices_ultimo, raw.data(), total)) {
+        std::fprintf(stderr, "[integrado] falha ao ler memoria do guest\n"); return false;
+    }
+
+    // Extrai posicoes (x,y) do atributo 0.
+    std::vector<float> positions;
+    positions.reserve(vertices_ultimo * 2);
+    for (std::uint64_t i = 0; i < vertices_ultimo; ++i) {
+        const std::size_t base = static_cast<std::size_t>(i) * stride_vertices_ultimo + a0.offset;
+        if (base + a0.size_bytes > raw.size()) { std::fprintf(stderr, "[integrado] buffer incompleto\n"); return false; }
+        const float* fp = reinterpret_cast<const float*>(raw.data() + base);
+        positions.push_back(fp[0]);
+        positions.push_back(fp[1]);
+    }
+
+    if (positions.empty()) { std::fprintf(stderr, "[integrado] sem posicoes\n"); return false; }
+
+    auto res = backend_->draw_vertex_buffer(vert_spv, frag_spv, positions.data(),
+                                           positions.size() / 2, 2 * sizeof(float));
+    std::fprintf(stderr, "[integrado] draw_vertex_buffer: ok=%d red=%u bg=%u other=%u %s\n",
+                 res.ok ? 1 : 0, res.pixels_red, res.pixels_background, res.pixels_other,
+                 res.error.c_str());
+    return res.ok;
+}
+
 void RasterizerG610::Clear(u32 layer_count) {
     ++contadores_.clears;
     (void)layer_count;
@@ -143,12 +192,17 @@ void RasterizerG610::DispatchCompute() {
 }
 
 void RasterizerG610::AnotaDesenho(std::uint64_t vertices, std::uint64_t indices, bool indexado,
-                                  std::uint64_t vertex_base_va, std::uint32_t vertex_stride) {
+                                  std::uint64_t vertex_base_va, std::uint32_t vertex_stride,
+                                  const std::vector<VertexAttributeDesc>& attributes,
+                                  bool topology_known, std::uint32_t topology) {
     vertices_ultimo = vertices;
     indices_ultimo = indices;
     indexado_ultimo = indexado;
     va_vertices_ultimo = vertex_base_va;
     stride_vertices_ultimo = vertex_stride;
+    attributes_ultimo = attributes;
+    topology_known_ultimo = topology_known;
+    topology_ultimo = topology;
 }
 
 // ── As queries ──────────────────────────────────────────────────────────────

@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "video_core/rasterizer_interface.h"
+#include "g610/gpu/maxwell_translator.hpp"
 
 namespace g610::gpu {
 
@@ -139,11 +140,18 @@ public:
     // Leitura segura da memória do guest. Valida overflow e tamanho.
     bool ler_do_guest(std::uint64_t src, void* dst, std::size_t size) const;
 
+    // Tenta um desenho integrado (topologia + vertices reais) no backend.
+    // Devolve false se faltar informacao ou falhar. Recebe shaders de teste.
+    bool desenhar_integrado(const std::vector<char>& vert_spv,
+                            const std::vector<char>& frag_spv);
+
     // Os vertices/indices que o motor pediu no último desenho — é o que
     // permite confirmar que a traducao do estado está certa ✓ (a contagem
     // de vertices e' o que a GPU faria).
     void AnotaDesenho(std::uint64_t vertices, std::uint64_t indices, bool indexado,
-                      std::uint64_t vertex_base_va = 0, std::uint32_t vertex_stride = 0);
+                      std::uint64_t vertex_base_va = 0, std::uint32_t vertex_stride = 0,
+                      const std::vector<VertexAttributeDesc>& attributes = {},
+                      bool topology_known = false, std::uint32_t topology = 0);
 
     std::uint64_t vertices_ultimo = 0;
     std::uint64_t indices_ultimo = 0;
@@ -159,6 +167,9 @@ private:
     // Metadados do último desenho (para Draw()).
     std::uint64_t va_vertices_ultimo = 0;
     std::uint32_t stride_vertices_ultimo = 0;
+    std::vector<VertexAttributeDesc> attributes_ultimo;
+    bool topology_known_ultimo = false;
+    std::uint32_t topology_ultimo = 0;
 
 public:
     // Acesso ao backend (para testes/diagnóstico).
