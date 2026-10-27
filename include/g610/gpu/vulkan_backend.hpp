@@ -55,9 +55,17 @@ public:
     // readback. Thread-safe.
     ClearResult clear_image();
 
-    // Executa um pipeline gráfico real: desenha um triângulo (SPIR-V
-    // fornecido pelo chamador) sobre a imagem offscreen e verifica os
-    // pixels por readback. Thread-safe.
+    // Desenha a partir de um buffer de vértices fornecido pelo chamador
+    // (SPIR-V + dados). Thread-safe. Interface para integração futura
+    // com dados decodificados do guest.
+    PipelineDrawResult draw_vertex_buffer(const std::vector<char>& vert_spv,
+                                        const std::vector<char>& frag_spv,
+                                        const void* vertex_data,
+                                        std::size_t vertex_count,
+                                        std::size_t stride_bytes);
+
+    // Wrapper de conveniência para o triângulo de teste (dados
+    // artificiais, apenas infraestrutura).
     PipelineDrawResult draw_triangle(const std::vector<char>& vert_spv,
                                     const std::vector<char>& frag_spv);
 

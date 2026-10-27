@@ -412,6 +412,10 @@ if(VULKAN_LIB)
   target_link_libraries(g610_guest_memory_read PRIVATE g610_core)
   add_test(NAME guest_memory_read COMMAND g610_guest_memory_read)
 
+  add_executable(g610_vertex_attributes tests/test_vertex_attributes.cpp)
+  target_link_libraries(g610_vertex_attributes PRIVATE g610_core)
+  add_test(NAME vertex_attributes COMMAND g610_vertex_attributes)
+
   # Teste de pipeline gráfico Vulkan real: triângulo offscreen + readback.
   add_executable(g610_vulkan_pipeline tests/test_vulkan_pipeline.cpp)
   target_link_libraries(g610_vulkan_pipeline PRIVATE g610_core ${VULKAN_LIB})
