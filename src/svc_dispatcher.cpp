@@ -2410,12 +2410,18 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
     if (trace_sync != nullptr) {
         const std::uint64_t s = seq_wait.fetch_add(1);
         if (s < 200 || s % 50 == 0) {
+            std::uint8_t flagval = 0;
+            const std::uint64_t flag_addr = ctx.gpr[19] + 0x2F8;
+            (void)read_guest(flag_addr, &flagval, 1);
             std::fprintf(stderr,
-                         "[trace-sync] WAIT seq=%llu cv=0x%llx tag=0x%x timeout=%lld guest_pc=0x%llx\n",
+                         "[trace-sync] WAIT seq=%llu cv=0x%llx tag=0x%x timeout=%lld guest_pc=0x%llx x19=0x%llx flag_addr=0x%llx flag=%u\n",
                          (unsigned long long)s,
                          (unsigned long long)cv_key, tag,
                          (long long)timeout,
-                         (unsigned long long)ctx.pc);
+                         (unsigned long long)ctx.pc,
+                         (unsigned long long)ctx.gpr[19],
+                         (unsigned long long)flag_addr,
+                         (unsigned)flagval);
         }
     }
 
@@ -2607,6 +2613,13 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
                 std::fprintf(stderr,
                              "[svc] WaitProcessWideKeyAtomic: sinal pendente na cv 0x%llx\n",
                              static_cast<unsigned long long>(cv_key));
+                if (std::getenv("G610_TRACE_SYNC") != nullptr) {
+                    static std::atomic<std::uint64_t> seq_pend{0};
+                    std::fprintf(stderr, "[trace-sync] WAIT-RET seq=%llu cv=0x%llx reason=pending_signal guest_pc=0x%llx\n",
+                                 (unsigned long long)seq_pend.fetch_add(1),
+                                 (unsigned long long)cv_key,
+                                 (unsigned long long)ctx.pc);
+                }
                 ctx.ret     = 0;
                 ctx.has_ret = true;
                 ctx.x[1]    = 0;
@@ -2767,6 +2780,13 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
                             g_arbiter.wake.notify_all();
                         dispatch_owner_set(token);
                         (void)dispatch_owner_claim();
+                        if (std::getenv("G610_TRACE_SYNC") != nullptr) {
+                            static std::atomic<std::uint64_t> seq_to{0};
+                            std::fprintf(stderr, "[trace-sync] WAIT-RET seq=%llu cv=0x%llx reason=timeout guest_pc=0x%llx\n",
+                                         (unsigned long long)seq_to.fetch_add(1),
+                                         (unsigned long long)cv_key,
+                                         (unsigned long long)ctx.pc);
+                        }
                         return Result::TimedOut;
                     }
                     // Entrega no instante do prazo: seguir como entrega
@@ -2828,8 +2848,24 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
     // InvalidCurrentMemory. `Success` devolve o mutex JÁ em mão — o
     // sinalizador escreveu o nosso tag na palavra ANTES de despertar
     // (Eden: WriteToUser, depois EndWait), nada a re-escrever aqui.
-    if (acordei_com != ArbitrationBoard::DespertaSucesso)
+    if (acordei_com != ArbitrationBoard::DespertaSucesso) {
+        if (std::getenv("G610_TRACE_SYNC") != nullptr) {
+            static std::atomic<std::uint64_t> seq_inv{0};
+            std::fprintf(stderr, "[trace-sync] WAIT-RET seq=%llu cv=0x%llx reason=invalid_memory acordei=%d guest_pc=0x%llx\n",
+                         (unsigned long long)seq_inv.fetch_add(1),
+                         (unsigned long long)cv_key,
+                         (int)acordei_com,
+                         (unsigned long long)ctx.pc);
+        }
         return Result::InvalidCurrentMemory;
+    }
+    if (std::getenv("G610_TRACE_SYNC") != nullptr) {
+        static std::atomic<std::uint64_t> seq_ok{0};
+        std::fprintf(stderr, "[trace-sync] WAIT-RET seq=%llu cv=0x%llx reason=success guest_pc=0x%llx\n",
+                     (unsigned long long)seq_ok.fetch_add(1),
+                     (unsigned long long)cv_key,
+                     (unsigned long long)ctx.pc);
+    }
     ctx.ret     = 0;
     ctx.has_ret = true;
     ctx.x[1]    = 0;
