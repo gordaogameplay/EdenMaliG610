@@ -18,9 +18,12 @@ namespace g610::gpu {
 using EscreveNoGuestCb = bool (*)(void* contexto, std::uint64_t endereco,
                                   const void* dados, std::size_t tamanho);
 using SinalizaFenceCb = void (*)(void* contexto, std::uint32_t syncpoint);
+using LeDoGuestCb = bool (*)(void* contexto, std::uint64_t src, void* dst,
+                             std::size_t size);
 
 void processar_draw_comandos(std::vector<DrawCommand>& comandos, void* contexto,
                              EscreveNoGuestCb escreve_no_guest,
-                             SinalizaFenceCb sinaliza_fence);
+                             SinalizaFenceCb sinaliza_fence,
+                             LeDoGuestCb le_do_guest = nullptr);
 
 } // namespace g610::gpu

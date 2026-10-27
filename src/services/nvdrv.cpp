@@ -2408,9 +2408,28 @@ private:
         // A execucao e' sincrona (nao ha thread de GPU separada), o que
         // e' o mesmo que o Eden faz: o trabalho termina quando a
         // submissao e' aceite e o syncpoint sobe.
+        // Instrumentacao diagnostica (ETAPA 8): controlada por
+        // G610_TRACE_DRAWS. Zero custo quando desativada.
+        if (std::getenv("G610_TRACE_DRAWS") != nullptr && !comandos.empty()) {
+            for (std::size_t ci = 0; ci < comandos.size(); ++ci) {
+                const auto& c = comandos[ci];
+                std::fprintf(stderr,
+                    "[trace-draw] submit draws=%zu idx=%zu method=%u indexed=%d "
+                    "vertices=%u indices=%u base_vertex=%u instance=%u "
+                    "va=0x%llx stride=%u attrs=%zu topo_known=%d topology=%u "
+                    "ptc=%u topo_raw=0x%x\n",
+                    comandos.size(), ci, c.method, c.indexado ? 1 : 0,
+                    c.vertex_count, c.index_count, c.base_vertex, c.instance_count,
+                    (unsigned long long)c.vertex_base_va, c.vertex_stride,
+                    c.attributes.size(), c.topology_known ? 1 : 0, c.topology,
+                    c.primitive_topology_control_raw, c.topology_raw);
+            }
+        }
+
         g610::gpu::processar_draw_comandos(comandos, this,
                                            &NvDrv::EscreverNoGuestWrapper,
-                                           &NvDrv::SinalizaFenceWrapper);
+                                           &NvDrv::SinalizaFenceWrapper,
+                                           &NvDrv::LerDoGuestWrapper);
         gpu_draws_exec_ += comandos.size();
         if (!comandos.empty()) {
             LOG_DEBUG(Service_NVDRV,
@@ -3126,10 +3145,12 @@ private:
         return static_cast<NvDrv*>(contexto)->EscreverNoGuest(endereco, origem, tamanho);
     }
 
-    // Função livre para o draw_consumer (callback de leitura).
-    friend bool NvDrvLerDoGuest(void* contexto, std::uint64_t src, void* dst, std::size_t size) {
+    static bool LerDoGuestWrapper(void* contexto, std::uint64_t src, void* dst,
+                                 std::size_t size) {
         return static_cast<NvDrv*>(contexto)->LerDoGuest(src, dst, size);
     }
+
+    // (sem friend livre; usa-se LerDoGuestWrapper)
 
     static void SinalizaFenceWrapper(void* contexto, std::uint32_t syncpoint) {
         auto* d = static_cast<NvDrv*>(contexto);

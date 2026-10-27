@@ -13,7 +13,8 @@ namespace g610::gpu {
 
 void processar_draw_comandos(std::vector<DrawCommand>& comandos, void* contexto,
                              EscreveNoGuestCb escreve_no_guest,
-                             SinalizaFenceCb sinaliza_fence) {
+                             SinalizaFenceCb sinaliza_fence,
+                             LeDoGuestCb le_do_guest) {
     static RasterizerG610 rasterizer{
         [contexto, escreve_no_guest](
             std::uint64_t endereco, const void* dados,
@@ -23,11 +24,9 @@ void processar_draw_comandos(std::vector<DrawCommand>& comandos, void* contexto,
         [contexto, sinaliza_fence](std::uint32_t syncpoint) {
             sinaliza_fence(contexto, syncpoint);
         },
-        [contexto](std::uint64_t src, void* dst, std::size_t size) -> bool {
-            // Leitura via nvdrv wrapper estático (definido em nvdrv.cpp).
-            // Se não disponível, falha explicitamente.
-            extern bool NvDrvLerDoGuest(void* contexto, std::uint64_t src, void* dst, std::size_t size);
-            return NvDrvLerDoGuest(contexto, src, dst, size);
+        [contexto, le_do_guest](std::uint64_t src, void* dst, std::size_t size) -> bool {
+            if (le_do_guest == nullptr) return false;
+            return le_do_guest(contexto, src, dst, size);
         }};
 
     for (auto& cmd : comandos) {
