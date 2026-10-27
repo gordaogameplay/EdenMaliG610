@@ -74,9 +74,12 @@ public:
     using EscreveNoGuest =
         std::function<bool(std::uint64_t endereco, const void* dados, std::size_t tamanho)>;
     using SinalizaFence = std::function<void(std::uint32_t syncpoint)>;
+    // Leitura segura da memória do guest. Devolve false em caso de erro.
+    using LeDoGuest =
+        std::function<bool(std::uint64_t src, void* dst, std::size_t size)>;
 
     explicit RasterizerG610(EscreveNoGuest escreve = {}, SinalizaFence sinaliza = {},
-                            std::shared_ptr<VulkanBackend> backend = nullptr);
+                            LeDoGuest le = {}, std::shared_ptr<VulkanBackend> backend = nullptr);
 
     // ── A interface do upstream ───────────────────────────────────────────
     void Draw(bool is_indexed, u32 instance_count) override;
@@ -133,10 +136,14 @@ public:
 
     const Contadores& contadores() const noexcept { return contadores_; }
 
+    // Leitura segura da memória do guest. Valida overflow e tamanho.
+    bool ler_do_guest(std::uint64_t src, void* dst, std::size_t size) const;
+
     // Os vertices/indices que o motor pediu no último desenho — é o que
     // permite confirmar que a traducao do estado está certa ✓ (a contagem
     // de vertices e' o que a GPU faria).
-    void AnotaDesenho(std::uint64_t vertices, std::uint64_t indices, bool indexado);
+    void AnotaDesenho(std::uint64_t vertices, std::uint64_t indices, bool indexado,
+                      std::uint64_t vertex_base_va = 0, std::uint32_t vertex_stride = 0);
 
     std::uint64_t vertices_ultimo = 0;
     std::uint64_t indices_ultimo = 0;
@@ -145,8 +152,13 @@ public:
 private:
     EscreveNoGuest escreve_;
     SinalizaFence sinaliza_;
+    LeDoGuest le_;
     std::shared_ptr<VulkanBackend> backend_;
     Contadores contadores_{};
+
+    // Metadados do último desenho (para Draw()).
+    std::uint64_t va_vertices_ultimo = 0;
+    std::uint32_t stride_vertices_ultimo = 0;
 
 public:
     // Acesso ao backend (para testes/diagnóstico).

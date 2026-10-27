@@ -14,7 +14,7 @@ int main() {
         return 1;
     }
 
-    g610::gpu::RasterizerG610 rasterizer{nullptr, nullptr, backend};
+    g610::gpu::RasterizerG610 rasterizer{nullptr, nullptr, nullptr, backend};
 
     // Chamada recebida: contador incrementado.
     rasterizer.Clear(1);

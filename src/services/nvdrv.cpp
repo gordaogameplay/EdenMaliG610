@@ -3126,6 +3126,11 @@ private:
         return static_cast<NvDrv*>(contexto)->EscreverNoGuest(endereco, origem, tamanho);
     }
 
+    // Função livre para o draw_consumer (callback de leitura).
+    friend bool NvDrvLerDoGuest(void* contexto, std::uint64_t src, void* dst, std::size_t size) {
+        return static_cast<NvDrv*>(contexto)->LerDoGuest(src, dst, size);
+    }
+
     static void SinalizaFenceWrapper(void* contexto, std::uint32_t syncpoint) {
         auto* d = static_cast<NvDrv*>(contexto);
         if (auto* canal = d->CanalDoFd()) {

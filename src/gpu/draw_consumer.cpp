@@ -22,12 +22,18 @@ void processar_draw_comandos(std::vector<DrawCommand>& comandos, void* contexto,
         },
         [contexto, sinaliza_fence](std::uint32_t syncpoint) {
             sinaliza_fence(contexto, syncpoint);
+        },
+        [contexto](std::uint64_t src, void* dst, std::size_t size) -> bool {
+            // Leitura via nvdrv wrapper estático (definido em nvdrv.cpp).
+            // Se não disponível, falha explicitamente.
+            extern bool NvDrvLerDoGuest(void* contexto, std::uint64_t src, void* dst, std::size_t size);
+            return NvDrvLerDoGuest(contexto, src, dst, size);
         }};
 
     for (auto& cmd : comandos) {
+        rasterizer.AnotaDesenho(cmd.vertex_count, cmd.index_count, cmd.indexado,
+                                cmd.vertex_base_va, cmd.vertex_stride);
         rasterizer.Draw(cmd.indexado, cmd.instance_count);
-        rasterizer.AnotaDesenho(cmd.vertex_count, cmd.index_count,
-                                cmd.indexado);
     }
 }
 

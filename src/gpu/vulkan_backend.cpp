@@ -455,8 +455,11 @@ ClearResult VulkanBackend::clear_image() {
     return result;
 }
 
-PipelineDrawResult VulkanBackend::draw_triangle(const std::vector<char>& vert_spv,
-                                               const std::vector<char>& frag_spv) {
+PipelineDrawResult VulkanBackend::draw_vertex_buffer(const std::vector<char>& vert_spv,
+                                                   const std::vector<char>& frag_spv,
+                                                   const void* vertex_data,
+                                                   std::size_t vertex_count,
+                                                   std::size_t stride_bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
     PipelineDrawResult result;
     if (!ready_) {
@@ -579,11 +582,21 @@ PipelineDrawResult VulkanBackend::draw_triangle(const std::vector<char>& vert_sp
     }
 
     // Vertex buffer com 3 vértices (triângulo).
-    float verts[6] = {-0.5f, -0.5f, 0.5f, -0.5f, 0.0f, 0.5f};
+    if (vertex_data == nullptr || vertex_count == 0 || stride_bytes == 0) {
+        result.error = "buffer de vertices invalido";
+        // cleanup of already-created resources
+        vkDestroyFramebuffer(device_, fb, nullptr);
+        vkDestroyRenderPass(device_, rp, nullptr);
+        vkDestroyImageView(device_, view, nullptr);
+        vkDestroyShaderModule(device_, fs, nullptr);
+        vkDestroyShaderModule(device_, vs, nullptr);
+        return result;
+    }
+    const std::size_t total_bytes = vertex_count * stride_bytes;
     VkBuffer vbo = VK_NULL_HANDLE;
     VkBufferCreateInfo vbc{};
     vbc.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    vbc.size = sizeof(verts);
+    vbc.size = total_bytes;
     vbc.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
     vbc.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     r = vkCreateBuffer(device_, &vbc, nullptr, &vbo);
@@ -624,7 +637,7 @@ PipelineDrawResult VulkanBackend::draw_triangle(const std::vector<char>& vert_sp
     }
     vkBindBufferMemory(device_, vbo, vmem, 0);
     void* vp = nullptr;
-    r = vkMapMemory(device_, vmem, 0, sizeof(verts), 0, &vp);
+    r = vkMapMemory(device_, vmem, 0, total_bytes, 0, &vp);
     if (r != VK_SUCCESS || vp == nullptr) {
         vkFreeMemory(device_, vmem, nullptr);
         vkDestroyBuffer(device_, vbo, nullptr);
@@ -640,7 +653,7 @@ PipelineDrawResult VulkanBackend::draw_triangle(const std::vector<char>& vert_sp
         result.error = "vkMapMemory (vbo) falhou";
         return result;
     }
-    std::memcpy(vp, verts, sizeof(verts));
+    std::memcpy(vp, vertex_data, total_bytes);
     vkUnmapMemory(device_, vmem);
 
     // Pipeline layout (sem descriptors).
@@ -814,7 +827,7 @@ PipelineDrawResult VulkanBackend::draw_triangle(const std::vector<char>& vert_sp
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     const VkDeviceSize off = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vbo, &off);
-    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdDraw(cmd, static_cast<std::uint32_t>(vertex_count), 1, 0, 0);
     vkCmdEndRenderPass(cmd);
 
     // transition finalLayout (TRANSFER_SRC_OPTIMAL) already; copy.
@@ -956,6 +969,13 @@ PipelineDrawResult VulkanBackend::draw_triangle(const std::vector<char>& vert_sp
                        " bg=" + std::to_string(bg) + " other=" + std::to_string(other) + ")";
     }
     return result;
+}
+
+PipelineDrawResult VulkanBackend::draw_triangle(const std::vector<char>& vert_spv,
+                                               const std::vector<char>& frag_spv) {
+    // Triângulo de teste (dados artificiais, apenas infraestrutura).
+    const float verts[6] = {-0.5f, -0.5f, 0.5f, -0.5f, 0.0f, 0.5f};
+    return draw_vertex_buffer(vert_spv, frag_spv, verts, 3, 2 * sizeof(float));
 }
 
 }  // namespace g610::gpu

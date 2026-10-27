@@ -52,9 +52,9 @@ AceleraDMAVazio& dma_vazio() {
 }  // namespace
 
 RasterizerG610::RasterizerG610(EscreveNoGuest escreve, SinalizaFence sinaliza,
-                               std::shared_ptr<VulkanBackend> backend)
+                               LeDoGuest le, std::shared_ptr<VulkanBackend> backend)
     : escreve_(std::move(escreve)), sinaliza_(std::move(sinaliza)),
-      backend_(std::move(backend)) {}
+      le_(std::move(le)), backend_(std::move(backend)) {}
 
 // ── Os comandos de desenho ───────────────────────────────────────────────────
 
@@ -62,6 +62,39 @@ void RasterizerG610::Draw(bool is_indexed, u32 instance_count) {
     ++contadores_.draws;
     (void)is_indexed;
     (void)instance_count;
+
+    // Validação do stream de vértices capturado. Não interpreta bytes como
+    // coordenadas (formato desconhecido) e não chama o backend Vulkan.
+    if (va_vertices_ultimo == 0) {
+        std::fprintf(stderr, "[RasterizerG610::Draw] sem vertex_base_va capturado (bloqueio: formato/topologia não decodificados)\n");
+        return;
+    }
+    if (stride_vertices_ultimo == 0) {
+        std::fprintf(stderr, "[RasterizerG610::Draw] stride nulo para VA 0x%llx\n",
+                     (unsigned long long)va_vertices_ultimo);
+        return;
+    }
+    if (vertices_ultimo == 0) {
+        std::fprintf(stderr, "[RasterizerG610::Draw] vertex_count=0 para VA 0x%llx\n",
+                     (unsigned long long)va_vertices_ultimo);
+        return;
+    }
+    // Verificação de overflow e limite de tamanho (64 MiB).
+    constexpr std::size_t kMaxBytes = 64 * 1024 * 1024;
+    std::size_t total = 0;
+    if (vertices_ultimo > kMaxBytes / (stride_vertices_ultimo ? stride_vertices_ultimo : 1)) {
+        std::fprintf(stderr, "[RasterizerG610::Draw] overflow de tamanho (vertices=%llu stride=%u)\n",
+                     (unsigned long long)vertices_ultimo, stride_vertices_ultimo);
+        return;
+    }
+    total = static_cast<std::size_t>(vertices_ultimo) * stride_vertices_ultimo;
+    if (total > kMaxBytes) {
+        std::fprintf(stderr, "[RasterizerG610::Draw] buffer demasiado grande (%zu bytes)\n", total);
+        return;
+    }
+    std::fprintf(stderr, "[RasterizerG610::Draw] stream valido: VA=0x%llx stride=%u vertices=%llu bytes=%zu (formato/topologia ainda não decodificados — Vulkan não chamado)\n",
+                 (unsigned long long)va_vertices_ultimo, stride_vertices_ultimo,
+                 (unsigned long long)vertices_ultimo, total);
 }
 
 void RasterizerG610::DrawIndirect() {
@@ -70,6 +103,17 @@ void RasterizerG610::DrawIndirect() {
 
 void RasterizerG610::DrawTexture() {
     ++contadores_.texturas;
+}
+
+bool RasterizerG610::ler_do_guest(std::uint64_t src, void* dst, std::size_t size) const {
+    if (dst == nullptr) return false;
+    if (size == 0) return true;
+    // Overflow check.
+    if (src > UINT64_MAX - size) return false;
+    constexpr std::size_t kMax = 64 * 1024 * 1024;
+    if (size > kMax) return false;
+    if (!le_) return false;
+    return le_(src, dst, size);
 }
 
 void RasterizerG610::Clear(u32 layer_count) {
@@ -98,10 +142,13 @@ void RasterizerG610::DispatchCompute() {
     ++contadores_.computos;
 }
 
-void RasterizerG610::AnotaDesenho(std::uint64_t vertices, std::uint64_t indices, bool indexado) {
+void RasterizerG610::AnotaDesenho(std::uint64_t vertices, std::uint64_t indices, bool indexado,
+                                  std::uint64_t vertex_base_va, std::uint32_t vertex_stride) {
     vertices_ultimo = vertices;
     indices_ultimo = indices;
     indexado_ultimo = indexado;
+    va_vertices_ultimo = vertex_base_va;
+    stride_vertices_ultimo = vertex_stride;
 }
 
 // ── As queries ──────────────────────────────────────────────────────────────
