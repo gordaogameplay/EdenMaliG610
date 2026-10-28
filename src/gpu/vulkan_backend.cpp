@@ -978,4 +978,18 @@ PipelineDrawResult VulkanBackend::draw_triangle(const std::vector<char>& vert_sp
     return draw_vertex_buffer(vert_spv, frag_spv, verts, 3, 2 * sizeof(float));
 }
 
+std::vector<std::uint8_t> VulkanBackend::readback_pixels() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::uint8_t> pixels(kW * kH * 4, 0);
+    if (!ready_)
+        return pixels;
+    void* p = nullptr;
+    VkResult r = vkMapMemory(device_, readback_memory_, 0, kW * kH * 4, 0, &p);
+    if (r != VK_SUCCESS || p == nullptr)
+        return pixels;
+    std::memcpy(pixels.data(), p, kW * kH * 4);
+    vkUnmapMemory(device_, readback_memory_);
+    return pixels;
+}
+
 }  // namespace g610::gpu

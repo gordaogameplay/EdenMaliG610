@@ -103,6 +103,7 @@ add_library(g610_core STATIC
   src/gpu/rasterizer_g610.cpp
   src/gpu/vulkan_backend.cpp
   src/gpu/draw_consumer.cpp
+  src/gpu/shader_spv.cpp
   src/patcher.cpp
   src/native_engine.cpp
   src/g610_call_guest.S

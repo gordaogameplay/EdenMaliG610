@@ -56,6 +56,12 @@ RasterizerG610::RasterizerG610(EscreveNoGuest escreve, SinalizaFence sinaliza,
     : escreve_(std::move(escreve)), sinaliza_(std::move(sinaliza)),
       le_(std::move(le)), backend_(std::move(backend)) {}
 
+void RasterizerG610::set_shaders(const std::vector<char>& vert_spv,
+                                 const std::vector<char>& frag_spv) noexcept {
+    vert_spv_ = vert_spv;
+    frag_spv_ = frag_spv;
+}
+
 // ── Os comandos de desenho ───────────────────────────────────────────────────
 
 void RasterizerG610::Draw(bool is_indexed, u32 instance_count) {
@@ -92,9 +98,27 @@ void RasterizerG610::Draw(bool is_indexed, u32 instance_count) {
         std::fprintf(stderr, "[RasterizerG610::Draw] buffer demasiado grande (%zu bytes)\n", total);
         return;
     }
-    std::fprintf(stderr, "[RasterizerG610::Draw] stream valido: VA=0x%llx stride=%u vertices=%llu bytes=%zu (formato/topologia ainda não decodificados — Vulkan não chamado)\n",
-                 (unsigned long long)va_vertices_ultimo, stride_vertices_ultimo,
-                 (unsigned long long)vertices_ultimo, total);
+
+    // Desenho integrado: chama o backend Vulkan com shaders e dados de
+    // vertice lidos da memoria do guest. Sem backend ou sem shaders, fica
+    // so na contagem (modo diagnostico).
+    if (backend_ && !vert_spv_.empty() && !frag_spv_.empty()) {
+        if (desenhar_integrado(vert_spv_, frag_spv_)) {
+            std::fprintf(stderr,
+                         "[RasterizerG610::Draw] desenho integrado OK: VA=0x%llx stride=%u vertices=%llu\n",
+                         (unsigned long long)va_vertices_ultimo, stride_vertices_ultimo,
+                         (unsigned long long)vertices_ultimo);
+        } else {
+            std::fprintf(stderr,
+                         "[RasterizerG610::Draw] desenho integrado falhou: VA=0x%llx stride=%u vertices=%llu\n",
+                         (unsigned long long)va_vertices_ultimo, stride_vertices_ultimo,
+                         (unsigned long long)vertices_ultimo);
+        }
+    } else {
+        std::fprintf(stderr, "[RasterizerG610::Draw] stream valido: VA=0x%llx stride=%u vertices=%llu bytes=%zu (sem backend Vulkan ou sem shaders)\n",
+                     (unsigned long long)va_vertices_ultimo, stride_vertices_ultimo,
+                     (unsigned long long)vertices_ultimo, total);
+    }
 }
 
 void RasterizerG610::DrawIndirect() {

@@ -286,6 +286,7 @@ std::string to_string(Svc s) {
     case Svc::MapMemory:               return "MapMemory";
     case Svc::UnmapMemory:             return "UnmapMemory";
     case Svc::QueryMemory:             return "QueryMemory";
+    case Svc::ReturnFromException:     return "ReturnFromException";
     case Svc::ExitProcess:             return "ExitProcess";
     case Svc::ExitThread:              return "ExitThread";
     case Svc::CreateThread:            return "CreateThread";
@@ -558,6 +559,8 @@ void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
     case Svc::SignalProcessWideKey: r = svc_signal_process_wide_key(ctx); break;
     case Svc::WaitForAddress:       r = svc_wait_for_address(ctx); break;
     case Svc::SignalToAddress:      r = svc_signal_to_address(ctx); break;
+    case Svc::Break:                r = svc_break(ctx); break;
+    case Svc::ReturnFromException:  r = svc_return_from_exception(ctx); break;
     default:                        r = svc_unsupported(ctx);    break;
     }
 
@@ -789,6 +792,10 @@ bool SvcDispatcher::attach_eden(std::uint64_t pid, std::uint64_t tid) {
     }
     eden_ = std::make_unique<EdenSystem>(*mem_, pid, tid);
     return true;
+}
+
+EdenSystem& SvcDispatcher::eden_system() noexcept {
+    return *eden_;
 }
 
 Result SvcDispatcher::svc_connect_port(SvcContext& ctx) {
@@ -2164,6 +2171,26 @@ Result SvcDispatcher::svc_arbitrate_lock(SvcContext& ctx) {
     if (addr == 0 || (addr & 3) != 0)
         return Result::InvalidAddress;
 
+    // **G610_NO_WAIT**: não estacionar em ArbitrateLock.
+    // Permite que o guest prossiga para o caminho de renderização sem
+    // ficar preso em loops de sincronização. Usar apenas para diagnóstico.
+    if (std::getenv("G610_NO_WAIT") != nullptr) {
+        // Escreve o owner_tag no endereço do mutex para simular que o lock
+        // foi adquirido por esta thread. O valor correcto é o tag do dono
+        // (handle), não 1 — o SDK lê a palavra depois do lock e espera ver
+        // o seu próprio tag (ou tag|kArbWaitMask se houver waiters).
+        std::uint32_t adquirido = handle;
+        if (addr != 0) {
+            auto* proc = Kernel::Bridge::processo();
+            if (proc != nullptr) {
+                proc->GetMemory().WriteBlock(
+                    static_cast<Common::ProcessAddress>(addr),
+                    &adquirido, sizeof adquirido);
+            }
+        }
+        return Result::Success;
+    }
+
     // O token EM CURSO desta thread (o que se larga ao estacionar e a
     // identidade de despertar). Declarado a nível da função porque o
     // pós-wait ainda o usa. thread_local: nenhum outro despacho o toca.
@@ -2404,6 +2431,32 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
     const std::uint64_t cv_key  = ctx.x[1] & ~std::uint64_t{3};  // AlignDown (svc :54)
     const std::uint32_t tag     = static_cast<std::uint32_t>(ctx.x[2]);
     const std::int64_t  timeout = static_cast<std::int64_t>(ctx.x[3]);
+
+    // **G610_NO_WAIT**: não estacionar em WaitProcessWideKeyAtomic.
+    // Permite que o guest prossiga para o caminho de renderização sem
+    // ficar preso em loops de sincronização. Usar apenas para diagnóstico.
+    if (std::getenv("G610_NO_WAIT") != nullptr) {
+        // Escreve o tag do chamador no endereço de espera para simular que
+        // a espera foi satisfeita e esta thread ficou dona do mutex.
+        // Escreve também 1 na cv_key (HasWaiterFlag), como o Eden faria
+        // antes de estacionar.
+        if (addr != 0) {
+            auto* proc = Kernel::Bridge::processo();
+            if (proc != nullptr) {
+                std::uint32_t adquirido = tag;
+                proc->GetMemory().WriteBlock(
+                    static_cast<Common::ProcessAddress>(addr),
+                    &adquirido, sizeof adquirido);
+                if (cv_key != 0) {
+                    std::uint32_t tem_waiter = 1;
+                    proc->GetMemory().WriteBlock(
+                        static_cast<Common::ProcessAddress>(cv_key),
+                        &tem_waiter, sizeof tem_waiter);
+                }
+            }
+        }
+        return Result::Success;
+    }
 
     static const char* trace_sync = std::getenv("G610_TRACE_SYNC");
     static std::atomic<std::uint64_t> seq_wait{0};
@@ -3191,6 +3244,14 @@ Result SvcDispatcher::svc_signal_to_address(SvcContext& ctx) {
 //     (HasNoWaiterFlag, :257) — inclusive quando nunca houve waiters
 //     (nfind nulo e WriteToUser na mesma; retorno de WriteToUser não é
 //     verificado aqui no Eden).
+Result SvcDispatcher::svc_break(SvcContext&) {
+    // `Break` (0x26) define o resultado de término de uma thread/processo.
+    // O jogo chama-o em vários pontos durante a inicialização. Retornar
+    // Success permite que o guest prossiga em vez de ficar preso no stub
+    // do ABI (`b self` em 0x8390d1e8).
+    return Result::Success;
+}
+
 Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
     const std::uint64_t cv_key = ctx.x[0] & ~std::uint64_t{3};
     const auto count = static_cast<std::int32_t>(ctx.x[1]);
@@ -3479,6 +3540,15 @@ std::uint64_t SvcDispatcher::random_u64() {
 // motor — ver o comentário de `Result::Unsupported` no cabeçalho.
 Result SvcDispatcher::svc_unsupported(SvcContext&) {
     return Result::Unsupported;
+}
+
+Result SvcDispatcher::svc_return_from_exception(SvcContext&) {
+    // O guest chama svcReturnFromException para sair de um exception handler.
+    // No nosso motor, as exceções (SIGSEGV, SIGTRAP) são tratadas diretamente
+    // pelo handler de sinais do host, que regressa ao guest sem precisar
+    // deste SVC. Devolver Sucesso é o comportamento correto: o guest continua
+    // a execução no ponto seguinte ao da exceção.
+    return Result::Success;
 }
 
 // ── O sinal de "a GPU terminou" ────────────────────────────────────────────

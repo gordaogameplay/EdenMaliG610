@@ -4,9 +4,10 @@
 #include "g610/guest_program.hpp"
 
 #include <algorithm>
-#include <cstring>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <iostream>
 
 #include "g610/patcher.hpp"
 
@@ -350,6 +351,20 @@ bool GuestProgram::map_into(std::uint64_t heap_reserve, std::string& error) {
             return false;
         }
 
+        // **Escrever o cabecalho NSO no endereço base do módulo.** O rtld do
+        // jogo precisa dele para encontrar as tabelas de símbolos (dynstr,
+        // dynsym) e resolver imports. Sem ele, TODOS os GOT entries ficam em 0
+        // e o rtld nunca consegue resolver nada — o jogo fica preso em loops
+        // de sincronização.
+        if (m.nso.nso_header_bytes.size() >= sizeof(g610::NsoHeader)) {
+            if (!mem_.write(m.vaddr_base, m.nso.nso_header_bytes.data(),
+                            sizeof(g610::NsoHeader), error)) {
+                error = std::string("módulo ") + m.name() +
+                        ": falha ao escrever cabecalho NSO: " + error;
+                return false;
+            }
+        }
+
         // **O cabecalho MOD0** — e' o que o rtld do jogo inspeciona
         // (`ldr w8, [base, #4]` — o offset — e depois a magic
         // "MOD0", 0x30444F4D, no offset).
@@ -542,6 +557,10 @@ bool GuestProgram::patch_all(std::string& error) {
     }
 
     error.clear();
+    std::cerr << "[patch_all] total: words=" << patch_report_.words_scanned
+              << " svc=" << patch_report_.svc_patched
+              << " hints=" << patch_report_.hints_nop
+              << " saw_any_svc=" << patch_report_.saw_any_svc << "\n";
     return true;
 }
 

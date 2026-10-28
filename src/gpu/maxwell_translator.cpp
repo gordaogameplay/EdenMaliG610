@@ -273,10 +273,13 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
             // upstream): reinicia a contagem de instâncias e o modo.
             dentro = true;
             instance_count = 0;
+            std::fprintf(stderr, "[DRAW_TRACE] draw_begin (1414) chamado, dentro=true\n");
             break;
 
         case gpu::maxwell3d::draw_end: {
             // O `draw.end` é o desenho (`DrawEnd` no upstream).
+            std::fprintf(stderr, "[DRAW_TRACE] draw_end (1413) chamado, dentro=%d vertex_count=%u\n",
+                         dentro, regs[gpu::maxwell3d::vertex_buffer_count]);
             if (!dentro)
                 break;
             dentro = false;
@@ -526,6 +529,11 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
             processar_macro(metodo, base, quantidade, e_ultimo);
             return;
         }
+        if (quantidade == 0) {
+            // Método sem parâmetros (ex. draw_begin/draw_end): chama com valor 0.
+            palavra_engine(metodo, 0);
+            return;
+        }
         for (std::uint32_t i = 0; i < quantidade; ++i)
             palavra_engine(metodo, base[i]);
     };
@@ -537,11 +545,15 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
                                     const std::uint32_t* base,
                                     std::uint32_t quantidade, bool e_ultimo) {
         ++cmds_total_;
-        if (quantidade == 0)
-            return;
+        if (metodo >= 1400) {
+            std::fprintf(stderr,
+                "[SUBCANAL_TRACE] sc=%u metodo=%u qtd=%u motor[%u]=0x%x Maxwell3D=0x%x\n",
+                sc, metodo, quantidade, sc,
+                motores_por_subcanal[sc], gpu::motor::Maxwell3D);
+        }
         if (metodo == gpu::canal::BindObject) {
             // O `ProcessBindMethod` (o `puller.cpp:29-58`).
-            if (sc < 8)
+            if (sc < 8 && quantidade > 0)
                 motores_por_subcanal[sc] = *base;
             return;
         }
@@ -624,8 +636,15 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
             std::uint32_t valor = (w >> 16) & 0x1FFFu;
             chamada_via_subcanal((w >> 13) & 7u, w & 0x1FFFu, &valor, 1, true);
         }
-        // Os modos 0 e 2 (`IncreasingOld`/`NonIncreasingOld`) não
-        // existem no upstream: o `default` ignora a palavra.
+        // Se o cabeçalho tem count==0 (método sem parâmetros, como
+        // draw_begin/draw_end), despacha imediatamente.
+        if (burst_count == 0 && (modo == gpu::modo::Increasing ||
+                                 modo == gpu::modo::NonIncreasing ||
+                                 modo == gpu::modo::IncreaseOnce)) {
+            chamada_via_subcanal(burst_sc, burst_metodo, nullptr, 0, true);
+            burst_metodo = 0;
+            burst_sc = 0;
+        }
         ++i;
     }
 

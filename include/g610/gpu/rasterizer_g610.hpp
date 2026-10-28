@@ -145,6 +145,11 @@ public:
     bool desenhar_integrado(const std::vector<char>& vert_spv,
                             const std::vector<char>& frag_spv);
 
+    // Define os shaders SPIR-V a usar no desenho integrado (definidos em
+    // shader_spv.cpp). Chame antes de processar DrawCommands.
+    void set_shaders(const std::vector<char>& vert_spv,
+                     const std::vector<char>& frag_spv) noexcept;
+
     // Os vertices/indices que o motor pediu no último desenho — é o que
     // permite confirmar que a traducao do estado está certa ✓ (a contagem
     // de vertices e' o que a GPU faria).
@@ -170,6 +175,10 @@ private:
     std::vector<VertexAttributeDesc> attributes_ultimo;
     bool topology_known_ultimo = false;
     std::uint32_t topology_ultimo = 0;
+
+    // Shaders SPIR-V para desenho integrado (definidos externamente).
+    std::vector<char> vert_spv_;
+    std::vector<char> frag_spv_;
 
 public:
     // Acesso ao backend (para testes/diagnóstico).

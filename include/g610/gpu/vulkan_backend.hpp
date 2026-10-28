@@ -69,6 +69,10 @@ public:
     PipelineDrawResult draw_triangle(const std::vector<char>& vert_spv,
                                     const std::vector<char>& frag_spv);
 
+    // Lê os pixels do último desenho/clear da memória de readback.
+    // Devolve os dados RGBA8 em kW x kH. Thread-safe.
+    std::vector<std::uint8_t> readback_pixels();
+
     // Cor usada no clear (para diagnóstico).
     static constexpr float kR = 0.25f;
     static constexpr float kG = 0.5f;
@@ -104,5 +108,10 @@ private:
     bool ready_ = false;
     mutable std::mutex mutex_;
 };
+
+// **Backend Vulkan global** — definido pelo `NvDrv` no arranque para que
+// outras partes do sistema (ex. o thread de vsync em `vi.cpp`) possam
+// disparar desenho quando o jogo não o faz por conta própria.
+extern std::shared_ptr<VulkanBackend> g_vulkan_backend;
 
 }  // namespace g610::gpu

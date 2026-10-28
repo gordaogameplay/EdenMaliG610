@@ -3,9 +3,11 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "g610/gpu/maxwell_translator.hpp"
+#include "g610/gpu/vulkan_backend.hpp"
 
 namespace g610::gpu {
 
@@ -24,6 +26,7 @@ using LeDoGuestCb = bool (*)(void* contexto, std::uint64_t src, void* dst,
 void processar_draw_comandos(std::vector<DrawCommand>& comandos, void* contexto,
                              EscreveNoGuestCb escreve_no_guest,
                              SinalizaFenceCb sinaliza_fence,
-                             LeDoGuestCb le_do_guest = nullptr);
+                             LeDoGuestCb le_do_guest = nullptr,
+                             std::shared_ptr<VulkanBackend> backend = nullptr);
 
 } // namespace g610::gpu

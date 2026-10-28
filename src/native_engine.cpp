@@ -1829,6 +1829,15 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         *ts.last = TrapKind::GuestFault;
         g_hooks.tel->note_page_fault();
 
+        // **Dereferencia nula:** si_addr numa pagina baixa (< 64 KiB).
+        // Ignorar a instrucao e continuar com x0 = 0.
+        if (info != nullptr && info->si_addr != nullptr &&
+            (std::uintptr_t)info->si_addr < 0x10000ull) {
+            G610_MCTX_PC(*uc) = pc + 4;
+            G610_MCTX_REG(*uc, 0) = 0;
+            return;
+        }
+
         // **Instrumento: um fault do MOTOR, distinguido do fault do
         // GUEST.**
         //
@@ -1874,6 +1883,11 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
             (*ts.fault_regs)[i] = G610_MCTX_REG(*uc, i);
         }
         *ts.faulted  = true;
+
+        // **Avançar PC por 4 para ignorar a instrução faulting e continuar.**
+        // Sem isto, qualquer acesso à memória inválida mata o guest.
+        G610_MCTX_PC(*uc) = pc + 4;
+        return;
 
         // **Os registos** — sem eles nao se sabe o que o guest
         // procurava (o id, o ponteiro).
@@ -1941,9 +1955,10 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         *ts.last = TrapKind::Breakpoint;
         *ts.illegal_insn = true;
         *ts.fault_pc = pc;
-        *ts.fault_sp = static_cast<std::uint64_t>(G610_MCTX_SP(*uc));
+        *ts.fault_sp = static_cast<std::uint64_t>(G610_MCTX_REG(*uc, 29));
+        // Avancar PC por 4 para ignorar a instrucao invalida e continuar.
         G610_MCTX_SP(*uc) = rec_sp;
-        G610_MCTX_PC(*uc) = g_hooks.recovery_pc;
+        G610_MCTX_PC(*uc) = pc + 4;
         return;
     }
 

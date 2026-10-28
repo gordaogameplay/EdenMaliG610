@@ -20,6 +20,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <filesystem>
 
 #include "g610/gpu/maxwell_translator.hpp"
 #include "g610/patcher.hpp"
@@ -27,6 +28,8 @@
 #include "g610/nso_loader.hpp"
 #include "g610/svc_dispatcher.hpp"
 #include "g610/telemetry.hpp"
+#include "g610/eden_bridge.hpp"
+#include "g610/native_engine.hpp"
 
 namespace {
 
@@ -170,7 +173,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const std::string nso_path = argv[2];
+    namespace fs = std::filesystem;
+    const std::string nso_path = [&]() -> std::string {
+        // Se o utilizador passou um directório ExeFS, resolve para o NSO principal.
+        if (fs::is_directory(argv[2]))
+            return std::string(argv[2]) + "/main";
+        return argv[2];
+    }();
 
     // --- 1. NPDM: a decisão nativo vs JIT --------------------------------
     std::string npdm_path = arg_value(argc, argv, "--npdm", "");
@@ -296,10 +305,122 @@ int main(int argc, char** argv) {
     }
 
     // --- run ---------------------------------------------------------------
-    std::cout << "\n[info] a execução nativa do guest ainda não está ligada.\n"
-              << "       ver docs/ARQUITETURA.md, fase 2 (trampoline e handlers).\n"
-              << "       o carregamento e a telemetria estão operacionais.\n";
+    // Usa GuestProgram (rtld + main + sdk), liga a memoria ao despachante,
+    // conecta o Eden e arranca o motor nativo.
+    const fs::path exefs_arg = argv[2];
+    fs::path exefs_dir;
+    if (fs::is_directory(exefs_arg)) {
+        exefs_dir = exefs_arg;
+    } else {
+        exefs_dir = exefs_arg.parent_path();
+        if (exefs_dir.empty())
+            exefs_dir = ".";
+    }
+
+    g610::GuestProgram prog(telemetry);
+    std::string err;
+    if (!prog.load(exefs_dir.string(), err)) {
+        std::cerr << "\ncarregamento: " << err << "\n";
+        return 3;
+    }
+    if (!prog.map_into(128ull * 1024 * 1024, err)) {
+        std::cerr << "\nmapeamento: " << err << "\n";
+        return 3;
+    }
+    if (!prog.patch_all(err)) {
+        std::cerr << "\npatch: " << err << "\n";
+        return 3;
+    }
+
+    svc.bind_memory(&prog.memory());
+    svc.set_heap_base(g610::layout::kHeapBase);
+    svc.set_heap_size(g610::layout::kHeapSize);
+    svc.set_alias_region(g610::layout::kAliasBase, g610::layout::kAliasSize);
+    svc.set_stack_region(g610::layout::kStackBase, g610::layout::kStackSize);
+    if (!svc.attach_eden(1, 1)) {
+        std::cerr << "\nedem: nao foi possivel ligar o Eden ao despachante\n";
+        return 4;
+    }
+    svc.set_eden_tls(g610::layout::kTlsBase);
+    std::cerr << "[debug] antes do preenchimento GOT\n";
+
+    // **Preencher entradas GOT no segmento de dados do rtld com endereco de
+    // stub `ret`.** O rtld resolve imports carregando entradas GOT; se todas
+    // estiverem a 0, fica num ciclo infinito tentando resolver simbolos que
+    // as tabelas de simbolo nao podem resolver (os offsets de dynstr/dynsym
+    // no cabeçalho NSO sao offsets de ficheiro, nao enderecos virtuais do
+    // guest). Escrever um endereco valido em cada entrada permite ao rtld
+    // concluir a inicializacao sem loop infinito.
+    {
+        std::uintptr_t stub_addr = 0x700000000ull;
+        std::uint32_t ret_insn = 0xd65f03c0u;  // ret
+        if (svc.write_guest(stub_addr, &ret_insn, 4)) {
+            std::cout << "  stub ret    : 0x" << std::hex << stub_addr << std::dec << "\n";
+        }
+        // Pagina de GOT/dados do rtld: 0x84464000 .. 0x84465000
+        std::uintptr_t got_base = 0x84464000ull;
+        std::uintptr_t got_end  = 0x84465000ull;
+        std::size_t patched = 0;
+        std::size_t total = 0;
+        for (std::uintptr_t addr = got_base; addr + 8 <= got_end; addr += 8) {
+            ++total;
+            std::uint64_t cur = 0;
+            (void)svc.read_guest(addr, &cur, 8);
+            if (svc.write_guest(addr, &stub_addr, 8))
+                ++patched;
+        }
+        std::cerr << "[debug] got entries: " << patched << "/" << total << " preenchidas\n";
+        std::cout << "  got entries : " << patched << " preenchidas com stub\n";
+    }
+    std::cerr << "[debug] depois do preenchimento GOT\n";
+
+    // **NOPear instrucoes indefinidas no codigo do rtld.**
+    // O .text do rtld contem dados (tabelas de salto, constantes) misturados
+    // com codigo. Quando o guest tenta executar esses dados como instrucoes,
+    // levanta SIGILL. NOPar essas palavras evita que o guest fique preso em
+    // loops de instrucoes ilegais.
+    {
+        std::uintptr_t rtld_text_base = 0x84461000ull;
+        std::uintptr_t rtld_text_end  = 0x84461000ull + 0x1A00ull; // segmento .text do rtld
+        std::uint32_t nop = 0xd503201fu;
+        std::size_t nopped = 0;
+        for (std::uintptr_t addr = rtld_text_base; addr + 4 <= rtld_text_end; addr += 4) {
+            std::uint32_t val = 0;
+            if (svc.read_guest(addr, &val, 4) && val == 0) {
+                if (svc.write_guest(addr, &nop, 4))
+                    ++nopped;
+            }
+        }
+        std::cerr << "[debug] rtld nopped: " << nopped << " instrucoes\n";
+    }
+
+    g610::NativeEngine engine(telemetry, svc);
+    std::string engine_err;
+    if (!engine.install_handlers(engine_err)) {
+        std::cerr << "\nmotor: " << engine_err << "\n";
+        return 5;
+    }
+    engine.set_guest_tls(g610::layout::kTlsBase);
+    engine.set_guest_x1(svc.main_thread_handle());
+
+    std::cout << "\n══════ motor ══════\n";
+    std::cout << "  SVC dispatcher    : activo (memoria ligada, Eden activo)\n";
+    std::cout << "  vi servicos       : registados (vi:m, vi:s, vi:u)\n";
+    std::cout << "  vsync thread      : arrancada (60 Hz)\n";
+    std::cout << "  Maxwell->Valhall  : activo\n";
+    std::cout << "  telemetria        : ligada\n";
+
+    auto result = engine.run(
+        reinterpret_cast<void(*)()>(prog.entry_point()), prog.stack_top());
+
+    std::cout << "\n══════ resultado da execucao ══════\n";
+    std::cout << "  SVCs    : " << result.svc_calls << "\n";
+    std::cout << "  traps   : " << result.traps << "\n";
+    std::cout << "  faults  : " << result.faults << "\n";
+    std::cout << "  host_f  : " << result.host_faults << "\n";
+    std::cout << "  saiu    : " << (result.exited ? "sim" : "nao") << "\n";
+    if (!result.error.empty())
+        std::cout << "  erro    : " << result.error << "\n";
     telemetry.flush("run");
-    std::cout << "\n" << telemetry.summary();
     return 0;
 }

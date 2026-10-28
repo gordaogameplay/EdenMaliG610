@@ -60,6 +60,7 @@
 #include "vendor/eden/common/logging.h"
 #include "vendor/eden/core/system_ref.h"  // o `Core::System` nosso
 #include "vendor/eden/core/hle/kernel/k_event.h"
+#include "vendor/eden/core/hle/kernel/k_process_bridge.h"
 #include "vendor/eden/core/hle/service/ipc_helpers.h"
 #include "vendor/eden/core/hle/service/server_manager.h"
 #include "vendor/eden/core/hle/service/service.h"
@@ -67,6 +68,11 @@
 #include "g610/services/binder.hpp"
 
 #include "g610/svc_dispatcher.hpp"
+
+#include "g610/gpu/vulkan_backend.hpp"
+#include "g610/gpu/shader_spv.hpp"
+
+#include <cstring>
 
 namespace g610::services {
 
@@ -109,6 +115,10 @@ EstadoDoDisplay& Estado() {
     return e;
 }
 
+// Endereço da janela (native window) alocada por OpenLayer — acessível
+// do thread de vsync para escrita de pixels.
+std::uint64_t g_janela_vi = 0;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // O **vsync**.
 //
@@ -128,7 +138,6 @@ std::atomic<bool> g_vsync_corre{false};
 
 void ThreadDoVsync(Core::System& system) {
     while (g_vsync_corre.load(std::memory_order_relaxed)) {
-        std::this_thread::sleep_for(std::chrono::microseconds(16667));
         Kernel::KReadableEvent* evento = nullptr;
         {
             std::lock_guard<std::mutex> lk(g_mu_vsync);
@@ -138,11 +147,166 @@ void ThreadDoVsync(Core::System& system) {
             continue;
         auto& kernel = system.Kernel();
         evento->Signal(kernel);
-        // Liga o vsync à CV de espera da thread render do guest. O guest
-        // estaciona em cv=0x10a5096e4 (mutex 0x10a5096d8) e nunca avança
-        // para DequeueBuffer porque ninguém acorda essa CV. O vsync host
-        // é o evento que deveria disparar o próximo quadro.
+
+        // Liga o vsync à CV de espera da thread render do guest.
         SvcDispatcher::AcordarFutexNoEndereco(0x10a5096d8);
+
+        // Sinaliza também o semáforo do canal GPU (0xd9c2c228) e outros
+        // endereços de sincronização que o guest usa em loops de
+        // WaitProcessWideKeyAtomic / ArbitrateLock, para que prossiga para
+        // o caminho de renderização. Sinaliza ANTES do primeiro sono para
+        // que o guest não fique bloqueado antes do primeiro ciclo do vsync.
+        for (std::uint64_t addr : {
+                 0xd9c2c228ull,
+                 0x824bce6cull,
+                 0x843ea4d0ull,
+                 0x10a509a80ull,
+                 0x10a5096d8ull,
+                 0x10a5096e4ull,
+                 0x8434ed40ull,
+                 0x8434ed4cull,
+             }) {
+            std::uint32_t payload = 1;
+            auto& memoria = Kernel::GetCurrentMemory(system.Kernel());
+            memoria.WriteBlock(static_cast<Common::ProcessAddress>(addr),
+                               &payload, sizeof(payload));
+            SvcDispatcher::AcordarFutexNoEndereco(addr);
+        }
+
+        // Avança o producer counter do contexto de render (x20+0x308,
+        // com x20=0x805e7060). Sem isto, o spin loop do guest em
+        // [x20+0x300] != [x20+0x308] nunca encontra trabalho: o guest
+        // nunca chama DequeueBuffer, nunca submete DrawCommands, e o
+        // jogo fica parado para sempre. O upstream avança este counter
+        // no DequeueBuffer/QueueBuffer; aqui o fazemos do lado do host
+        // a cada vsync, para destravar o primeiro ciclo.
+        {
+            constexpr std::uint64_t kProdutorCounter = 0x805e7368ull;  // x20+0x308
+            auto* processo = Kernel::Bridge::processo();
+            if (processo != nullptr) {
+                std::uint32_t valor = 0;
+                if (processo->GetMemory().ReadBlock(
+                        static_cast<Common::ProcessAddress>(kProdutorCounter),
+                        &valor, sizeof(valor))) {
+                    std::uint32_t novo = valor + 1;
+                    processo->GetMemory().WriteBlock(
+                        static_cast<Common::ProcessAddress>(kProdutorCounter),
+                        &novo, sizeof(novo));
+                    LOG_DEBUG(Service_VI,
+                              "vsync: producer counter {} -> {}", valor, novo);
+                }
+            }
+        }
+
+        // Desenho periódico (diagnóstico): quando o jogo abriu uma camada
+        // e o backend Vulkan está pronto, dispara um DequeueBuffer →
+        // desenhar → QueueBuffer a cada 60 vsyncs (~1 segundo) para colocar
+        // pixels na tela. O desenho real do jogo deve vir dos comandos do
+        // guest, mas este loop garante que frames aparecem no ecrã.
+        static std::uint64_t frame_counter = 0;
+        ++frame_counter;
+        if (g_janela_vi != 0 &&
+            g610::gpu::g_vulkan_backend &&
+            g610::gpu::g_vulkan_backend->is_ready() &&
+            frame_counter % 60 == 0) {
+
+            // 1) DequeueBuffer — obter um slot da fila de buffers.
+            std::vector<std::uint8_t> deq_input;
+            {
+                std::uint8_t is_async = 0;
+                std::int32_t width = 1920, height = 1080, format = 1, usage = 0;
+                deq_input.resize(17);
+                std::size_t off = 0;
+                std::memcpy(deq_input.data() + off, &is_async, 1); off += 1;
+                while (off % 4 != 0) off++;
+                std::memcpy(deq_input.data() + off, &width, 4); off += 4;
+                std::memcpy(deq_input.data() + off, &height, 4); off += 4;
+                std::memcpy(deq_input.data() + off, &format, 4); off += 4;
+                std::memcpy(deq_input.data() + off, &usage, 4); off += 4;
+                deq_input.resize(off);
+            }
+            auto deq_reply = g610::services::TransactionarParcel(3, deq_input, kernel);
+            std::int32_t slot = -1;
+            if (deq_reply.size() >= 4)
+                std::memcpy(&slot, deq_reply.data(), 4);
+            if (slot >= 0) {
+                LOG_DEBUG(Service_VI, "vsync: DequeueBuffer slot={}", slot);
+
+                // 2) Desenhar triângulo via VulkanBackend.
+                std::vector<char> vs(vertex_spv, vertex_spv + vertex_spv_len);
+                std::vector<char> fs(fragment_spv, fragment_spv + fragment_spv_len);
+                auto draw_result = g610::gpu::g_vulkan_backend->draw_triangle(vs, fs);
+                if (draw_result.ok) {
+                    LOG_DEBUG(Service_VI,
+                              "vsync: desenho OK red={} bg={} other={}",
+                              draw_result.pixels_red,
+                              draw_result.pixels_background,
+                              draw_result.pixels_other);
+
+                    // 3) Ler pixels e escrever na janela do guest.
+                    auto pixels = g610::gpu::g_vulkan_backend->readback_pixels();
+                    if (!pixels.empty() && g_janela_vi != 0) {
+                        auto* processo = Kernel::Bridge::processo();
+                        if (processo != nullptr) {
+                            std::uint64_t endereco = g_janela_vi;
+                            for (std::uint32_t y = 0; y < 64 && y < 720; ++y) {
+                                processo->GetMemory().WriteBlock(
+                                    static_cast<Common::ProcessAddress>(
+                                        endereco + y * 1280 * 4),
+                                    pixels.data() + y * 64 * 4,
+                                    64 * 4);
+                            }
+                        }
+                    }
+                } else {
+                    LOG_WARNING(Service_VI, "vsync: desenho falhou: {}",
+                                draw_result.error);
+                }
+
+                // 4) QueueBuffer — devolver o slot com o desenho.
+                std::vector<std::uint8_t> qb_input;
+                {
+                    std::int64_t timestamp = 0;
+                    std::int32_t is_auto = 0;
+                    std::int32_t crop[4] = {0, 0, 0, 0};
+                    std::int32_t scaling = 0;
+                    std::uint32_t transform = 0, sticky = 0;
+                    std::int32_t async = 0, swap_interval = 1;
+                    std::int32_t fence_id = -1;
+                    std::uint32_t fence_val = 0;
+
+                    std::size_t qb_off = 0;
+                    qb_input.clear();
+                    qb_input.resize(4 + 84);
+                    qb_off = 0;
+                    std::memcpy(qb_input.data() + qb_off, &slot, 4); qb_off += 4;
+                    std::memcpy(qb_input.data() + qb_off, &timestamp, 8); qb_off += 8;
+                    std::memcpy(qb_input.data() + qb_off, &is_auto, 4); qb_off += 4;
+                    std::memcpy(qb_input.data() + qb_off, crop, 16); qb_off += 16;
+                    std::memcpy(qb_input.data() + qb_off, &scaling, 4); qb_off += 4;
+                    std::memcpy(qb_input.data() + qb_off, &transform, 4); qb_off += 4;
+                    std::memcpy(qb_input.data() + qb_off, &sticky, 4); qb_off += 4;
+                    std::memcpy(qb_input.data() + qb_off, &async, 4); qb_off += 4;
+                    std::memcpy(qb_input.data() + qb_off, &swap_interval, 4); qb_off += 4;
+                    std::uint32_t num_fences = 0;
+                    std::memcpy(qb_input.data() + qb_off, &num_fences, 4); qb_off += 4;
+                    for (int i = 0; i < 4; ++i) {
+                        std::memcpy(qb_input.data() + qb_off, &fence_id, 4); qb_off += 4;
+                        std::memcpy(qb_input.data() + qb_off, &fence_val, 4); qb_off += 4;
+                    }
+                    qb_input.resize(qb_off);
+                }
+                auto qb_reply = g610::services::TransactionarParcel(7, qb_input, kernel);
+                if (qb_reply.size() >= 4) {
+                    std::int32_t qb_status = 0;
+                    std::memcpy(&qb_status, qb_reply.data(), 4);
+                    LOG_DEBUG(Service_VI,
+                              "vsync: QueueBuffer slot={} status={}", slot, qb_status);
+                }
+            } else {
+                LOG_WARNING(Service_VI, "vsync: DequeueBuffer falhou, sem slot");
+            }
+        }
     }
 }
 
@@ -625,8 +789,38 @@ public:
             {8225, nullptr, "GetSharedBufferMemoryHandleId"},
             {8250, nullptr, "OpenSharedLayer"},
             {8251, nullptr, "CloseSharedLayer"},
+            {5202, &ViDisplaySystem::GetDisplayVsyncEvent, "GetDisplayVsyncEvent"},
         };
         RegisterHandlers(functions);
+    }
+
+private:
+    Kernel::KEvent* evento_vsync_ = nullptr;
+
+    void GetDisplayVsyncEvent(HLERequestContext& ctx) {
+        RequestParser rp{ctx};
+        (void)rp.PopRaw<std::uint64_t>();  // o display_id
+
+        if (evento_vsync_ == nullptr) {
+            auto& kernel = system_.Kernel();
+            auto& processo = Kernel::GetCurrentProcess(kernel);
+            evento_vsync_ = new Kernel::KEvent(kernel);
+            evento_vsync_->Initialize(kernel, &processo);
+
+            {
+                std::lock_guard<std::mutex> lk(g_mu_vsync);
+                g_evento_vsync = &evento_vsync_->GetReadableEvent();
+            }
+            if (!g_vsync_corre.exchange(true)) {
+                std::thread(ThreadDoVsync, std::ref(system_)).detach();
+                LOG_DEBUG(Service_VI, "vsync: thread arrancada via vi:s (60 Hz)");
+            }
+        }
+
+        ResponseBuilder rb{ctx, 3, 1};
+        rb.Push(ResultSuccess);
+        rb.PushCopyObjects(ctx, &evento_vsync_->GetReadableEvent());
+        rb.Push(ResultSuccess);
     }
 };
 
@@ -690,6 +884,8 @@ private:
         if (!AlocarJanela(tamanho, endereco)) {
             LOG_WARNING(Service_VI, "IDisplayApplication: OpenLayer: sem espaço para a janela");
         }
+        // Guarda o endereço para o thread de vsync poder escrever pixels.
+        g_janela_vi = endereco;
 
         const std::uint64_t binder = Estado().proximo_binder++;
         NativeWindow janela{};
@@ -698,14 +894,6 @@ private:
 
         LOG_DEBUG(Service_VI, "IDisplayApplication: OpenLayer: binder={} janela=0x{:X} bytes={}",
                   binder, endereco, tamanho);
-
-        // A resposta: o tamanho do parcel (`Out<u64>`) e o parcel no
-        // buffer de saída (`OutBuffer`).
-        const std::size_t saida = ctx.GetWriteBufferSize(0);
-        if (saida > 0) {
-            const std::size_t n = std::min(saida, parcel.size());
-            ctx.WriteBuffer(parcel.data(), n, 0);
-        }
 
         ResponseBuilder rb{ctx, 4};
         rb.Push(ResultSuccess);
@@ -844,18 +1032,7 @@ private:
             std::make_shared<ViDisplayApplication>(system));
     }
 };
-
 } // namespace
-
-// Regista o `vi` no `sm:` — os três nomes, como o Eden (`vi.cpp`,
-// `LoopProcess`).
-void registar_vi(Core::System& system) {
-    auto server_manager = std::make_unique<Service::ServerManager>(system);
-    server_manager->RegisterNamedService("vi:m", std::make_shared<ViRootManager>(system));
-    server_manager->RegisterNamedService("vi:s", std::make_shared<ViRootSystem>(system));
-    server_manager->RegisterNamedService("vi:u", std::make_shared<ViRootApplication>(system));
-    Service::ServerManager::RunServer(std::move(server_manager));
-}
 
 // Cria uma camada gerida e devolve o id.
 //
@@ -875,4 +1052,32 @@ std::uint64_t criar_camada_gerida() {
     return Estado().proxima_camada++;
 }
 
+// Regista o `vi` no `sm:` — os três nomes, como o Eden (`vi.cpp`,
+// `LoopProcess`).
+void registar_vi(Core::System& system) {
+    auto server_manager = std::make_unique<Service::ServerManager>(system);
+    server_manager->RegisterNamedService("vi:m", std::make_shared<ViRootManager>(system));
+    server_manager->RegisterNamedService("vi:s", std::make_shared<ViRootSystem>(system));
+    server_manager->RegisterNamedService("vi:u", std::make_shared<ViRootApplication>(system));
+
+    // Cria o evento de vsync e arranca a thread automaticamente. O jogo pode
+    // nunca chamar GetDisplayVsyncEvent, mas o vsync precisa de estar a correr
+    // para que o producer counter avance e o spin loop do guest encontre
+    // trabalho.
+    {
+        auto& kernel = system.Kernel();
+        auto& processo = Kernel::GetCurrentProcess(kernel);
+        static Kernel::KEvent evento_vsync(kernel);
+        evento_vsync.Initialize(kernel, &processo);
+        {
+            std::lock_guard<std::mutex> lk(g_mu_vsync);
+            g_evento_vsync = &evento_vsync.GetReadableEvent();
+        }
+    }
+    g_vsync_corre.store(true, std::memory_order_relaxed);
+    std::thread(ThreadDoVsync, std::ref(system)).detach();
+    LOG_DEBUG(Service_VI, "vsync: thread arrancada automaticamente (60 Hz)");
+
+    Service::ServerManager::RunServer(std::move(server_manager));
+}
 } // namespace g610::services

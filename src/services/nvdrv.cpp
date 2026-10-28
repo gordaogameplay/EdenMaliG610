@@ -66,12 +66,20 @@
 #include "vendor/eden/core/hle/service/service.h"
 
 #include "g610/gpu/maxwell_translator.hpp"
+#include "g610/gpu/vulkan_backend.hpp"
 #include "g610/gpu/pushbuffer.hpp"
 #include "g610/gpu/draw_consumer.hpp"
 #include "g610/services/binder.hpp"
 #include "g610/svc_dispatcher.hpp"
 #include "g610/services/nvmap_registry.hpp"
 #include "g610/telemetry.hpp"
+
+// **O backend Vulkan global** — definido no construtor do NvDrv para que
+// o thread de vsync (vi.cpp) possa disparar desenho quando o jogo não
+// submete comandos de desenho por conta própria.
+namespace g610::gpu {
+std::shared_ptr<VulkanBackend> g_vulkan_backend;
+}  // namespace g610::gpu
 
 namespace g610::services {
 
@@ -624,6 +632,20 @@ public:
              "SetGraphicsFirmwareMemoryMarginEnabled"},
         };
         RegisterHandlers(functions);
+
+        // Instancia o backend Vulkan para desenho real na GPU Mali-G610.
+        backend_ = std::make_shared<g610::gpu::VulkanBackend>();
+        std::string vk_error;
+        if (!backend_->init(vk_error)) {
+            std::fprintf(stderr,
+                         "[nvdrv] VulkanBackend init falhou: %s\n",
+                         vk_error.c_str());
+            backend_.reset();
+        } else {
+            g610::gpu::g_vulkan_backend = backend_;  // expõe globalmente para vi.cpp
+            std::fprintf(stderr,
+                         "[nvdrv] VulkanBackend inicializado (Mali-G610 via panfrost)\n");
+        }
     }
 
 private:
@@ -2429,7 +2451,8 @@ private:
         g610::gpu::processar_draw_comandos(comandos, this,
                                            &NvDrv::EscreverNoGuestWrapper,
                                            &NvDrv::SinalizaFenceWrapper,
-                                           &NvDrv::LerDoGuestWrapper);
+                                           &NvDrv::LerDoGuestWrapper,
+                                           backend_);
         gpu_draws_exec_ += comandos.size();
         if (!comandos.empty()) {
             LOG_DEBUG(Service_NVDRV,
@@ -2713,6 +2736,19 @@ private:
                 // são despertos (sem varredura de filas de cv não relacionadas).
                 if (rs_endereco != 0)
                     SvcDispatcher::AcordarFutexNoEndereco(rs_endereco);
+                else {
+                    // Nenhum ReportSemaphore no push buffer: o guest pode
+                    // estar à espera no endereço do semáforo do canal
+                    // (0xd9c2c228). Sinalizá-lo permite que o guest avance
+                    // para o próximo ciclo DequeueBuffer -> desenhar ->
+                    // QueueBuffer.
+                    std::uint32_t payload = 1;
+                    if (EscreverNoGuest(0xd9c2c228ull, &payload, sizeof(payload))) {
+                        SvcDispatcher::AcordarFutexNoEndereco(0xd9c2c228ull);
+                        LOG_DEBUG(Service_NVDRV,
+                                  "SubmitGPFIFO: semáforo canal sinalizado em 0xd9c2c228");
+                    }
+                }
 
                 // Após a conclusão da GPU, processar IPCs pendentes — um
                 // deles pode sinalizar a cv que alguma thread espera
@@ -3237,6 +3273,33 @@ private:
                     break;
                 }
             }
+            // O **grupo 0x01** — `GetWaitbase` (cmd 0x01) lê o valor base
+            // do syncpoint de espera do canal. O jogo chama isto em loop
+            // para saber quando o trabalho da GPU terminou. Sem este
+            // handler, o jogo recebe valor zero sempre e fica preso à
+            // espera de um syncpoint que nunca avança.
+            if (comando.group() == 0x01) {
+                switch (comando.cmd()) {
+                case 0x01: {
+                    // GetWaitbase: ler o valor atual do syncpoint do canal.
+                    // O jogo chama isto em loop para saber quando o trabalho
+                    // da GPU terminou. Incrementamos o fence_valor para
+                    // simular que o trabalho foi concluído, permitindo que o
+                    // guest prossiga para o caminho de renderização.
+                    if (auto* canal = CanalDoFd()) {
+                        IoctlGetWaitbase params{};
+                        params.value = ++canal->fence_valor;
+                        EscreverSaida(ctx, params);
+                        RespostaOk(ctx);
+                    } else {
+                        RespostaErro(ctx, NvResult::BadParameter, "no channel");
+                    }
+                    return;
+                }
+                default:
+                    break;
+                }
+            }
             break;
         case TipoDeDevice::ControleGpu:
             if (comando.group() == 'G') {
@@ -3533,6 +3596,11 @@ private:
     // O **tradutor** Maxwell -> Vulkan da casa (`src/gpu/`). É ele que
     // consome o push buffer que o guest submete.
     g610::gpu::MaxwellTranslator tradutor_{g610::tel::Telemetria()};
+    // O **backend Vulkan** — instancia o dispositivo, a imagem offscreen e
+    // executa o desenho real via `draw_vertex_buffer`. Inicializado no
+    // construtor; usado por `processar_draw_comandos` via
+    // `draw_consumer.cpp`.
+    std::shared_ptr<g610::gpu::VulkanBackend> backend_;
     // Contador de comandos de desenho executados (a "emissăo equivalente"
     // para PanVK/Mali-G610). Os `DrawCommand` sao encaminhados para o
     // `RasterizerG610` via `processar_draw_comandos` (em

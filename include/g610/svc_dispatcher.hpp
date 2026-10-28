@@ -404,6 +404,11 @@ public:
     // Processa IPC pendente no EdenSystem deste dispatcher (usado por hooks static via g_dispatcher_atual).
     void ProcessPendingIpcPendente();
 
+    // O sistema do Eden, quando ligado. Devolve referencia invalida se
+    // `attach_eden` nao foi chamado ou falhou. Usado para registar servicos
+    // (vi, nvdrv, ...) depois de o dispatcher estar completo.
+    EdenSystem& eden_system() noexcept;
+
     // O handle da thread principal, no espaço de handles do Eden.
     //
     // Vai para o x1 do entry point do guest, que é onde o Eden o põe
@@ -691,6 +696,8 @@ private:
     // waiters. É o par que o mutex do nn::os usa para acordar.
     Result svc_wait_for_address(SvcContext&);
     Result svc_signal_to_address(SvcContext&);
+    Result svc_break(SvcContext&);
+    Result svc_return_from_exception(SvcContext&);
 
     Result svc_exit_process(SvcContext&);
     Result svc_close_handle(SvcContext&);

@@ -7,7 +7,7 @@
   "dominant_bottleneck": "unknown",
   "exec": {
     "svc_calls": 0,
-    "page_faults": 0,
+    "page_faults": 1,
     "alignment_faults": 0,
     "illegal_instructions": 0,
     "guest_instructions": 0
