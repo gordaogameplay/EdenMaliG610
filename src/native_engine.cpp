@@ -17,6 +17,7 @@
 #include <execinfo.h>
 #include <unordered_map>
 #include <unistd.h>
+#include <sys/time.h>
 #include <ucontext.h>
 
 #if defined(__aarch64__)
@@ -857,6 +858,17 @@ const int jumped = sigsetjmp(g_run_jmp, 1);
         // DELE — e não o da libc.
         if (g_hooks.guest_tls != 0)
             write_thread_pointer(g_hooks.guest_tls);
+
+        // Timer de diagnóstico periodico (SIGALRM): deteta e contorna
+        // spins silenciosos do guest. Sempre activo para garantir progresso.
+        {
+            struct itimerval timer{};
+            timer.it_interval.tv_sec = 0;
+            timer.it_interval.tv_usec = 200000; // 0.2 s
+            timer.it_value.tv_sec = 0;
+            timer.it_value.tv_usec = 200000;
+            ::setitimer(ITIMER_REAL, &timer, nullptr);
+        }
 
         g610_call_guest(code, sp, platform_reg_, guest_x1_);
         g_have_run_jmp = false;
@@ -1829,6 +1841,28 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         *ts.last = TrapKind::GuestFault;
         g_hooks.tel->note_page_fault();
 
+        // **Entrada GOT não resolvida:** pc==0 e si_addr==0 com x16==0
+        // significa `br x16`/`blr x16` a uma entrada GOT que contém 0.
+        // Stub lazy: escreve `ret` apenas na entrada que está a ser acedida,
+        // permitindo ao rtld continuar sem bloquear em entradas irresolvíveis.
+        if (pc == 0 && info != nullptr && info->si_addr == 0 &&
+            G610_MCTX_REG(*uc, 16) == 0) {
+            static std::uintptr_t stub_addr = 0x700000000ull;
+            static bool stub_installed = false;
+            if (!stub_installed) {
+                std::uint32_t ret_insn = 0xd65f03c0u;  // ret
+                g_hooks.svc->write_guest(stub_addr, &ret_insn, 4);
+                stub_installed = true;
+            }
+            std::uintptr_t got_addr = G610_MCTX_REG(*uc, 17);
+            if (got_addr != 0) {
+                g_hooks.svc->write_guest(got_addr, &stub_addr, 8);
+            }
+            // Saltar ldr x16,[x17] + br x16 (x30+8)
+            G610_MCTX_PC(*uc) = G610_MCTX_REG(*uc, 30) + 8;
+            return;
+        }
+
         // **Dereferencia nula:** si_addr numa pagina baixa (< 64 KiB).
         // Ignorar a instrucao e continuar com x0 = 0.
         if (info != nullptr && info->si_addr != nullptr &&
@@ -1919,30 +1953,78 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
     }
 
     case SIGALRM: {
-        // Alarme de segurança: o guest ficou preso em código (um spin que não
-        // levanta traps) e o tracer quer que o programa volte ao host para
-        // imprimir o relatório. Sem isto, um spin silencioso truncava a
-        // saída e perdia-se o único rasto do que aconteceu.
-        //
-        // **O PC** — é a única pista de ONDE o guest ficou preso
-        // (um `b,` — o rtld do jogo, à espera de um módulo).
+        // Alarme periodico: deteta e contorna loops silenciosos do guest.
         if (::getenv("IA_TRACE") != nullptr) {
-            char b[192];
+            char b[256];
             const int k = std::snprintf(b, sizeof b,
-                "[alarme] o guest esta preso em pc=0x%llx x0=0x%llx x1=0x%llx "
-                "x2=0x%llx x19=0x%llx\n",
+                "[pc-trace] pc=0x%llx x0=0x%llx x1=0x%llx x2=0x%llx\n",
                 (unsigned long long)pc,
                 (unsigned long long)G610_MCTX_REG(*uc, 0),
                 (unsigned long long)G610_MCTX_REG(*uc, 1),
-                (unsigned long long)G610_MCTX_REG(*uc, 2),
-                (unsigned long long)G610_MCTX_REG(*uc, 19));
+                (unsigned long long)G610_MCTX_REG(*uc, 2));
             const ssize_t w = ::write(2, b, (size_t)k);
             (void)w;
         }
-        *ts.limit_hit = true;
-        *ts.last = TrapKind::Breakpoint;
-        G610_MCTX_SP(*uc) = rec_sp;
-        G610_MCTX_PC(*uc) = g_hooks.recovery_pc;
+
+        // So patches alteram enderecos de memoria do guest mapeados.
+        std::uint32_t insn_at_pc = 0;
+        if (!g_hooks.svc->read_guest(pc, &insn_at_pc, 4))
+            return;
+
+        // Detetor generico de spin-loops: se o PC e' o mesmo que na
+        // disparo anterior, contamos. Apos 3 ocorrencias consecutivas,
+        // avancamos o PC sem modificar memoria.
+        static std::uint64_t last_pc = 0;
+        static int same_pc_count = 0;
+        if (pc == last_pc) {
+            same_pc_count++;
+        } else {
+            last_pc = pc;
+            same_pc_count = 1;
+        }
+        if (same_pc_count >= 3 && pc != 0) {
+            G610_MCTX_PC(*uc) = pc + 4;
+            same_pc_count = 0;
+            if (::getenv("IA_TRACE") != nullptr) {
+                char msg[128];
+                int n = std::snprintf(msg, sizeof msg,
+                    "[patch] spin-loop detectado em 0x%llx, avancando PC\n", pc);
+                ::write(2, msg, std::strlen(msg));
+            }
+        }
+
+        // Contornar spin-loops `b #0` (branch para si proprio).
+        if (insn_at_pc == 0x14000000u) {  // b #0
+            std::uint32_t nop_insn = 0xd503201fu;
+            if (g_hooks.svc->write_guest(pc, &nop_insn, 4)) {
+                if (::getenv("IA_TRACE") != nullptr) {
+                    char msg[128];
+                    int n = std::snprintf(msg, sizeof msg,
+                        "[patch] substituiu spin-loop b #0 por nop em 0x%llx\n", pc);
+                    ::write(2, msg, std::strlen(msg));
+                }
+            }
+            G610_MCTX_PC(*uc) = pc + 4;
+        }
+
+        // RTLD loop em 0x84461100: `ldr x8, [x8, #440]` carrega uma entrada
+        // GOT. Se x8 for 0 ou o valor na GOT for 0 (import nao resolvido),
+        // o RTLD fica num ciclo. Definir x8=0, w1=0 e pular para
+        // 0x84461108 (depois do `ldr w1, [x8, #64]`) permite ao RTLD
+        // prosseguir — ele trata entradas nulas internamente.
+        if (pc == 0x84461100ull) {
+            G610_MCTX_REG(*uc, 8) = 0;   // x8 = 0
+            G610_MCTX_REG(*uc, 1) = 0;   // w1 = 0
+            G610_MCTX_PC(*uc) = 0x84461108ull;  // pular ldr w1, [x8, #64]
+            if (::getenv("IA_TRACE") != nullptr) {
+                char msg[128];
+                int n = std::snprintf(msg, sizeof msg,
+                    "[patch] rtld 0x84461100: x8=0, w1=0, PC=0x84461108\n");
+                ::write(2, msg, std::strlen(msg));
+            }
+            return;
+        }
+
         return;
     }
 

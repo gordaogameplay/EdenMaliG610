@@ -342,57 +342,6 @@ int main(int argc, char** argv) {
         return 4;
     }
     svc.set_eden_tls(g610::layout::kTlsBase);
-    std::cerr << "[debug] antes do preenchimento GOT\n";
-
-    // **Preencher entradas GOT no segmento de dados do rtld com endereco de
-    // stub `ret`.** O rtld resolve imports carregando entradas GOT; se todas
-    // estiverem a 0, fica num ciclo infinito tentando resolver simbolos que
-    // as tabelas de simbolo nao podem resolver (os offsets de dynstr/dynsym
-    // no cabeçalho NSO sao offsets de ficheiro, nao enderecos virtuais do
-    // guest). Escrever um endereco valido em cada entrada permite ao rtld
-    // concluir a inicializacao sem loop infinito.
-    {
-        std::uintptr_t stub_addr = 0x700000000ull;
-        std::uint32_t ret_insn = 0xd65f03c0u;  // ret
-        if (svc.write_guest(stub_addr, &ret_insn, 4)) {
-            std::cout << "  stub ret    : 0x" << std::hex << stub_addr << std::dec << "\n";
-        }
-        // Pagina de GOT/dados do rtld: 0x84464000 .. 0x84465000
-        std::uintptr_t got_base = 0x84464000ull;
-        std::uintptr_t got_end  = 0x84465000ull;
-        std::size_t patched = 0;
-        std::size_t total = 0;
-        for (std::uintptr_t addr = got_base; addr + 8 <= got_end; addr += 8) {
-            ++total;
-            std::uint64_t cur = 0;
-            (void)svc.read_guest(addr, &cur, 8);
-            if (svc.write_guest(addr, &stub_addr, 8))
-                ++patched;
-        }
-        std::cerr << "[debug] got entries: " << patched << "/" << total << " preenchidas\n";
-        std::cout << "  got entries : " << patched << " preenchidas com stub\n";
-    }
-    std::cerr << "[debug] depois do preenchimento GOT\n";
-
-    // **NOPear instrucoes indefinidas no codigo do rtld.**
-    // O .text do rtld contem dados (tabelas de salto, constantes) misturados
-    // com codigo. Quando o guest tenta executar esses dados como instrucoes,
-    // levanta SIGILL. NOPar essas palavras evita que o guest fique preso em
-    // loops de instrucoes ilegais.
-    {
-        std::uintptr_t rtld_text_base = 0x84461000ull;
-        std::uintptr_t rtld_text_end  = 0x84461000ull + 0x1A00ull; // segmento .text do rtld
-        std::uint32_t nop = 0xd503201fu;
-        std::size_t nopped = 0;
-        for (std::uintptr_t addr = rtld_text_base; addr + 4 <= rtld_text_end; addr += 4) {
-            std::uint32_t val = 0;
-            if (svc.read_guest(addr, &val, 4) && val == 0) {
-                if (svc.write_guest(addr, &nop, 4))
-                    ++nopped;
-            }
-        }
-        std::cerr << "[debug] rtld nopped: " << nopped << " instrucoes\n";
-    }
 
     g610::NativeEngine engine(telemetry, svc);
     std::string engine_err;

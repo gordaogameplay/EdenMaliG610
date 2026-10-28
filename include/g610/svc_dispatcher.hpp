@@ -697,6 +697,7 @@ private:
     Result svc_wait_for_address(SvcContext&);
     Result svc_signal_to_address(SvcContext&);
     Result svc_break(SvcContext&);
+    Result svc_output_debug_string(SvcContext&);
     Result svc_return_from_exception(SvcContext&);
 
     Result svc_exit_process(SvcContext&);

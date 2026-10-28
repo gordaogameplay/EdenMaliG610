@@ -560,6 +560,7 @@ void SvcDispatcher::dispatch(std::uint32_t number, SvcContext& ctx) {
     case Svc::WaitForAddress:       r = svc_wait_for_address(ctx); break;
     case Svc::SignalToAddress:      r = svc_signal_to_address(ctx); break;
     case Svc::Break:                r = svc_break(ctx); break;
+    case Svc::OutputDebugString:    r = svc_output_debug_string(ctx); break;
     case Svc::ReturnFromException:  r = svc_return_from_exception(ctx); break;
     default:                        r = svc_unsupported(ctx);    break;
     }
@@ -3252,6 +3253,14 @@ Result SvcDispatcher::svc_break(SvcContext&) {
     return Result::Success;
 }
 
+Result SvcDispatcher::svc_output_debug_string(SvcContext&) {
+    // `OutputDebugString` (0x27) envia uma string de depuração para o
+    // console do sistema. No nosso ambiente, ignoramos a string e
+    // devolvemos Success para permitir que o RTLD prossiga sem abortar
+    // quando o serviço não está implementado.
+    return Result::Success;
+}
+
 Result SvcDispatcher::svc_signal_process_wide_key(SvcContext& ctx) {
     const std::uint64_t cv_key = ctx.x[0] & ~std::uint64_t{3};
     const auto count = static_cast<std::int32_t>(ctx.x[1]);
@@ -3542,12 +3551,14 @@ Result SvcDispatcher::svc_unsupported(SvcContext&) {
     return Result::Unsupported;
 }
 
-Result SvcDispatcher::svc_return_from_exception(SvcContext&) {
+Result SvcDispatcher::svc_return_from_exception(SvcContext& ctx) {
     // O guest chama svcReturnFromException para sair de um exception handler.
     // No nosso motor, as exceções (SIGSEGV, SIGTRAP) são tratadas diretamente
     // pelo handler de sinais do host, que regressa ao guest sem precisar
-    // deste SVC. Devolver Sucesso é o comportamento correto: o guest continua
-    // a execução no ponto seguinte ao da exceção.
+    // deste SVC. Preservar x0 (que pode conter um código de erro) para que
+    // o guest possa verificá-lo após o retorno.
+    ctx.ret = ctx.x[0];
+    ctx.has_ret = true;
     return Result::Success;
 }
 

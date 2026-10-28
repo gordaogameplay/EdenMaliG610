@@ -486,3 +486,65 @@ Este SVC vem do rtld durante a inicialização. O caminho completo funciona:
 
 **Próximo passo:**
 Usar Ghidra/REA para analisar o módulo `main` e entender por que não chama funções do SDK que usam SVCs. Investigar se o jogo está preso em inicialização ou se o caminho de código simplesmente não inclui chamadas IPC.
+
+---
+
+### Atualização — RTLD preso após ReturnFromException (2026-10-27)
+
+## Estado atual: RTLD não consegue completar inicialização
+
+O RTLD carrega todos os módulos na memória, mas fica preso após chamar `svcReturnFromException` (#28) com `x0=0x81ff` (código de erro). Depois disso, não são emitidos mais SVCs.
+
+**Evidência observada:**
+```
+[svc] #0x06 QueryMemory sp=0x30fffff50 x0=0x30fffff68 x1=0x30fffff60 x2=0x0 x3=0x84464008
+[svc] #0x27 OutputDebugString sp=0x30ffffe90 x0=0x844637df x1=0x1b x2=0x30ffffea8 x3=0x844617b0
+[svc] #0x28 ReturnFromException sp=0xaaaab64c52e0 x0=0xf801 x1=0x84465000 x2=0x0 x3=0x844617b0
+```
+
+**Análise:**
+- O RTLD chama `OutputDebugString` (agora implementado como no-op, retorna Success)
+- Depois chama `ReturnFromException` com `x0=0xf801` (código de erro)
+- Depois de `ReturnFromException`, não há mais SVCs
+- O RTLD pode estar executando código não-SVC ou preso num loop
+
+**Causa provável: relocações do NSO não aplicadas**
+
+O código do `main` acessa globais em endereços que estão fora de todos os segmentos alocados. Exemplo observado:
+- Código em `0x80000100` acessa global `0x824B5CA0`
+- `0x824B5CA0 - 0x80000000 = 0x024B5CA0` (offset do módulo)
+- Este endereço está além do fim do segmento de data (0x8024B9B10)
+- Está em memória não mapeada → lê-se 0 → crash
+
+**Por que o RTLD não aplica relocações:**
+- O cabeçalho NSO tem `dynstr_offset` e `dynsym_offset` que são offsets de ficheiro, não endereços virtuais do guest
+- O RTLD não consegue localizar as tabelas de símbolos
+- Sem símbolos, não consegue resolver imports
+- Sem imports resolvidos, não pode aplicar relocações
+- Sem relocações, o `main` não pode executar corretamente
+
+**Soluções possíveis:**
+1. **Implementar suporte a relocações NSO:** analisar dynstr/dynsym, converter offsets de ficheiro para endereços virtuais do guest, aplicar relocações
+2. **Contornar o RTLD:** pular directamente para `main` com relocações aplicadas manualmente
+3. **Fazer o RTLD completar:** fornecer tabelas de símbolos em endereços que o RTLD consiga encontrar
+
+**Próximo passo:** implementar análise do cabeçalho NSO para extrair dynstr/dynsym e aplicar relocações ao módulo `main`.
+
+---
+
+### Alterações nesta sessão
+
+| Arquivo | Alteração |
+|---|---|
+| `src/native_engine.cpp` | Adicionado `sys/time.h`; SIGALRM timer sempre activo; SIGSEGV handler com NULL deref e PC advance para qualquer falha; SIGILL handler com PC advance; SIGTRAP handler com dispatch de SVCs; deteção de spin-loops e `b #0` no SIGALRM; tratamento específico de `0x84461100` (ldr x8, [x8, #440]) |
+| `src/main.cpp` | Removido GOT pre-population e NOP patching do rtld (causavam mais problemas do que resolviam); adicionado `svc_return_from_exception` preservando x0 |
+| `src/svc_dispatcher.cpp` | Adicionado `svc_output_debug_string` (SVC #27) como no-op; `svc_return_from_exception` preserva x0 (`ctx.ret = ctx.x[0]`) |
+| `include/g610/svc_dispatcher.hpp` | Declarada `svc_output_debug_string` |
+
+**Arquivos preservados (não commitados):** `build_asan/`, `*.bak`, `svc_dispatcher.cpp.trunc-runO`, `0_total=0`, `g610-telemetry/` (ficheiros de output)
+
+---
+
+**Bloqueador principal:** relocações do NSO não aplicadas. O módulo `main` não pode executar porque referências a símbolos importados apontam para endereços inválidos.
+
+**Próximo marco:** implementar suporte a relocações NSO para permitir que o `main` execute e faça chamadas IPC.

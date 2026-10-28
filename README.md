@@ -104,18 +104,27 @@ generation and a different GPU.
 |---|---|
 | NSO loader (LZ4 segments, NPDM) | done, validated on a real title |
 | Static patcher (SVC→BRK, HINT→NOP) | done |
-| Native execution engine (traps, faults, 39-bit space) | done, validated |
+| Native execution engine (traps, faults, 39-bit space) | experimental — runs 5+ min without crash, but RTLD does not complete |
 | Telemetry (frame, SVC, service, GPU, bottleneck classifier) | done |
-| Horizon IPC transport and `sm:` | done |
-| `am` / `appletOE` (focus, messages, system event) | done |
-| `apm`, `pctl` | done |
-| Maxwell command extraction | done (opcode table under validation) |
+| Horizon IPC transport and `sm:` | partial — 24 services registered, but no IPC from `main` module |
+| `am` / `appletOE` (focus, messages, system event) | blocked — `main` module does not execute (missing NSO relocations) |
+| `apm`, `pctl` | blocked — same reason |
+| Maxwell command extraction | skeleton — no real commands from game yet |
 | Maxwell → Vulkan translation | skeleton |
 | Maxwell → SPIR-V shader compiler | integration point |
-| `aoc` and the remaining services | in progress |
+| `aoc` and the remaining services | pending |
+| Pokémon Shield pixels on physical display | blocked — no GPU commands from game yet |
 
-The guest currently reaches the `am`, opens the application's proxy and its
-sub-interfaces, and waits on the services that are not implemented yet.
+The guest executes natively on the A76 for several minutes without crashing,
+and the RTLD loads all modules (rtld, main, subsdk0, subsdk1, sdk) into the
+guest's 39-bit address space. However, the RTLD does not complete its
+initialization: after `svcReturnFromException` (#28), no further SVCs are
+emitted, and the `main` module never starts executing. The root cause is
+believed to be missing NSO relocations — symbol tables (`dynstr`/`dynsym`)
+are referenced by file offset rather than guest virtual address, so the RTLD
+cannot resolve imports and apply relocations. Without relocations, `main`
+cannot access its global variables and cannot make IPC calls.
+
 
 ## Building
 
@@ -137,7 +146,7 @@ cmake --build build -j"$(nproc)"
 ## Running
 
 ```sh
-./build/g610_boot /path/to/exefs
+./build/g610 /path/to/exefs
 ```
 
 ### The game files — yours, not ours
@@ -179,9 +188,13 @@ Useful environment variables:
 cd build && ctest
 ```
 
-Six suites: core (telemetry, SVC dispatch, decoder, patcher), exec, program,
-maxwell, translate, input, and a GPU execution test that actually runs on the
-Mali-G610.
+18 test executables: `g610_tests` (core: telemetry, SVC dispatch, decoder, patcher),
+`g610_program`, `g610_pushbuffer`, `g610_gpfifo_replay`, `g610_bench_svc`,
+`g610_maxwell_test`, `g610_translate_test`, `g610_gpu_exec` (GPU execution on
+Mali-G610), `g610_rasterizer_clear`, `g610_guest_memory_read`,
+`g610_vertex_attributes`, `g610_gpfifo_inspect`, `g610_integrated_draw`,
+`g610_vulkan_pipeline`, `g610_input`, `g610_mostra`, `g610_input_test`,
+`g610_boot`.
 
 ## Layout
 
