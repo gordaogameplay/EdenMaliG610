@@ -60,6 +60,16 @@ void guest_threads_parar();
 void guest_threads_aguardar(int teto_segundos);
 bool guest_threads_paragem_ativa();
 
+// **Boot natural** (definido em `native_engine.cpp`). Verdadeiro por
+// omissão; `G610_ARTIFACTS_BOOT=1` restaura o modo antigo (relocações
+// heurísticas + NOPs do crt0 + band-aids). Os serviços que têm band-aids
+// da era-artefato (ex. `ThreadDoVsync` em vi.cpp) usam isto para os
+// deixar de fora no boot natural — medido 28/10: o escritor do "1" na
+// palavra do mutex 0x843ea4d0 era o `ThreadDoVsync` (watchpoint gdb:
+// old=0 new=1 ANTES da primeira instrução do guest), que envenena o CAS
+// do SDK e faz um dono fantasma no ArbitrateLock.
+bool natural_boot();
+
 // ── O dono do despacho, partilhado com o SVC que precisa estacionar ───────
 //
 // O SvcDispatcher é serializado por um dono atómico (`g_dispatch_owner` em

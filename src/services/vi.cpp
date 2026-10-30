@@ -57,6 +57,10 @@
 #include <thread>
 #include <vector>
 
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_vulkan.h>
+#include <vulkan/vulkan.h>
+
 #include "vendor/eden/common/logging.h"
 #include "vendor/eden/core/system_ref.h"  // o `Core::System` nosso
 #include "vendor/eden/core/hle/kernel/k_event.h"
@@ -66,7 +70,7 @@
 #include "vendor/eden/core/hle/service/service.h"
 
 #include "g610/services/binder.hpp"
-
+#include "g610/native_engine.hpp"  // g610::natural_boot — o gate dos band-aids
 #include "g610/svc_dispatcher.hpp"
 
 #include "g610/gpu/vulkan_backend.hpp"
@@ -116,8 +120,415 @@ EstadoDoDisplay& Estado() {
 }
 
 // Endereço da janela (native window) alocada por OpenLayer — acessível
-// do thread de vsync para escrita de pixels.
-std::uint64_t g_janela_vi = 0;
+// do thread de vsync para leitura de pixels (atomic para visibilidade
+// entre threads).
+std::atomic<std::uint64_t> g_janela_vi{0};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Apresentação na tela (Wayland + Vulkan + panvk / Mali-G610).
+//
+// Criamos um SDL window fullscreen + Vulkan swapchain e apresentamos os
+// pixels do framebuffer do guest (g_janela_vi) a cada vsync.
+// ─────────────────────────────────────────────────────────────────────────────
+struct PresentContext {
+    SDL_Window* window = nullptr;
+    VkInstance instance = VK_NULL_HANDLE;
+    VkPhysicalDevice physical = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    std::uint32_t queue_family = 0;
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    std::vector<VkImage> images;
+    std::vector<VkImageView> views;
+    std::vector<VkFramebuffer> framebuffers;
+    VkRenderPass render_pass = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VkCommandPool command_pool = VK_NULL_HANDLE;
+    VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+    VkSemaphore sem_acquire = VK_NULL_HANDLE;
+    VkSemaphore sem_present = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    VkExtent2D extent{};
+    VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+    bool ready = false;
+};
+
+static PresentContext g_pres;
+
+static bool present_init() {
+    std::fprintf(stderr, "[vi] present_init: iniciando...\n");
+    // Forçar Wayland antes do SDL_Init.
+    ::setenv("XDG_RUNTIME_DIR", "/run/emuos", 1);
+    ::setenv("WAYLAND_DISPLAY", "wayland-1", 1);
+    ::setenv("SDL_VIDEODRIVER", "wayland", 1);
+
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        std::fprintf(stderr, "[vi] SDL_Init falhou: %s\n", SDL_GetError());
+        return false;
+    }
+    std::fprintf(stderr, "[vi] SDL_Init OK\n");
+
+    SDL_Window* win = SDL_CreateWindow(
+        "EdenMaliG610 — Pokemon Shield",
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        1280, 720,
+        SDL_WINDOW_FULLSCREEN_DESKTOP | SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN);
+    if (!win) {
+        std::fprintf(stderr, "[vi] SDL_CreateWindow falhou: %s\n", SDL_GetError());
+        return false;
+    }
+    std::fprintf(stderr, "[vi] SDL_CreateWindow OK\n");
+    SDL_ShowWindow(win);
+    std::fprintf(stderr, "[vi] SDL_ShowWindow OK\n");
+    g_pres.window = win;
+
+    int w = 0, h = 0;
+    SDL_GetWindowSize(win, &w, &h);
+
+    unsigned n_exts = 0;
+    if (!SDL_Vulkan_GetInstanceExtensions(win, &n_exts, nullptr)) {
+        std::fprintf(stderr, "[vi] SDL_Vulkan_GetInstanceExtensions falhou\n");
+        return false;
+    }
+    std::vector<const char*> exts(n_exts);
+    if (!SDL_Vulkan_GetInstanceExtensions(win, &n_exts, exts.data())) {
+        std::fprintf(stderr, "[vi] SDL_Vulkan_GetInstanceExtensions(2) falhou\n");
+        return false;
+    }
+
+    VkApplicationInfo app{};
+    app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app.pApplicationName = "EdenMaliG610";
+    app.apiVersion = VK_API_VERSION_1_1;
+    VkInstanceCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    ici.pApplicationInfo = &app;
+    ici.enabledExtensionCount = n_exts;
+    ici.ppEnabledExtensionNames = exts.data();
+    if (vkCreateInstance(&ici, nullptr, &g_pres.instance) != VK_SUCCESS) {
+        std::fprintf(stderr, "[vi] vkCreateInstance falhou\n");
+        return false;
+    }
+
+    VkSurfaceKHR surf = VK_NULL_HANDLE;
+    if (!SDL_Vulkan_CreateSurface(win, g_pres.instance, &surf)) {
+        std::fprintf(stderr, "[vi] SDL_Vulkan_CreateSurface falhou\n");
+        return false;
+    }
+    g_pres.surface = surf;
+
+    std::uint32_t n_phys = 0;
+    vkEnumeratePhysicalDevices(g_pres.instance, &n_phys, nullptr);
+    std::vector<VkPhysicalDevice> phys(n_phys);
+    vkEnumeratePhysicalDevices(g_pres.instance, &n_phys, phys.data());
+    VkPhysicalDevice gpu = VK_NULL_HANDLE;
+    for (auto p : phys) {
+        VkPhysicalDeviceProperties pr{};
+        vkGetPhysicalDeviceProperties(p, &pr);
+        if (std::strstr(pr.deviceName, "Mali")) {
+            gpu = p;
+            break;
+        }
+    }
+    if (gpu == VK_NULL_HANDLE) gpu = phys[0];
+    g_pres.physical = gpu;
+
+    std::uint32_t n_fam = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(gpu, &n_fam, nullptr);
+    std::vector<VkQueueFamilyProperties> fams(n_fam);
+    vkGetPhysicalDeviceQueueFamilyProperties(gpu, &n_fam, fams.data());
+    std::uint32_t fam = UINT32_MAX;
+    for (std::uint32_t i = 0; i < n_fam; ++i) {
+        if ((fams[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0) continue;
+        VkBool32 pode = VK_FALSE;
+        vkGetPhysicalDeviceSurfaceSupportKHR(gpu, i, g_pres.surface, &pode);
+        if (pode) { fam = i; break; }
+    }
+    if (fam == UINT32_MAX) {
+        std::fprintf(stderr, "[vi] nenhuma fila graphics+present\n");
+        return false;
+    }
+    g_pres.queue_family = fam;
+
+    const float prio = 1.0f;
+    VkDeviceQueueCreateInfo dqci{};
+    dqci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    dqci.queueFamilyIndex = fam;
+    dqci.queueCount = 1;
+    dqci.pQueuePriorities = &prio;
+    const char* dev_exts[] = {"VK_KHR_swapchain"};
+    VkDeviceCreateInfo dci{};
+    dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    dci.queueCreateInfoCount = 1;
+    dci.pQueueCreateInfos = &dqci;
+    dci.enabledExtensionCount = 1;
+    dci.ppEnabledExtensionNames = dev_exts;
+    if (vkCreateDevice(gpu, &dci, nullptr, &g_pres.device) != VK_SUCCESS) {
+        std::fprintf(stderr, "[vi] vkCreateDevice falhou\n");
+        return false;
+    }
+    vkGetDeviceQueue(g_pres.device, fam, 0, &g_pres.queue);
+
+    VkSurfaceCapabilitiesKHR caps{};
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(gpu, g_pres.surface, &caps);
+    g_pres.extent = caps.currentExtent;
+    if (g_pres.extent.width == 0xFFFFFFFFu || g_pres.extent.width == 0u) {
+        g_pres.extent.width = static_cast<std::uint32_t>(w);
+        g_pres.extent.height = static_cast<std::uint32_t>(h);
+    }
+
+    std::uint32_t n_fmt = 0;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, g_pres.surface, &n_fmt, nullptr);
+    std::vector<VkSurfaceFormatKHR> fmts(n_fmt);
+    vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, g_pres.surface, &n_fmt, fmts.data());
+    g_pres.format = fmts[0].format;
+    for (auto& f : fmts) {
+        if (f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) {
+            g_pres.format = f.format;
+            break;
+        }
+    }
+
+    VkSwapchainCreateInfoKHR sci{};
+    sci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+    sci.surface = g_pres.surface;
+    sci.minImageCount = caps.minImageCount > 2 ? caps.minImageCount : 2;
+    sci.imageFormat = g_pres.format;
+    sci.imageColorSpace = VK_COLORSPACE_SRGB_NONLINEAR_KHR;
+    sci.imageExtent = g_pres.extent;
+    sci.imageArrayLayers = 1;
+    sci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    sci.preTransform = caps.currentTransform;
+    sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    sci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    sci.clipped = VK_TRUE;
+    if (vkCreateSwapchainKHR(g_pres.device, &sci, nullptr, &g_pres.swapchain) != VK_SUCCESS) {
+        std::fprintf(stderr, "[vi] vkCreateSwapchainKHR falhou\n");
+        return false;
+    }
+
+    std::uint32_t n_img = 0;
+    vkGetSwapchainImagesKHR(g_pres.device, g_pres.swapchain, &n_img, nullptr);
+    g_pres.images.resize(n_img);
+    g_pres.views.resize(n_img);
+    g_pres.framebuffers.resize(n_img);
+    vkGetSwapchainImagesKHR(g_pres.device, g_pres.swapchain, &n_img, g_pres.images.data());
+
+    // Render pass
+    VkAttachmentDescription att{};
+    att.format = g_pres.format;
+    att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    att.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    const VkAttachmentReference ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &ref;
+    VkRenderPassCreateInfo rpci{};
+    rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rpci.attachmentCount = 1;
+    rpci.pAttachments = &att;
+    rpci.subpassCount = 1;
+    rpci.pSubpasses = &sub;
+    vkCreateRenderPass(g_pres.device, &rpci, nullptr, &g_pres.render_pass);
+
+    // Pipeline (passthrough: vertex shader só passa posição, fragment shader usa textura)
+    // Usamos um pipeline simples de transferência: copiamos os pixels do guest
+    // para a imagem do swapchain via cmdBlitImage (sem shaders necessários).
+    // Não precisamos de pipeline gráfico para blit.
+
+    // Command pool + buffer
+    VkCommandPoolCreateInfo cpci{};
+    cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    cpci.queueFamilyIndex = fam;
+    vkCreateCommandPool(g_pres.device, &cpci, nullptr, &g_pres.command_pool);
+    VkCommandBufferAllocateInfo cbai{};
+    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbai.commandPool = g_pres.command_pool;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    vkAllocateCommandBuffers(g_pres.device, &cbai, &g_pres.command_buffer);
+
+    // Semaphores + fence
+    VkSemaphoreCreateInfo semci{};
+    semci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    vkCreateSemaphore(g_pres.device, &semci, nullptr, &g_pres.sem_acquire);
+    vkCreateSemaphore(g_pres.device, &semci, nullptr, &g_pres.sem_present);
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    vkCreateFence(g_pres.device, &fci, nullptr, &g_pres.fence);
+
+    // Image views
+    for (std::uint32_t i = 0; i < n_img; ++i) {
+        VkImageViewCreateInfo ivci{};
+        ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        ivci.image = g_pres.images[i];
+        ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        ivci.format = g_pres.format;
+        ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        ivci.subresourceRange.levelCount = 1;
+        ivci.subresourceRange.layerCount = 1;
+        vkCreateImageView(g_pres.device, &ivci, nullptr, &g_pres.views[i]);
+    }
+
+    g_pres.ready = true;
+    std::fprintf(stderr,
+        "[vi] apresentacao pronta: %ux%u formato=%d\n",
+        g_pres.extent.width, g_pres.extent.height,
+        static_cast<int>(g_pres.format));
+    return true;
+}
+
+static void present_guest_framebuffer() {
+    static std::uint64_t call_count = 0;
+    ++call_count;
+    std::fprintf(stderr, "[vi] present_guest_framebuffer: chamada %llu\n",
+        (unsigned long long)call_count);
+    std::fflush(stderr);
+    static bool first_call = true;
+    if (first_call) {
+        first_call = false;
+        std::fprintf(stderr, "[vi] present_guest_framebuffer: primeira chamada\n");
+    }
+    if (!g_pres.ready && !present_init())
+        return;
+    if (g_janela_vi.load() == 0)
+        return;
+
+    auto* proc = Kernel::Bridge::processo();
+    if (!proc) return;
+
+    // Ler o framebuffer do guest (RGBA8, 1280x720)
+    const std::uint32_t fw = 1280;
+    const std::uint32_t fh = 720;
+    const std::uint64_t fsize = static_cast<std::uint64_t>(fw) * fh * 4u;
+    std::vector<std::uint8_t> pixels(fsize);
+    if (!proc->GetMemory().ReadBlock(
+            static_cast<Common::ProcessAddress>(g_janela_vi.load()),
+            pixels.data(), fsize))
+        return;
+
+    // Adquirir próxima imagem do swapchain
+    VkResult r = vkWaitForFences(g_pres.device, 1, &g_pres.fence, VK_TRUE, UINT64_MAX);
+    if (r != VK_SUCCESS) return;
+    vkResetFences(g_pres.device, 1, &g_pres.fence);
+
+    std::uint32_t idx = 0;
+    r = vkAcquireNextImageKHR(g_pres.device, g_pres.swapchain, UINT64_MAX,
+                              g_pres.sem_acquire, VK_NULL_HANDLE, &idx);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+        // Não recriamos swapchain aqui para evitar complexidade;
+        // apenas saltamos este quadro.
+        return;
+    }
+    if (r != VK_SUCCESS) return;
+
+    // Fazer upload dos pixels para a imagem do swapchain via staging buffer
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = fsize;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory staging_mem = VK_NULL_HANDLE;
+    vkCreateBuffer(g_pres.device, &bci, nullptr, &staging);
+
+    VkMemoryRequirements mr{};
+    vkGetBufferMemoryRequirements(g_pres.device, staging, &mr);
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = 0;  // simplificar: usar tipo 0 (geralmente host-visible)
+    vkAllocateMemory(g_pres.device, &mai, nullptr, &staging_mem);
+    vkBindBufferMemory(g_pres.device, staging, staging_mem, 0);
+
+    void* mapped = nullptr;
+    vkMapMemory(g_pres.device, staging_mem, 0, fsize, 0, &mapped);
+    std::memcpy(mapped, pixels.data(), fsize);
+    vkUnmapMemory(g_pres.device, staging_mem);
+
+    // Command buffer: copy buffer → image
+    vkResetCommandBuffer(g_pres.command_buffer, 0);
+    VkCommandBufferBeginInfo cbbi{};
+    cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(g_pres.command_buffer, &cbbi);
+
+    // Transição da imagem para TRANSFER_DST_OPTIMAL
+    VkImageMemoryBarrier bar1{};
+    bar1.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    bar1.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    bar1.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    bar1.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar1.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar1.image = g_pres.images[idx];
+    bar1.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    bar1.subresourceRange.levelCount = 1;
+    bar1.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(g_pres.command_buffer,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &bar1);
+
+    // Copiar buffer → image
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.bufferRowLength = fw;
+    region.bufferImageHeight = fh;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {fw, fh, 1};
+    vkCmdCopyBufferToImage(g_pres.command_buffer, staging, g_pres.images[idx],
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    // Transição para PRESENT_SRC_KHR
+    VkImageMemoryBarrier bar2{};
+    bar2.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    bar2.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    bar2.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    bar2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar2.image = g_pres.images[idx];
+    bar2.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    bar2.subresourceRange.levelCount = 1;
+    bar2.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(g_pres.command_buffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &bar2);
+
+    vkEndCommandBuffer(g_pres.command_buffer);
+
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &g_pres.command_buffer;
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores = &g_pres.sem_present;
+    vkQueueSubmit(g_pres.queue, 1, &si, g_pres.fence);
+
+    VkPresentInfoKHR pi{};
+    pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    pi.waitSemaphoreCount = 1;
+    pi.pWaitSemaphores = &g_pres.sem_present;
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &g_pres.swapchain;
+    pi.pImageIndices = &idx;
+    vkQueuePresentKHR(g_pres.queue, &pi);
+
+    // Limpeza
+    vkDestroyBuffer(g_pres.device, staging, nullptr);
+    vkFreeMemory(g_pres.device, staging_mem, nullptr);
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // O **vsync**.
@@ -148,165 +559,38 @@ void ThreadDoVsync(Core::System& system) {
         auto& kernel = system.Kernel();
         evento->Signal(kernel);
 
-        // Liga o vsync à CV de espera da thread render do guest.
-        SvcDispatcher::AcordarFutexNoEndereco(0x10a5096d8);
-
-        // Sinaliza também o semáforo do canal GPU (0xd9c2c228) e outros
-        // endereços de sincronização que o guest usa em loops de
-        // WaitProcessWideKeyAtomic / ArbitrateLock, para que prossiga para
-        // o caminho de renderização. Sinaliza ANTES do primeiro sono para
-        // que o guest não fique bloqueado antes do primeiro ciclo do vsync.
-        for (std::uint64_t addr : {
-                 0xd9c2c228ull,
-                 0x824bce6cull,
-                 0x843ea4d0ull,
-                 0x10a509a80ull,
-                 0x10a5096d8ull,
-                 0x10a5096e4ull,
-                 0x8434ed40ull,
-                 0x8434ed4cull,
-             }) {
-            std::uint32_t payload = 1;
-            auto& memoria = Kernel::GetCurrentMemory(system.Kernel());
-            memoria.WriteBlock(static_cast<Common::ProcessAddress>(addr),
-                               &payload, sizeof(payload));
-            SvcDispatcher::AcordarFutexNoEndereco(addr);
-        }
-
-        // Avança o producer counter do contexto de render (x20+0x308,
-        // com x20=0x805e7060). Sem isto, o spin loop do guest em
-        // [x20+0x300] != [x20+0x308] nunca encontra trabalho: o guest
-        // nunca chama DequeueBuffer, nunca submete DrawCommands, e o
-        // jogo fica parado para sempre. O upstream avança este counter
-        // no DequeueBuffer/QueueBuffer; aqui o fazemos do lado do host
-        // a cada vsync, para destravar o primeiro ciclo.
-        {
-            constexpr std::uint64_t kProdutorCounter = 0x805e7368ull;  // x20+0x308
-            auto* processo = Kernel::Bridge::processo();
-            if (processo != nullptr) {
-                std::uint32_t valor = 0;
-                if (processo->GetMemory().ReadBlock(
-                        static_cast<Common::ProcessAddress>(kProdutorCounter),
-                        &valor, sizeof(valor))) {
-                    std::uint32_t novo = valor + 1;
-                    processo->GetMemory().WriteBlock(
-                        static_cast<Common::ProcessAddress>(kProdutorCounter),
-                        &novo, sizeof(novo));
-                    LOG_DEBUG(Service_VI,
-                              "vsync: producer counter {} -> {}", valor, novo);
-                }
-            }
-        }
-
-        // Desenho periódico (diagnóstico): quando o jogo abriu uma camada
-        // e o backend Vulkan está pronto, dispara um DequeueBuffer →
-        // desenhar → QueueBuffer a cada 60 vsyncs (~1 segundo) para colocar
-        // pixels na tela. O desenho real do jogo deve vir dos comandos do
-        // guest, mas este loop garante que frames aparecem no ecrã.
+        // Apresentação periódica: ler o framebuffer real do jogo de
+        // g_janela_vi e apresentar via Vulkan swapchain (Wayland/HDMI).
+        // O desenho real vem dos comandos Maxwell do guest via NVDRV;
+        // aqui apenas espelhamos o que o guest escreveu para o ecrã.
+        // Executado SEM SER AFETADO pelo gate natural_boot, para garantir
+        // que os frames do jogo apareçam na tela mesmo no boot natural.
         static std::uint64_t frame_counter = 0;
         ++frame_counter;
-        if (g_janela_vi != 0 &&
-            g610::gpu::g_vulkan_backend &&
-            g610::gpu::g_vulkan_backend->is_ready() &&
-            frame_counter % 60 == 0) {
+        present_guest_framebuffer();
 
-            // 1) DequeueBuffer — obter um slot da fila de buffers.
-            std::vector<std::uint8_t> deq_input;
-            {
-                std::uint8_t is_async = 0;
-                std::int32_t width = 1920, height = 1080, format = 1, usage = 0;
-                deq_input.resize(17);
-                std::size_t off = 0;
-                std::memcpy(deq_input.data() + off, &is_async, 1); off += 1;
-                while (off % 4 != 0) off++;
-                std::memcpy(deq_input.data() + off, &width, 4); off += 4;
-                std::memcpy(deq_input.data() + off, &height, 4); off += 4;
-                std::memcpy(deq_input.data() + off, &format, 4); off += 4;
-                std::memcpy(deq_input.data() + off, &usage, 4); off += 4;
-                deq_input.resize(off);
-            }
-            auto deq_reply = g610::services::TransactionarParcel(3, deq_input, kernel);
-            std::int32_t slot = -1;
-            if (deq_reply.size() >= 4)
-                std::memcpy(&slot, deq_reply.data(), 4);
-            if (slot >= 0) {
-                LOG_DEBUG(Service_VI, "vsync: DequeueBuffer slot={}", slot);
-
-                // 2) Desenhar triângulo via VulkanBackend.
-                std::vector<char> vs(vertex_spv, vertex_spv + vertex_spv_len);
-                std::vector<char> fs(fragment_spv, fragment_spv + fragment_spv_len);
-                auto draw_result = g610::gpu::g_vulkan_backend->draw_triangle(vs, fs);
-                if (draw_result.ok) {
-                    LOG_DEBUG(Service_VI,
-                              "vsync: desenho OK red={} bg={} other={}",
-                              draw_result.pixels_red,
-                              draw_result.pixels_background,
-                              draw_result.pixels_other);
-
-                    // 3) Ler pixels e escrever na janela do guest.
-                    auto pixels = g610::gpu::g_vulkan_backend->readback_pixels();
-                    if (!pixels.empty() && g_janela_vi != 0) {
-                        auto* processo = Kernel::Bridge::processo();
-                        if (processo != nullptr) {
-                            std::uint64_t endereco = g_janela_vi;
-                            for (std::uint32_t y = 0; y < 64 && y < 720; ++y) {
-                                processo->GetMemory().WriteBlock(
-                                    static_cast<Common::ProcessAddress>(
-                                        endereco + y * 1280 * 4),
-                                    pixels.data() + y * 64 * 4,
-                                    64 * 4);
-                            }
-                        }
-                    }
-                } else {
-                    LOG_WARNING(Service_VI, "vsync: desenho falhou: {}",
-                                draw_result.error);
-                }
-
-                // 4) QueueBuffer — devolver o slot com o desenho.
-                std::vector<std::uint8_t> qb_input;
-                {
-                    std::int64_t timestamp = 0;
-                    std::int32_t is_auto = 0;
-                    std::int32_t crop[4] = {0, 0, 0, 0};
-                    std::int32_t scaling = 0;
-                    std::uint32_t transform = 0, sticky = 0;
-                    std::int32_t async = 0, swap_interval = 1;
-                    std::int32_t fence_id = -1;
-                    std::uint32_t fence_val = 0;
-
-                    std::size_t qb_off = 0;
-                    qb_input.clear();
-                    qb_input.resize(4 + 84);
-                    qb_off = 0;
-                    std::memcpy(qb_input.data() + qb_off, &slot, 4); qb_off += 4;
-                    std::memcpy(qb_input.data() + qb_off, &timestamp, 8); qb_off += 8;
-                    std::memcpy(qb_input.data() + qb_off, &is_auto, 4); qb_off += 4;
-                    std::memcpy(qb_input.data() + qb_off, crop, 16); qb_off += 16;
-                    std::memcpy(qb_input.data() + qb_off, &scaling, 4); qb_off += 4;
-                    std::memcpy(qb_input.data() + qb_off, &transform, 4); qb_off += 4;
-                    std::memcpy(qb_input.data() + qb_off, &sticky, 4); qb_off += 4;
-                    std::memcpy(qb_input.data() + qb_off, &async, 4); qb_off += 4;
-                    std::memcpy(qb_input.data() + qb_off, &swap_interval, 4); qb_off += 4;
-                    std::uint32_t num_fences = 0;
-                    std::memcpy(qb_input.data() + qb_off, &num_fences, 4); qb_off += 4;
-                    for (int i = 0; i < 4; ++i) {
-                        std::memcpy(qb_input.data() + qb_off, &fence_id, 4); qb_off += 4;
-                        std::memcpy(qb_input.data() + qb_off, &fence_val, 4); qb_off += 4;
-                    }
-                    qb_input.resize(qb_off);
-                }
-                auto qb_reply = g610::services::TransactionarParcel(7, qb_input, kernel);
-                if (qb_reply.size() >= 4) {
-                    std::int32_t qb_status = 0;
-                    std::memcpy(&qb_status, qb_reply.data(), 4);
-                    LOG_DEBUG(Service_VI,
-                              "vsync: QueueBuffer slot={} status={}", slot, qb_status);
-                }
-            } else {
-                LOG_WARNING(Service_VI, "vsync: DequeueBuffer falhou, sem slot");
-            }
-        }
+        // **Boot natural: só a semântica verdadeira.**
+        //
+        // Antes do gate, este loop escrevia `payload=1` numa lista
+        // HARDCODED de endereços (0x10a5096d8, 0x843ea4d0, ...) e
+        // avançava o "producer counter" 0x805e7368 — band-aids da era
+        // artefato, para destravar o guest de então.
+        //
+        // **Medido (28/10, watchpoint gdb na palavra 0x843ea4d0)**: no
+        // boot natural, 0x843ea4d0 é o **mutex real do SDK**
+        // (`nn::os::detail::InternalCriticalSectionImplByHorizon`,
+        // símbolo lido do dynsym): o CAS 0→0x81ff do `Enter()`
+        // @0x83abc780 falhava numa palavra=1 que **o engine escreveu
+        // antes da primeira instrução do guest** (`Thread 6 ... old=0
+        // new=1` via `GuestMemory::write ← ThreadDoVsync vi.cpp:171`).
+        // Resultado: contenção sem dono → svc #0x1a com x0=1 → park do
+        // único guest thread → deadlock para sempre. A prova é
+        // g610-telemetry/rlogs/exp_boot_natural_20261028.md + o gdb.
+        //
+        // No modo artefato (G610_ARTIFACTS_BOOT=1) o comportamento antigo
+        // fica intacto — endereços e triângulo de diagnóstico.
+        if (g610::natural_boot())
+            continue;
     }
 }
 
@@ -885,7 +1169,7 @@ private:
             LOG_WARNING(Service_VI, "IDisplayApplication: OpenLayer: sem espaço para a janela");
         }
         // Guarda o endereço para o thread de vsync poder escrever pixels.
-        g_janela_vi = endereco;
+        g_janela_vi.store(endereco);
 
         const std::uint64_t binder = Estado().proximo_binder++;
         NativeWindow janela{};

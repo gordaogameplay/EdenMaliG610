@@ -1,0 +1,1560 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
+// O `appletOE` — o proxy do `am` (Application Manager), **nosso**.
+//
+// ## O que é
+//
+// O SDK da Nintendo, no arranque, pede o serviço `appletOE` ao `sm:`. Esse
+// serviço é o *proxy* do `am`: dá ao jogo um conjunto de sub-interfaces
+// (`ICommonStateGetter`, `ISelfController`, `IApplicationFunctions`, …) que
+// respondem a perguntas sobre o estado da aplicação.
+//
+// A estrutura vem do Eden (`core/hle/service/am/service/`), e é esta:
+//
+//   appletOE  (o serviço)
+//     └─ IApplicationProxy        (o proxy, comando 0 = OpenApplicationProxy)
+//          ├─ 0  GetCommonStateGetter
+//          ├─ 1  GetSelfController
+//          ├─ 2  GetWindowController
+//          ├─ 3  GetAudioController
+//          ├─ 4  GetDisplayController
+//          ├─ 10 GetProcessWindingController
+//          ├─ 11 GetLibraryAppletCreator
+//          ├─ 20 GetApplicationFunctions
+//          └─ 1000 GetDebugFunctions
+//
+// ## Porque não é o do Eden
+//
+// O `am` do Eden tem 8946 linhas e arrasta o **núcleo de HID** (o
+// `ButtonPoller` precisa de `hid_core/frontend/emulated_controller.h`) e o
+// **sistema de janelas** (`WindowSystem`, que é o que o `appletOE` consulta
+// para saber que applet é o do processo). Trazer o `am` inteiro seria trazer
+// o emulador.
+//
+// O que o SDK precisa, no arranque, é um conjunto pequeno de respostas. E
+// este ficheiro é a versão fina: a **interface CMIF é a do Eden, tal e
+// qual** (os IDs dos comandos e o formato das respostas são o que tem de
+// ser exacto — é o contrato com o guest), e o **conteúdo** é o mínimo que
+// um jogo precisa.
+//
+// ## O estilo
+//
+// Os handlers são escritos à mão (`IPC::RequestParser` para ler,
+// `IPC::ResponseBuilder` para responder), e não com o mecanismo tipado
+// (`CmifReplyWrap`). O mecanismo tipado obriga a que a assinatura do handler
+// corresponda exactamente à do comando, e isso obriga a vendorizar os
+// cabeçalhos do `am` inteiro. À mão, o que interessa é o **formato** do
+// pacote, e esse está medido no Eden.
+//
+// A consequência: cada handler responde com o que o Eden responderia,
+// **quando o valor é óbvio** (o modo de performance é `Normal`, o foco é
+// `NotFocused`, o idioma é o do sistema). Onde o Eden consulta o estado
+// real — o applet, a janela, a camada de display — não há estado para
+// consultar, e a resposta é a de um applet que está a correr em primeiro
+// plano, que é o caso do jogo.
+//
+// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "g610/services/vi.hpp"
+#include "vendor/eden/common/logging.h"
+#include "vendor/eden/core/system_ref.h"  // o `Core::System` nosso
+#include "vendor/eden/core/hle/kernel/k_event.h"
+#include "vendor/eden/core/hle/service/ipc_helpers.h"
+#include "vendor/eden/core/hle/service/server_manager.h"
+#include "vendor/eden/core/hle/service/service.h"
+
+namespace g610::services {
+
+namespace {
+
+using Service::HLERequestContext;
+
+using IPC::RequestParser;
+using IPC::ResponseBuilder;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Os resultados
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// **Um Result invalido e' pior do que um Result de erro.** O SDK da
+// Nintendo aborta ante um Result invalido: `nn::result::detail::ConvertInvalidImpl`
+// (medido em 0x82d37748) chama o abort. E o nosso `ResultUnknown` — que e'
+// `0xFFFFFFFF` — e' exactamente isso: um Result invalido.
+//
+// A medicao: o SDK pediu `ReceiveMessage` (comando 1 do `ICommonStateGetter`),
+// o nosso servico respondeu `ResultUnknown`, e o SDK morreu num assert.
+//
+// A regra que daqui sai, e que vale para **todos** os comandos deste
+// servico:
+//
+//   - um comando que sabemos responder: `ResultSuccess` e o valor certo;
+//   - um comando que nao sabemos responder: `ResultSuccess` e saidas a zero.
+//
+// Ou seja: **nunca um Result de erro**. O Eden pode dar-se a esse luxo
+// porque implementa tudo; aqui, um Result de erro e' um assert no guest.
+//
+// A excecao e' o `ReceiveMessage`, em que o proprio Eden devolve um
+// Result de erro especifico — `Service::AM::ResultNoMessages`
+// (`am_results.h`), que e' um Result **valido** (modulo 128) e que o SDK
+// sabe interpretar como "nao ha mensagens".
+constexpr Result kResultNoMessages{ErrorModule::AM, 3};
+
+// `ResultSuccess` e `ResultUnknown` sao globais (estao em
+// `core/hle/result.h`, fora de qualquer namespace) — o Eden usa-os assim
+// nos seus servicos, e o mesmo vale aqui.
+
+// ─────────────────────────────────────────────────────────────────────────────
+// O estado do applet
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// O `am` do Eden tem um `Applet` com um `LifecycleManager`, e o
+// `WindowSystem` empurra para a fila do applet as mensagens de mudança de
+// estado. A fila e' o que o `ReceiveMessage` vai buscar.
+//
+// **O que o SDK espera, medido:** o SDK ficou preso a pedir `ReceiveMessage`
+// sem parar. E a mensagem que falta e' a de entrada no primeiro plano —
+// `AppletMessage::ChangeIntoForeground` (= 1), do enum do Eden
+// (`am_types.h:125-147`).
+//
+// No Switch, um applet e' lançado, o `am` mete-o em primeiro plano e
+// entrega-lhe essa mensagem. O SDK inicializa, e so depois de a receber e'
+// que continua.
+//
+// Aqui nao ha `Applet`, nem `LifecycleManager`, nem `WindowSystem`. Mas a
+// mensagem e' uma **primeira vez**: o applet e' criado, e vai para o
+// primeiro plano. Por isso a fila tem uma mensagem, e so uma.
+//
+// A fila vive no `AppletOE` — o objecto do serviço — e e' partilhada por
+// referencia com o proxy e com as sub-interfaces. **Nao pode viver na
+// sub-interface**: cada `PushIpcInterface` cria um objecto novo, e a
+// mensagem seria entregue uma vez por sub-interface.
+struct EstadoDoApplet {
+    // As mensagens, por ordem. `AppletMessage`, do Eden (`am_types.h`).
+    std::vector<u32> mensagens;
+
+    // A mensagem da **mudanca de foco**.
+    //
+    // **Este motor corre um jogo, e um jogo e' uma aplicacao** — nao um
+    // applet. E o Eden distingue os dois (`lifecycle_manager.cpp:47-63`):
+    //
+    //     if (!m_is_application) {
+    //         ... return AppletMessage::ChangeIntoForeground;  // = 1
+    //     } else if (m_has_focus_state_changed) {
+    //         m_has_focus_state_changed = false;
+    //         return AppletMessage::FocusStateChanged;       // = 15
+    //     }
+    //
+    // Logo a mensagem e' `FocusStateChanged` (15).
+    static constexpr u32 kFocusStateChanged = 15;
+
+    // O evento do sistema: o que o `GetEventHandle` devolve, e o que e'
+    // sinalizado quando o estado muda.
+    //
+    // **A ligacao entre a mensagem e o evento e' do Eden**, e e' o que
+    // faz o SDK arrancar (`lifecycle_manager.cpp:31-34`):
+    //
+    //     void LifecycleManager::PushUnorderedMessage(Kernel::KernelCore& kernel,
+    //                                                AppletMessage message) {
+    //         m_unordered_messages.push_back(message);
+    //         this->SignalSystemEventIfNeeded(kernel);
+    //     }
+    //
+    // A mensagem diz **o que** mudou; o evento diz **que** mudou. O SDK
+    // espera por um e le o outro.
+    Kernel::KEvent* evento = nullptr;
+
+    // O `KReadableEvent` — o objecto que o guest recebe de um
+    // `GetEventHandle`, e sobre o qual espera. E' o **filho** do `KEvent`.
+    //
+    // O Eden devolve exactamente este (`os/event.cpp:33-35`):
+    //
+    //     Kernel::KReadableEvent* Event::GetHandle() noexcept {
+    //         return std::addressof(m_event->GetReadableEvent());
+    //     }
+    Kernel::KReadableEvent* readable = nullptr;
+
+    bool tem_mensagem() const {
+        if (!mensagens.empty())
+            return true;
+        // A `FocusStateChanged` so' conta se a notificacao de foco estiver
+        // ligada — a regra do Eden (ver `proxima`).
+        return notificar_foco && foco_mudou;
+    }
+
+    // **O evento deve estar sinalizado?**
+    //
+    // A regra do Eden (`lifecycle_manager.cpp:125-141`):
+    //
+    //     bool LifecycleManager::ShouldSignalSystemEvent() {
+    //         if (m_focus_state_changed_notification_enabled) {
+    //             if (!m_is_application) {
+    //                 if (m_requested_focus_state != m_acknowledged_focus_state) {
+    //                     return true;
+    //                 }
+    //             } else if (m_has_focus_state_changed) {
+    //                 return true;
+    //             }
+    //         }
+    //         return !m_unordered_messages.empty() || m_has_resume || ...;
+    //     }
+    //
+    // Traduzida para o que este motor tem:
+    //
+    //  * a mudanca de foco conta (o `am` diz que o applet foi para o
+    //    primeiro plano);
+    //  * e ha mensagens na fila.
+    //
+    // **O que faltava no nosso motor e' a mudanca de foco** — e e' a que
+    // o SDK esta a espera. O `am` do Eden sinaliza o evento quando o
+    // applet entra em primeiro plano, e o SDK (que espera do evento de
+    // inter-processo) prossegue.
+    bool deve_estar_sinalizado() const {
+        // **O evento fica sinalizado para sempre** (teste: o applet event
+        // 0x000401f9 e' o que o jogo espera; se ficar sinalizado, o
+        // WaitSynchronization devolve sucesso e o loop de mensagens nao
+        // bloqueia. Se o jogo comecar a desenhar (DrawBegin/DrawEnd 1413/
+        // 1414 no pushbuffer), o portao era este.)
+        return true;
+    }
+
+    // **A mudanca de foco** — o `m_has_focus_state_changed` do Eden.
+    //
+    // A aplicacao entra em primeiro plano no arranque
+    // (`applet_manager.cpp:342`: `SetFocusState(m_system.Kernel(),
+    // FocusState::InFocus)`), e o Eden sinaliza o evento por causa disso.
+    //
+    // **E' um flag, e nao uma mensagem na fila.** A distincao e' o que
+    // importa: o Eden so' o consome no `PopMessage`, e so' se a
+    // notificacao de foco **estiver ligada** (`lifecycle_manager.cpp:47-63`).
+    bool foco_mudou = true;
+
+    // **`m_focus_state_changed_notification_enabled` do Eden.**
+    //
+    // O guest liga-o com o `SetFocusHandlingMode` (o `self_controller.cpp:191`).
+    //
+    // **Comeca a `true`, como no Eden** (`lifecycle_manager.h:159`:
+    // `bool m_focus_state_changed_notification_enabled{true};`). Com o
+    // notify desligado, o `ShouldSignalSystemEvent` do Eden dava sempre
+    // falso — e o guest ficava **a espera de um evento que nunca era
+    // sinalizado**, em 3936 esperas seguidas.
+    bool notificar_foco = true;
+
+    // Tira a proxima. Devolve `None` (= 0) quando nao ha nenhuma.
+    u32 proxima() {
+        if (!mensagens.empty()) {
+            const u32 m = mensagens.front();
+            mensagens.erase(mensagens.begin());
+            return m;
+        }
+        // **A regra do Eden** (`lifecycle_manager.cpp:47-63`):
+        //
+        //     if (m_focus_state_changed_notification_enabled) {
+        //         if (!m_is_application) {
+        //             ...
+        //         } else if (m_has_focus_state_changed) {
+        //             m_has_focus_state_changed = false;
+        //             return AppletMessage::FocusStateChanged;
+        //         }
+        //     }
+        //
+        // A `FocusStateChanged` **so' e' devolvida — e so' e' consumida —
+        // se a notificacao de foco estiver ligada**.
+        //
+        // **Sem esta condicao, o guest ficava a espera para sempre.**
+        // O `ReceiveMessage` (que vem **antes**) consumia a mensagem da
+        // fila, e o `SetFocusHandlingMode` (que vem **depois**) ja nao
+        // encontrava nada para sinalizar — e o evento do sistema nunca
+        // era sinalizado.
+        if (notificar_foco && foco_mudou) {
+            foco_mudou = false;
+            return kFocusStateChanged;
+        }
+        return 0;
+    }
+
+    // Empurra uma mensagem e sinaliza o evento do sistema.
+    //
+    // **O sinal e' no `KReadableEvent`** — o filho, que e' o objecto que
+    // o guest recebe e sobre o qual espera. O `KEvent::Signal` (o pai)
+    // propaga ao filho (`k_event.cpp:52-60`), por isso sinalizar o pai
+    // chega — mas o `Clear` **nao** propaga da mesma maneira, e por isso
+    // o sinal e' feito aqui, no objecto que o guest tem.
+    void empurrar(Kernel::KernelCore& kernel, u32 mensagem) {
+        mensagens.push_back(mensagem);
+        sinalizar_se_precisa(kernel);
+    }
+
+    // **Sinaliza (ou limpa) o evento, conforme a regra do Eden.**
+    //
+    // O Eden (`lifecycle_manager.cpp:158-171`):
+    //
+    //     void LifecycleManager::SignalSystemEventIfNeeded(KernelCore& kernel) {
+    //         const bool applet_message_available = m_applet_message_available;
+    //         if (applet_message_available != this->ShouldSignalSystemEvent()) {
+    //             if (!applet_message_available) {
+    //                 m_system_event.Signal(kernel);
+    //                 m_applet_message_available = true;
+    //             } else {
+    //                 m_system_event.Clear(kernel);
+    //                 m_applet_message_available = false;
+    //             }
+    //         }
+    //     }
+    //
+    // **O evento e' de nivel**: o `WaitSynchronization` do guest consome o
+    // sinal (o nosso `Clear`), e o `am` volta a sinaliza-lo se ainda
+    // houver razao. Sem esta regra, o guest consome o sinal e fica a
+    // espera para sempre — que e' exactamente o que se media.
+    void sinalizar_se_precisa(Kernel::KernelCore& kernel) {
+        if (readable == nullptr)
+            return;
+        const bool precisa = deve_estar_sinalizado();
+        if (precisa == evento_sinalizado)
+            return;
+        if (precisa) {
+            readable->Signal(kernel);
+        } else {
+            readable->Clear(kernel);
+        }
+        evento_sinalizado = precisa;
+    }
+
+    // O estado do sinal, espelhado no `KReadableEvent`.
+    bool evento_sinalizado = false;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// O evento
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Varios comandos do `am` devolvem um **handle de evento** — o evento de
+// notificacao do applet, o evento do sleep lock, o evento de mudanca de
+// resolucao. O Eden devolve o evento do applet, que vive no
+// `LifecycleManager`.
+//
+// Aqui nao ha applet nem gestor de ciclo de vida: ha um motor a correr um
+// jogo. O que se devolve e' um evento **novo**, registado na tabela de
+// handles do processo, que nunca e' sinalizado — que e' exactamente o
+// comportamento de um applet que nao tem nada para notificar.
+//
+// A razao de ser um evento a serio e nao um handle zero: um handle zero e'
+// um handle **invalido**, e o guest que o tenta usar aborta. E o SDK usa
+// estes eventos para esperar por algo — e o `WaitSynchronization` do Eden
+// com um handle invalido e' um caminho que nao devolve nada.
+//
+// O que o Eden faz, medido (`common_state_getter.cpp:93-97`):
+//
+//     *out_event = m_applet->lifecycle_manager.GetSystemEvent().GetHandle();
+//
+// e' um `OutCopyHandle`, ou seja, um handle copiado para o guest.
+//
+// **Devolve o `KReadableEvent`, e nao o handle.** E' o que o Eden faz
+// (`os/event.cpp:33-35`):
+//
+//     Kernel::KReadableEvent* Event::GetHandle() noexcept {
+//         return std::addressof(m_event->GetReadableEvent());
+//     }
+//
+// E' o `KReadableEvent` — o **filho** do `KEvent` — que o guest
+// recebe, e sobre o qual espera. O `PushCopyObjects` (o `OutCopyHandle` do
+// Eden) e' que o regista na handle table e escreve o handle.
+//
+// A versao anterior devolvia o handle e escrevia-o no raw data com
+// `rb.Push` — o que punha o handle no sitio errado. **Foi assim que o
+// `GetEventHandle` devolveu `0x8000`** (o pseudo-handle da thread
+// corrente) em vez do handle do evento, e o SDK ficou a esperar por
+// um handle que nunca chegou.
+Kernel::KReadableEvent* evento_de_sistema(Core::System& system) {
+    auto& kernel = system.Kernel();
+    auto& processo = Kernel::GetCurrentProcess(kernel);
+
+    auto* evento = new Kernel::KEvent(kernel);
+    evento->Initialize(kernel, &processo);
+
+    return &evento->GetReadableEvent();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Os sub-controllers
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Cada um é um `ServiceFramework` com a tabela de comandos do Eden. A tabela
+// é a parte que não se inventa: os IDs estão medidos no
+// `core/hle/service/am/service/*.cpp` do Eden.
+//
+// Os handlers que não consequentialmente-necessários respondem
+// `ResultUnknown`, e **dizem-no na telemetria**. A ideia é que a lista do
+// que o jogo pede seja um registo, não uma adivinhação.
+
+/// O `ICommonStateGetter` — o estado comum do applet.
+class CommonStateGetter final : public Service::ServiceFramework<CommonStateGetter> {
+public:
+    CommonStateGetter(Core::System& system, std::shared_ptr<EstadoDoApplet> estado)
+        : ServiceFramework{system, "ICommonStateGetter"}, estado_{std::move(estado)} {
+        static const FunctionInfo functions[] = {
+            {0, &CommonStateGetter::GetEventHandle, "GetEventHandle"},
+            {1, &CommonStateGetter::ReceiveMessage, "ReceiveMessage"},
+            {5, &CommonStateGetter::GetOperationMode, "GetOperationMode"},
+            {6, &CommonStateGetter::GetPerformanceMode, "GetPerformanceMode"},
+            {8, &CommonStateGetter::GetBootMode, "GetBootMode"},
+            {9, &CommonStateGetter::GetCurrentFocusState, "GetCurrentFocusState"},
+            {10, &CommonStateGetter::RequestToAcquireSleepLock, "RequestToAcquireSleepLock"},
+            {11, &CommonStateGetter::ReleaseSleepLock, "ReleaseSleepLock"},
+            {12, &CommonStateGetter::ReleaseSleepLockTransiently, "ReleaseSleepLockTransiently"},
+            {13, &CommonStateGetter::GetAcquiredSleepLockEvent, "GetAcquiredSleepLockEvent"},
+            {20, &CommonStateGetter::PushToGeneralChannel, "PushToGeneralChannel"},
+            {31, &CommonStateGetter::GetReaderLockAccessorEx, "GetReaderLockAccessorEx"},
+            {32, &CommonStateGetter::GetWriterLockAccessorEx, "GetWriterLockAccessorEx"},
+            {50, &CommonStateGetter::IsVrModeEnabled, "IsVrModeEnabled"},
+            {51, &CommonStateGetter::SetVrModeEnabled, "SetVrModeEnabled"},
+            {52, &CommonStateGetter::SetLcdBacklighOffEnabled, "SetLcdBacklighOffEnabled"},
+            {53, &CommonStateGetter::BeginVrModeEx, "BeginVrModeEx"},
+            {54, &CommonStateGetter::EndVrModeEx, "EndVrModeEx"},
+            {55, &CommonStateGetter::IsInControllerFirmwareUpdateSection,
+             "IsInControllerFirmwareUpdateSection"},
+            {60, &CommonStateGetter::GetDefaultDisplayResolution, "GetDefaultDisplayResolution"},
+            {61, &CommonStateGetter::GetDefaultDisplayResolutionChangeEvent,
+             "GetDefaultDisplayResolutionChangeEvent"},
+        };
+        RegisterHandlers(functions);
+    }
+
+private:
+    // O evento de notificação. O Eden devolve um `KReadableEvent`; aqui
+    // devolve-se um handle inválido e diz-se isso, porque um evento que
+    // nunca é sinalizado é o que um applet sem gestor de eventos recebe.
+    // O evento do sistema do applet.
+    //
+    // **O Eden usa `PushCopyObjects`**, e nao `Push` de um handle
+    // (`cmif_serialization.h:397`): o `OutCopyHandle` registado no
+    // objecto e' posto na handle table do processo, e o handle escrito
+    // no descritor de handles.
+    //
+    // Com `Push` de um handle, o handle ia parar ao raw data — e o guest
+    // lia um numero onde esperava um handle. **Foi assim que o
+    // `GetEventHandle` devolveu `0x8000`** (o pseudo-handle da thread
+    // corrente, lido do sitio errado) em vez do handle do evento, e o
+    // SDK ficou a esperar por um handle que nunca chegou.
+    void GetEventHandle(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2, 1, 0};
+        rb.Push(ResultSuccess);
+        rb.PushCopyObjects(ctx, estado_ ? estado_->readable : nullptr);
+    }
+
+    void ReceiveMessage(HLERequestContext& ctx) {
+        // A mensagem, se a houver. `AppletMessage`, que e' um u32.
+        if (estado_ && estado_->tem_mensagem()) {
+            const u32 mensagem = estado_->proxima();
+            LOG_DEBUG(Service_AM, "ReceiveMessage: entrega {}", mensagem);
+            // **O evento e' de nivel, e o Eden re-sinaliza depois de
+            // tirar a mensagem** (`lifecycle_manager.cpp:186-192`):
+            //
+            //     bool PopMessage(kernel, out) {
+            //         const auto message = PopMessageInOrderOfPriority();
+            //         this->SignalSystemEventIfNeeded(kernel);
+            //         *out_message = message;
+            //         return message != AppletMessage::None;
+            //     }
+            //
+            // Sem isto, o guest consome o sinal na espera e fica a
+            // espera para sempre.
+            // **A mudanca de foco e' consumida com a mensagem** — como
+            // o Eden (`lifecycle_manager.cpp:60-63`):
+            //
+            //     } else if (m_has_focus_state_changed) {
+            //         m_has_focus_state_changed = false;
+            //         return AppletMessage::FocusStateChanged;
+            //     }
+            //
+            // Sem este consumo, o `foco_mudou` fica a `true` para
+            // sempre, o `ShouldSignalSystemEvent` continua a dizer "sim",
+            // o evento fica sinalizado, e o SDK volta a pedir o
+            // `ReceiveMessage` — **1311 pedidos em ciclo**, e o motor a
+            // 100% de CPU a fazer nada.
+            estado_->sinalizar_se_precisa(system.Kernel());
+            ResponseBuilder rb{ctx, 3};
+            rb.Push(ResultSuccess);
+            rb.Push(mensagem);
+            return;
+        }
+
+        // `ResultNoMessages`, como o Eden (`common_state_getter.cpp:99-104`).
+        // E' um Result **valido**, e o SDK sabe o que significa.
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(kResultNoMessages);
+    }
+
+    // `OperationMode`: 0 = Handheld, 1 = Console.
+    void GetOperationMode(HLERequestContext& ctx) {
+        LOG_DEBUG(Service_AM, "GetOperationMode: Handheld");
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(static_cast<u32>(0));
+    }
+
+    // `PerformanceMode`: 0 = Normal, 1 = Boost. O Eden decide pelo
+    // `Settings::IsDockedMode()`; este motor corre um jogo, e o jogo não
+    // está docked.
+    void GetPerformanceMode(HLERequestContext& ctx) {
+        LOG_DEBUG(Service_AM, "GetPerformanceMode: Normal");
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(static_cast<u32>(0));
+    }
+
+    // `SystemBootMode`: 0 = NormalBoot.
+    void GetBootMode(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(static_cast<u32>(0));
+    }
+
+    // `FocusState`: 0 = NotFocused, 1 = Focused. Um jogo que está a correr
+    // tem o foco.
+    void GetCurrentFocusState(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(static_cast<u32>(1));
+    }
+
+    void RequestToAcquireSleepLock(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void ReleaseSleepLock(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void ReleaseSleepLockTransiently(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void GetAcquiredSleepLockEvent(HLERequestContext& ctx) {
+        // **O Eden usa `PushCopyObjects`** (`cmif_serialization.h:397`),
+        // e nao `Push` de um handle: o `OutCopyHandle` registado no
+        // objecto e' posto na handle table do processo, e o handle
+        // escrito no descritor de handles.
+        //
+        // Com `Push` de um handle, o handle ia parar ao raw data — e o
+        // guest lia um numero onde esperava um handle. **Foi assim que o
+        // `GetEventHandle` devolveu `0x8000`** (o pseudo-handle da thread
+        // corrente, lido do sitio errado) em vez do handle do evento.
+        ResponseBuilder rb{ctx, 2, 1, 0};
+        rb.Push(ResultSuccess);
+        rb.PushCopyObjects(ctx, evento_de_sistema(system));
+    }
+
+    void PushToGeneralChannel(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void GetReaderLockAccessorEx(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void GetWriterLockAccessorEx(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void IsVrModeEnabled(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(false);
+    }
+
+    void SetVrModeEnabled(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void SetLcdBacklighOffEnabled(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void BeginVrModeEx(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void EndVrModeEx(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void IsInControllerFirmwareUpdateSection(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(false);
+    }
+
+    // A resolução por omissão do ecrã do Switch: 1280x720.
+    void GetDefaultDisplayResolution(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 4};
+        rb.Push(ResultSuccess);
+        rb.Push(static_cast<s32>(1280));
+        rb.Push(static_cast<s32>(720));
+    }
+
+    void GetDefaultDisplayResolutionChangeEvent(HLERequestContext& ctx) {
+        // **O Eden usa `PushCopyObjects`** (`cmif_serialization.h:397`),
+        // e nao `Push` de um handle: o `OutCopyHandle` registado no
+        // objecto e' posto na handle table do processo, e o handle
+        // escrito no descritor de handles.
+        //
+        // Com `Push` de um handle, o handle ia parar ao raw data — e o
+        // guest lia um numero onde esperava um handle. **Foi assim que o
+        // `GetEventHandle` devolveu `0x8000`** (o pseudo-handle da thread
+        // corrente, lido do sitio errado) em vez do handle do evento.
+        ResponseBuilder rb{ctx, 2, 1, 0};
+        rb.Push(ResultSuccess);
+        rb.PushCopyObjects(ctx, evento_de_sistema(system));
+    }
+
+private:
+    std::shared_ptr<EstadoDoApplet> estado_;
+};
+
+/// O `ISelfController` — o que o jogo pode fazer consigo próprio.
+class SelfController final : public Service::ServiceFramework<SelfController> {
+public:
+    explicit SelfController(Core::System& system, std::shared_ptr<EstadoDoApplet> estado)
+        : ServiceFramework{system, "ISelfController"}, estado_{std::move(estado)} {
+        static const FunctionInfo functions[] = {
+            {0, &SelfController::Exit, "Exit"},
+            {1, &SelfController::LockExit, "LockExit"},
+            {2, &SelfController::UnlockExit, "UnlockExit"},
+            {3, &SelfController::EnterFatalSection, "EnterFatalSection"},
+            {4, &SelfController::LeaveFatalSection, "LeaveFatalSection"},
+            {9, &SelfController::GetLibraryAppletLaunchableEvent, "GetLibraryAppletLaunchableEvent"},
+            {10, &SelfController::SetScreenShotPermission, "SetScreenShotPermission"},
+            {11, &SelfController::SetOperationModeChangedNotification,
+             "SetOperationModeChangedNotification"},
+            {12, &SelfController::SetPerformanceModeChangedNotification,
+             "SetPerformanceModeChangedNotification"},
+            {13, &SelfController::SetFocusHandlingMode, "SetFocusHandlingMode"},
+            {14, &SelfController::SetRestartMessageEnabled, "SetRestartMessageEnabled"},
+            {15, &SelfController::SetScreenShotAppletIdentityInfo, "SetScreenShotAppletIdentityInfo"},
+            {16, &SelfController::SetOutOfFocusSuspendingEnabled, "SetOutOfFocusSuspendingEnabled"},
+            {19, &SelfController::SetAlbumImageOrientation, "SetAlbumImageOrientation"},
+            {40, &SelfController::CreateManagedDisplayLayer, "CreateManagedDisplayLayer"},
+            {41, &SelfController::IsSystemBufferSharingEnabled, "IsSystemBufferSharingEnabled"},
+            {42, &SelfController::GetSystemSharedLayerHandle, "GetSystemSharedLayerHandle"},
+            {43, &SelfController::GetSystemSharedBufferHandle, "GetSystemSharedBufferHandle"},
+            {44, &SelfController::CreateManagedDisplaySeparableLayer,
+             "CreateManagedDisplaySeparableLayer"},
+            {50, &SelfController::SetHandlesRequestToDisplay, "SetHandlesRequestToDisplay"},
+            {51, &SelfController::ApproveToDisplay, "ApproveToDisplay"},
+            {60, &SelfController::OverrideAutoSleepTimeAndDimmingTime,
+             "OverrideAutoSleepTimeAndDimmingTime"},
+            {90, &SelfController::GetAccumulatedSuspendedTickValue,
+             "GetAccumulatedSuspendedTickValue"},
+            {91, &SelfController::GetAccumulatedSuspendedTickChangedEvent,
+             "GetAccumulatedSuspendedTickChangedEvent"},
+        };
+        RegisterHandlers(functions);
+    }
+
+private:
+    // O estado do `am` — o mesmo de todas as sub-interfaces. E' o que
+    // permite ao `SetFocusHandlingMode` ligar a notificacao de mudanca de
+    // foco e sinalizar o evento do sistema.
+    std::shared_ptr<EstadoDoApplet> estado_;
+
+    // Sair do jogo. O Eden chama `m_system.Exit()`; aqui o jogo pode
+    // simplesmente regressar, e a telemetria regista.
+    void Exit(HLERequestContext& ctx) {
+        LOG_WARNING(Service_AM, "Exit: o jogo pediu para sair");
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void LockExit(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void UnlockExit(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void EnterFatalSection(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void LeaveFatalSection(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void GetLibraryAppletLaunchableEvent(HLERequestContext& ctx) {
+        // **O Eden usa `PushCopyObjects`** (`cmif_serialization.h:397`),
+        // e nao `Push` de um handle: o `OutCopyHandle` registado no
+        // objecto e' posto na handle table do processo, e o handle
+        // escrito no descritor de handles.
+        //
+        // Com `Push` de um handle, o handle ia parar ao raw data — e o
+        // guest lia um numero onde esperava um handle. **Foi assim que o
+        // `GetEventHandle` devolveu `0x8000`** (o pseudo-handle da thread
+        // corrente, lido do sitio errado) em vez do handle do evento.
+        ResponseBuilder rb{ctx, 2, 1, 0};
+        rb.Push(ResultSuccess);
+        rb.PushCopyObjects(ctx, evento_de_sistema(system));
+    }
+
+    void SetScreenShotPermission(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void SetOperationModeChangedNotification(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void SetPerformanceModeChangedNotification(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void SetFocusHandlingMode(HLERequestContext& ctx) {
+        // **Tres bools** (`notify`, `background`, `suspend`) — o Eden
+        // (`self_controller.cpp:187`).
+        //
+        // **`notify` e' o que liga a notificacao de mudanca de foco** — e
+        // e' o que faz o `am` sinalizar o evento do sistema
+        // (`lifecycle_manager.cpp`:
+        // `SetFocusStateChangedNotificationEnabled` chama
+        // `SignalSystemEventIfNeeded`).
+        //
+        // Sem isto, o guest ficava a espera de um evento que nunca
+        // chegava, e fazia **polling**: 74 `SignalProcessWideKey` e 53
+        // `SendSyncRequest` antes do primeiro assert.
+        RequestParser rp{ctx};
+        bool args[3]{};
+        rp.PopBools(args, 3);
+
+        if (estado_) {
+            estado_->notificar_foco = args[0];
+            estado_->sinalizar_se_precisa(system.Kernel());
+        }
+
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void SetRestartMessageEnabled(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void SetScreenShotAppletIdentityInfo(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void SetOutOfFocusSuspendingEnabled(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void SetAlbumImageOrientation(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    // 40: criar uma camada gerida para o jogo.
+//
+// **Medido** (`/tmp/boot_r25.log`): com o id a ser **zero**, o jogo
+// usou-o como se fosse um ponteiro e faultou (`ldr w8, [x0, #0x38]` com
+// `x0` = 0, em 0x8177d290). O id tem de ser um id **de verdade**.
+//
+// O Eden (`core/hle/service/am/display_layer_manager.cpp:64`) abre o
+// display "Default" e cria a camada no `vi:m`. Na casa o `am` nao tem o
+// `vi`, por isso o id vem do `vi` (ver `criar_camada_gerida`).
+void CreateManagedDisplayLayer(HLERequestContext& ctx) {
+    const std::uint64_t camada = services::criar_camada_gerida();
+    LOG_DEBUG(Service_AM, "CreateManagedDisplayLayer: camada={}", camada);
+    ResponseBuilder rb{ctx, 4};
+    rb.Push(ResultSuccess);
+    rb.Push(camada);
+}
+
+    void IsSystemBufferSharingEnabled(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(false);
+    }
+
+    void GetSystemSharedLayerHandle(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 6};
+        rb.Push(ResultSuccess);
+        rb.Push(static_cast<u64>(0));
+        rb.Push(static_cast<u64>(0));
+    }
+
+    void GetSystemSharedBufferHandle(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 4};
+        rb.Push(ResultSuccess);
+        rb.Push(static_cast<u64>(0));
+    }
+
+    void CreateManagedDisplaySeparableLayer(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 4};
+        rb.Push(ResultSuccess);
+        rb.Push(static_cast<u64>(0));
+    }
+
+    void SetHandlesRequestToDisplay(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void ApproveToDisplay(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void OverrideAutoSleepTimeAndDimmingTime(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    // O numero de ticks que o applet passou suspenso. Nao ha suspensao
+    // aqui, e' zero.
+    void GetAccumulatedSuspendedTickValue(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 4};
+        rb.Push(ResultSuccess);
+        rb.Push(static_cast<u64>(0));
+    }
+
+    // O evento que dispara quando esse numero muda. Ver `handle_de_evento`.
+    void GetAccumulatedSuspendedTickChangedEvent(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2, 1, 0};
+        rb.Push(ResultSuccess);
+        rb.PushCopyObjects(ctx, evento_de_sistema(system));
+    }
+};
+
+/// O `IWindowController` — o estado da janela do applet.
+class WindowController final : public Service::ServiceFramework<WindowController> {
+public:
+    explicit WindowController(Core::System& system)
+        : ServiceFramework{system, "IWindowController"} {
+        static const FunctionInfo functions[] = {
+            {0, &WindowController::CreateWindow, "CreateWindow"},
+            {1, &WindowController::GetAppletResourceUserId, "GetAppletResourceUserId"},
+            {2, &WindowController::GetAppletResourceUserIdOfCallerApplet,
+             "GetAppletResourceUserIdOfCallerApplet"},
+            {10, &WindowController::AcquireForegroundRights, "AcquireForegroundRights"},
+            {11, &WindowController::ReleaseForegroundRights, "ReleaseForegroundRights"},
+            {12, &WindowController::RejectToChangeIntoBackground, "RejectToChangeIntoBackground"},
+            {20, &WindowController::SetAppletWindowVisibility, "SetAppletWindowVisibility"},
+            {21, &WindowController::SetAppletGpuTimeSlice, "SetAppletGpuTimeSlice"},
+        };
+        RegisterHandlers(functions);
+    }
+
+private:
+    // A criacao de janelas e do subsistema de video. O Eden responde
+    // `nullptr` — ou seja, **nao responde**. Aqui responde-se com um erro
+    // explicito, porque uma ausencia de resposta deixa o guest a ler lixo
+    // (ver a nota sobre o auto-stub em `settings_bridge.h`).
+    void CreateWindow(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    // O `AppletResourceUserId` e' o PID do processo. O Eden tira-o do
+    // `AppletManager`, que o associa ao applet; aqui e' o nosso PID, que e'
+    // o unico que existe.
+    void GetAppletResourceUserId(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 4};
+        rb.Push(ResultSuccess);
+        rb.Push(static_cast<u64>(1));
+    }
+
+    void GetAppletResourceUserIdOfCallerApplet(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 4};
+        rb.Push(ResultSuccess);
+        rb.Push(static_cast<u64>(1));
+    }
+
+    void AcquireForegroundRights(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void ReleaseForegroundRights(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void RejectToChangeIntoBackground(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void SetAppletWindowVisibility(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void SetAppletGpuTimeSlice(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+};
+
+/// O `IAudioController` — o volume esperado.
+class AudioController final : public Service::ServiceFramework<AudioController> {
+public:
+    explicit AudioController(Core::System& system)
+        : ServiceFramework{system, "IAudioController"} {
+        static const FunctionInfo functions[] = {
+            {0, &AudioController::SetExpectedMasterVolume, "SetExpectedMasterVolume"},
+            {1, &AudioController::GetMainAppletExpectedMasterVolume,
+             "GetMainAppletExpectedMasterVolume"},
+            {2, &AudioController::GetLibraryAppletExpectedMasterVolume,
+             "GetLibraryAppletExpectedMasterVolume"},
+            {3, &AudioController::ChangeMainAppletMasterVolume, "ChangeMainAppletMasterVolume"},
+            {4, &AudioController::SetTransparentVolumeRate, "SetTransparentVolumeRate"},
+        };
+        RegisterHandlers(functions);
+    }
+
+private:
+    void SetExpectedMasterVolume(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void GetMainAppletExpectedMasterVolume(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(1.0f);
+    }
+
+    void GetLibraryAppletExpectedMasterVolume(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(1.0f);
+    }
+
+    void ChangeMainAppletMasterVolume(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void SetTransparentVolumeRate(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+};
+
+/// O `IDisplayController` — as capturas de ecrã.
+class DisplayController final : public Service::ServiceFramework<DisplayController> {
+public:
+    explicit DisplayController(Core::System& system)
+        : ServiceFramework{system, "IDisplayController"} {
+        static const FunctionInfo functions[] = {
+            {5, &DisplayController::GetLastForegroundCaptureImageEx, "GetLastForegroundCaptureImageEx"},
+            {7, &DisplayController::GetCallerAppletCaptureImageEx, "GetCallerAppletCaptureImageEx"},
+            {8, &DisplayController::TakeScreenShotOfOwnLayer, "TakeScreenShotOfOwnLayer"},
+            {20, &DisplayController::ClearCaptureBuffer, "ClearCaptureBuffer"},
+            {22, &DisplayController::AcquireLastApplicationCaptureSharedBuffer,
+             "AcquireLastApplicationCaptureSharedBuffer"},
+            {23, &DisplayController::ReleaseLastApplicationCaptureSharedBuffer,
+             "ReleaseLastApplicationCaptureSharedBuffer"},
+            {24, &DisplayController::AcquireLastForegroundCaptureSharedBuffer,
+             "AcquireLastForegroundCaptureSharedBuffer"},
+            {25, &DisplayController::ReleaseLastForegroundCaptureSharedBuffer,
+             "ReleaseLastForegroundCaptureSharedBuffer"},
+            {26, &DisplayController::AcquireCallerAppletCaptureSharedBuffer,
+             "AcquireCallerAppletCaptureSharedBuffer"},
+            {27, &DisplayController::ReleaseCallerAppletCaptureSharedBuffer,
+             "ReleaseCallerAppletCaptureSharedBuffer"},
+        };
+        RegisterHandlers(functions);
+    }
+
+private:
+    // Todas as capturas dependem do subsistema de vídeo. Não o há.
+    void GetLastForegroundCaptureImageEx(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(false);
+    }
+
+    void GetCallerAppletCaptureImageEx(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(false);
+    }
+
+    void TakeScreenShotOfOwnLayer(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void ClearCaptureBuffer(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void AcquireLastApplicationCaptureSharedBuffer(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(false);
+    }
+
+    void ReleaseLastApplicationCaptureSharedBuffer(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void AcquireLastForegroundCaptureSharedBuffer(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(false);
+    }
+
+    void ReleaseLastForegroundCaptureSharedBuffer(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void AcquireCallerAppletCaptureSharedBuffer(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(false);
+    }
+
+    void ReleaseCallerAppletCaptureSharedBuffer(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+};
+
+/// O `IApplicationFunctions` — o que o jogo faz com o seu armazenamento.
+class ApplicationFunctions final : public Service::ServiceFramework<ApplicationFunctions> {
+public:
+    explicit ApplicationFunctions(Core::System& system)
+        : ServiceFramework{system, "IApplicationFunctions"} {
+        static const FunctionInfo functions[] = {
+            {1, &ApplicationFunctions::PopLaunchParameter, "PopLaunchParameter"},
+            {12, &ApplicationFunctions::CreateApplicationAndRequestToStart,
+             "CreateApplicationAndRequestToStart"},
+            {20, &ApplicationFunctions::EnsureSaveData, "EnsureSaveData"},
+            {21, &ApplicationFunctions::GetDesiredLanguage, "GetDesiredLanguage"},
+            {22, &ApplicationFunctions::SetTerminateResult, "SetTerminateResult"},
+            {23, &ApplicationFunctions::GetDisplayVersion, "GetDisplayVersion"},
+            {25, &ApplicationFunctions::ExtendSaveData, "ExtendSaveData"},
+            {26, &ApplicationFunctions::GetSaveDataSize, "GetSaveDataSize"},
+            {27, &ApplicationFunctions::CreateCacheStorage, "CreateCacheStorage"},
+            {28, &ApplicationFunctions::GetSaveDataSizeMax, "GetSaveDataSizeMax"},
+            {29, &ApplicationFunctions::GetCacheStorageMax, "GetCacheStorageMax"},
+            {30, &ApplicationFunctions::BeginBlockingHomeButtonShortAndLongPressed,
+             "BeginBlockingHomeButtonShortAndLongPressed"},
+            {31, &ApplicationFunctions::EndBlockingHomeButtonShortAndLongPressed,
+             "EndBlockingHomeButtonShortAndLongPressed"},
+            {32, &ApplicationFunctions::BeginBlockingHomeButton, "BeginBlockingHomeButton"},
+            {33, &ApplicationFunctions::EndBlockingHomeButton, "EndBlockingHomeButton"},
+            {40, &ApplicationFunctions::NotifyRunning, "NotifyRunning"},
+            {50, &ApplicationFunctions::GetPseudoDeviceId, "GetPseudoDeviceId"},
+            {60, &ApplicationFunctions::SetMediaPlaybackStateForApplication,
+             "SetMediaPlaybackStateForApplication"},
+            {65, &ApplicationFunctions::IsGamePlayRecordingSupported,
+             "IsGamePlayRecordingSupported"},
+            {66, &ApplicationFunctions::InitializeGamePlayRecording,
+             "InitializeGamePlayRecording"},
+        };
+        RegisterHandlers(functions);
+    }
+
+private:
+    void PopLaunchParameter(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void CreateApplicationAndRequestToStart(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    // O armazenamento é o sistema de ficheiros, que não existe ainda.
+    void EnsureSaveData(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    // O idioma: o do sistema. `nn::oe::Language::AmericanEnglish` = 1.
+    void GetDesiredLanguage(HLERequestContext& ctx) {
+        LOG_DEBUG(Service_AM, "GetDesiredLanguage: 1 (AmericanEnglish)");
+        ResponseBuilder rb{ctx, 4};
+        rb.Push(ResultSuccess);
+        rb.Push(static_cast<u64>(1));
+    }
+
+    void SetTerminateResult(HLERequestContext& ctx) {
+        // **Instrumento.** O `SetTerminateResult` é o pranto do guest:
+        // o Result que ele manda é o código exacto do nn::erro que o
+        // matou (o módulo no byte alto, o desc no baixo). Sem este
+        // número, não se sabe qual peça falta.
+        RequestParser rp{ctx};
+        const u32 resultado = rp.PopRaw<u32>();
+        LOG_WARNING(Service_AM,
+                    "SetTerminateResult: modulo={} desc={} (0x{:08X})",
+                    static_cast<unsigned>((resultado >> 0) & 0x1FF),
+                    static_cast<unsigned>((resultado >> 9) & 0x3FFF),
+                    resultado);
+
+        // **A stack do guest** — é ela que diz **qual** peça do SDK
+        // falhou (o módulo 64 e' do SDK, e so' a cadeia de
+        // frames o diz).
+        if (std::getenv("IA_IPC_TRACE") != nullptr) {
+            // O contexto tem o `sp` do guest ? — nao. O que se pode
+            // fazer e' ler a stack pelo endereco que o `am` tem.
+            (void)0;
+        }
+
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void GetDisplayVersion(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(static_cast<u32>(0));
+    }
+
+    void ExtendSaveData(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void GetSaveDataSize(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void CreateCacheStorage(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void GetSaveDataSizeMax(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void GetCacheStorageMax(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void BeginBlockingHomeButtonShortAndLongPressed(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void EndBlockingHomeButtonShortAndLongPressed(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void BeginBlockingHomeButton(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void EndBlockingHomeButton(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void NotifyRunning(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(false);
+    }
+
+    void GetPseudoDeviceId(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void SetMediaPlaybackStateForApplication(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void IsGamePlayRecordingSupported(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(false);
+    }
+
+    void InitializeGamePlayRecording(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+};
+
+/// O `IProcessWindingController` — como o jogo foi lançado.
+class ProcessWindingController final : public Service::ServiceFramework<ProcessWindingController> {
+public:
+    explicit ProcessWindingController(Core::System& system)
+        : ServiceFramework{system, "IProcessWindingController"} {
+        static const FunctionInfo functions[] = {
+            {0, &ProcessWindingController::GetLaunchReason, "GetLaunchReason"},
+            {11, &ProcessWindingController::OpenCallingLibraryApplet, "OpenCallingLibraryApplet"},
+            {21, &ProcessWindingController::PushContext, "PushContext"},
+            {22, &ProcessWindingController::PopContext, "PopContext"},
+            {23, &ProcessWindingController::CancelWindingReservation, "CancelWindingReservation"},
+            {30, &ProcessWindingController::WindAndDoReserved, "WindAndDoReserved"},
+            {40, &ProcessWindingController::ReserveToStartAndWaitAndUnwindThis,
+             "ReserveToStartAndWaitAndUnwindThis"},
+            {41, &ProcessWindingController::ReserveToStartAndWait, "ReserveToStartAndWait"},
+        };
+        RegisterHandlers(functions);
+    }
+
+private:
+    // `AppletProcessLaunchReason`: 0 = Normal, 1 = ApplicationRequested.
+    void GetLaunchReason(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.Push(static_cast<u32>(0));
+    }
+
+    void OpenCallingLibraryApplet(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void PushContext(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void PopContext(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void CancelWindingReservation(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void WindAndDoReserved(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void ReserveToStartAndWaitAndUnwindThis(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void ReserveToStartAndWait(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+};
+
+/// O `IDebugFunctions` — o que só o.debug usa.
+class DebugFunctions final : public Service::ServiceFramework<DebugFunctions> {
+public:
+    explicit DebugFunctions(Core::System& system)
+        : ServiceFramework{system, "IDebugFunctions"} {
+        // O Eden nao tem comandos registados neste interface (a tabela
+        // esta vazia), e por isso o regista do mesmo modo: um interface
+        // sem comandos responde "desconhecido" a tudo, que e' o que o Eden
+        // faz.
+        static const FunctionInfo functions[] = {
+            {0, &DebugFunctions::Reservado, "Reservado"},
+        };
+        RegisterHandlers(functions);
+    }
+
+private:
+    void Reservado(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+};
+
+/// O `ILibraryAppletCreator` — abrir um applet de biblioteca.
+class LibraryAppletCreator final : public Service::ServiceFramework<LibraryAppletCreator> {
+public:
+    explicit LibraryAppletCreator(Core::System& system)
+        : ServiceFramework{system, "ILibraryAppletCreator"} {
+        static const FunctionInfo functions[] = {
+            {0, &LibraryAppletCreator::CreateLibraryApplet, "CreateLibraryApplet"},
+            {1, &LibraryAppletCreator::CreateLibraryAppletEx, "CreateLibraryAppletEx"},
+            {2, &LibraryAppletCreator::CreateStorage, "CreateStorage"},
+            {3, &LibraryAppletCreator::CreateTransferMemoryStorage, "CreateTransferMemoryStorage"},
+            {4, &LibraryAppletCreator::CreateHandleStorage, "CreateHandleStorage"},
+        };
+        RegisterHandlers(functions);
+    }
+
+private:
+    void CreateLibraryApplet(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void CreateLibraryAppletEx(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void CreateStorage(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void CreateTransferMemoryStorage(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    void CreateHandleStorage(HLERequestContext& ctx) {
+        ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// O proxy
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// O `IApplicationProxy` — o que dá as sub-interfaces.
+class ApplicationProxy final : public Service::ServiceFramework<ApplicationProxy> {
+public:
+    ApplicationProxy(Core::System& system, std::shared_ptr<EstadoDoApplet> estado)
+        : ServiceFramework{system, "IApplicationProxy"}, estado_{std::move(estado)} {
+        static const FunctionInfo functions[] = {
+            {0, &ApplicationProxy::GetCommonStateGetter, "GetCommonStateGetter"},
+            {1, &ApplicationProxy::GetSelfController, "GetSelfController"},
+            {2, &ApplicationProxy::GetWindowController, "GetWindowController"},
+            {3, &ApplicationProxy::GetAudioController, "GetAudioController"},
+            {4, &ApplicationProxy::GetDisplayController, "GetDisplayController"},
+            {10, &ApplicationProxy::GetProcessWindingController, "GetProcessWindingController"},
+            {11, &ApplicationProxy::GetLibraryAppletCreator, "GetLibraryAppletCreator"},
+            {20, &ApplicationProxy::GetApplicationFunctions, "GetApplicationFunctions"},
+            {1000, &ApplicationProxy::GetDebugFunctions, "GetDebugFunctions"},
+        };
+        RegisterHandlers(functions);
+    }
+
+private:
+    // Todas as sub-interfaces se devolvem do mesmo modo: um interface novo,
+    // registado no gerenciador de sessoes, e o handle da sessao vai no
+    // descritor de handles da resposta.
+    //
+    // `rb{ctx, 2, 0, 1}`: dois palavras de corpo (o Result e um
+    // reservado), e **um** objecto a mover (a sessao do interface).
+    // Devolve uma sub-interface.
+    //
+    // A fabrica vem de fora porque **so o `CommonStateGetter` precisa do
+    // estado**: e' o unico que tem a fila de mensagens. Os outros nao tem
+    // estado nenhum, e um `make_shared<T>(system, estado_)` a todos seria
+    // uma assinatura que nenhum deles tem.
+    template <typename T>
+    void Devolve(HLERequestContext& ctx, const char* nome,
+                 std::shared_ptr<T> (*fabrica)(Core::System&, std::shared_ptr<EstadoDoApplet>)) {
+        LOG_DEBUG(Service_AM, "{}: devolvido", nome);
+        ResponseBuilder rb{ctx, 2, 0, 1};
+        rb.Push(ResultSuccess);
+        rb.PushIpcInterface<T>(ctx, fabrica(system, estado_));
+    }
+
+    std::shared_ptr<EstadoDoApplet> estado_;
+
+    void GetCommonStateGetter(HLERequestContext& ctx) {
+        Devolve<CommonStateGetter>(ctx, "GetCommonStateGetter", [](Core::System& sys, std::shared_ptr<EstadoDoApplet> est) {
+            return std::make_shared<CommonStateGetter>(sys, est);
+        });
+    }
+
+    void GetSelfController(HLERequestContext& ctx) {
+        Devolve<SelfController>(ctx, "GetSelfController", [](Core::System& sys, std::shared_ptr<EstadoDoApplet> est) {
+            return std::make_shared<SelfController>(sys, std::move(est));
+        });
+    }
+
+    void GetWindowController(HLERequestContext& ctx) {
+        Devolve<WindowController>(ctx, "GetWindowController", [](Core::System& sys, std::shared_ptr<EstadoDoApplet>) {
+            return std::make_shared<WindowController>(sys);
+        });
+    }
+
+    void GetAudioController(HLERequestContext& ctx) {
+        Devolve<AudioController>(ctx, "GetAudioController", [](Core::System& sys, std::shared_ptr<EstadoDoApplet>) {
+            return std::make_shared<AudioController>(sys);
+        });
+    }
+
+    void GetDisplayController(HLERequestContext& ctx) {
+        Devolve<DisplayController>(ctx, "GetDisplayController", [](Core::System& sys, std::shared_ptr<EstadoDoApplet>) {
+            return std::make_shared<DisplayController>(sys);
+        });
+    }
+
+    void GetProcessWindingController(HLERequestContext& ctx) {
+        Devolve<ProcessWindingController>(ctx, "GetProcessWindingController", [](Core::System& sys, std::shared_ptr<EstadoDoApplet>) {
+            return std::make_shared<ProcessWindingController>(sys);
+        });
+    }
+
+    void GetLibraryAppletCreator(HLERequestContext& ctx) {
+        Devolve<LibraryAppletCreator>(ctx, "GetLibraryAppletCreator", [](Core::System& sys, std::shared_ptr<EstadoDoApplet>) {
+            return std::make_shared<LibraryAppletCreator>(sys);
+        });
+    }
+
+    void GetApplicationFunctions(HLERequestContext& ctx) {
+        Devolve<ApplicationFunctions>(ctx, "GetApplicationFunctions", [](Core::System& sys, std::shared_ptr<EstadoDoApplet>) {
+            return std::make_shared<ApplicationFunctions>(sys);
+        });
+    }
+
+    void GetDebugFunctions(HLERequestContext& ctx) {
+        Devolve<DebugFunctions>(ctx, "GetDebugFunctions", [](Core::System& sys, std::shared_ptr<EstadoDoApplet>) {
+            return std::make_shared<DebugFunctions>(sys);
+        });
+    }
+};
+
+/// O `appletOE` propriamente dito.
+class AppletOE final : public Service::ServiceFramework<AppletOE> {
+public:
+    explicit AppletOE(Core::System& system) : ServiceFramework{system, "appletOE"} {
+        LOG_DEBUG(Service_AM, "appletOE: registado");
+
+        // O applet e' criado, e vai para o primeiro plano — que e' o que o
+        // `am` do Eden faz quando lanca um applet
+        // (`window_system.cpp`, `AppletMessage::ChangeIntoForeground`).
+        //
+        // **Sem esta mensagem o SDK nao arranca.** Medido: o guest ficou a
+        // pedir `ReceiveMessage` sem parar, e a unica mensagem que o
+        // `am` entrega no arranque e' esta.
+        estado_ = std::make_shared<EstadoDoApplet>();
+
+        // Experimento: empurra AMBAS as mensagens de arranque (ChangeIntoForeground
+        // (1) e FocusStateChanged (15)) em vez de so' a segunda. Se o jogo
+        // comecar a desenhar (DrawBegin/DrawEnd 1413/1414 no pushbuffer), o
+        // portao e' a mensagem que faltava.
+        estado_->mensagens.push_back(1);   // ChangeIntoForeground
+        estado_->mensagens.push_back(15);  // FocusStateChanged
+
+        // O evento do sistema. E' o que o `GetEventHandle` devolve, e e'
+        // sinalizado quando a mensagem e' empurrada.
+        {
+            auto& kernel = system.Kernel();
+            auto& processo = Kernel::GetCurrentProcess(kernel);
+            auto* evento = new Kernel::KEvent(kernel);
+            evento->Initialize(kernel, &processo);
+            // O objecto registado e' o `KReadableEvent` — o **filho**,
+            // que e' o que o guest recebe. O `KEvent` (o pai) fica
+            // apontado para o `empurrar` o sinalizar, e o
+            // `KEvent::Signal` propaga ao filho
+            // (`k_event.cpp:52-60`).
+            estado_->evento = evento;
+            estado_->readable = &evento->GetReadableEvent();
+            // **O evento do sistema ja nasce sinalizado.**
+            //
+            // No Eden, o `m_focus_state_changed_notification_enabled` e' o
+            // `m_has_focus_state_changed` comecam ambos a `true`
+            // (`lifecycle_manager.h:159` e `:168`), e o
+            // `SignalSystemEventIfNeeded` — chamado pelo `SetFocusState` do
+            // lancamento — encontra o `ShouldSignalSystemEvent()` verdadeiro
+            // e **sinaliza o evento**.
+            //
+            // Sem isto, o guest ficava a espera para sempre: o
+            // `WaitSynchronization` devolvia `ResultTimedOut` (o motor nao
+            // dorme) e o guest repetia — 3936 vezes seguidas, ate ao
+            // limite de traps.
+            estado_->sinalizar_se_precisa(system.Kernel());
+        }
+
+        // A mudanca de foco: a aplicacao entra em primeiro plano. No Eden
+        // e' o `AppletManager` que o faz quando lanca o applet
+        // (`applet_manager.cpp:342`):
+        //
+        //     // Applet was started by frontend, so it is foreground.
+        //     applet->lifecycle_manager.SetFocusState(m_system.Kernel(), FocusState::InFocus);
+        //
+        // E o `SetFocusState` poe o `m_has_focus_state_changed` — que e'
+        // o que faz o `ShouldSignalSystemEvent` devolver verdadeiro, e o
+        // que sinaliza o evento do sistema.
+        //
+        // **E' um flag, e nao uma mensagem na fila** — ver `proxima()`.
+        estado_->foco_mudou = true;
+        static const FunctionInfo functions[] = {
+            {0, &AppletOE::OpenApplicationProxy, "OpenApplicationProxy"},
+        };
+        RegisterHandlers(functions);
+    }
+
+private:
+    // `OpenApplicationProxy(out, pid, process_handle)`.
+    //
+    // O `pid` vem no corpo (2 palavras) e o handle do processo vem no
+    // descritor de handles — e o Eden não o usa para nada além de
+    // confirmar que o applet existe.
+    //
+    // A resposta é o proxy, como um objecto a mover.
+    void OpenApplicationProxy(HLERequestContext& ctx) {
+        LOG_DEBUG(Service_AM, "appletOE: OpenApplicationProxy");
+        RequestParser rp{ctx};
+        const auto pid = rp.Pop<u64>();
+        LOG_DEBUG(Service_AM, "OpenApplicationProxy: pid={}", pid);
+
+        ResponseBuilder rb{ctx, 2, 0, 1};
+        rb.Push(ResultSuccess);
+        rb.PushIpcInterface<ApplicationProxy>(ctx, std::make_shared<ApplicationProxy>(system, estado_));
+    }
+
+    // O estado do applet: a fila de mensagens. Vive aqui porque o objecto
+    // do servico e' o unico que sobrevive a todas as sub-interfaces.
+    std::shared_ptr<EstadoDoApplet> estado_;
+};
+
+} // namespace
+
+// ─────────────────────────────────────────────────────────────────────────────
+// O registo
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Regista o `appletOE` no `sm:`.
+//
+// O `sm:` é o `Service::SM::ServiceManager` do Eden, e o registo de um
+// serviço faz-se por um `ServerManager` — o mesmo caminho que o `apm` e o
+// `lm` usam (`Service::APM::LoopProcess` e `Service::LM::LoopProcess`).
+void registar_applet_oe(Core::System& system) {
+    auto server_manager = std::make_unique<Service::ServerManager>(system);
+    server_manager->RegisterNamedService("appletOE", std::make_shared<AppletOE>(system));
+    Service::ServerManager::RunServer(std::move(server_manager));
+}
+
+} // namespace g610::services

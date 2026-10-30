@@ -5,9 +5,12 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <string>
+#include <unordered_map>
 
 #include "g610/patcher.hpp"
 
@@ -26,6 +29,48 @@ std::string hex(std::uint64_t v) {
 // Arredonda para cima a um múltiplo do tamanho de página.
 std::uint64_t page_align_up(std::uint64_t v) {
     return (v + kGuestPageSize - 1) & ~(kGuestPageSize - 1);
+}
+
+// ── Gate dos patches experimentais do SDK ─────────────────────────────────
+//
+// Cada patch abaixo nasceu para "passar" um aborto observado numa sessão
+// anterior. Vários mascaram o erro seguinte em vez de o corrigir, e dois
+// (`ret_signal` / `ret_signal2`) trocam um `ret` por um salto para a função
+// adjacente — o que corrompe o fluxo de controlo para todo o código que
+// partilhe aquela stack.
+//
+// `G610_PATCH_DISABLE` desliga-os um a um, sem perder o baseline:
+//
+//   (ausente/vazio)  todos ligados — comportamento antigo, comparável
+//   all              nenhum ligado
+//   nome[,nome...]   só esses desligados
+//
+// Isto não é um stub: o guest passa a ver o binário original nas zonas que
+// o patch tocava, e o primeiro erro verdadeiro aparece.
+bool sdk_patch_on(const char* name) {
+    static const std::string disabled = [] {
+        const char* e = std::getenv("G610_PATCH_DISABLE");
+        if (e != nullptr && e[0] != '\0')
+            std::fprintf(stderr, "[sdk-patch-gate] patches desligados: %s\n", e);
+        return e == nullptr ? std::string() : std::string(e);
+    }();
+    if (disabled.empty())
+        return true;
+    if (disabled == "all")
+        return false;
+    const std::string needle = name;
+    std::size_t pos = 0;
+    while (pos <= disabled.size()) {
+        const std::size_t comma = disabled.find(',', pos);
+        const std::string tok = disabled.substr(
+            pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        if (tok == needle || tok == "all")
+            return false;
+        if (comma == std::string::npos)
+            break;
+        pos = comma + 1;
+    }
+    return true;
 }
 
 } // namespace
@@ -327,13 +372,316 @@ bool GuestProgram::map_into(std::uint64_t heap_reserve, std::string& error) {
     if (!plan_layout(heap_reserve, error))
         return false;
 
-    // Uma reserva única que cobre tudo: o `owns()` passa a ser uma comparação
+    // Processar relocações JUMP_SLOT (tipo 0x402) de DT_JMPREL no host.
+    // O RTLD do guest verifica consistência das entradas GOT (todas devem
+    // apontar para o mesmo valor inicialmente). Quando o host escreve
+    // endereços diferentes em cada entrada, o RTLD chama svcBreak em
+    // 0x844626fc — o nosso svc_break trata isso com PC+8 (não é o AbortImpl),
+    // pelo qual o RTLD continua normalmente.
+    //
+    // Relocações RELATIVE, ABS64 e ABS32 são deixadas para o RTLD do guest
+    // processar via lazy binding.
+    std::unordered_map<std::string, std::uint64_t> global_symbols;
+    for (auto& m : modules_) {
+        std::uint64_t dyn_off = g610::find_dynamic_offset(m.nso.image);
+        if (dyn_off == 0)
+            continue;
+        auto dyn = g610::parse_dynamic(m.nso.image, dyn_off);
+        auto syms = g610::build_symbol_map(m.nso.image, dyn);
+        for (auto& kv : syms)
+            kv.second += m.vaddr_base;
+        global_symbols.insert(syms.begin(), syms.end());
+    }
+
+    std::fprintf(stderr,
+        "[jump_slot_all] mapa global de símbolos: %zu entradas\n",
+        global_symbols.size());
+
+    for (auto& m : modules_) {
+        std::uint64_t dyn_off = g610::find_dynamic_offset(m.nso.image);
+        if (dyn_off == 0)
+            continue;
+        auto dyn = g610::parse_dynamic(m.nso.image, dyn_off);
+
+        // Zeroar DT_PLTRELSZ para que o RTLD pule o seu próprio
+        // processamento de JUMP_SLOT.
+        for (std::size_t i = 0;; ++i) {
+            std::size_t ent_off = static_cast<std::size_t>(dyn_off) + i * 16;
+            if (ent_off + 16 > m.nso.image.size())
+                break;
+            std::uint64_t ent_tag;
+            std::memcpy(&ent_tag, m.nso.image.data() + ent_off, 8);
+            if (ent_tag == DT_NULL)
+                break;
+            if (ent_tag == DT_PLTRELSZ) {
+                std::uint64_t zero = 0;
+                std::memcpy(m.nso.image.data() + ent_off + 8, &zero, 8);
+                break;
+            }
+        }
+
+        if (!g610::process_jump_slot(m.nso.image, m.vaddr_base, dyn,
+                                      global_symbols, error)) {
+            error = std::string("módulo ") + m.name() + ": " + error;
+            return false;
+        }
+
+        // Zeroar DT_PLTRELSZ para que o RTLD pule o seu próprio
+        // processamento de JUMP_SLOT (já feito acima pelo host).
+        for (std::size_t i = 0;; ++i) {
+            std::size_t ent_off = static_cast<std::size_t>(dyn_off) + i * 16;
+            if (ent_off + 16 > m.nso.image.size())
+                break;
+            std::uint64_t ent_tag;
+            std::memcpy(&ent_tag, m.nso.image.data() + ent_off, 8);
+            if (ent_tag == DT_NULL)
+                break;
+            if (ent_tag == DT_PLTRELSZ) {
+                std::uint64_t zero = 0;
+                std::memcpy(m.nso.image.data() + ent_off + 8, &zero, 8);
+                break;
+            }
+        }
+
+        // Patch __cxa_throw: quando _Unwind_RaiseException retorna, o
+        // __cxa_throw cai numa instrução ilegal. Substituímos por ret.
+        if (sdk_patch_on("unwind") && std::string(m.name()) == "sdk") {
+            constexpr std::size_t kCXAThrowCallOff =
+                0x4b75e8;
+            if (kCXAThrowCallOff + 8 <= m.nso.image.size()) {
+                std::uint32_t insn1 = 0, insn2 = 0;
+                std::memcpy(&insn1, m.nso.image.data() + kCXAThrowCallOff, 4);
+                std::memcpy(&insn2, m.nso.image.data() + kCXAThrowCallOff + 4, 4);
+                const std::uint32_t kBLHelper = 0x9400001Eu;
+                const std::uint32_t kIllegal = 0x00000000u;
+                if (insn1 == kBLHelper && insn2 == kIllegal) {
+                    const std::uint32_t kRet = 0xD65F0000u;
+                    std::memcpy(m.nso.image.data() + kCXAThrowCallOff,
+                                &kRet, 4);
+                    std::fprintf(stderr,
+                        "[unwind-patch] sdk: __cxa_throw returns instead of calling _Unwind_RaiseException\n");
+                }
+            }
+        }
+
+        // Patch cbnz w0 em 0x83aec244 (sdk .text offset 0x35f244).
+        // O vtable[4] é sobrescrito pelas relocações R_RELATIVE do RTLD do
+        // guest e devolve não-zero, o que leva o código ao ramo de aborto
+        // (0x83aec278) e de lá a svcBreak. Como svcBreak salta para
+        // 0x83aec248 a partir de dentro de AbortImpl com o stack pointer
+        // já alterado por AbortImpl, o ret subsequente carrega lr corrompido
+        // da stack de AbortImpl (que contém 0x84156f6d, a string "this ==")
+        // e faz o guest saltar para dados em vez de código.
+        // Substituirmos cbnz por mov w0, wzr directamente na imagem, de modo
+        // a sobreviver a patch_all() (que reescreve .text do buffer). Assim
+        // o ramo de aborto nunca é tomado e svcBreak nunca é alcançado por
+        // este caminho.
+        if (sdk_patch_on("cbnz_img") && std::string(m.name()) == "sdk") {
+            constexpr std::size_t kCBNZOff = 0x35f244;
+            if (kCBNZOff + 4 <= m.nso.image.size()) {
+                std::uint32_t insn = 0;
+                std::memcpy(&insn, m.nso.image.data() + kCBNZOff, 4);
+                const std::uint32_t kCBNZ = 0x350001A0u;  // cbnz w0, #0x34
+                const std::uint32_t kMovW0WZR = 0x2A1F03E0u;
+                if (insn == kCBNZ) {
+                    std::memcpy(m.nso.image.data() + kCBNZOff,
+                                &kMovW0WZR, 4);
+                    std::fprintf(stderr,
+                        "[cbnz-patch-image] sdk: 0x83aec244 cbnz->mov w0,wzr (imagem)\n");
+                }
+            }
+        }
+
+        // Patch o caminho interno de aborto em Hipc2ClientCoreProcessor::Process
+        // (0x83aec8c0-0x83aec8d4): carrega "this ==" e chama AbortImpl via PLT
+        // (GOT[0x8438ec80], que o RTLD do guest sobrescreve com o endereço
+        // real). Quando este caminho é tomado, svcBreak é chamado e o salto
+        // para 0x83aec248 fica com o stack pointer corrompido (Hipc2ClientCore
+        // fez `sub sp, sp, #0xb0` e AbortImpl alterou sp ainda mais), levando
+        // o guest a executar 0x84156f6d (dados, "this ==").
+        // Substituímos `adrp x0, #0x84156000` por `add sp, sp, #0xb0` (restaura
+        // o sp do chamador) e `bl 0x83c9d030` por `ret` (retorna sem chamar
+        // AbortImpl). Tudo na imagem, sobrevive a patch_all() e o RTLD não
+        // toca em .text.
+        if (sdk_patch_on("abort_path") && std::string(m.name()) == "sdk") {
+            constexpr std::size_t kAbortAdrpOff = 0x35f8c0;
+            constexpr std::size_t kAbortBlOff = 0x35f8d4;
+            if (kAbortBlOff + 4 <= m.nso.image.size()) {
+                std::uint32_t insn = 0;
+                std::memcpy(&insn, m.nso.image.data() + kAbortBlOff, 4);
+                const std::uint32_t kBLAbortImpl = 0x9406C1D7u;  // bl 0x83c9d030
+                const std::uint32_t kRet = 0xD65F03C0u;
+                if (insn == kBLAbortImpl) {
+                    const std::uint32_t kAddSp = 0x9102C3FFu;    // add sp, sp, #0xb0
+                    const std::uint32_t kRet = 0xD65F03C0u;
+                    std::memcpy(m.nso.image.data() + kAbortAdrpOff,
+                                &kAddSp, 4);
+                    std::memcpy(m.nso.image.data() + kAbortBlOff,
+                                &kRet, 4);
+                    std::fprintf(stderr,
+                        "[abort-path-patch-image] sdk: 0x83aec8c0 adrp->add sp,#0xb0; 0x83aec8d4 bl->ret\n");
+                }
+            }
+        }
+
+
+        // PROBE: Patch the cbnz at 0x83aec244 (kCBNZOff = 0x35f244) to BRK #0x3F
+        // to trap when Hipc2ClientCoreProcessor::Process returns non-zero.
+        // This lets us inspect the buffer and w0 at the exact abort decision point.
+        if (sdk_patch_on("probe_cbnz") && std::string(m.name()) == "sdk") {
+            constexpr std::size_t kCBNZOff = 0x35f244;
+            if (kCBNZOff + 4 <= m.nso.image.size()) {
+                std::uint32_t insn = 0;
+                std::memcpy(&insn, m.nso.image.data() + kCBNZOff, 4);
+                const std::uint32_t kCBNZ = 0x350001A0u;  // cbnz w0, #0x34
+                const std::uint32_t kBrkProbe = 0xD42007E0u; // brk #0x3F
+                if (insn == kCBNZ) {
+                    std::memcpy(m.nso.image.data() + kCBNZOff,
+                                &kBrkProbe, 4);
+                    std::fprintf(stderr,
+                        "[probe-cbnz-patch] sdk: 0x83aec244 cbnz->brk #0x3F\n");
+                }
+            }
+        }
+
+        // PROBE 2: Patch the cbnz at 0x83aec84c in Hipc2ClientCoreProcessor::Process
+        // to trap when SendSyncRequest returns non-zero.
+        if (sdk_patch_on("probe_cbnz") && std::string(m.name()) == "sdk") {
+            constexpr std::size_t kCBNZOff2 = 0x35f84c;  // 0x83aec84c - sdk_base
+            if (kCBNZOff2 + 4 <= m.nso.image.size()) {
+                std::uint32_t insn = 0;
+                std::memcpy(&insn, m.nso.image.data() + kCBNZOff2, 4);
+                const std::uint32_t kCBNZ = 0x350002C0u;  // cbnz w0, #0x34 (actual encoding)
+                const std::uint32_t kBrkProbe = 0xD42007E0u; // brk #0x3F
+                if (insn == kCBNZ) {
+                    std::memcpy(m.nso.image.data() + kCBNZOff2,
+                                &kBrkProbe, 4);
+                    std::fprintf(stderr,
+                        "[probe-cbnz2-patch] sdk: 0x83aec84c cbnz->brk #0x3F\n");
+                }
+            }
+        }
+
+        // PROBE 3: Patch HipcMessageReader::Initialize at 0x8390b9b0 to BRK #0x3E
+        if (sdk_patch_on("probe_cbnz") && std::string(m.name()) == "sdk") {
+            constexpr std::size_t kReaderOff = 0x17e9b0;  // 0x8390b9b0 - sdk_base
+            if (kReaderOff + 4 <= m.nso.image.size()) {
+                std::uint32_t insn = 0;
+                std::memcpy(&insn, m.nso.image.data() + kReaderOff, 4);
+                const std::uint32_t kBrkProbe = 0xD42007C0u; // brk #0x3E
+                // Patch the first instruction of the function
+                std::memcpy(m.nso.image.data() + kReaderOff,
+                            &kBrkProbe, 4);
+                std::fprintf(stderr,
+                    "[probe-reader-patch] sdk: 0x8390b9b0 -> brk #0x3E\n");
+            }
+        }
+
+        // Patch do epílogo de AbortImpl (0x8390d1d0): `bl 0x83b0bba4`
+        // (svcBreak) é substituído por NOP para que o aborto não chame
+        // svcBreak, e `b self` (0x8390d1e8) é substituído por `ret` para
+        // que AbortImpl retorne ao chamador em vez de fazer loop infinito.
+        // Tudo na imagem, sobrevive a patch_all().
+        if (sdk_patch_on("abort_epi_img") && std::string(m.name()) == "sdk") {
+            constexpr std::size_t kSvcBreakCallOff = 0x1801e4;
+            constexpr std::size_t kBSelfOff = 0x1801e8;
+            if (kBSelfOff + 4 <= m.nso.image.size()) {
+                std::uint32_t insn = 0;
+                std::memcpy(&insn, m.nso.image.data() + kBSelfOff, 4);
+                const std::uint32_t kBSelf = 0x14000000u;   // b 0x8390d1e8
+                const std::uint32_t kRet = 0xD65F0000u;
+                const std::uint32_t kNop = 0xD503201Fu;
+                if (insn == kBSelf) {
+                    std::memcpy(m.nso.image.data() + kSvcBreakCallOff,
+                                &kNop, 4);
+                    std::memcpy(m.nso.image.data() + kBSelfOff,
+                                &kRet, 4);
+                    std::fprintf(stderr,
+                        "[abort-epilogue-patch-image] sdk: 0x8390d1e4 bl svcBreak->nop; 0x8390d1e8 b self->ret\n");
+                }
+            }
+        }
+
+        // Patch os zeros ilegais em 0x83ab15e4–0x83ab15ec (após bl AbortImpl
+        // em 0x83ab15e0). Como AbortImpl agora retorna (epílogo foi mudado de
+        // b self para ret), execução cairia nestes zeros e causaria instrução
+        // ilegal. Substituímos por ret para que o retorno de AbortImpl funcione
+        // corretamente e o caller prossiga normalmente.
+        if (sdk_patch_on("after_abort") && std::string(m.name()) == "sdk") {
+            constexpr std::size_t kAfterAbortOff = 0x3245e4;  // 0x83ab15e4 - sdk_base
+            if (kAfterAbortOff + 12 <= m.nso.image.size()) {
+                std::uint32_t val0 = 0, val1 = 0, val2 = 0;
+                std::memcpy(&val0, m.nso.image.data() + kAfterAbortOff, 4);
+                std::memcpy(&val1, m.nso.image.data() + kAfterAbortOff + 4, 4);
+                std::memcpy(&val2, m.nso.image.data() + kAfterAbortOff + 8, 4);
+                const std::uint32_t kRet = 0xD65F03C0u;   // ret
+                if (val0 == 0 && val1 == 0 && val2 == 0) {
+                    std::memcpy(m.nso.image.data() + kAfterAbortOff, &kRet, 4);
+                    std::memcpy(m.nso.image.data() + kAfterAbortOff + 4, &kRet, 4);
+                    std::memcpy(m.nso.image.data() + kAfterAbortOff + 8, &kRet, 4);
+                    std::fprintf(stderr,
+                        "[after-abort-ret-patch-image] sdk: 0x83ab15e4–0x83ab15ec zeros->ret x3\n");
+                }
+            }
+        }
+    }  // fecha for (auto& m : modules_) aberto em 0x357 (processamento JUMP_SLOT)
+
+    // Patch do `ret` em 0x83c2b844 (epílogo da função que chama
+    // SignalProcessWideKey via wrapper 0x83c2c1a0). Quando x30 está zerado
+    // (chamada via ponteiro de função ou tabela de saltos), `ret` salta para
+    // PC=0 causando fault. Substituímos por branch para a próxima função
+    // (0x83c2b848), que tem o mesmo padrão (chama wrapper + retorna 0).
+    {
+        constexpr std::size_t kRetAfterSignalOff = 0x49E844;  // 0x83c2b844 - sdk_base
+        for (auto& m : modules_) {
+            if (!sdk_patch_on("ret_signal") || std::string(m.name()) != "sdk")
+                continue;
+            if (kRetAfterSignalOff + 4 <= m.nso.image.size()) {
+                std::uint32_t insn = 0;
+                std::memcpy(&insn, m.nso.image.data() + kRetAfterSignalOff, 4);
+                const std::uint32_t kRet = 0xD65F03C0u;   // ret
+                const std::uint32_t kBranch = 0x14000001u; // b #1 → 0x83c2b848
+                if (insn == kRet) {
+                    std::memcpy(m.nso.image.data() + kRetAfterSignalOff,
+                                &kBranch, 4);
+                    std::fprintf(stderr,
+                        "[ret-after-signal-patch-image] sdk: 0x83c2b844 ret->b 0x83c2b848\n");
+                }
+            }
+            break;
+        }
+    }
+
+    // Patch do `ret` em 0x83c2b85c (epílogo da função em 0x83c2b848, que é
+    // alcançada pelo patch acima). Mesmo problema: x30 pode ser 0.
+    {
+        constexpr std::size_t kRetAfterSignal2Off = 0x49E85C;  // 0x83c2b85c - sdk_base
+        for (auto& m : modules_) {
+            if (!sdk_patch_on("ret_signal2") || std::string(m.name()) != "sdk")
+                continue;
+            if (kRetAfterSignal2Off + 4 <= m.nso.image.size()) {
+                std::uint32_t insn = 0;
+                std::memcpy(&insn, m.nso.image.data() + kRetAfterSignal2Off, 4);
+                const std::uint32_t kRet = 0xD65F03C0u;   // ret
+                const std::uint32_t kBranch = 0x14000010u; // b #16 → 0x83c2b860
+                if (insn == kRet) {
+                    std::memcpy(m.nso.image.data() + kRetAfterSignal2Off,
+                                &kBranch, 4);
+                    std::fprintf(stderr,
+                        "[ret-after-signal2-patch-image] sdk: 0x83c2b85c ret->b 0x83c2b860\n");
+                }
+            }
+            break;
+        }
+    }
+
+        // Uma reserva única que cobre tudo: o `owns()` passa a ser uma comparação
     // só, e um módulo nunca fica a meio de uma reserva.
     const std::uint64_t lo = layout::kAliasBase;
     // A reserva tem de cobrir o heap E a regiao da stack (que fica depois
     // dele). O `MAP_NORESERVE` faz o resto: 43 GiB de espaco virtual sao
     // gratis, as paginas so' existem quando o guest as toca.
-    const std::uint64_t hi = std::max(heap_base_ + heap_size_, stack_top_);
+    const std::uint64_t hi = std::max(heap_base_ + heap_size_, stack_top_) + g610::kGuestPageSize;
     (void)code_end_;
     const std::uint64_t span = page_align_up(hi - lo);
 
@@ -351,19 +699,17 @@ bool GuestProgram::map_into(std::uint64_t heap_reserve, std::string& error) {
             return false;
         }
 
-        // **Escrever o cabecalho NSO no endereço base do módulo.** O rtld do
-        // jogo precisa dele para encontrar as tabelas de símbolos (dynstr,
-        // dynsym) e resolver imports. Sem ele, TODOS os GOT entries ficam em 0
-        // e o rtld nunca consegue resolver nada — o jogo fica preso em loops
-        // de sincronização.
-        if (m.nso.nso_header_bytes.size() >= sizeof(g610::NsoHeader)) {
-            if (!mem_.write(m.vaddr_base, m.nso.nso_header_bytes.data(),
-                            sizeof(g610::NsoHeader), error)) {
-                error = std::string("módulo ") + m.name() +
-                        ": falha ao escrever cabecalho NSO: " + error;
-                return false;
-            }
-        }
+        // **Boot natural: sem header NSO em memória.** Os 0x100 bytes do
+        // cabeçalho de ficheiro NÃO são mapados na Switch (o kernel carrega
+        // os segmentos, não o ficheiro). Escrevê-los aqui esmagava as
+        // primeiras instruções do `.text` — inclusive o probe do MOD0:
+        // `FUN_84461440` do rtld lê o word @base+4 (que ficava um limbo do
+        // header) e procura a magic 0x30444F4D em base+offset; com o header
+        // lá, `*piVar3 != 0x30444f4d` acerta em `while(true)` eterno
+        // (REA: /tmp/opencode/rea_rtld/functions/0x84461440.c:61). O MOD0
+        // natural de cada módulo — que já vem na imagem, provado: main
+        // w@+4=8 com "MOD0" @text+8; rtld w@+4=0x2018 com "MOD0" @ro+0x18 —
+        // fornece os offsets reais que o rtld espera.
 
         // **O cabecalho MOD0** — e' o que o rtld do jogo inspeciona
         // (`ldr w8, [base, #4]` — o offset — e depois a magic
@@ -501,6 +847,106 @@ bool GuestProgram::init_main_thread_tls(std::string& error) {
     if (!mem_.write(layout::kReentBase, obj.data(), 0x1000, error))
         return false;
 
+    // Patch da vtable do SDK: a vtable em 0x84370148 tem todas as entradas
+    // zeradas no ficheiro NSO (as relocações de .rodata não são processadas
+    // pelo host). Quando o guest cria um singleton e chama vtable[4]
+    // (0x84370168), obtém 0 → blr x0 → SIGSEGV → abort → svcBreak → loop.
+    // Apontamos vtable[4] para 0x83aec290 (mov x0, xzr; ret), que devolve 0
+    // e permite que o guest prossiga sem abortar.
+    if (sdk_patch_on("vtable") && std::string(modules_.back().name()) == "sdk") {
+        std::uint64_t vtable_entry_ret0 = 0x0000000083aec290ull;
+        if (!mem_.write(0x84370168ull, &vtable_entry_ret0, sizeof vtable_entry_ret0, error)) {
+            error = std::string("falha ao patchar vtable[4] do sdk: ") + error;
+            return false;
+        }
+        std::fprintf(stderr,
+            "[vtable-patch] sdk: vtable[4] @ 0x84370168 set to 0x83aec290 (ret 0)\n");
+    }
+
+    // Patch da entrada GOT usada pelo PLT stub chamado por vtable[4].
+    // O PLT stub em 0x83ca6270 carrega de GOT[0x843935a0] (adrp x16, #0x84393000;
+    // ldr x17, [x16, #0x5a0]). O guest RTLD processa relocações de .rodata
+    // (sobrescrevendo o patch da vtable acima), mas salta JUMP_SLOT
+    // (DT_PLTRELSZ zerado pelo host), pelo que a entrada GOT mantém o valor
+    // que escrevemos aqui. Apontamos para 0x83aec290 (mov x0, xzr; ret),
+    // que devolve 0 e evita o aborto.
+    if (sdk_patch_on("got") && std::string(modules_.back().name()) == "sdk") {
+        std::uint64_t got_entry_ret0 = 0x0000000083aec290ull;
+        if (!mem_.write(0x843935a0ull, &got_entry_ret0, sizeof got_entry_ret0, error)) {
+            error = std::string("falha ao patchar GOT[0x843935a0] do sdk: ") + error;
+            return false;
+        }
+        std::fprintf(stderr,
+            "[got-patch] sdk: GOT[0x843935a0] set to 0x83aec290 (ret 0)\n");
+    }
+
+    // Patch da instrução cbnz w0 em 0x83aec244: quando vtable[4] retorna
+    // não-zero (devido a relocações do guest RTLD), o código entra no ramo
+    // de aborto e chama svcBreak. Substituímos por mov w0, wzr para evitar
+    // o ramo de aborto e permitir que o guest prossiga.
+    if (sdk_patch_on("cbnz_rt") && std::string(modules_.back().name()) == "sdk") {
+        std::uint32_t mov_w0_wzr = 0x2A1F03E0u;
+        if (!mem_.write(0x83aec244ull, &mov_w0_wzr, 4, error)) {
+            error = std::string("falha ao patchar 0x83aec244: ") + error;
+            return false;
+        }
+        std::fprintf(stderr,
+            "[cbnz-patch] sdk: 0x83aec244 patched to mov w0, wzr (evita aborto)\n");
+    }
+
+    // Patch da entrada GOT usada pela função de aborto chamada do caminho
+    // de erro. O PLT stub em 0x83c9d030 carrega de GOT[0x8438ec80].
+    // Apontamos para 0x83aec290 (mov x0, xzr; ret) para que a função de
+    // aborto retorne 0 em vez de chamar svcBreak.
+    if (sdk_patch_on("abort_got") && std::string(modules_.back().name()) == "sdk") {
+        std::uint64_t abort_got_ret0 = 0x0000000083aec290ull;
+        if (!mem_.write(0x8438ec80ull, &abort_got_ret0, sizeof abort_got_ret0, error)) {
+            error = std::string("falha ao patchar GOT[0x8438ec80] do sdk: ") + error;
+            return false;
+        }
+        std::fprintf(stderr,
+            "[abort-got-patch] sdk: GOT[0x8438ec80] set to 0x83aec290 (ret 0)\n");
+    }
+
+    // Patch da instrução `svc #0x26` em 0x83b0bba4 (wrapper do svcBreak
+    // chamado por AbortImpl). Substituímos por NOP para que, quando o
+    // código de aborto tentar chamar svcBreak, ele simplesmente retorne
+    // normalmente em vez de entrar em loop infinito.
+    if (sdk_patch_on("svc_break") && std::string(modules_.back().name()) == "sdk") {
+        std::uint32_t nop_insn = 0xD503201Fu; // NOP
+        if (!mem_.write(0x83b0bba4ull, &nop_insn, 4, error)) {
+            error = std::string("falha ao patchar svc #0x26 em 0x83b0bba4: ") + error;
+            return false;
+        }
+        std::fprintf(stderr,
+            "[svc-patch] sdk: 0x83b0bba4 svc #0x26 -> NOP (evita svcBreak)\n");
+    }
+
+    // Patch do epílogo de AbortImpl em 0x8390d1e8: `b self; udf` é substituído
+    // por `ldp x29, x30, [sp], #16; ret` para que AbortImpl retorne normalmente
+    // ao seu chamador em vez de entrar em loop infinito. Isto restaura o ponteiro
+    // de frame e o link register salvos no prólogo (0x8390d1d0) e devolve o
+    // controlo ao código que chamou AbortImpl.
+    if (sdk_patch_on("abort_epi_rt") && std::string(modules_.back().name()) == "sdk") {
+        // `add sp, sp, #0x10` desfaz o `stp x29, x30, [sp, #-16]!` do prólogo
+        // (0x8390d1d0), restaurando o stack pointer. `ret` volta ao endereço
+        // guardado em x30 pelo `bl 0x8390d1d0` do chamador. Isto evita o ciclo
+        // infinito que o `ldp x29, x30, [sp], #16` + `ret` causava (o `ret`
+        // voltava a x30 = 0x8390d1e8, o próprio `ldp`).
+        std::uint32_t add_sp_insn = 0x910013FFu;  // add sp, sp, #0x10
+        std::uint32_t ret_insn = 0xD65F0000u;     // ret
+        if (!mem_.write(0x8390d1e8ull, &add_sp_insn, 4, error)) {
+            error = std::string("falha ao patchar add sp em 0x8390d1e8: ") + error;
+            return false;
+        }
+        if (!mem_.write(0x8390d1ecull, &ret_insn, 4, error)) {
+            error = std::string("falha ao patchar ret em 0x8390d1ec: ") + error;
+            return false;
+        }
+        std::fprintf(stderr,
+            "[abort-epilogue-patch] sdk: 0x8390d1e8 b self->add sp,#0x10; 0x8390d1ec udf->ret\n");
+    }
+
     return true;
 }
 
@@ -565,13 +1011,23 @@ bool GuestProgram::patch_all(std::string& error) {
 }
 
 std::uint64_t GuestProgram::entry_point() const {
-    // O rtld é o entry point real. O `main` tem zero SVC (medido): é código
-    // que só corre depois de o rtld ter preparado tudo, e o seu entry point
-    // não é o ponto de entrada do programa.
+    // **Boot natural: o rtld corre PRIMEIRO.** É o que a Switch faz: o
+    // crt0 pré-carrega `rtld.elf` e salta para a sua entrada com x0=0 (a
+    // cadeia fria, REA: /tmp/opencode/rea_rtld/functions/entry — cp a
+    // bss, processa as .rela.dyn RELATIVE do próprio rtld, percorre o
+    // espaço com QueryMemory à procura das magics MOD0, relocaliza os
+    // módulos e, só então, chama `nn::init::Start` via PLT). O main com
+    // as relocações feitas à mão era o arranque imposto ao rtld por
+    // trás das costas — e o cabeçalho NSO (0x100 sobre o texto real)
+    // era o caminho antigo (e errado).
+    //
+    // SEM o header (0x100) mapeado, o texto real começa em
+    // base + segments[kNsoText].vaddr.
     for (const auto& m : modules_) {
         if (m.kind == GuestModule::kRtld)
             return m.vaddr_base + m.nso.segments[kNsoText].vaddr;
     }
+    // Fallback (sem rtld, ex. testes): a entrada do main.
     for (const auto& m : modules_) {
         if (m.kind == GuestModule::kMain)
             return m.vaddr_base + m.nso.segments[kNsoText].vaddr;

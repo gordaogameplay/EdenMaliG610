@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace g610 {
@@ -74,6 +75,112 @@ struct NsoHeader {
 };
 static_assert(sizeof(NsoHeader) == 0x100, "NsoHeader tem de ter 0x100 bytes");
 #pragma pack(pop)
+
+// ---------------------------------------------------------------------------
+// Secção dinâmica do NSO (DT_* entries).
+//
+// Os NSOs da Switch armazenam uma secção dinâmica semelhante à de um ELF64,
+// com entradas de 16 bytes (tag + valor). Não há secção .rela.dyn no formato
+// ELF tradicional: as relocations vivem numa tabela apontada por DT_RELA,
+// e os símbolos por DT_SYMTAB/DT_STRTAB/DT_HASH.
+//
+// A localização da secção dinâmica é encontrada através da estrutura MOD0:
+//   1. image[4]        = offset para a estrutura MOD0 (tipicamente 8)
+//   2. image[mod0+0]   = magic "MOD0" (0x30444F4D)
+//   3. image[mod0+8]   = MOD0[1], offset da secção dinâmica (relativo ao base do módulo, menos 8)
+//   4. dyn_offset      = 8 + MOD0[1]
+//
+// Todas as offsets na secção dinâmica e nas tabelas de símbolos são
+// relativas ao base do módulo (vaddr 0 da imagem).
+// ---------------------------------------------------------------------------
+
+enum DynTag : std::uint64_t {
+    DT_NULL          = 0,
+    DT_RELA          = 7,
+    DT_RELASZ        = 8,
+    DT_RELAENT       = 9,
+    DT_STRTAB        = 5,
+    DT_SYMTAB        = 6,
+    DT_HASH          = 4,
+    DT_STRSZ         = 10,
+    DT_SYMENT        = 11,
+    DT_PLTGOT        = 3,
+    DT_JMPREL        = 23,
+    DT_PLTRELSZ      = 2,
+    DT_PLTREL        = 20,
+    DT_FLAGS         = 0x6FFFFFF9ull,
+    DT_AARCH64_FLAGS = 0x6FFFFEF5ull,
+};
+
+// Tipos de relocação (formato NSO, observados no rtld real).
+enum RelType : std::uint32_t {
+    R_RELATIVE   = 0x403, // *target = module_base + addend
+    R_ABS64      = 0x101, // *target = symbol_addr + addend
+    R_ABS32      = 0x102, // *(uint32_t*)target = (uint32_t)(symbol_addr + addend)
+    R_JUMP_SLOT  = 0x402, // *GOT = symbol_addr - got_page_base (formato NSO)
+};
+
+struct DynEntry {
+    std::uint64_t tag;
+    std::uint64_t val;
+};
+
+#pragma pack(push, 1)
+struct Elf64Sym {
+    std::uint32_t st_name;   // índice na DT_STRTAB
+    std::uint8_t  st_info;   // tipo + bind
+    std::uint8_t  st_other;  // visibilidade
+    std::uint16_t st_shndx;  // secção (0 = indefinido)
+    std::uint64_t st_value;  // endereço relativo ao base do módulo
+    std::uint64_t st_size;   // tamanho
+};
+static_assert(sizeof(Elf64Sym) == 0x18, "Elf64Sym tem de ter 24 bytes");
+
+struct Elf64Rela {
+    std::uint64_t r_offset;  // offset relativo ao base do módulo
+    std::uint64_t r_info;    // símbolo (bits 63:32) | tipo (bits 31:0)
+    std::int64_t  r_addend;  // addendo
+};
+static_assert(sizeof(Elf64Rela) == 0x18, "Elf64Rela tem de ter 24 bytes");
+#pragma pack(pop)
+
+// Localiza o offset da secção dinâmica através da estrutura MOD0.
+std::uint64_t find_dynamic_offset(const std::vector<std::uint8_t>& image);
+
+// Faz parse das entradas DT_* a partir do offset da secção dinâmica.
+std::vector<DynEntry> parse_dynamic(const std::vector<std::uint8_t>& image,
+                                    std::uint64_t dyn_offset);
+
+// Constrói um mapa nome->endereço (relativo ao base do módulo) a partir da
+// secção dinâmica de um único módulo.
+std::unordered_map<std::string, std::uint64_t> build_symbol_map(
+    const std::vector<std::uint8_t>& image,
+    const std::vector<DynEntry>& dyn);
+
+// Processa todas as relocações de um módulo sobre o seu buffer `image`.
+// `module_base` é o endereço onde o módulo será carregado no guest.
+// `global_symbols` contém nomes já resolvidos de outros módulos.
+// Retorna false e preenche `error` apenas em caso de erro estrutural;
+// símbolos não resolvidos são reportados mas não falham a carga.
+bool relocate_module(
+    std::vector<std::uint8_t>& image,
+    std::uint64_t module_base,
+    const std::vector<DynEntry>& dyn,
+    const std::unordered_map<std::string, std::uint64_t>& global_symbols,
+    std::string& error);
+
+// Processa apenas as relocações JUMP_SLOT (tipo 0x402) da tabela DT_JMPREL.
+// Escreve em cada entrada da GOT o valor symbol_addr - got_page_base, de modo
+// que o stub PLT (ADRP+LDR+ADD+BR) possa reconstituir o endereço absoluto.
+// got_page_base = (module_base + DT_PLTGOT_val) & ~0xFFF, isto é, a página
+// que o ADRP de cada stub PLT carrega. Símbolos não resolvidos são reportados
+// mas não falham a carga.
+bool process_jump_slot(
+    std::vector<std::uint8_t>& image,
+    std::uint64_t module_base,
+    const std::vector<DynEntry>& dyn,
+    const std::unordered_map<std::string, std::uint64_t>& global_symbols,
+    std::string& error);
 
 // Flags do NSO. Bit N = segmento N comprimido. Confirmado em
 // src/core/loader/nso.cpp do Eden: `return ((flags >> segment_num) & 1) != 0;`

@@ -1,0 +1,31 @@
+ M CMakeLists.txt
+ M PROGRESSO.md
+ M docs/RELATORIO_GHIDRA_REA_PIXELS.md
+ M include/g610/eden_bridge.hpp
+ M include/g610/native_engine.hpp
+ M include/g610/nso_loader.hpp
+ M include/g610/svc_dispatcher.hpp
+ M src/eden_bridge.cpp
+ M src/g610_call_guest.S
+ M src/guest_program.cpp
+ M src/ipc_min.cpp
+ M src/native_engine.cpp
+ M src/nso_loader.cpp
+ M src/services/vi.cpp
+ M src/svc_dispatcher.cpp
+ M tests/boot_trace.cpp
+ M vendor/eden/core/hle/service/lm/lm.cpp
+?? 0_total=0
+?? PROMPT_CONTINUACAO.md
+?? build_asan/
+?? docs/ANALISE_ESTADO_2026-10-29.md
+?? g610-telemetry/doctor.csv
+?? g610-telemetry/doctor_0.json
+?? g610-telemetry/fase0/
+?? g610-telemetry/rlogs/
+?? rtld_natural
+?? src/gpu/maxwell_translator.cpp.bak
+?? src/services/binder.cpp.bak
+?? src/services/nvdrv.cpp.bak
+?? src/svc_dispatcher.cpp.bak
+?? src/svc_dispatcher.cpp.trunc-runO

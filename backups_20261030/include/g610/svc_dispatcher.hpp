@@ -1,0 +1,856 @@
+// SPDX-FileCopyrightText: Copyright 2026 gordaogameplay
+// SPDX-License-Identifier: GPL-3.0-or-later
+// EdenMaliG610 — despachante de SVC.
+//
+// A execução nativa funciona assim: o binário ARM64 do jogo corre tal e qual no
+// Cortex-A76, em modo de utilizador. Não há JIT nem intérprete. A única coisa
+// que é interceptado é o `SVC` — a instrução com que o guest chama o sistema.
+//
+// Quando o patcher StaticPatcher encontra um `SVC #imm` na carga do programa,
+// reescreve-o para `BRK #imm`. O `BRK` gera uma excepção, o tratador de sinais
+// identifica o número, chama este despachante, e regressa ao guest com
+// `svc_return`. O registo x0 em modo de saída é o resultado.
+//
+// O ganho sobre um JIT não é "executar mais depressa" — é não executar trabalho
+// de tradução em lado nenhum. O que resta no caminho são estes SVC.
+//
+// Este ficheiro implementa os serviços de controlo do Horizon OS. Os serviços
+// basados em porta (nvdrv, vi, am, audio, ...) são encaminhados para o
+// SvcRegistry e respondidos pelo motor de IPC.
+#pragma once
+
+#include "g610/guest_memory.hpp"
+#include "g610/kobject.hpp"
+
+#include <cstdint>
+#include <cstdint>
+#include <cstdio>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <ucontext.h>
+
+#include "g610/telemetry.hpp"
+
+namespace g610 {
+
+// Heap por omissão quando não há programa ligado. Dentro dos 39 bits e longe
+// do zero, porque devolver 0 faz o guest faultar no primeiro acesso.
+inline constexpr std::uint64_t kDefaultHeapBase = 0x0000'0000'9000'0000ull;
+
+// Prioridade da thread principal quando o NPDM nao diz nada.
+//
+// O libnx diz que 0x2C e' "a prioridade habitual da thread principal"
+// (thread.h:39). E' um valor de referência, nao uma medicao: se o NPDM
+// trouxer `main_thread_priority`, usa-se essa.
+inline constexpr std::uint32_t kDefaultMainPriority = 0x2C;
+
+// Núcleos virtuais que o guest vê. O Eden: `Core::Hardware::NUM_CPU_CORES`
+// (`hardware_properties.h:18`) = 4. O host (RK3588) tem 8; o guest vê 4,
+// como no Switch.
+inline constexpr std::uint32_t kVirtualCoreCount = 4;
+
+// A máscara de núcleos do processo. Um processo de jogo tem todos: os bits
+// de `KCapabilities::m_core_mask` são todos posts no arranque.
+inline constexpr std::uint64_t kProcessCoreMask = 0xF;
+
+// O handle pseudo da thread corrente, no Eden (`kobject.hpp`): -2.
+inline constexpr std::uint64_t kCurrentThreadHandle = 0xFFFFFFFFFFFFFFFEull;
+
+// Threads livres que o processo pode criar. O Eden nao impõe um limite ao
+// nosso motor — nao temos scheduler — mas o SDK le este numero ANTES de criar
+// threads, e zero e' uma resposta que o faria desistir.
+inline constexpr std::uint64_t kFreeThreadCount = 0x3E;
+
+// Números de SVC do Horizon OS (ABI Nintendo). Só os que este motor
+// implementa directamente; o resto devolve Result::Unsupported.
+// Números de serviço.
+//
+// FONTE: src/core/hle/kernel/svc.h do Eden (enum SvcId), que é a implementação
+// de referência. Copiados de lá, não de memória nem de documentação
+// secundária — e a diferença importa: a versão anterior deste ficheiro tinha
+// ExitProcess = 0x03 quando o valor real é 0x07, e GetSystemTick = 0x6E quando
+// é 0x1E. Com números errados, um SVC do rtld caía no `default` e o guest
+// recebia "não implementado" para uma chamada que devia funcionar — sem
+// qualquer erro visível, só um arranque que não acontece.
+//
+// Nomes não implementados ainda assim estão listados: o patcher e a
+// telemetria precisam de saber que o número é conhecido, mesmo que o
+// comportamento ainda não exista.
+enum class Svc : std::uint32_t {
+    SetHeapSize          = 0x01,
+    SetMemoryPermission  = 0x02,
+    SetMemoryAttribute   = 0x03,
+    MapMemory            = 0x04,
+    UnmapMemory          = 0x05,
+    QueryMemory          = 0x06,
+    ExitProcess          = 0x07,
+    CreateThread         = 0x08,
+    StartThread          = 0x09,
+    ExitThread           = 0x0A,
+    SleepThread          = 0x0B,
+    GetThreadPriority    = 0x0C,
+    SetThreadPriority    = 0x0D,
+    GetThreadCoreMask    = 0x0E,
+    SetThreadCoreMask    = 0x0F,
+    GetCurrentProcessorNumber = 0x10,
+    SignalEvent          = 0x11,
+    ClearEvent           = 0x12,
+    MapSharedMemory      = 0x13,
+    UnmapSharedMemory    = 0x14,
+    CreateTransferMemory = 0x15,
+    CloseHandle          = 0x16,
+    ResetSignal          = 0x17,
+    WaitSynchronization  = 0x18,
+    CancelSynchronization = 0x19,
+    ArbitrateLock        = 0x1A,
+    ArbitrateUnlock      = 0x1B,
+    WaitProcessWideKeyAtomic = 0x1C,
+    SignalProcessWideKey = 0x1D,
+    GetSystemTick        = 0x1E,
+    ConnectToNamedPort   = 0x1F,
+    SendSyncRequestLight = 0x20,
+    SendSyncRequest      = 0x21,
+    SendSyncRequestWithUserBuffer = 0x22,
+    SendAsyncRequestWithUserBuffer = 0x23,
+    GetProcessId         = 0x24,
+    GetThreadId          = 0x25,
+    // 0x26 (`Break`): aborta o processo — `nn::diag::detail::AbortImpl`.
+    // Argumentos: x0 = BreakReason, x1 = ponteiro para dados de diagnóstico,
+    // x2 = tamanho desses dados. No hardware nunca retorna; o processo morre.
+    // No nosso motor, `svc_break` faz o diagnóstico (veja src/svc_dispatcher.cpp)
+    // e devolve Success; o PC avança 4, o `ret` seguinte volta para LR
+    // (`b 0x8390d1e8` — loop de abort do guest).
+    Break                = 0x26,
+    OutputDebugString    = 0x27,
+    // 0x28 (`ReturnFromException`): sai de um exception handler. No hardware
+    // nunca retorna; restaura o contexto da exceção e salta para um novo PC.
+    // No nosso motor, sem contexto de exceção salvo, devolve Success e avança
+    // PC em 4; o `ret` seguinte volta para LR.
+    ReturnFromException  = 0x28,
+    GetInfo              = 0x29,
+    FlushEntireDataCache = 0x2A,
+    FlushDataCache       = 0x2B,
+    MapPhysicalMemory    = 0x2C,
+    UnmapPhysicalMemory  = 0x2D,
+    // O arbiter de endereços (Eden, `svc/svc_address_arbiter.cpp`). O mutex
+    // do nn::os constrói-se sobre estes dois SVC — **medido** no módulo sdk:
+    // o Lock (0x83ab1c60) chama `WaitForAddress(word, WaitIfEqual, 1, -1)` e
+    // o Unlock (0x83ab1ad0) acorda com `SignalToAddress(word,
+    // SignalAndModifyByWaitingCountIfEqual, 1, 1)`. Sem o par, o lock lento
+    // do SDK recebe "não implementado" no x0 (`Unsupported` = 0x40) e o jogo
+    // aborta com `Break(payload 0x40)` — exactamente o que a runL de 23/10
+    // mostrou (o quadro `sdk 0x83ab1dc4` é o fim do `Lock`).
+    WaitForAddress  = 0x34,
+    SignalToAddress = 0x35,
+};
+
+
+// Códigos de resultado do Horizon. O guest verifica estes valores, portanto a
+// semântica importa: devolver 0 é sucesso, qualquer outro é erro.
+//
+// **E o VALOR importa tanto como a semântica.** O guest conhece os Results
+// do Eden, e um Result que ele não reconhece é fatal — o SDK aborta.
+//
+// **Medido** (`boot_p6q.log`): o `SetMemoryAttribute` devolveu o `Invalid`
+// desta tabela (o valor **inventado** 0x1), e o SDK foi logo ao
+// `SetTerminateResult(0x1)` e ao `Break`. O erro era verdadeiro (o
+// endereço 0 não está no espaço do processo), mas o **Result** não era um
+// Result: o Eden devolveria `ResultInvalidCurrentMemory` (54273), que o
+// SDK sabe ignorar. A diferença entre 1 e 54273 foi a diferença entre o
+// jogo morrer e o jogo continuar.
+//
+// Por isso os valores são os do Eden (`core/hle/kernel/svc_results.h`):
+// o módulo do kernel é 1 (`ErrorModule::Kernel`), e o valor no fio é
+// `descrição << 9 | 1`.
+enum class Result : std::uint32_t {
+    Success              = 0,
+    // `ResultInvalidAddress` (desc 102), `ResultInvalidSize` (101),
+    // `ResultInvalidCurrentMemory` (106), `ResultInvalidCombination` (116),
+    // `ResultInvalidHandle` (114), `ResultInvalidState` (125),
+    // `ResultInvalidPointer` (115), `ResultOutOfResource` (103),
+    // `ResultOutOfMemory` (104), `ResultNotFound` (121), `ResultBusy` (122),
+    // `ResultNotImplemented` (33), `ResultOutOfRange` (119),
+    // `ResultLimitReached` (132).
+    InvalidAddress       = (102u << 9) | 1u,
+    InvalidSize          = (101u << 9) | 1u,
+    InvalidCurrentMemory = (106u << 9) | 1u,
+    InvalidCombination   = (116u << 9) | 1u,
+    InvalidHandle        = (114u << 9) | 1u,
+    InvalidState         = (125u << 9) | 1u,
+    InvalidPointer       = (115u << 9) | 1u,
+    // `ResultInvalidNewMemoryPermission` (desc 108) — o Eden devolve-o
+    // quando as permissões de uma memória não são válidas
+    // (`svc_transfer_memory.cpp`, `IsValidTransferMemoryPermission`).
+    InvalidNewMemoryPermission = (108u << 9) | 1u,
+    OutOfResource        = (103u << 9) | 1u,
+    OutOfMemory          = (104u << 9) | 1u,
+    NotFound             = (121u << 9) | 1u,
+    Busy                 = (122u << 9) | 1u,
+    NotImplemented       = (33u  << 9) | 1u,
+    OutOfRange           = (119u << 9) | 1u,
+    LimitReached         = (132u << 9) | 1u,
+    // O `Unsupported` (0x40) **não** é um Result do Eden: é o marcador do
+    // motor para "esta SVC não está implementada". O guest trata-o como
+    // fatal — e é o que deve acontecer, porque uma SVC em falta é um
+    // buraco no emulador, não um erro de runtime do jogo.
+    Unsupported           = 64,
+    // `ResultTimedOut` do Eden (`svc_results.h:30`): modulo Kernel (1),
+    // descricao 117. Vale 1 | (117 << 9) = 0xEA01.
+    //
+    // E' o que o `WaitSynchronization` devolve quando o prazo expira sem
+    // nada acontecer — e o que o SDK sabe interpretar.
+    TimedOut              = 1 | (117 << 9),
+    // `ResultInvalidCoreId` do Eden (`kernel/svc_results.h:26`): módulo
+    // Kernel (1), descrição 113.
+    InvalidCoreId         = 1 | (113 << 9),
+    // `ResultInvalidPriority` do Eden (`kernel/svc_results.h:25`): modulo
+    // Kernel (1), descricao 112.
+    InvalidPriority       = 1 | (112 << 9),
+    // `ResultInvalidEnumValue` do Eden (`kernel/svc_results.h:33`): módulo
+    // Kernel (1), descricao 120. O arbiter (0x34/0x35) devolve-o quando o
+    // ArbitrationType/SignalType sai da enumeracao — é o unico Result
+    // restante do par que o guest consulta.
+    InvalidEnumValue      = (120u << 9) | 1u,
+};
+
+// Contexto de um SVC. x0–x5 são os argumentos (o kernel do Switch passa-os
+// pela x0 e pela x1..x5); o resultado é escrito em x0 ao regressar.
+struct SvcContext {
+    // x0-x5: os argumentos do serviço, pela ABI do Switch. São os únicos que
+    // o despachante usa para decidir o que fazer.
+    std::uint64_t x[6]  = {};
+
+    // gpr[0..30]: TODOS os registos do guest no momento da chamada.
+    //
+    // Existe para diagnóstico, e a distinção importa. Ler `x[18]` quando o
+    // que se quer é o registo x18 é um erro que já foi cometido: `x` só tem 6
+    // entradas, e `x[18]` lê memória a seguir ao struct — que num processo com
+    // outros dados dá valores plausíveis e completamente falsos.
+    //
+    // Foi o que aconteceu ao diagnosticar o arranque do rtld: os registos
+    // "contenham ASCII" e pareceu uma pistaChanged até perceber que o ASCII
+    // vinha do meu próprio heap.
+    std::uint64_t gpr[31] = {};
+
+    // Ponteiro para o ucontext do guest (definido pelo motor antes do dispatch).
+    // Serviços como ReturnFromException precisam alterar o PC do guest.
+    ucontext_t*   guest_uc = nullptr;
+
+    std::uint64_t ret   = 0; // valor devolvido em x0
+
+    // O serviço pôs `ret`? Então NÃO é um Result a escrever por cima.
+    //
+    // Na ABI do Switch, x0 tanto pode ser um Result (a maioria dos serviços)
+    // como um VALOR de retorno (SetHeapSize devolve o endereço do heap,
+    // GetSystemTick devolve o tick, CloseHandle devolve o handle).
+    //
+    // Sem esta distinção, `ctx.ret = resultado` no fim de `dispatch()`
+    // deitava fora o valor que o serviço tinha posto — e o `SetHeapSize`
+    // devolvia 0 em vez do endereço do heap.
+    bool          has_ret = false;
+    std::uint64_t pc    = 0; // PC do guest, para diagnóstico
+    std::uint64_t sp    = 0; // sp do guest
+    bool          threaded = true;
+};
+
+std::string to_string(Svc s);
+std::string to_string(Result r);
+
+// ---------------------------------------------------------------------------
+// Serviço de porta.
+//
+// `nvdrv` é o que interessa à GPU: é por aí que o driver NVIDIA do Switch
+// recebe os comandos Maxwell. A tradução para Valhall acontece a jusante.
+// ---------------------------------------------------------------------------
+struct PortService {
+    std::string name;
+    std::uint32_t handle = 0;
+    bool         connected = false;
+};
+
+// ---------------------------------------------------------------------------
+// Despachante.
+// ---------------------------------------------------------------------------
+// Uma região do espaço do guest tal como o kernel do Switch a descreve.
+//
+// Não é abstracção: é o que `svcQueryMemory` devolve ao guest, e o rtld
+// decide o que fazer com ela a partir de DOIS campos — `state` e
+// `permission`. As permissões e os estados abaixo são os valores que o Eden
+// declara em `svc_types.h:19-24` e `47-52`.
+//
+// Um R-X com state=Code é o que o rtld trata como módulo: em cada um deles
+// lê um cabeçalho `MOD0` e extrai as tabelas de símbolos. Todo o resto é
+// ignorado.
+struct GuestRegion {
+    std::uint64_t base = 0;
+    std::uint64_t size = 0;
+    std::uint32_t state = 0;       // MemoryState
+    std::uint32_t permission = 0;  // MemoryPermission
+
+    // MemoryState (Eden, svc_types.h:19-43)
+    static constexpr std::uint32_t kFree        = 0x00;
+    static constexpr std::uint32_t kStatic      = 0x02;
+    static constexpr std::uint32_t kCode        = 0x03;
+    static constexpr std::uint32_t kNormal      = 0x05;
+    static constexpr std::uint32_t kIpc         = 0x0A;
+    static constexpr std::uint32_t kStack       = 0x0B;
+    static constexpr std::uint32_t kThreadLocal = 0x0C;
+
+    // MemoryPermission (Eden, svc_types.h:57)
+    static constexpr std::uint32_t kNone       = 0u;
+    static constexpr std::uint32_t kRead       = 1u << 0;
+    static constexpr std::uint32_t kWrite      = 1u << 1;
+    static constexpr std::uint32_t kExecute    = 1u << 2;
+    static constexpr std::uint32_t kReadOnly   = kRead;
+    static constexpr std::uint32_t kReadExec   = kRead | kExecute;
+    static constexpr std::uint32_t kReadWrite  = kRead | kWrite;
+};
+
+// O sistema do Eden, quando está ligado. Ver `attach_eden`.
+//
+// **Declarado no namespace, e não dentro de `SvcDispatcher`.** Declarado
+// dentro, seria `SvcDispatcher::EdenSystem` — um tipo diferente do
+// `g610::EdenSystem` que `eden_bridge.cpp` define, e o `unique_ptr` daria
+// "invalid application of sizeof to incomplete type" ao destruir. É o mesmo
+// erro do `KObjectNameGlobalData`, e pela mesma razão: uma declaração à
+// frente dentro de uma classe nomeia a classe, não o namespace.
+class EdenSystem;
+
+class SvcDispatcher {
+public:
+    // Declarado aqui e definido no `.cpp`, como o destructor: um construtor
+    // definido no cabeçalho tem de poder DESTRUIR os membros se algo
+    // disparar uma excepção a meio, e isso exige o `sizeof` do `EdenSystem`
+    // em cada translation unit.
+    explicit SvcDispatcher(tel::Telemetry& tel);
+
+    // Definido no `.cpp`, e não aqui.
+    //
+    // O `unique_ptr<EdenSystem>` tem de destruir um tipo que aqui só está
+    // declarado. O destructor implícito de `SvcDispatcher` seria gerado em
+    // EVERYWHERE este cabeçalho aparece — incluindo os testes, que não incluem
+    // `ia/eden_bridge.hpp` — e em cada um deles o `sizeof` de um tipo
+    // incompleto é um erro de compilação. Declarar o destructor aqui e
+    // defini-lo no `.cpp` é a forma de o `sizeof` só acontecer num sítio onde
+    // o tipo está completo.
+    ~SvcDispatcher();
+
+    // ── O sinal de "a GPU terminou" ───────────────────────────────────────
+    //
+    // O driver (`nvdrv`) chama isto no fim de uma submissão: o trabalho
+    // acabou, e o guest tem de ser acordado.
+    //
+    // **Medido**: o jogo bloqueia numa espera de *condition variable*
+    // (`WaitProcessWideKeyAtomic`, cv em `0x10a2c7d64`) e ninguém a
+    // acorda — e o `SignalProcessWideKey` do próprio jogo só acorda o
+    // que o *jogo* sinaliza, e o jogo está à espera do driver.
+    //
+    // O mecanismo é o do Eden (`SignalImpl`,
+    // `k_condition_variable.cpp:209-220`): a palavra do mutex passa a
+    // zero (liberta) e o *waiter* acorda **já dono**.
+    static void DespertarCvWaitersDoGuest();
+
+    // ── A fence: "o trabalho da GPU já acabou" ────────────────────────────
+    //
+    // O driver chama isto no fim de uma submissão. **Medido**: o jogo
+    // submete e *depois* espera — a espera vem depois da submissão, por
+    // isso o sinal tem de estar *pronto* quando o guest chega lá, e não
+    // ser um sinal主动 no momento da submissão.
+    //
+    // É a semântica da fence do upstream (`SubmitGPFIFOImpl`): o `valor`
+    // da fence devolve o syncpoint já incrementado, e o guest que espera
+    // por ele prossegue logo.
+    static void RegistarTrabalhoGpu();
+
+    // Acorda quem estiver à espera **numa chave de processo** (um
+    // endereço) — é o que o driver faz quando escreve num semáforo do
+    // guest: escreve o valor e acorda quem estava a olhar para ele.
+    //
+    // No Eden, o sinal do semáforo é `rasterizer->Query(...Payload...)`
+    // (`puller.cpp:ProcessSemaphoreTriggerMethod`): o valor é escrito
+    // na memória do guest e o syncpoint é sinalizado. O guest espera
+    // pelo semáforo com um futex sobre esse endereço — por isso o
+    // sinal tem de ser o do endereço.
+    static void AcordarFutexNoEndereco(std::uint64_t endereco);
+
+    // Acorda um waiter de cada fila de ArbitrateLock (mutex) e de cada
+    // cv_fila com waiters. Usado para romper deadlocks onde o dono de um
+    // mutex está estacionado numa cv, ou onde um sinal foi enviado para
+    // uma cv sem waiters enquanto threads esperam em outra cv.
+    void DespertarUmWaiterDeCadaFilaDeMutexECvs();
+
+    // Liga o espaço de endereçamento do guest.
+    //
+    // Sem isto, os SVC que recebem um endereço do guest (MapMemory,
+    // ConnectToNamedPort, GetInfo) desreferenciam-no directamente — e o
+    // resultado depende de o endereço cair ou não dentro de algum mapeamento
+    // do host. Num espaço de 39 bits isso dá SIGSEGV sem contexto, num
+    // endereço que não pertence a nada.
+    //
+    // A mesma limitação se aplica à LEITURA: `safe_copy_string` desreferencia
+    // um endereço do guest. Isso é seguro aqui porque o espaço do guest é
+    // realmente memória do host, mas é uma dependência implícita que fica
+    // explícita quando o despachante sabe qual é o espaço.
+    void bind_memory(GuestMemory* mem) noexcept { mem_ = mem; }
+    GuestMemory* memory() const noexcept { return mem_; }
+
+    // Liga a camada de IPC do Eden (o `sm:` a sério, as portas e as sessões).
+    //
+    // Devolve `false` — e fica tudo como estava — quando não há memória do
+    // guest ligada. É o caso dos testes que não montam um programa, e é
+    // melhor que uma falha: o dispatcher continua a responder com o caminho
+    // antigo, e o teste que estava a passar continua a passar.
+    //
+    // **Quando isto succeeds, `ConnectToNamedPort` e `SendSyncRequest` deixam
+    // de ser nossos.** Deixam de ser o `connect_named_port` (uma tabela
+    // handle→nome e quatro comandos de `sm` escritos à mão) e passam a ser o
+    // `KObjectName` e o `KClientSession` do Eden. Ver `vendor/eden/README.md`.
+    bool attach_eden(std::uint64_t pid, std::uint64_t tid);
+    bool eden_attached() const noexcept { return eden_ != nullptr; }
+    // Processa IPC pendente no EdenSystem deste dispatcher (usado por hooks static via g_dispatcher_atual).
+    void ProcessPendingIpcPendente();
+
+    // O sistema do Eden, quando ligado. Devolve referencia invalida se
+    // `attach_eden` nao foi chamado ou falhou. Usado para registar servicos
+    // (vi, nvdrv, ...) depois de o dispatcher estar completo.
+    EdenSystem& eden_system() noexcept;
+
+    // O handle da thread principal, no espaço de handles do Eden.
+    //
+    // Vai para o x1 do entry point do guest, que é onde o Eden o põe
+    // (`k_process.cpp:1006-1010`) e onde o SDK da Nintendo o lê.
+    std::uint32_t main_thread_handle() const noexcept;
+
+    // A base da TLS do guest, para o `KThread`.
+    //
+    // `KThread::GetTlsAddress` é o que o `KClientSession::SendSyncRequest`
+    // usa para encontrar a `MessageBuffer` — é por isso que este valor tem de
+    // chegar ao `EdenSystem` e não só ao `NativeEngine`.
+    //
+    // Vem depois de `attach_eden` porque a TLS só está montada depois de o
+    // programa estar carregado.
+    // (definido no .cpp: `EdenSystem` so esta completo la)")
+    //
+    // **E escreve aqui o handle da thread principal, em TLS+0x110.** É o Eden,
+    // medido (`k_process.cpp:1014`):
+    //
+    //     this->GetMemory().Write32(GetInteger(main_thread->GetTlsAddress()) + 0x110,
+    //                                thread_handle);
+    //
+    // E é o elo que faltava na cadeia toda:
+    //
+    //   1. o kernel escreve o handle em TLS+0x110
+    //   2. o rtld lê-o e passa-o no x1 do entry do `main`
+    //   3. o crt0 do SDK copia-o para `nn::os::detail::g_OsBootParamter`
+    //   4. o `SdkMutexType::TryLock` compara o dono do mutex com esse valor
+    //
+    // Se o passo 1 der zero, o passo 4 compara zero com zero — o valor de um
+    // mutex **livre** — e o SDK aborta a dizer que o mutex já é seu. Foi
+    // exactamente o que aconteceu, e o sintoma (`this == NULL`) não aponta
+    // para nada disto.
+    //
+    // **O mesmo handle que vai no x1** — o Eden usa uma variável para os dois,
+    // e é o que o loader espera.
+    void set_eden_tls(std::uint64_t endereco) noexcept;
+
+    // O TLS **da thread que está a fazer o pedido** — não o bloco base.
+    //
+    // **A resposta do IPC vai para aqui.** O Eden (`hle_ipc.cpp:330`):
+    //
+    //     memory.WriteBlock(thread->GetTlsAddress(), cmd_buf.data(), ...);
+    //
+    // e `thread` é a thread do **cliente** — a que fez o pedido. A casa
+    // tem **um só** `KThread` para todas as threads de guest, por isso o
+    // seu `GetTlsAddress()` tem de ser o da thread que está a pedir.
+    //
+    // **Medido**: sem isto, a resposta de uma thread de guest vai para o
+    // TLS da principal (0x88000000) — e o guest, que a lê do TLS *dela*
+    // (0x88004000), lê lixo. O sintoma é um abort do SDK com um erro de
+    // CMIF (modulo 10, desc 212): o leitor CMIF rejeita a resposta.
+    //
+    // A diferença para `set_eden_tls`: aqui **não** se mexe no `tls_base_`
+    // (a base de onde se tiram os TLS das threads novas) nem no handle da
+    // thread principal (que é de uma só).
+    void set_tls_da_thread(std::uint64_t endereco) noexcept;
+
+    // Onde começa o heap que SetHeapSize devolve.
+    //
+    // Vem do layout do programa (`g610::layout::kHeapBase`). Definir aqui
+    // separado permite ao despachante funcionar sem um programa — que é o
+    // caso dos testes, e o caso de um dia em que o heap seja gerido de outra
+    // forma.
+    void set_heap_base(std::uint64_t base) noexcept { heap_base_ = base; }
+
+    // O tamanho do heap do guest.
+    //
+    // **O SDK dimensiona o heap do jogo a partir do `GetInfo(21)`**
+    // (`TotalNonSystemMemorySize`), e o que pede no `SetHeapSize` tem de
+    // caber no que o motor mapeou. Por isso o valor tem de ser o do
+    // layout, e nao o da reserva inteira.
+    void set_heap_size(std::uint64_t size) noexcept { heap_size_ = size; }
+    std::uint64_t heap_base() const noexcept { return heap_base_; }
+
+    // A pilha do guest, para `GetInfo(StackRegionAddress/Size)`.
+    //
+    // Passado por setter como o heap, e nao lido de `layout::` directamente:
+    // `guest_program.hpp` inclui este header, e ler o layout aqui seria um
+    // include circular. A dependencia fica na mao de quem chama, que e quem
+    // sabe o layout.
+    // A região de alias, para `GetInfo(AliasRegionAddress/Size)`.
+    void set_alias_region(std::uint64_t base, std::uint64_t size) noexcept {
+        alias_base_ = base;
+        alias_size_ = size;
+    }
+
+    // A região ASLR: onde o código do processo está mapeado.
+    //
+    // **Não é o heap, e não é a região de alias.** No Eden
+    // (`svc_info.cpp:76-82`):
+    //
+    //     case InfoType::AslrRegionAddress:
+    //         *result = GetInteger(process->GetPageTable().GetAliasCodeRegionStart());
+    //     case InfoType::AslrRegionSize:
+    //         *result = process->GetPageTable().GetAliasCodeRegionSize();
+    //
+    // E uma versão anterior deste motor devolvia o **heap** em 12 e 13 — o
+    // que se vê no commentário de `case 16`, que fala de um `PersonalWordSize`
+    // que não existe em lado nenhum. A conta estava errada e o resultado
+    // também.
+    //
+    // A consequência medida: o SDK da Nintendo usa esta região para instalar
+    // o seu heap e o seu estado. Com o heap devolvido no sítio da região ASLR,
+    // o `nn::os::detail::g_OsBootParamter` do SDK ficava a zeros, e o
+    // `SdkMutexType::TryLock` comparava o dono do mutex (0, livre) com esse
+    // zero — concluía que o mutex já era seu, e abortava com `this == NULL`.
+    void set_aslr_region(std::uint64_t base, std::uint64_t size) noexcept {
+        aslr_base_ = base;
+        aslr_size_ = size;
+    }
+    std::uint64_t aslr_base() const noexcept { return aslr_base_; }
+    std::uint64_t aslr_size() const noexcept { return aslr_size_; }
+
+
+    // O que `GetInfo` responde a "TotalMemorySize" e "UsedMemorySize".
+    void set_memory_totals(std::uint64_t total, std::uint64_t used) noexcept {
+        mem_total_ = total;
+        mem_used_  = used;
+    }
+
+    // `SystemResourceSizeTotal` vem do NPDM (`system_resource_size`, 0x14).
+    void set_system_resource_size(std::uint64_t v) noexcept { system_resource_size_ = v; }
+
+    void set_stack_region(std::uint64_t base, std::uint64_t size) noexcept {
+        stack_base_ = base;
+        stack_size_ = size;
+    }
+
+    // A prioridade da thread principal, vinda do NPDM (`main_thread_priority`).
+    // E' o que `GetThreadPriority(handle 0)` devolve: handle 0 e' a thread
+    // corrente, e a thread corrente no arranque e' a principal.
+    void set_main_thread_priority(std::uint32_t p) noexcept { main_priority_ = p; }
+    std::uint32_t main_thread_priority() const noexcept { return main_priority_; }
+
+    // As regiões do espaço de endereçamento, por ordem de base.
+    //
+    // `svcQueryMemory` responde a partir desta tabela, e a resposta é o que o
+    // rtld usa para encontrar módulos: ele começa por interrogar o endereço
+    // 0 e vai avançando de `base + size` em `base + size`, aceitando uma
+    // região só se `state == Code` e `permission == Read|Execute`. Tudo o que
+    // não cumpra isso é saltado.
+    //
+    // Duas consequências, ambas medidas no rtld real (binário, offset 0x4cc):
+    //
+    //   - a tabela tem de cobrir o espaço SEM BURACOS. Um buraco devolveria
+    //     "Free" com base=0 e size=0, e o rtld parava de avançar.
+    //   - a primeira região tem de começar em 0, pelo mesmo motivo: a
+    //     primeira interrogação é ao endereço 0.
+    //
+    // Ver `GuestProgram::memory_regions()`.
+    void set_regions(std::vector<GuestRegion> regions) { regions_ = std::move(regions); }
+    const std::vector<GuestRegion>& regions() const noexcept { return regions_; }
+
+    // Liga a telemetria. Toda a chamada a dispatch() é cronometrada e
+    // atribuída ao slot do serviço correspondente — é esta atribuição que
+    // permite responder "qual serviço do Horizon está a custar mais".
+    void dispatch(std::uint32_t number, SvcContext& ctx);
+
+    // Portas de serviço nomeadas. Devolve um handle ou 0.
+    std::uint32_t connect_named_port(const std::string& name);
+
+    // A tabela de objectos. Substitui o contador `next_handle_`, que
+    // fabricava handles sem geração — e `linear_id == 0` é inválido pela
+    // regra do Eden, por isso nenhum deles era um handle a sério.
+    HandleTable handles_;
+    std::size_t vivos_ = 0;
+    const std::string& last_port() const noexcept { return last_port_; }
+
+    // O último comando IPC despachado, e quantos houve. O tracer usa isto
+    // para mostrar o que o guest perguntou — sem ele, "o jogo não arrancou" é
+    // a única informação que sobra.
+    const std::string& last_ipc() const noexcept { return last_ipc_; }
+    std::uint64_t sync_request_calls() const noexcept { return sync_request_calls_; }
+    void          close_handle(std::uint32_t handle);
+
+    // O jogo pediu para terminar?
+    bool exited() const noexcept { return exited_; }
+    int  exit_code() const noexcept { return exit_code_; }
+    std::uint64_t heap_size() const noexcept { return heap_size_; }
+
+    // Lê `size` bytes do espaço do guest. Devolve false se o endereço não
+    // pertencer à reserva — o que evita um SIGSEGV dentro de um handler de
+    // sinais, que é o pior sítio possível para um crash.
+    bool read_guest(std::uint64_t addr, void* dst, std::size_t size) const;
+
+    // Escreve no espaço do guest.
+    //
+    // Qualquer SVC que devolva dados TEM de passar por aqui: devolver um
+    // ponteiro para memória do host seria o host a escrever no sítio errado,
+    // e o guest leria lixo. O endereço é do guest — 39 bits — e a validação
+    // é a mesma que na leitura.
+    bool write_guest(std::uint64_t addr, const void* src, std::size_t size);
+
+    // Compara-e-troca uma palavra u32 do guest. O `esperado` é o valor
+    // que se via na leitura; a troca passa por ATOMICIDADE na memória do
+    // guest (o par LL/SC equivalente ao `__atomic_compare_exchange_n`
+    // que o `svc_wait_for_address` já usa no decremento).
+    //
+    // **Porquê**: o guest corre nativo e os loops de mutex/cv do SDK
+    // escrevem a MESMA palavra com pares LL/SC em paralelo. Uma escrita
+    // cega (`write_guest`) pode sobrescrever uma troca que o SDK fez no
+    // meio — e gerar estado fantasma (dono|waiters sem dono real): foi
+    // o congelamento da runL (svc #912, word 0x400081ff órfã).
+    bool cas_word_guest(std::uint64_t addr, std::uint32_t esperado,
+                        std::uint32_t novo);
+
+    // Escreve uma palavra do guest com CAS por tentativa (até 16). O
+    // `novo` é a DECISÃO do quadro (a fila já foi consumida antes) —
+    // nunca derivada da re-leitura: se a palavra mudou entretanto
+    // (acionamento do LL/SC do guest no meio), re-ler e trocar de novo.
+    // A reserva, esgotadas as trocas, é a escrita cega (liveness).
+    // Devolve false só se a memória deixou de estar acessível.
+    bool escrita_atomica_word(std::uint64_t addr, std::uint32_t novo);
+
+    // Repõe o estado de execução para um novo arranque.
+    //
+    // Sem isto, um `exited_` que ficou a true de uma execução anterior
+    // contamina a seguinte: o motor veria "o guest pediu para sair" num
+    // arranque que nem sequer chamou ExitProcess, e classificaria um fault de
+    // memória como saída limpa. Foi exactamente o que aconteceu nos testes —
+    // um falso "não chegou a chamar ExitProcess" num guest que levava um
+    // fault de propósito.
+    //
+    // As portas nomeadas NÃO são repostas: são estado do sistema, não do
+    // processo, e um `SetHeapSize` seguido de `ConnectToNamedPort` tem de ver
+    // o heap que o primeiro definiu.
+    void reset_run_state() {
+        exited_    = false;
+        exit_code_ = 0;
+        map_memory_calls_   = 0;
+        unmap_memory_calls_ = 0;
+        query_memory_calls_ = 0;
+    }
+
+    // **Um watchpoint** — pôr uma página do guest em so' leitura,
+    // para que a escrita do guest nela levante um SIGSEGV — e o
+    // motor reporte **quem** escreveu (o PC e os registos).
+    //
+    // E' a unica forma de descobrir **qual** das respostas do host
+    // encheu um campo do jogo (e no Eden nao encheria).
+    void ArmarWatchpoint(std::uint64_t endereco, std::uint64_t tamanho);
+
+    // **Armar o watchpoint depois do rtld** — o rtld escreve na
+    // pagina (as relocacoes), e o watchpoint dispararia nessa
+    // altura. O primeiro SVC e' do jogo — logo depois.
+    void ArmarWatchpointSePedir(std::uint64_t endereco, std::uint64_t tamanho);
+
+    // Chamadas de mapeamento desde o último reset.
+    //
+    // O rtld faz dezenas no arranque, e vê-las a crescer é a forma mais
+    // directa de saber que progrediu do loader até ao código do jogo. É uma
+    // métrica de progresso, não um detalhe interno.
+    std::uint64_t map_memory_calls()   const noexcept { return map_memory_calls_; }
+    std::uint64_t unmap_memory_calls() const noexcept { return unmap_memory_calls_; }
+    std::uint64_t query_memory_calls() const noexcept { return query_memory_calls_; }
+
+    // Vista apenas de leitura para o tracer (tests/boot_trace.cpp): o nome
+    // do servico que um handle de sessao serve. Consulta pura da mesa de
+    // objectos (sessao -> porta-mae -> nome); nada muda de estado.
+    std::string service_name_for_tracer(std::uint32_t handle) const {
+        return service_name_for_handle(handle);
+    }
+
+private:
+    // Cada grupo devolve Result; o resultado é escrito em ctx.ret.
+    Result svc_set_heap_size(SvcContext&);
+    Result svc_signal_process_wide_key(SvcContext&);
+    Result svc_wait_process_wide_key_atomic(SvcContext&);
+
+    // O arbiter de mutex do nn::os (passo 4). Semântica medida no Eden:
+    // `KConditionVariable::WaitForAddress` / `SignalToAddress`
+    // (k_condition_variable.cpp:116,156) e `svc_lock.cpp`. O Lock só
+    // estaciona quando o u32 em `addr` é `handle | 0x40000000`
+    // (HandleWaitMask, svc_common.h:19); o Unlock escreve o tag do próximo
+    // dono e desperta-o. As duas JUNTAS são o mutex: implementar uma sem a
+    // outra deixa as threads em loop como antes.
+    Result svc_arbitrate_lock(SvcContext&);
+    Result svc_arbitrate_unlock(SvcContext&);
+
+    // Arbiter de endereços (0x34/0x35). Semântica do Eden
+    // (svc/svc_address_arbiter.cpp → k_address_arbiter.cpp): o waiter é
+    // validado contra o valor lido e estacionado na fila do ENDEREÇO; o
+    // signal escreve o valor que o tipo manda e desperta até `count`
+    // waiters. É o par que o mutex do nn::os usa para acordar.
+    Result svc_wait_for_address(SvcContext&);
+    Result svc_signal_to_address(SvcContext&);
+    Result svc_break(SvcContext&);
+    Result svc_output_debug_string(SvcContext&);
+    Result svc_return_from_exception(SvcContext&);
+
+    Result svc_exit_process(SvcContext&);
+    Result svc_close_handle(SvcContext&);
+    Result svc_control_memory(SvcContext&);
+    Result svc_get_system_tick(SvcContext&);
+    Result svc_get_thread_id(SvcContext&);
+    Result svc_get_process_info(SvcContext&);
+    Result svc_connect_port(SvcContext&);
+    Result svc_get_process_id(SvcContext&);
+    Result svc_map_memory(SvcContext&);
+
+    Result svc_unmap_memory(SvcContext&);
+    Result svc_map_shared_memory(SvcContext&);
+    Result svc_create_transfer_memory(SvcContext&);
+    Result svc_set_memory_attribute(SvcContext&);
+    Result svc_query_memory(SvcContext&);
+
+    // `svcGetInfo`. O VALOR volta em x1, o Result em x0 — ver a
+    // implementacao para o porque de isso ser contra-intuitivo.
+    Result svc_get_info(SvcContext&);
+
+    // Entropia para `InfoType::RandomEntropy`. Reabre `/dev/urandom` a cada
+    // chamada: sao duas por arranque, e nenhum estado para gerir.
+    std::uint64_t random_u64();
+
+    // GetThreadPriority (0x0C). O valor volta em x1, como no GetInfo.
+    Result svc_get_thread_priority(SvcContext& ctx);
+
+    // SetThreadPriority (0x0D). Aceitar e' melhor que falhar: o guest trata
+    // um erro como motivo para abortar, e um stub transparente deixa-o
+    // seguir. A prioridade e' anotada para o relatorio.
+    Result svc_set_thread_priority(SvcContext& ctx);
+    Result svc_get_thread_core_mask(SvcContext& ctx);
+    Result svc_set_thread_core_mask(SvcContext& ctx);
+    Result svc_get_current_processor_number(SvcContext& ctx);
+    Result svc_create_thread(SvcContext& ctx);
+    Result svc_start_thread(SvcContext& ctx);
+
+    Result svc_unsupported(SvcContext&);
+
+    // ── IPC mínimo ────────────────────────────────────────────────────────
+    //
+    // O transporte do `sm:`. Ver `src/ipc_min.cpp` para o layout, que foi
+    // medido no pedido real e conferido contra `ipc.h` do Eden.
+    static constexpr std::size_t kIpcBufferMax = 0x200;
+
+    // Despacha um pedido e escreve a resposta no MESMO buffer do guest.
+    // Devolve false se não foi um pedido SMART válido.
+    bool ipc_dispatch(std::uint64_t buffer, std::size_t size);
+
+    // A geometria da resposta, lida de `IA_IPC_VARIANT`.
+    //
+    // Existe porque três palpites seguidos falharam e deduzir mais um ia ser
+    // adivinhar. Testam-se todas as combinações e vê-se qual deixa o guest
+    // avançar — que é uma forma de medir em vez de supor.
+    static int ipc_variant();
+
+    Result svc_send_sync_request(SvcContext& ctx);
+    // `WaitSynchronization(handles, num_handles, timeout_ns)`.
+    //
+    // A ABI, do Eden (`svc.cpp:1420`):
+    //
+    //     x0 = timeout em nanossegundos
+    //     x1 = ponteiro para o array de handles
+    //     x2 = numero de handles
+    //     saida: x0 = Result, x1 = o indice do handle sinalizado
+    Result svc_wait_synchronization(SvcContext& ctx);
+    Result svc_send_sync_request_light(SvcContext& ctx);
+
+    // Escreve uma resposta vazia com um Result — o "não sei responder" honesto.
+    void write_empty_reply(std::uint64_t buffer, std::size_t size, std::uint32_t result);
+
+    // Handle <-> nome de serviço. É a única "sessão" que existe: um handle é
+    // um inteiro e um nome, e nada mais. STUB declarado.
+    std::string service_name_for_handle(std::uint32_t handle) const;
+
+    // O objecto que um handle aponta, ou nullptr se o handle não for válido.
+    // `obter()` valida a forma, o índice e a geração.
+    KObject* object_for_handle(std::uint32_t handle) const;
+
+    static constexpr std::uint32_t kResultNotImplemented = 0x00040001;
+
+    std::string       last_ipc_;
+    std::uint64_t     sync_request_calls_ = 0;
+
+
+
+    tel::Telemetry& tel_;
+    GuestMemory* mem_ = nullptr;
+
+    // Ver `EdenSystem` acima, e `attach_eden`.
+    std::unique_ptr<EdenSystem> eden_;
+
+    // A tabela de regiões que `svcQueryMemory` consulta. Ver `set_regions()`.
+    std::vector<GuestRegion> regions_;
+    // Scratch reutilizável para as mensagens de erro de read_guest(). Não é
+    // const, e read_guest() é const porque é uma consulta.
+    mutable std::string g_err_scratch;
+    std::unordered_map<std::string, Handle> port_by_name_;
+    std::uint32_t    next_handle_ = 0x1000;
+    std::uint64_t    entropy_counter_ = 0x9E3779B97F4A7C15ull;
+    // A última porta a que o guest se ligou, para o relatório. STUB: não há
+    // IPC por trás do handle.
+    std::string       last_port_;
+
+    // `ConnectToNamedPort` fabrica handles a partir de 0x1000, só no caminho
+    // sem Eden. Com o Eden ligado os handles de sessão vêm da mesa dele.
+
+    std::uint64_t    mem_total_   = 0;
+    std::uint64_t    mem_used_    = 0;
+    std::uint64_t    system_resource_size_ = 0;
+    std::uint64_t    alias_base_   = 0;
+    std::uint64_t    alias_size_   = 0;
+
+    std::uint64_t    aslr_base_    = 0;
+    std::uint64_t    aslr_size_    = 0;
+    std::uint64_t    stack_base_   = 0;
+    std::uint64_t    stack_size_   = 0;
+    std::uint32_t    main_priority_ = 0;
+
+    // A máscara de núcleos e o "ideal core" da thread do guest, como o Eden
+    // os guarda (`KThread::m_core_mask`).
+    std::uint64_t    core_mask_ = kProcessCoreMask;
+
+    // A base do TLS da thread principal, e o contador de threads de guest
+    // criadas. Cada thread nova recebe a sua pagina de TLS.
+    std::uint64_t    tls_base_     = 0;
+    std::uint32_t    tls_threads_  = 0;
+    std::int32_t     core_id_   = 0;
+    std::int32_t     last_priority_ = 0;
+
+    // O id do processo e o da thread principal. Fixos: o SDK usa-os como
+    // chave do estado por-thread, e um id que muda entre chamadas faz o jogo
+    // achar que está numa thread diferente.
+    std::uint64_t    process_id_ = 1;
+    std::uint64_t    thread_id_  = 1;
+    std::uint64_t    heap_size_   = 0;
+    std::uint64_t    heap_base_   = 0;
+    std::uint64_t    map_memory_calls_   = 0;
+    std::uint64_t    unmap_memory_calls_ = 0;
+    std::uint64_t    query_memory_calls_ = 0;
+    bool             exited_      = false;
+    int              exit_code_   = 0;
+};
+
+} // namespace g610

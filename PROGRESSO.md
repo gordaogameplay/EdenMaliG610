@@ -342,3 +342,123 @@ Implementar a ligação do vsync ao caminho de apresentação do guest de forma 
 - Sem sinais artificiais nem `Success` para ocultar falhas.
 
 Requer determinar o endereço guest de `x20` (base do contexto de render) ou encontrar um mecanismo host que avance `x20+0x308` sem conhecer `x20` diretamente.
+
+---
+
+## EXPERIMENTO "BOOT NATURAL" — PASSOU (28/10/2026)
+
+> **Esta secção substitui como moldura atual as conclusões das secções anteriores**
+> (25/10: spin `0x805e706`, vsync→CV, produtor `x20+0x308`). Aquelas análises foram
+> feitas em **modo artefacto** (band-aids a forçar o guest para a frente). No boot
+> natural a cadeia fria é **o próprio rtld do jogo** a aplicar relocações, e o fluxo
+> até aqui é outro. As notas antigas continuam úteis como pano de fundo para fases
+> posteriores (caminho de display), **não** como fronteira atual.
+
+### O que foi aplicado (sem commit)
+
+1. `src/guest_program.cpp`: **sem** header NSO em memória (causa raiz da laça eterna
+   em `FUN_84461440` — probe MODO_0 quebrado); `entry_point()` devolve o **rtld
+   primeiro** (cadeia fria), fallback `main` sem +0x100.
+2. `src/g610_call_guest.S`: **x0 = xzr** (era `movz x0,#0x8800, lsl #16` — kTlsBase).
+   Evidência da run1: o `cmp x0,#0` do entry falhava → ramo quente → fail-arm
+   `CallSupervisor(0x28, 0xf801)` + spin `b .`@0x844610f8, svc_calls=1.
+3. `src/svc_dispatcher.cpp`: `svc_return_from_exception` deixa de forçar PC
+   (0x84461100 removido; mantém ret=0).
+4. `src/native_engine.cpp`: flag `natural_boot()` (por omissão ON; env
+   `G610_ARTIFACTS_BOOT=1` restaura o modo antigo); gates sobre relocações
+   heurísticas + NOPs do crt0; band-aids gated off (SIGSEGV stub-GOT / skip
+   low-addr / skip espaço guest; SIGILL auto-nop + pc+4; SIGALRM spin-advance +
+   patch `b #0`; o force pós-ReturnFromException; o early-return pc==0x844610fc).
+   Sampler no SIGALRM (só observação). SITES DE SAÍDA MANTIDOS: trap-limit /
+   kBrkForceStop / kBrkGuestReturned / paragem / ExitProcess → `recovery_pc` (não
+   são forcing de boot, são terminação de run).
+5. `tests/boot_trace.cpp`: escrutínio pós-boot (slots PLT/GOT lidos de memória) +
+   `--dumpaddr <vaddr>,<bytes>`.
+
+### Critérios SC1–SC5 — todos verificados (run3 = `boot_natural_run3.log`)
+
+| SC | Verificação | Evidência |
+|----|-------------|-----------|
+| SC1 ✓ | entrada rtld 0x84461000 com **x0=0**; cadeia fria executou; primeira svc = QueryMemory (não 0x28) | sem fail-arm; linha `[boot]` |
+| SC2 ✓ | 15 RELATIVE do rtld aplicados com valores esperados | +0x3180=0x844642b0, +0x3188=0x84461710, +0x3190=0x844642a0, +0x3198=0x844642a8, +0x31a0=0x84462624, +0x31a8=0x84465000, +0x31b8=0x84464008(&dynamic), +0x3218/22/260/268=0x84464280, +0x3270=0x8446376c, +0x3278=0x8446393c; nós da lista 0x84464280/88 self |
+| SC3 ✓ | PLT +0x3170 = **0x83a23c50** (nn::init::Start, sdk); fluxo entrou no SDK (GetInfo @0x83b0bbc0, SendSyncRequest, caminho mutex @0x83abc780) | escrutínio |
+| SC4 ✓ | main[0x24B5CA0] = **0x8246a8b0** (=0x80000000+0x246a8b0) — relocalizado **pelo próprio rtld**; nenhum motor escreveu .data | escrutínio |
+| SC5 ✓ | zero forçamentos de PC: 0 ocorrências de [patch]/[illeg]/SIGILL/[host-fault]/0x84461100 | run3 integral |
+
+### PAREDE 1 (fronteira atual) — ArbitrateLock (svc #0x1a)
+
+SVCs observados no run2 (21×, #44–64) e run3 (3×, #44–46), todos idênticos:
+`x0=0x1 x1=0x843ea4d0 x2=0x81ff x4=0x30ffffeb8 x30=0x83abc7e0`; palavra do mutex
+0x843ea4d0 no fim do run = **0x00000001**.
+
+**Disassembly do SDK real** (0x83abc780–0x83abc81c, módulo sdk descomprimido, base
+0x8378d000; artefacto: `/tmp/opencode/sdk_text_now.bin`):
+
+```
+w20 = [tpidrro_el0 → [x+0x1F8] → +0x1B0]   ; self tag do SDK
+CAS word ← w20 (0 → self tag); se word==0 → adquirido
+contenção (word≠0): CAS word → word|0x40000000 (bit 30)
+svc#0x1a: x0 = word & ~0x40000000   (= TAG DO DONO)
+          x1 = endereço do mutex
+          x2 = w20                  (= TAG DE SI MESMO)
+após acordar: ldaxr word; se (word&~0x40000000) == w20 → adquirido; senão re-loop
+```
+
+**Assinaturas autoritativas** (verificadas 28/10):
+- libnx `svc.h`: `Result svcArbitrateLock(u32 wait_tag, u32* tag_location, u32 self_tag);`
+  / `Result svcArbitrateUnlock(u32* tag_location);` (0x1A / 0x1B)
+- SwitchBrew (wiki/SVC): ArbitrateLock — **(In) W0: Handle\<Thread\> ThreadHandle**,
+  X1: void\* Address, W2: uint32_t Tag. ArbitrateUnlock — X0: address.
+- Referência vendored: `vendor/eden/core/hle/kernel/svc/svc_lock.cpp:15` →
+  'KConditionVariable::WaitForAddress'; regra do Eden ("se a tag não for o handle
+  com a máscara de espera, acabou"): só estaciona quando
+  `test_tag == (handle | HandleWaitMask=0x40000000)`.
+
+**Estado do motor**: a leitura de argumentos do dispatcher (`handle=x0, addr=x1,
+tag=x2`) está **correta**; `kArbWaitMask=0x40000000` correto; o caminho de park
+existe e é Eden-faithful; o `svc_arbitrate_unlock` (l.2340) já faz a transferência
+completa (escreve a tag do acordado na palavra + desperta). A paragem aconteceu
+em runs recentes sem à luz do dia (sampler pegou a thread estacionada em
+`g_arbiter.wake.wait`, pc host `0xffff87821d6c`; o run desistiu aos ~4 s).
+
+**Pergunta empírica em aberto** (decide a correção, sem hardcode):
+- A palavra que o engine vê em cada svc (=x0&~mask implica 1 ou 0x40000001) nunca
+  concretizou a condição de park no fast-path nas iterações observadas; a palavra
+  pós-run é 1 **sem bit30** — alguém deu a volta ao bit 30 entre o `stlxr` do SDK
+  e a leitura do engine, ou o engine nunca chega ao ramo de park. O instrumento
+  existe: com `IA_WORD_TRACE=1` o ramo de park imprime `word` e a vizinhança
+  (±0x40); com `IA_THREAD_TRACE=1` saem `[thrd] LPAUSA/LACORDEI/DLOCK`.
+- Em sessões de artefacto antigas, as famílias de palavra medidas foram
+  `0x0 / 0x00020003 / 0x000081ff / 0x400081ff / 0x40020003` — a tag 0x81ff é
+  recorrente e o protocolo word/tag casa com o que o SDK disassembled mostra.
+
+**Próximo passo concreto**: um run de diagnóstico
+`IA_WORD_TRACE=1 IA_THREAD_TRACE=1 timeout 8 ./build/g610_boot ...` — deduzir
+a partir de `word=` no ramo park se a cond. de estacionamento concretiza; só
+depois decidir a correção do dispatcher, e com evidência (nada de hardcode).
+
+### PAREDE 2 — SIGSEGV rc=139 no teardown
+
+Acontece em **todos** os runs, incluindo os pré-experimento e o naive. Fault addr
+0x0; dump mostra o TLS de bootstrap do guest (`magic=0x21545624 handle=0x1 obj=
+0x88200000 reent=0x88201000 tls_tp=0x84432bc0`). Não é introduzido pelo boot
+natural; problema de teardown separado, para olhar depois.
+
+### Artefactos STALE — não confiar
+
+`/tmp/opencode/rtld_text.dis` e `/tmp/opencode/rea_rtld/` vêm de uma dump antiga
+(era artefacto): endereços como 0x26e8/0x26fc NÃO batem certo com a imagem atual.
+Verdade atual: svc/BRK no rtld em 0x16e8(#6)/0x16fc(#0x26)/0x1704(#0x27)/
+0x170c(#0x28), dynstr ~0x26e0, MOD0 probe ~0x2018; imagem natural do rtld em
+`/tmp/opencode/rtld_now.bin`.
+
+### Como reproduzir
+
+```bash
+cmake --build build -j8 --target g610_boot
+./build/g610_boot /home/emuos/piDroid/pokemon/exefs
+# modo artefacto antigo: env G610_ARTIFACTS_BOOT=1
+```
+
+Logs da experiência: `/tmp/opencode/boot_natural_run{1,2,3}.log`; relatório
+completo em `g610-telemetry/rlogs/exp_boot_natural_20261028.md`.

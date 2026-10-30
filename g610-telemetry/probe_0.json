@@ -1,0 +1,28 @@
+{
+  "title_id": "0000000000000000",
+  "title": "probe",
+  "frames": 0,
+  "avg_fps": 0.00,
+  "avg_frame_ms": 0.000,
+  "dominant_bottleneck": "unknown",
+  "exec": {
+    "svc_calls": 0,
+    "page_faults": 0,
+    "alignment_faults": 0,
+    "illegal_instructions": 0,
+    "guest_instructions": 0
+  },
+  "gpu": {
+    "draw_calls": 0,
+    "triangles": 0,
+    "shaders_compiled": 0,
+    "shader_cache_hits": 0,
+    "shader_cache_misses": 0,
+    "submits": 0,
+    "gpu_faults": 0,
+    "device_lost": 0,
+    "texture_bytes": 0
+  },
+  "services_top": [
+  ]
+}

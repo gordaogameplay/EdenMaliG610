@@ -88,6 +88,19 @@ void ArmarWatchpointNoProximoTrap();
 // **A flag de re-armar** — ver `svc_dispatcher.cpp`.
 extern volatile bool g_rearmar_watchpoint;
 
+// Natural boot gate: true = boot natural (sem forçar PC), false = modo antigo com patches de PC.
+// Controlado por variável de ambiente G610_NATURAL_BOOT (padrão: true/ON).
+bool natural_boot() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("G610_NATURAL_BOOT");
+        if (e == nullptr || e[0] == '\0') return true;  // default ON
+        if (std::strcmp(e, "0") == 0 || std::strcmp(e, "false") == 0 || std::strcmp(e, "off") == 0)
+            return false;
+        return true;
+    }();
+    return enabled;
+}
+
 namespace {
 
 // Os hooks são file-scope porque um handler de sinais não sabe que thread o
@@ -1692,6 +1705,9 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         for (int i = 1; i < 6; ++i)
             G610_MCTX_REG(*uc, i) = c.x[i];
         G610_MCTX_REG(*uc, 0) = c.ret;
+        // Escreve x30 (LR) de volta, para que svc_break possa alterar o
+        // endereço de retorno (ex. saltar o `b self` de AbortImpl).
+        G610_MCTX_REG(*uc, 30) = c.gpr[30];
 
         // Repõe x18. O `ret` do guest clobbera o platform register, e o
         // próximo SVC que verificar a canary encontraria um valor diferente
@@ -1744,8 +1760,9 @@ void NativeEngine::handle_guest_signal(int sig, siginfo_t* info, void* raw,
         }
 
         // Saltar o BRK. O kernel honra esta escrita — medido em
-        // tests/probe_ucontext.cpp.
-        G610_MCTX_PC(*uc) = pc + 4;
+        // tests/probe_ucontext.cpp. Usar c.pc permite que svc_break altere
+        // o ponto de continuação (ex. saltar o `b self` de AbortImpl).
+        G610_MCTX_PC(*uc) = c.pc + 4;
         return;
     }
 

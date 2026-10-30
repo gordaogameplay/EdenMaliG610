@@ -20,3 +20,7 @@ build/
 
 # Python bytecode (gerado)
 __pycache__/
+.aider*
+
+# Artefatos de compilação ASAN
+build_asan/

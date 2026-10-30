@@ -548,3 +548,36 @@ O código do `main` acessa globais em endereços que estão fora de todos os seg
 **Bloqueador principal:** relocações do NSO não aplicadas. O módulo `main` não pode executar porque referências a símbolos importados apontam para endereços inválidos.
 
 **Próximo marco:** implementar suporte a relocações NSO para permitir que o `main` execute e faça chamadas IPC.
+
+## REA + Ghidra 12.1.4 com decompilador nativo AArch64 (28/10/2026)
+
+Instalação verificada: `/home/emuos/opt/ghidra` = Ghidra **12.1.4 PUBLIC** (`application.version=12.1.4`,
+build 20260921, sha256 do zip `ddac49f9…`, zip removido em 28/10).
+
+Ghidra não fornece binário nativo do decompilador para ARM64 host. Compilamos:
+
+```sh
+SRC=/home/emuos/opt/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp
+# lista exacta de fontes do binário `decompile` (gradle: decompile(NativeExecutableSpec)):
+awk '/decompile\(NativeExecutableSpec\)/,/sleigh\(NativeExecutableSpec\)/' \
+  /home/emuos/opt/ghidra/Ghidra/Features/Decompiler/build.gradle \
+  | grep 'include "' | sed 's/.*include "\(.*\)".*/\1/' | sort -u > sources.txt   # 79 ficheiros
+# compilar (cc1.sh = g++ -std=c++11 -w -O2 -c $f -o $(basename .o)) e ligar:
+g++ -O2 -o decompile *.o -lz -lpthread
+# destino (Plataforma de Ghidra para ARM64 Linux = "linux_arm_64", confirmado em
+# Generic.jar/ghidra/framework/Platform.class):
+mkdir -p /home/emuos/opt/ghidra/Ghidra/Features/Decompiler/os/linux_arm_64
+cp decompile /home/emuos/opt/ghidra/Ghidra/Features/Decompiler/os/linux_arm_64/decompile
+```
+
+BuildID `d133d5d7…`, ELF ARM aarch64, 3,9 MB. Notas preservadas em `/tmp/opencode/dc_build/`
+(`sources.txt`, `cc1.sh`; objectos apagados).
+
+O REA lê a versão do Ghidra no arranque e mantem estado em memória; com uma troca de
+instalação **é preciso reiniciar o cliente MCP do REA** para re-detectar (o REA ainda
+"sabia" do Ghidra 12.2 antigo e rejeitava com `unsupported_version`).
+
+Ferramentas locais de análise (mantidas em `/tmp/opencode/`): `nso_layout.py`
+(replica `GuestProgram::plan_layout`), `nso_to_elf.py` (converte NSO → ELF64 de tempo-de-execução),
+`rtld_rela_dump.py` (verte `.dynamic`/`.rela.dyn`/`.rela.plt`/dynsym/dynstr do rtld com
+endereços vaddr reais), disassemblies `rtld_text.dis`.

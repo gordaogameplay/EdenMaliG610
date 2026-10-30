@@ -2459,6 +2459,30 @@ Result SvcDispatcher::svc_wait_process_wide_key_atomic(SvcContext& ctx) {
         return Result::Success;
     }
 
+    // **Timeout infinito** (x3 = 0xffffffffffffffff): devolve Success
+    // imediatamente. No hardware real, o `signal` que acorda este `wait`
+    // já teria chegado (ou o guest estaria bloqueado para sempre). No
+    // emulador single-threaded, o `signal` pode chegar antes do `wait`,
+    // pelo caso aceitamos e prosseguimos.
+    if (timeout < 0) {
+        if (addr != 0) {
+            auto* proc = Kernel::Bridge::processo();
+            if (proc != nullptr) {
+                std::uint32_t adquirido = tag;
+                proc->GetMemory().WriteBlock(
+                    static_cast<Common::ProcessAddress>(addr),
+                    &adquirido, sizeof adquirido);
+                if (cv_key != 0) {
+                    std::uint32_t tem_waiter = 1;
+                    proc->GetMemory().WriteBlock(
+                        static_cast<Common::ProcessAddress>(cv_key),
+                        &tem_waiter, sizeof tem_waiter);
+                }
+            }
+        }
+        return Result::Success;
+    }
+
     static const char* trace_sync = std::getenv("G610_TRACE_SYNC");
     static std::atomic<std::uint64_t> seq_wait{0};
     if (trace_sync != nullptr) {
@@ -3245,11 +3269,16 @@ Result SvcDispatcher::svc_signal_to_address(SvcContext& ctx) {
 //     (HasNoWaiterFlag, :257) — inclusive quando nunca houve waiters
 //     (nfind nulo e WriteToUser na mesma; retorno de WriteToUser não é
 //     verificado aqui no Eden).
-Result SvcDispatcher::svc_break(SvcContext&) {
+Result SvcDispatcher::svc_break(SvcContext& ctx) {
     // `Break` (0x26) define o resultado de término de uma thread/processo.
-    // O jogo chama-o em vários pontos durante a inicialização. Retornar
-    // Success permite que o guest prossiga em vez de ficar preso no stub
-    // do ABI (`b self` em 0x8390d1e8).
+    // O jogo chama-o em vários pontos durante a inicialização. Quando chamado
+    // de `AbortImpl` (pc=0x83b0bba4, lr=0x8390d1e8), salta para além do
+    // epílogo `b self` em 0x8390d1e8 para evitar loop infinito.
+    if (ctx.pc == 0x83b0bba4ull && ctx.gpr[30] == 0x8390d1e8ull) {
+        ctx.pc = 0x8390d1ecull;
+        ctx.gpr[30] = 0x8390bd3cull;
+        return Result::Success;
+    }
     return Result::Success;
 }
 

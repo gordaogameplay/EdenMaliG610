@@ -280,8 +280,10 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
             // O `draw.end` é o desenho (`DrawEnd` no upstream).
             std::fprintf(stderr, "[DRAW_TRACE] draw_end (1413) chamado, dentro=%d vertex_count=%u\n",
                          dentro, regs[gpu::maxwell3d::vertex_buffer_count]);
-            if (!dentro)
-                break;
+            // Nota: não gateamos por `dentro`. O `draw.begin` pode ter
+            // ficado num SubmitGPFIFO anterior e o estado está perdido
+            // entre chamadas a translate(). Produzimos sempre o DrawCommand;
+            // o rasterizador ignora se o estado estiver vazio.
             dentro = false;
 
             // Os contagens vêm dos registos — como no upstream.
@@ -545,6 +547,11 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
                                     const std::uint32_t* base,
                                     std::uint32_t quantidade, bool e_ultimo) {
         ++cmds_total_;
+        if (std::getenv("G610_TRACE_DRAWS") != nullptr && (metodo == 1413 || metodo == 1414)) {
+            std::fprintf(stderr,
+                "[DRAW_TRACE] chamada_via_subcanal sc=%u metodo=%u qtd=%u e_ultimo=%d\n",
+                sc, metodo, quantidade, e_ultimo ? 1 : 0);
+        }
         if (metodo >= 1400) {
             std::fprintf(stderr,
                 "[SUBCANAL_TRACE] sc=%u metodo=%u qtd=%u motor[%u]=0x%x Maxwell3D=0x%x\n",
@@ -559,8 +566,10 @@ std::size_t MaxwellTranslator::translate(const std::vector<std::uint8_t>& pushbu
         }
         if (metodo < kPullerMetodos)
             return;  // semáforos/fence: do canal (o nvdrv trata), não do motor
-        if (sc >= 8 || motores_por_subcanal[sc] != gpu::motor::Maxwell3D)
-            return;  // métodos de outros motores: não são do 3D
+        // Nota: não filtramos por motor aqui — o BindObject que associa
+        // subcanal ao Maxwell3D pode vir num SubmitGPFIFO anterior, e o
+        // tradutor é re-iniciado a cada chamada. Filtrar por motor aqui
+        // faria com que todos os comandos de desenho fossem descartados.
         chamada_metodo(metodo, base, quantidade, e_ultimo);
     };
 

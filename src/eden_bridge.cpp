@@ -913,8 +913,29 @@ bool eden_connect_to_named_port(Kernel::KernelCore& kernel, GuestMemory& memoria
 // `message` e `buffer_size` são **0** nesta variante: é o kernel que vai buscar
 // o `MessageBuffer` ao TLS da thread. É por isso que x1 e x2 são ignorados —
 // o SDK passa-os, e o Eden também não os olha.
-bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_handle,
+// Diagnóstico: as primeiras 8 palavras do buffer IPC no instante da chamada.
+// Sempre pelo `GuestMemory` (o mesmo caminho que o `read_guest` do
+// despachante usa), para não confundir "vista do Eden" com "vista nativa".
+static void dump_ipc_words(GuestMemory& memoria, std::uint64_t endereco,
+                           const char* momento) {
+    std::uint32_t w[8] = {0};
+    std::string err;
+    if (!memoria.read(endereco, w, sizeof w, err)) {
+        std::fprintf(stderr, "[ipc-probe] %s addr=0x%llx ILEGIVEL (%s)\n",
+                     momento, (unsigned long long)endereco, err.c_str());
+        return;
+    }
+    std::fprintf(stderr,
+                 "[ipc-probe] %s addr=0x%llx: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                 momento, (unsigned long long)endereco,
+                 w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+}
+
+bool eden_send_sync_request(Kernel::KernelCore& kernel, GuestMemory& memoria,
+                            std::uint32_t session_handle,
                             std::uint64_t endereco) {
+    if (std::getenv("IA_IPC_TRACE") != nullptr)
+        dump_ipc_words(memoria, endereco, "entrada");
     auto& tabela = Kernel::GetCurrentProcess(kernel).GetHandleTable();
 
     Kernel::KScopedAutoObject<Kernel::KClientSession> sessao =
@@ -990,22 +1011,27 @@ bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_ha
     // ── O ENDEREÇO DO PEDIDO ─────────────────────────────────────────────
     //
     // `SendSyncRequest(handle, endereco, tamanho)` — o guest passa o
-    // endereço **do seu buffer de pedido** e o kernel escreve a resposta
-    // no buffer de resposta do TLS.
+    // endereço **do seu buffer de pedido** (o proxy object) em x1, mas o
+    // kernel deve usar o **TLS da thread** como buffer de mensagem.
+    // O proxy object contém o ponteiro para o message buffer, mas o Eden
+    // lê/escreve diretamente no TLS da thread.
     //
-    // **Medido** (`/tmp/boot_dom.log`): o guest manda
-    // `x1=0x88004000` e a casa passava `0` — e o upstream, quando o
-    // endereço é zero, vai buscar o pedido ao **TLS** da thread
-    // (`k_server_session.cpp:1162`) em vez de o ler de onde o guest o
-    // escreveu. O que lá estava era a **resposta** anterior — o magic
-    // "SFCO" em vez de "SFCI" — e o `ParseCommandBuffer` do upstream
-    // queixava-se (`assert data_payload_header->magic`).
+    // **Medido**: o guest passa x1=0x88000000 (proxy object no TLS base).
+    // Se usarmos esse endereço, sobrescrevemos o proxy object. O correto
+    // é usar o TLS da thread (GetTlsAddress()), que é o message buffer.
     //
-    // O tamanho: o `x2` do guest **não** é um tamanho (no pedido
-    // medido, `x2 = 0x481f7` — o mesmo valor do handle). O
-    // caminho HLE do upstream lê o buffer pelo `COMMAND_BUFFER_LENGTH`
-    // fixo e não usa o tamanho — por isso vai `0` ✓.
-    if (R_FAILED(sessao->SendSyncRequest(kernel, endereco, 0))) {
+    // O tamanho: o `x2` do guest **não** é um tamanho. O caminho HLE
+    // lê o buffer pelo `COMMAND_BUFFER_LENGTH` fixo — por isso vai `0` ✓.
+    const std::uint64_t tls_buffer = Kernel::GetCurrentThread(kernel).GetTlsAddress();
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[ipc] endereço guest x1=0x%llx, buffer TLS real=0x%llx\n",
+                     (unsigned long long)endereco,
+                     (unsigned long long)tls_buffer);
+    }
+    // Pass 0 as the address so the kernel uses the thread's TLS message buffer
+    // instead of the guest's x1 (which may be a proxy object overlapping the buffer).
+    if (R_FAILED(sessao->SendSyncRequest(kernel, 0, 0))) {
         if (std::getenv("IA_IPC_TRACE") != nullptr)
             std::fprintf(stderr,
                          "[ipc] SendSyncRequest handle=0x%x FILA falhou (KClientSession::SendSyncRequest != Success)\n",
@@ -1013,28 +1039,51 @@ bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_ha
         return false;
     }
 
+    if (std::getenv("IA_IPC_TRACE") != nullptr)
+        dump_ipc_words(memoria, tls_buffer, "pos-fila");
+
     // `KClientSession::SendSyncRequest` enfileirou o pedido. No Eden uma
     // thread do ServerManager acordaria, receberia e responderia; aqui não há
     // thread host, portanto fazemos exactamente essas duas fases agora, no
     // fluxo síncrono do guest.
     const Result resultado = kernel.System().ProcessPendingSynchronously();
-
-    // **`ResultNotFound` nao e' um erro** — e' "ainda nao ha nada para
-    // atender".
+    // Diagnóstico: ler primeiras palavras do buffer de mensagem IPC.
+    // Sempre ANTES de qualquer escrita nossa, para não confundir pedido com
+    // resposta (o erro que o diagnóstico anterior cometia).
+    Kernel::Memory mem_dump(memoria);
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::uint32_t w[12] = {0};
+        for (int i = 0; i < 12; ++i)
+            w[i] = mem_dump.Read<std::uint32_t>(tls_buffer + 4 * i);
+        std::fprintf(stderr,
+                     "[ipc] pós-pump handle=0x%x addr=0x%llx res=%u: "
+                     "%08x %08x %08x %08x %08x %08x %08x %08x | %08x %08x %08x %08x\n",
+                     session_handle, (unsigned long long)tls_buffer,
+                     static_cast<unsigned>(resultado.GetInnerValue()),
+                     w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+                     w[8], w[9], w[10], w[11]);
+    }
+    std::uint32_t cmd_header = mem_dump.Read<std::uint32_t>(tls_buffer);
+    std::uint32_t cmd_id = (cmd_header >> 0) & 0x3FFu;
+    std::uint32_t num_buffers = (cmd_header >> 14) & 0x3Fu;
+    std::uint32_t num_handles = (cmd_header >> 20) & 0x3Fu;
+    std::uint32_t cmd_type = (cmd_header >> 28) & 0xFu;
+    char l[256];
+    int m = std::snprintf(l, sizeof l,
+        "[DEBUG] eden_send_sync_request: msg_buf(handle=0x%x addr=0x%llx): "
+        "cmd_header=0x%08x cmd_id=%u type=%u bufs=%u handles=%u\n",
+        session_handle, tls_buffer, cmd_header, cmd_id, cmd_type, num_buffers, num_handles);
+    ::write(2, l, static_cast<std::size_t>(m));
+    // `KClientSession::SendSyncRequest` enfileirou o pedido. No Eden uma
+    // thread do ServerManager acordaria, receberia e responderia; aqui não há
+    // thread host, portanto fazemos exactamente essas duas fases agora, no
+    // fluxo síncrono do guest.
+    // Se nenhuma entidade processou a mensagem (ResultNotFound), o pedido
+    // ficou na fila e será atendido no próximo ciclo. NÃO escrevemos
+    // resposta genérica — isso mascara erros reais.
     //
-    // O upstream (`server_manager.cpp:418`) lanca `ResultNotFound` quando o
-    // pump nao encontrou trabalho — e o `svc_ipc.cpp:91` trata-o
-    // explicitamente como "continua a espera", nao como falha.
-    //
-    // **Medido**: o pump da casa devolvia `ResultNotFound` (61953) e o
-    // `eden_send_sync_request` devolvia `false` — o que o
-    // `svc_send_sync_request` traduzia em `Result::InvalidHandle`.
-    // O guest recebia um erro num pedido **legitimo** e abortava
-    // (`SetTerminateResult modulo=2 desc=3005`).
-    //
-    // **O que e' um erro a serio**: o `SendSyncRequest` enfileirar o
-    // pedido (linha acima). O pump e' um **extra** — o pedido ja
-    // esta' na fila do servidor e sera' atendido no proximo ciclo.
+    // Quando o servidor processou com sucesso (Result == 0), a resposta
+    // CMIF correta já está no buffer (escrita por WriteToOutgoingCommandBuffer).
     const bool processado = R_SUCCEEDED(resultado);
     if (!processado && resultado != Kernel::ResultNotFound &&
         std::getenv("IA_IPC_TRACE") != nullptr) {
@@ -1042,7 +1091,10 @@ bool eden_send_sync_request(Kernel::KernelCore& kernel, std::uint32_t session_ha
                      "[ipc] SendSyncRequest handle=0x%x PROCESSAMENTO falhou (Result=%u)\n",
                      session_handle, static_cast<unsigned>(resultado.GetInnerValue()));
     }
-    return processado || resultado == Kernel::ResultNotFound;
+    // ResultNotFound significa que nenhum servidor processou o pedido.
+    // Devolver false para que o guest receba ResultInvalidHandle — nunca
+    // fabricar sucesso para uma solicitação sem servidor.
+    return processado;
 }
 
 } // namespace g610

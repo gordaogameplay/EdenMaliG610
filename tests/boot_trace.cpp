@@ -412,6 +412,19 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
             std::uint32_t type, unk;
             std::memcpy(&type, m, 4);
             std::memcpy(&unk, m + 4, 4);
+            {
+                char pb[160];
+                std::uint32_t p10 = 0, p0c = 0, p14 = 0;
+                std::memcpy(&p0c, m + 0x0c, 4);
+                std::memcpy(&p10, m + 0x10, 4);
+                std::memcpy(&p14, m + 0x14, 4);
+                const int pk = std::snprintf(
+                    pb, sizeof pb,
+                    "[probe-obs] svc#%u addr=0x%llx +04=%08x +0c=%08x +10=%08x +14=%08x\n",
+                    n_svc, (unsigned long long)ctx.x[1], unk, p0c, p10, p14);
+                ssize_t pw = ::write(2, pb, (size_t)pk);
+                (void)pw;
+            }
             std::printf("[ipc ] pedido em %llu (handle %llx) type=%u unk=0x%08x\n",
                         (unsigned long long)ctx.x[1],
                         (unsigned long long)ctx.x[0], type, unk);
@@ -874,6 +887,13 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
     // A mensagem esta no x5 (o quinto argumento), e o ficheiro no x2/x3.
     // E' a unica forma de saber **o que** falhou: o SDK aborta por uma
     // assercao, e a assercao tem o ficheiro e a linha.
+    // `Break` (0x26): todo o diagnóstico de Break fica a cargo do
+    // `svc_break` em `svc_dispatcher.cpp` (usa apenas `::write`, seguro
+    // em handler de sinal). O observer não formata nada aqui — `printf`/`snprintf`
+    // crasham dentro do handler de sinal (`_nl_lookup` não é async-signal-safe).
+    if (number == 0x26)
+        return;
+
     // **O instante do `Break`** — o guest abortou. E o que separa o
     // tempo do **arranque** (o que o nosso motor custou) do tempo do
     // **loop infinito do `Abort`** (que nao e' nosso).
@@ -882,9 +902,14 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
         clock_gettime(CLOCK_MONOTONIC, &agora);
         const auto ns = static_cast<long long>(agora.tv_sec) * 1000000000LL + agora.tv_nsec;
         if (g_inicio_ns != 0) {
-            std::printf("[arranque] o guest abortou em %.3f ms, apos %llu SVC(s)\n",
-                        (ns - g_inicio_ns) / 1e6,
-                        (unsigned long long)g_svcs.load());
+            char arranque_linha[120];
+            int arranque_n = std::snprintf(arranque_linha, sizeof arranque_linha,
+                "[arranque] o guest abortou em %.3f ms, apos %llu SVC(s)\n",
+                (ns - g_inicio_ns) / 1e6,
+                (unsigned long long)g_svcs.load());
+            ssize_t arranque_w = ::write(2, arranque_linha,
+                                         static_cast<std::size_t>(arranque_n > 0 ? arranque_n : 0));
+            (void)arranque_w;
         }
     }
 
@@ -895,21 +920,29 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
         // string **do proprio SDK** (o `.rodata` dele), que nao esta no
         // espaco do guest. Por isso o `g_mem->read` nao a ve — e a
         // unica forma e' o dump do modulo.
-        std::printf("[brk] registos:");
-        for (int arg = 0; arg <= 7; ++arg) {
-            std::printf(" x%d=0x%llx", arg,
-                        (unsigned long long)ctx.gpr[arg]);
-        }
-        std::printf("  pc=0x%llx\n", (unsigned long long)ctx.pc);
-        // **Todos os registos.** A cadeia de chamadas do abort passa pelo
-        // `x29` (o frame pointer); sem os registos todos, o `x22` — que no
-        // `nn::fs` e' o caminho do ficheiro — fica a ser uma adivinhaca.
-        std::printf("[brk] gpr:");
-        for (int arg = 0; arg <= 30; ++arg) {
-            std::printf(" x%d=0x%llx", arg,
-                        (unsigned long long)ctx.gpr[arg]);
-        }
-        std::printf("\n");
+        char brk_linha[260];
+        int brk_n = std::snprintf(brk_linha, sizeof brk_linha,
+                                  "[brk] registos:");
+        for (int arg = 0; arg <= 7; ++arg)
+            brk_n += std::snprintf(brk_linha + brk_n, sizeof brk_linha - brk_n,
+                                   " x%d=0x%llx", arg,
+                                   (unsigned long long)ctx.gpr[arg]);
+        brk_n += std::snprintf(brk_linha + brk_n, sizeof brk_linha - brk_n,
+                               "  pc=0x%llx\n", (unsigned long long)ctx.pc);
+        ssize_t brk_w = ::write(2, brk_linha,
+                                static_cast<std::size_t>(brk_n > 0 ? brk_n : 0));
+        (void)brk_w;
+
+        brk_n = std::snprintf(brk_linha, sizeof brk_linha, "[brk] gpr:");
+        for (int arg = 0; arg <= 30; ++arg)
+            brk_n += std::snprintf(brk_linha + brk_n, sizeof brk_linha - brk_n,
+                                   " x%d=0x%llx", arg,
+                                   (unsigned long long)ctx.gpr[arg]);
+        brk_n += std::snprintf(brk_linha + brk_n, sizeof brk_linha - brk_n, "\n");
+        brk_w = ::write(2, brk_linha,
+                        static_cast<std::size_t>(brk_n > 0 ? brk_n : 0));
+        (void)brk_w;
+
         for (int arg = 1; arg <= 6; ++arg) {
             const std::uint64_t p = ctx.gpr[arg];
             if (p == 0 || p >= 0x98000000ull)
@@ -927,8 +960,12 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
                     break;
             if (legiveis < 4)
                 continue;
-            std::printf("[ass] x%d = 0x%llx -> \"%s\"\n", arg,
-                        (unsigned long long)p, buf);
+            brk_n = std::snprintf(brk_linha, sizeof brk_linha,
+                                  "[ass] x%d = 0x%llx -> \"%s\"\n", arg,
+                                  (unsigned long long)p, buf);
+            brk_w = ::write(2, brk_linha,
+                            static_cast<std::size_t>(brk_n > 0 ? brk_n : 0));
+            (void)brk_w;
         }
     }
 
@@ -946,18 +983,31 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
         std::uint8_t buf[0x60]{};
         std::string e7;
         if (g_mem->read(g_ultimo_req, buf, sizeof buf, e7)) {
-            std::printf("[ipcB] buffer do guest em %llu:\n",
-                        (unsigned long long)g_ultimo_req);
+            char ipc_linha[200];
+            int ipc_n = std::snprintf(ipc_linha, sizeof ipc_linha,
+                                      "[ipcB] buffer do guest em %llu:\n",
+                                      (unsigned long long)g_ultimo_req);
+            ssize_t ipc_w = ::write(2, ipc_linha,
+                                    static_cast<std::size_t>(ipc_n > 0 ? ipc_n : 0));
+            (void)ipc_w;
             for (std::size_t i = 0; i < sizeof buf; i += 16) {
-                std::printf("[ipcB]  +%02zx ", i);
+                ipc_n = std::snprintf(ipc_linha, sizeof ipc_linha,
+                                      "[ipcB]  +%02zx ", i);
                 for (std::size_t j = 0; j < 16; ++j)
-                    std::printf("%02x ", buf[i + j]);
-                std::printf(" |");
+                    ipc_n += std::snprintf(ipc_linha + ipc_n, sizeof ipc_linha - ipc_n,
+                                           "%02x ", buf[i + j]);
+                ipc_n += std::snprintf(ipc_linha + ipc_n, sizeof ipc_linha - ipc_n,
+                                       " |");
                 for (std::size_t j = 0; j < 16; ++j) {
                     const char c = (char)buf[i + j];
-                    std::printf("%c", (c >= ' ' && c <= '~') ? c : '.');
+                    ipc_n += std::snprintf(ipc_linha + ipc_n, sizeof ipc_linha - ipc_n,
+                                           "%c", (c >= ' ' && c <= '~') ? c : '.');
                 }
-                std::printf("|\n");
+                ipc_n += std::snprintf(ipc_linha + ipc_n, sizeof ipc_linha - ipc_n,
+                                       "|\n");
+                ipc_w = ::write(2, ipc_linha,
+                                static_cast<std::size_t>(ipc_n > 0 ? ipc_n : 0));
+                (void)ipc_w;
             }
         }
     }
@@ -966,15 +1016,24 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
         std::uint64_t palavras[128] = {0};
         std::string e;
         if (g_mem->read(sp, palavras, sizeof palavras, e)) {
-            std::printf("[pilha] sp=0x%llx\n", (unsigned long long)sp);
+            char pilha_linha[120];
+            int pilha_n = std::snprintf(pilha_linha, sizeof pilha_linha,
+                                        "[pilha] sp=0x%llx\n", (unsigned long long)sp);
+            ssize_t pilha_w = ::write(2, pilha_linha,
+                                      static_cast<std::size_t>(pilha_n > 0 ? pilha_n : 0));
+            (void)pilha_w;
             for (int k = 0; k < 128; ++k) {
                 const std::uint64_t v = palavras[k];
                 const char* marca = (v >= 0x80000000ull && v < 0x98000000ull) ? " <- codigo"
                                                                            : "";
                 if (v == 0 && k > 8)
                     continue;
-                std::printf("[pilha] +0x%03x = 0x%016llx%s\n", k * 8,
-                            (unsigned long long)v, marca);
+                pilha_n = std::snprintf(pilha_linha, sizeof pilha_linha,
+                                        "[pilha] +0x%03x = 0x%016llx%s\n", k * 8,
+                                        (unsigned long long)v, marca);
+                pilha_w = ::write(2, pilha_linha,
+                                  static_cast<std::size_t>(pilha_n > 0 ? pilha_n : 0));
+                (void)pilha_w;
             }
             // **A pilha toda, em binario.** A cadeia de chamadas passa por
             // varias frames (o `AbortImpl` do SDK tem uma frame de 0x190
@@ -990,8 +1049,13 @@ void on_svc(std::uint32_t number, g610::SvcContext& ctx, std::uint64_t pc,
                     if (f != nullptr) {
                         std::fwrite(janela.data(), 1, janela.size(), f);
                         std::fclose(f);
-                        std::printf("[pilha] despejada: %s (base 0x%llx, %zu bytes)\n",
-                                    caminho, (unsigned long long)inicio, janela.size());
+                        char despejo_linha[200];
+                        int despejo_n = std::snprintf(despejo_linha, sizeof despejo_linha,
+                                                      "[pilha] despejada: %s (base 0x%llx, %zu bytes)\n",
+                                                      caminho, (unsigned long long)inicio, janela.size());
+                        ssize_t despejo_w = ::write(2, despejo_linha,
+                                                        static_cast<std::size_t>(despejo_n > 0 ? despejo_n : 0));
+                        (void)despejo_w;
                     }
                 }
             }

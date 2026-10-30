@@ -345,7 +345,7 @@ private:
 
 class LM final : public ServiceFramework<LM> {
 public:
-    explicit LM(Core::System& system_) : ServiceFramework{system_, "lm"} {
+    explicit LM(Core::System& system_) : ServiceFramework{system_, "lm:"} {
         // clang-format off
         static const FunctionInfo functions[] = {
             {0, &LM::OpenLogger, "OpenLogger"},
@@ -368,7 +368,10 @@ private:
 void LoopProcess(Core::System& system) {
     auto server_manager = std::make_unique<ServerManager>(system);
 
+    // Register both with and without colon for compatibility.
+    // The guest's GetService request sends "lm" (without colon).
     server_manager->RegisterNamedService("lm", std::make_shared<LM>(system));
+    server_manager->RegisterNamedService("lm:", std::make_shared<LM>(system));
     ServerManager::RunServer(std::move(server_manager));
 }
 

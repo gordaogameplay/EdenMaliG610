@@ -30,6 +30,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <ucontext.h>
+
 #include "g610/telemetry.hpp"
 
 namespace g610 {
@@ -115,15 +117,18 @@ enum class Svc : std::uint32_t {
     SendAsyncRequestWithUserBuffer = 0x23,
     GetProcessId         = 0x24,
     GetThreadId          = 0x25,
-    // 0x26 (`Break`): o stub do ABI chama-o para MORRER — no hardware o
-    // processo não regressa. Quando dispara, cai no `default` (o Result
-    // `Unsupported` 0x40 vai para x0) e o guest fica no `b self` do stub
-    // (`sdk 0x8390d1e8`) — o sampler prende-se nele. Sem handler: um
-    // Break NUMA corrida verde é fatal e é exatamente o que se quer ver.
-    // O dump de evidência (payload + cadeia de frames) foi retirado com a
-    // verde da runP (23/10) — re-ciclar com gate novo se aparecer.
+    // 0x26 (`Break`): aborta o processo — `nn::diag::detail::AbortImpl`.
+    // Argumentos: x0 = BreakReason, x1 = ponteiro para dados de diagnóstico,
+    // x2 = tamanho desses dados. No hardware nunca retorna; o processo morre.
+    // No nosso motor, `svc_break` faz o diagnóstico (veja src/svc_dispatcher.cpp)
+    // e devolve Success; o PC avança 4, o `ret` seguinte volta para LR
+    // (`b 0x8390d1e8` — loop de abort do guest).
     Break                = 0x26,
     OutputDebugString    = 0x27,
+    // 0x28 (`ReturnFromException`): sai de um exception handler. No hardware
+    // nunca retorna; restaura o contexto da exceção e salta para um novo PC.
+    // No nosso motor, sem contexto de exceção salvo, devolve Success e avança
+    // PC em 4; o `ret` seguinte volta para LR.
     ReturnFromException  = 0x28,
     GetInfo              = 0x29,
     FlushEntireDataCache = 0x2A,
@@ -229,6 +234,10 @@ struct SvcContext {
     // "contenham ASCII" e pareceu uma pistaChanged até perceber que o ASCII
     // vinha do meu próprio heap.
     std::uint64_t gpr[31] = {};
+
+    // Ponteiro para o ucontext do guest (definido pelo motor antes do dispatch).
+    // Serviços como ReturnFromException precisam alterar o PC do guest.
+    ucontext_t*   guest_uc = nullptr;
 
     std::uint64_t ret   = 0; // valor devolvido em x0
 

@@ -33,6 +33,10 @@
 #include "vendor/eden/core/hle/service/ipc_helpers.h"
 #include "vendor/eden/core/memory_bridge.h"  // PONTE: substitui core/memory.h
 
+// Endereço do buffer de pedido IPC, capturado em PopulateFromIncomingCommandBuffer.
+// Usado em WriteToOutgoingCommandBuffer para escrever a resposta no local correto.
+std::uint64_t g_endereco_do_pedido = 0;
+
 namespace Service {
 
 SessionRequestHandler::SessionRequestHandler(Kernel::KernelCore& kernel_, const char* service_name_)
@@ -261,6 +265,10 @@ void HLERequestContext::ParseCommandBuffer(u32_le* src_cmdbuf, bool incoming) {
 Result HLERequestContext::PopulateFromIncomingCommandBuffer(u32_le* src_cmdbuf) {
     client_handle_table = &thread->GetOwnerProcess()->GetHandleTable();
 
+    // Capturar o endereço do buffer de pedido para a resposta ir no local correto.
+    // O guest passa o endereço do buffer em x1 do SendSyncRequest.
+    g_endereco_do_pedido = reinterpret_cast<std::uint64_t>(src_cmdbuf);
+
     ParseCommandBuffer(src_cmdbuf, true);
 
     if (command_header->IsCloseCommand()) {
@@ -323,7 +331,46 @@ Result HLERequestContext::WriteToOutgoingCommandBuffer() {
     }
 
     // Copy the translated command buffer back into the thread's command buffer area.
-    memory.WriteBlock(thread->GetTlsAddress(), cmd_buf.data(), write_size * sizeof(u32));
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[ipc] escrita: tls=0x%llx write_size=%u palavras: "
+                     "%08x %08x %08x %08x %08x %08x\n",
+                     static_cast<unsigned long long>(thread->GetTlsAddress()),
+                     static_cast<unsigned>(write_size),
+                     cmd_buf[0], cmd_buf[1], cmd_buf[2], cmd_buf[3],
+                     cmd_buf[4], cmd_buf[5]);
+        auto* p = reinterpret_cast<const std::uint32_t*>(
+            memory.GetPointer(thread->GetTlsAddress()));
+        if (p != nullptr) {
+            std::fprintf(stderr,
+                         "[ipc] escrita: antes no guest: "
+                         "%08x %08x %08x %08x %08x %08x\n",
+                         p[0], p[1], p[2], p[3], p[4], p[5]);
+        }
+    }
+
+    // **O endereço de destino da resposta.**
+    //
+    // No Eden o pedido é lido do TLS, então a resposta também vai para lá.
+    // Na casa, o guest passa o endereço do seu buffer IPC em x1 — e a
+    // resposta deve ir para esse mesmo endereço. O `g_endereco_do_pedido`
+    // é preenchido em `PopulateFromIncomingCommandBuffer`.
+    const std::uint64_t destino =
+        g_endereco_do_pedido != 0 ? g_endereco_do_pedido
+                                  : static_cast<std::uint64_t>(thread->GetTlsAddress());
+    memory.WriteBlock(destino, cmd_buf.data(), write_size * sizeof(u32));
+
+    if (std::getenv("IA_IPC_TRACE") != nullptr) {
+        auto* p = reinterpret_cast<const std::uint32_t*>(
+            memory.GetPointer(destino));
+        if (p != nullptr) {
+            std::fprintf(stderr,
+                         "[ipc] escrita: depois no guest (destino=0x%llx): "
+                         "%08x %08x %08x %08x %08x %08x\n",
+                         (unsigned long long)destino,
+                         p[0], p[1], p[2], p[3], p[4], p[5]);
+        }
+    }
 
     return ResultSuccess;
 }

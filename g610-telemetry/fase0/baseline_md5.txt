@@ -1,0 +1,17 @@
+0b79159bf0aaa52f7d44632ec35fa9e1  CMakeLists.txt
+6f9cd6101a5c5399034aba216f1cca77  PROGRESSO.md
+984a67fbc7c6df04464ddc88294dffb1  docs/RELATORIO_GHIDRA_REA_PIXELS.md
+66df6dac509fbfd93784e659c78fbb0e  include/g610/eden_bridge.hpp
+8afde6e83c0da83667b7fc0c909e18f4  include/g610/native_engine.hpp
+0e90ca4557ddf57de5cac1e6bb4e2365  include/g610/nso_loader.hpp
+a12c5ddc353530d6601d9ad41eeb1f67  include/g610/svc_dispatcher.hpp
+3d1591ae88709cd7b2619d0dbd55ad39  src/eden_bridge.cpp
+020165ff3e20ca29cac06030be7f3b16  src/g610_call_guest.S
+243390b1e3624e911bc369372bf30e68  src/guest_program.cpp
+1ccc39d25ebf26599bdd52dee7ae3329  src/ipc_min.cpp
+b24c1a57bbf3796f54481d498ff92043  src/native_engine.cpp
+b992fd42eb165aaeffbb68ca0e9aa2a5  src/nso_loader.cpp
+9943c1cbe8b77d9e87aec40c7e32aced  src/services/vi.cpp
+bdad9e4fafa77e108326df98690d5e48  src/svc_dispatcher.cpp
+dc1c4f0c7b8ad46145c0011c12803446  tests/boot_trace.cpp
+98c9d90b76f875d3485044a89c797b4c  vendor/eden/core/hle/service/lm/lm.cpp

@@ -170,7 +170,10 @@ g610_call_guest:
     mov     x13, xzr
     mov     x14, xzr
     mov     x15, xzr
-    mov     x16, xzr
+    /* x16 = base de TLS do guest (kTlsBase) — o crt0 usa x16 como ponteiro
+     * para estruturas de dados (GOT, TCB, etc.). Sem isto, qualquer acesso
+     * via x16 aponta para endereço zero e leva SIGSELG imediato. */
+    movz    x16, #0x8800, lsl #16   /* x16 = kTlsBase = 0x8800'0000 */
     mov     x17, xzr
     mov     x19, xzr
     mov     x20, xzr
@@ -183,24 +186,20 @@ g610_call_guest:
     mov     x27, xzr
     mov     x28, xzr
     mov     x29, xzr          /* fp */
-    mov     x30, xzr          /* lr: quem chamou foi o kernel, não uma função */
+    /* x30 = endereço de segurança (g610_guest_returned). Se o guest fizer
+     * `ret` sem ExitProcess, cai aqui em vez de ir para endereço zero. */
+    adrp    x30, g610_guest_returned
+    add     x30, x30, :lo12:g610_guest_returned
 
     /* x0 tem de ser 0: é o ARGUMENTO (KProcess::Run passa 0), e a PRIMEIRA
-     * instrução do entry faz `cmp x0, #0` sobre ele.
-     *
-     * O endereço de entrada NÃO pode ir em x0. Foi o que aconteceu durante
-     * muito tempo — `mov x0, xzr` seguido de `ldr x0, [sp]` — e o guest via
-     * `cmp x0, #0` falhar, saltava para o caminho alternativo e acabava num
-     * `b .` a girar para sempre. O sintoma — "o guest não faz nada" — não
-     * aponta de forma nenhuma para "estou a carregar o endereço no registo
-     * errado".
-     *
-     * O destino vai em x17 (IP1), que a AAPCS64 declara como descartável:
-     * qualquer código tem de assumir que o chamador o estragou. É o registo
-     * mais expênsico de todos, e por isso o mais seguro para transportar o
-     * destino durante o cleaning.
-     */
-    mov     x0,  xzr          /* o argumento: 0 */
+     * instrução do entry faz `cmp x0, #0` sobre ele. x0≠0 leva a
+     * `b.ne fail-arm` do crt0 (mov x0,#0xf801; CallSupervisor(0x28)) e ao
+     * spin eterno `b .` @0x844610f8 — medido no boot natural 28/10/2026:
+     * svc_calls=1, a cadeia fria nem arrancou. */
+    mov     x0, xzr                 /* x0 = 0: cadeia fria do crt0_ */
+    /* x28 = base para acesos de pilha/estrutura no arranque do crt0. */
+    /* x28 = base para acesos de pilha/estrutura no arranque do crt0. */
+    movz    x28, #0x8800, lsl #16  /* x28 = kTlsBase = 0x8800'0000 */
     add     sp,  sp, #32      /* sp do guest fica 32 bytes acima */
     ldr     x1,  [sp]         /* o handle da thread principal (ver o cabecalho) */
     ldr     x17, [sp, #-32]   /* endereço de entrada ([sp-32], nao [sp-16]) */

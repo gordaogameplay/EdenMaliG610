@@ -235,7 +235,7 @@ target_include_directories(g610_core PUBLIC
 )
 target_compile_definitions(g610_core PUBLIC ANKERL_UNORDERED_DENSE_STD_MODULE=1)
 target_link_libraries(g610_core PUBLIC Vulkan::Vulkan SDL2::SDL2 fmt::fmt pthread
-  OpenSSL::Crypto)
+  OpenSSL::Crypto lz4)
 
 # --- o Eden vendorizado ------------------------------------------------------
 # A parte SISTEMÁTICA do OS do Eden: a camada de IPC e os objectos de porta e
